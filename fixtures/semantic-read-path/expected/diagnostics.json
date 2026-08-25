@@ -1,0 +1,24 @@
+{
+  "diagnostics": [
+    {
+      "code": "malformed_frontmatter",
+      "path": "Malformed frontmatter.md",
+      "severity": "warning"
+    },
+    {
+      "code": "unresolved_reference",
+      "path": "Markdown links.md",
+      "severity": "warning"
+    },
+    {
+      "code": "unresolved_reference",
+      "path": "Wikilinks.md",
+      "severity": "warning"
+    },
+    {
+      "code": "ambiguous_reference",
+      "path": "Wikilinks.md",
+      "severity": "warning"
+    }
+  ]
+}

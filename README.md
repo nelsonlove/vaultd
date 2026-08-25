@@ -34,9 +34,20 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 
 The foundation implements semantic identity primitives, protocol versioning, and health dispatch. See `VAULTD-COMPATIBILITY.md`, `docs/protocol.md`, and `docs/adr/0001-core-language.md`.
 
+### Completed: semantic read path
+
+`vault-core` now scans an ordinary Obsidian vault into a read-only, in-memory semantic graph:
+
+- exact source preservation (`SourceDocument` keeps every UTF-8 byte) and content-derived revisions;
+- read-only deterministic enumeration (`FileSystemVaultSource` sorts vault paths, skips `.obsidian` and hidden directories, and bounds symlinks to the vault root);
+- semantic parsing with exact byte spans for properties, aliases, headings, blocks, tags, links, embeds, and wikilinks, plus explicit structured diagnostics for malformed content;
+- in-memory resolution with outgoing, backlink, unresolved, and ambiguous indexes (`scan_vault` → `SemanticGraph`);
+- a committed compatibility fixture corpus at `fixtures/semantic-read-path/` with golden public snapshots;
+- deliberately no protocol or daemon exposure, no persistence, no filesystem watching, and no mutation — the graph is a library boundary only.
+
 ## Non-goals
 
-This milestone does not parse or mutate vault files, build an index, run plugins, render UI, or implement Sync.
+This milestone does not mutate vault files, persist an index, run plugins, render UI, or implement Sync.
 
 ## Development
 

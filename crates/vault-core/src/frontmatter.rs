@@ -32,10 +32,10 @@ struct Fences {
 }
 
 fn find_fences(text: &str) -> Option<Result<Fences, ()>> {
-    let payload_start = if let Some(rest) = text.strip_prefix("---\n") {
-        text.len() - rest.len()
-    } else if let Some(rest) = text.strip_prefix("---\r\n") {
-        text.len() - rest.len()
+    let payload_start = if text.starts_with("---\n") {
+        4
+    } else if text.starts_with("---\r\n") {
+        5
     } else {
         return None;
     };

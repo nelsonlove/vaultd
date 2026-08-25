@@ -1,6 +1,7 @@
 mod diagnostic;
 mod domain;
 mod frontmatter;
+mod graph;
 mod markdown;
 mod obsidian;
 mod parse;
@@ -12,6 +13,7 @@ mod vault_source;
 
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use domain::{DomainError, NoteId, NoteRef, Revision, SourceSpan, VaultPath};
+pub use graph::{ScanReport, SemanticGraph, scan_vault};
 pub use parse::parse_note;
 pub use property::{Property, PropertyValue};
 pub use resolver::{Resolution, ResolvedReference, Resolver};

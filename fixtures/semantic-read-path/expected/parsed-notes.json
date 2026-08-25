@@ -1,0 +1,218 @@
+{
+  "notes": [
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [],
+      "path": "Ambiguous/Foo.md",
+      "references": [],
+      "tags": []
+    },
+    {
+      "aliases": [],
+      "blocks": [
+        {
+          "source": "^decision",
+          "value": "decision"
+        }
+      ],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Headings and blocks",
+          "text": "Headings and blocks"
+        },
+        {
+          "level": 2,
+          "source": "## Decision",
+          "text": "Decision"
+        }
+      ],
+      "path": "Headings and blocks.md",
+      "references": [],
+      "tags": []
+    },
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Recoverable",
+          "text": "Recoverable"
+        }
+      ],
+      "path": "Malformed frontmatter.md",
+      "references": [],
+      "tags": []
+    },
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Markdown links",
+          "text": "Markdown links"
+        }
+      ],
+      "path": "Markdown links.md",
+      "references": [
+        {
+          "kind": "markdown_link",
+          "origin": "body",
+          "rawTarget": "Unicode%20café.md",
+          "source": "[Unicode](Unicode%20café.md)",
+          "targetSource": "Unicode%20café.md"
+        },
+        {
+          "kind": "markdown_link",
+          "origin": "body",
+          "rawTarget": "Headings%20and%20blocks.md#Decision",
+          "source": "[Decision](Headings%20and%20blocks.md#Decision)",
+          "targetSource": "Headings%20and%20blocks.md#Decision"
+        },
+        {
+          "kind": "markdown_embed",
+          "origin": "body",
+          "rawTarget": "asset.png",
+          "source": "![Missing attachment](asset.png)",
+          "targetSource": "asset.png"
+        }
+      ],
+      "tags": []
+    },
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [],
+      "path": "Other/Foo.md",
+      "references": [],
+      "tags": []
+    },
+    {
+      "aliases": [
+        {
+          "source": "Props",
+          "value": "Props"
+        },
+        {
+          "source": "Metadata note",
+          "value": "Metadata note"
+        }
+      ],
+      "blocks": [],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Properties",
+          "text": "Properties"
+        }
+      ],
+      "path": "Properties and aliases.md",
+      "references": [
+        {
+          "kind": "wikilink",
+          "origin": "property",
+          "rawTarget": "Headings and blocks#Decision",
+          "source": "[[Headings and blocks#Decision]]",
+          "targetSource": "Headings and blocks#Decision"
+        }
+      ],
+      "tags": [
+        {
+          "comparisonKey": "project/phaseone",
+          "source": "Project/PhaseOne",
+          "value": "Project/PhaseOne"
+        },
+        {
+          "comparisonKey": "metadata",
+          "source": "metadata",
+          "value": "metadata"
+        }
+      ]
+    },
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Tags",
+          "text": "Tags"
+        }
+      ],
+      "path": "Tags.md",
+      "references": [],
+      "tags": [
+        {
+          "comparisonKey": "project/phaseone",
+          "source": "#Project/PhaseOne",
+          "value": "Project/PhaseOne"
+        },
+        {
+          "comparisonKey": "unicode/café",
+          "source": "#unicode/café",
+          "value": "unicode/café"
+        }
+      ]
+    },
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Unicode café",
+          "text": "Unicode café"
+        }
+      ],
+      "path": "Unicode café.md",
+      "references": [],
+      "tags": []
+    },
+    {
+      "aliases": [],
+      "blocks": [],
+      "headings": [
+        {
+          "level": 1,
+          "source": "# Wikilinks",
+          "text": "Wikilinks"
+        }
+      ],
+      "path": "Wikilinks.md",
+      "references": [
+        {
+          "kind": "wikilink",
+          "origin": "body",
+          "rawTarget": "Properties and aliases",
+          "source": "[[Properties and aliases|Properties]]",
+          "targetSource": "Properties and aliases"
+        },
+        {
+          "kind": "wiki_embed",
+          "origin": "body",
+          "rawTarget": "Headings and blocks#^decision",
+          "source": "![[Headings and blocks#^decision]]",
+          "targetSource": "Headings and blocks#^decision"
+        },
+        {
+          "kind": "wikilink",
+          "origin": "body",
+          "rawTarget": "Missing note",
+          "source": "[[Missing note]]",
+          "targetSource": "Missing note"
+        },
+        {
+          "kind": "wikilink",
+          "origin": "body",
+          "rawTarget": "Foo",
+          "source": "[[Foo]]",
+          "targetSource": "Foo"
+        }
+      ],
+      "tags": []
+    }
+  ]
+}

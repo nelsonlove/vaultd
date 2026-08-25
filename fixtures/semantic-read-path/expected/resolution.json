@@ -1,0 +1,88 @@
+{
+  "ambiguous": [
+    {
+      "candidates": [
+        "Ambiguous/Foo.md",
+        "Other/Foo.md"
+      ],
+      "rawTarget": "Foo",
+      "source": "Wikilinks.md"
+    }
+  ],
+  "backlinks": {
+    "Headings and blocks.md": [
+      {
+        "rawTarget": "Headings%20and%20blocks.md#Decision",
+        "source": "Markdown links.md"
+      },
+      {
+        "rawTarget": "Headings and blocks#Decision",
+        "source": "Properties and aliases.md"
+      },
+      {
+        "rawTarget": "Headings and blocks#^decision",
+        "source": "Wikilinks.md"
+      }
+    ],
+    "Properties and aliases.md": [
+      {
+        "rawTarget": "Properties and aliases",
+        "source": "Wikilinks.md"
+      }
+    ],
+    "Unicode café.md": [
+      {
+        "rawTarget": "Unicode%20café.md",
+        "source": "Markdown links.md"
+      }
+    ]
+  },
+  "resolved": [
+    {
+      "rawTarget": "Unicode%20café.md",
+      "source": "Markdown links.md",
+      "subpath": null,
+      "target": "Unicode café.md"
+    },
+    {
+      "rawTarget": "Headings%20and%20blocks.md#Decision",
+      "source": "Markdown links.md",
+      "subpath": {
+        "heading": "Decision"
+      },
+      "target": "Headings and blocks.md"
+    },
+    {
+      "rawTarget": "Headings and blocks#Decision",
+      "source": "Properties and aliases.md",
+      "subpath": {
+        "heading": "Decision"
+      },
+      "target": "Headings and blocks.md"
+    },
+    {
+      "rawTarget": "Properties and aliases",
+      "source": "Wikilinks.md",
+      "subpath": null,
+      "target": "Properties and aliases.md"
+    },
+    {
+      "rawTarget": "Headings and blocks#^decision",
+      "source": "Wikilinks.md",
+      "subpath": {
+        "block": "decision"
+      },
+      "target": "Headings and blocks.md"
+    }
+  ],
+  "unresolved": [
+    {
+      "rawTarget": "asset.png",
+      "source": "Markdown links.md"
+    },
+    {
+      "rawTarget": "Missing note",
+      "source": "Wikilinks.md"
+    }
+  ]
+}
