@@ -8,6 +8,8 @@ The protocol is transport-neutral. The foundation's newline-delimited JSON stdio
 
 Every request carries `version`, client-chosen `id`, and one tagged request. Every response echoes `id`, reports the server protocol `version`, and contains either an `ok` response or an `err` protocol error. Unknown or unsupported versions fail before operation dispatch.
 
+Version validation precedes method dispatch. The server first reads only the envelope (`version`, `id`, and the undecoded request), so an unsupported version receives `incompatible_version` even when the request names a method this server does not know. A supported version whose method is unknown receives `invalid_request`. Both refusals echo the request `id` and leave the server running; only input without a usable envelope is a fatal input error.
+
 ```json
 {"version":1,"id":"req-1","request":{"method":"health"}}
 ```
