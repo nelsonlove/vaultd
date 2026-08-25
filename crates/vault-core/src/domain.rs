@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VaultPath(String);
 
 impl VaultPath {
@@ -23,7 +23,7 @@ impl VaultPath {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NoteId(String);
 
 impl NoteId {
@@ -40,7 +40,7 @@ impl NoteId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Revision(String);
 
 impl Revision {
@@ -57,7 +57,7 @@ impl Revision {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SourceSpan {
     start: usize,
     end: usize,
