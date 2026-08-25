@@ -108,6 +108,9 @@ impl Walker<'_> {
             }
             Node::Code(_) | Node::InlineCode(_) | Node::Math(_) | Node::InlineMath(_) => {}
             Node::Html(html) => {
+                if html.value.trim_start().starts_with("<!--") {
+                    return;
+                }
                 let opens = count_opening_tags(&html.value);
                 let closes = html.value.matches("</").count();
                 self.html_depth = (self.html_depth + opens).saturating_sub(closes);
