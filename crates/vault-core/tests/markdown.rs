@@ -50,6 +50,23 @@ fn extracts_markdown_links_and_embeds_without_rewriting_targets() {
 }
 
 #[test]
+fn void_html_elements_do_not_suppress_later_prose_scanning() {
+    let text = "Line one<br>\n\nLater paragraph with #realtag and [[RealLink]].\n\nAfter <img src=\"x.png\"> more #tag2.\n";
+    let parsed = parse(text);
+
+    assert_eq!(
+        parsed
+            .tags
+            .iter()
+            .map(|tag| tag.value.as_str())
+            .collect::<Vec<_>>(),
+        ["realtag", "tag2"]
+    );
+    assert_eq!(parsed.references.len(), 1);
+    assert_eq!(parsed.references[0].raw_target, "RealLink");
+}
+
+#[test]
 fn obsidian_extensions_inside_code_html_and_link_labels_are_not_scanned() {
     let text = "`[[Code]]` <span>#html</span> [#label](Target.md)\n\n```md\n[[Fence]] #tag\n```\n";
     let parsed = parse(text);

@@ -183,14 +183,29 @@ fn collect_text(node: &Node, into: &mut String) {
     }
 }
 
+/// HTML5 void elements never take a closing tag, so they must not open a
+/// depth level — an unmatched opener would silently exclude the rest of the
+/// document from prose scanning.
+const VOID_ELEMENTS: [&str; 14] = [
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
 fn count_opening_tags(html: &str) -> usize {
     let mut count = 0;
     let bytes = html.as_bytes();
     for (index, window) in bytes.windows(2).enumerate() {
         if window[0] == b'<' && window[1].is_ascii_alphabetic() {
+            let name: String = html[index + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if VOID_ELEMENTS.contains(&name.as_str()) {
+                continue;
+            }
             let close = html[index..].find('>').map(|offset| index + offset);
-            let self_closing =
-                close.is_some_and(|end| html[..end].ends_with('/') || bytes[end - 1] == b'/');
+            let self_closing = close.is_some_and(|end| html[..end].ends_with('/'));
             if !self_closing {
                 count += 1;
             }
