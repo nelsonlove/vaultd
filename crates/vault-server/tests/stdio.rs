@@ -39,3 +39,32 @@ fn vaultd_serves_a_health_request_over_stdio() {
         ResponseOutcome::Ok(Response::Health(_))
     ));
 }
+
+#[test]
+fn vaultd_rejects_malformed_input_with_a_clear_failure() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vaultd"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start vaultd");
+
+    {
+        let stdin = child.stdin.as_mut().expect("child stdin");
+        writeln!(stdin, "{{\"not\":\"a request\"}}").expect("write malformed line");
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait for vaultd");
+    assert_eq!(output.status.code(), Some(2));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("vaultd: "),
+        "stderr must name the daemon: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no response may precede the failure"
+    );
+}
