@@ -1,6 +1,7 @@
 mod diagnostic;
 mod domain;
 mod frontmatter;
+mod markdown;
 mod parse;
 mod property;
 mod semantic;
