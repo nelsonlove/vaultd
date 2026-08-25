@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "vaultd"
+path = "src/main.rs"
+
 [dependencies]
 serde_json.workspace = true
 vault-protocol = { path = "../vault-protocol" }
