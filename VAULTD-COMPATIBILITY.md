@@ -27,7 +27,7 @@ Resolution follows the documented forms; undocumented Obsidian resolution behavi
 
 **Target contract:** Provide documented operations for note lookup, search, resolution, backlinks, compare-and-swap mutation, recoverable transactions, events, CLI commands, and `obsidian://` URI handling. Protocol support is declared per operation and version.
 
-Only `health` is executable in protocol version 1 of this milestone.
+**Current status:** protocol version 1 executes `health`, `get_vault_info`, `list_notes`, `get_note`, `resolve_link`, `get_backlinks`, `list_references`, `get_diagnostics`, and `refresh_index` against a persistent SQLite index; the filesystem remains authoritative and the daemon performs no vault writes. Mutation, transactions, events/subscriptions, search, CLI commands beyond daemon configuration, and URI handling remain targets, not implementations.
 
 ## Tier 3 — Headless Obsidian plugin API compatibility
 

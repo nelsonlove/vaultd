@@ -50,3 +50,33 @@ fn required_foundation_documents_declare_their_contracts() {
         ],
     );
 }
+
+#[test]
+fn persistent_index_documents_declare_the_executable_contract() {
+    assert_document_contains(
+        "README.md",
+        &[
+            "persistent SQLite",
+            "startup and manual reconciliation",
+            "filesystem watcher",
+        ],
+    );
+    assert_document_contains(
+        "VAULTD-COMPATIBILITY.md",
+        &[
+            "get_vault_info",
+            "get_note",
+            "refresh_index",
+            "filesystem remains authoritative",
+        ],
+    );
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "generation_mismatch",
+            "vault_changed_during_refresh",
+            "list_references",
+            "verify",
+        ],
+    );
+}
