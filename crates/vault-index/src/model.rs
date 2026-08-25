@@ -1,3 +1,10 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileFingerprint {
+    pub size: u64,
+    pub modified_seconds: i64,
+    pub modified_nanos: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Generation(u64);
 
