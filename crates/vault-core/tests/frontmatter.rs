@@ -29,6 +29,30 @@ fn parses_properties_aliases_and_tags_with_exact_spans() {
 }
 
 #[test]
+fn flow_and_block_property_value_spans_slice_their_exact_source() {
+    let text = "---\nlist: [a, b]\nmap: {k: v}\nseq:\n  - one\n---\nBody\n";
+    let parsed = parse(text);
+
+    assert_eq!(parsed.properties.len(), 3);
+    assert_eq!(
+        parsed.source.slice(parsed.properties[0].value.span),
+        Some("[a, b]")
+    );
+    assert_eq!(
+        parsed.source.slice(parsed.properties[1].value.span),
+        Some("{k: v}")
+    );
+    assert_eq!(
+        parsed.source.slice(parsed.properties[2].value.span),
+        Some("- one")
+    );
+    assert_eq!(
+        parsed.source.slice(parsed.properties[0].span),
+        Some("list: [a, b]")
+    );
+}
+
+#[test]
 fn malformed_closed_frontmatter_recovers_the_markdown_body() {
     let text = "---\ntags: [broken\n---\n# Recoverable\n";
     let parsed = parse(text);

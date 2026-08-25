@@ -84,6 +84,37 @@ fn span_from_marked(node: &MarkedYaml, table: &CharToByte, payload_start: usize)
     SourceSpan::new(start.min(end), end.max(start)).expect("ordered span from ordered offsets")
 }
 
+/// saphyr's end markers stop one character short of a flow collection's
+/// closing bracket and overshoot block collections into trailing whitespace.
+/// Adjust container spans so `text[span]` is the exact raw source (measured
+/// against saphyr 0.0.12).
+fn adjust_container_span(text: &str, span: SourceSpan) -> SourceSpan {
+    let bytes = text.as_bytes();
+    let start = span.start();
+    let mut end = span.end().min(bytes.len());
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let closer = match bytes.get(start) {
+        Some(b'[') => Some(b']'),
+        Some(b'{') => Some(b'}'),
+        _ => None,
+    };
+    if let Some(closer) = closer {
+        let mut probe = end;
+        while bytes
+            .get(probe)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            probe += 1;
+        }
+        if bytes.get(probe) == Some(&closer) {
+            end = probe + 1;
+        }
+    }
+    SourceSpan::new(start, end.max(start)).expect("adjusted span is ordered")
+}
+
 fn unsupported(span: SourceSpan, message: &str) -> Diagnostic {
     Diagnostic::new(
         DiagnosticCode::UnsupportedPropertyShape,
@@ -97,8 +128,9 @@ fn convert_value(
     node: &MarkedYaml,
     table: &CharToByte,
     payload_start: usize,
+    text: &str,
 ) -> Result<Spanned<PropertyValue>, Diagnostic> {
-    let span = span_from_marked(node, table, payload_start);
+    let mut span = span_from_marked(node, table, payload_start);
     let value = match &node.data {
         YamlData::Value(scalar) => match scalar {
             Scalar::Null => PropertyValue::Null,
@@ -108,9 +140,10 @@ fn convert_value(
             Scalar::String(value) => PropertyValue::String(value.to_string()),
         },
         YamlData::Sequence(items) => {
+            span = adjust_container_span(text, span);
             let mut values = Vec::with_capacity(items.len());
             for item in items {
-                values.push(convert_value(item, table, payload_start)?);
+                values.push(convert_value(item, table, payload_start, text)?);
             }
             PropertyValue::Sequence(values)
         }
@@ -123,13 +156,14 @@ fn convert_value(
                 };
                 entries.push((
                     Spanned::new(key_text.to_string(), key_span),
-                    convert_value(value, table, payload_start)?,
+                    convert_value(value, table, payload_start, text)?,
                 ));
             }
+            span = adjust_container_span(text, span);
             PropertyValue::Mapping(entries)
         }
         YamlData::Tagged(_, inner) => {
-            return convert_value(inner, table, payload_start).map(|converted| Spanned {
+            return convert_value(inner, table, payload_start, text).map(|converted| Spanned {
                 value: converted.value,
                 span,
             });
@@ -145,6 +179,7 @@ fn convert_mapping(
     root: &MarkedYaml,
     table: &CharToByte,
     payload_start: usize,
+    text: &str,
 ) -> Result<Vec<Property>, Diagnostic> {
     let YamlData::Mapping(map) = &root.data else {
         return Err(unsupported(
@@ -159,7 +194,7 @@ fn convert_mapping(
         let YamlData::Value(Scalar::String(key_text)) = &key.data else {
             return Err(unsupported(key_span, "property keys must be strings"));
         };
-        let value = convert_value(value, table, payload_start)?;
+        let value = convert_value(value, table, payload_start, text)?;
         let span = SourceSpan::new(key_span.start(), value.span.end().max(key_span.end()))
             .expect("property span is ordered");
         properties.push(Property {
@@ -314,7 +349,7 @@ pub(crate) fn parse_frontmatter(document: &SourceDocument) -> FrontmatterParse {
         return parse;
     }
 
-    match convert_mapping(root, &table, fences.payload_start) {
+    match convert_mapping(root, &table, fences.payload_start, text) {
         Ok(properties) => {
             parse.properties = properties;
             project_aliases_and_tags(
