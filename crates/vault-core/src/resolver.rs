@@ -215,17 +215,14 @@ impl Resolver {
     }
 
     fn exact_lookup(&self, spelling: &str) -> Option<VaultPath> {
-        if let Ok(path) = VaultPath::new(spelling)
-            && self.paths.contains(&path)
-        {
-            return Some(path);
-        }
-        if let Ok(path) = VaultPath::new(format!("{spelling}.md"))
-            && self.paths.contains(&path)
-        {
-            return Some(path);
-        }
-        None
+        VaultPath::new(spelling)
+            .ok()
+            .filter(|path| self.paths.contains(path))
+            .or_else(|| {
+                VaultPath::new(format!("{spelling}.md"))
+                    .ok()
+                    .filter(|path| self.paths.contains(path))
+            })
     }
 
     fn with_subpath(&self, target: VaultPath, subpath: Option<Subpath>) -> Resolution {

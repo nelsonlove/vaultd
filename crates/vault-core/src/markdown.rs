@@ -116,10 +116,8 @@ impl Walker<'_> {
                 self.html_depth = (self.html_depth + opens).saturating_sub(closes);
             }
             Node::Text(_) => {
-                if self.html_depth == 0
-                    && let Some(span) = self.node_span(node)
-                {
-                    self.parse.text_ranges.push(span);
+                if self.html_depth == 0 {
+                    self.parse.text_ranges.extend(self.node_span(node));
                 }
             }
             _ => {

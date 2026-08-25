@@ -71,12 +71,14 @@ pub(crate) fn open_connection(config: &IndexConfig) -> Result<Connection, IndexE
 /// process is retryable storage pressure, never evidence of corruption — a
 /// busy healthy cache must not be deleted and rebuilt.
 fn open_issue_from(error: rusqlite::Error) -> OpenIssue {
-    if let rusqlite::Error::SqliteFailure(failure, _) = &error
-        && matches!(
+    let lock_contention = matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(failure, _) if matches!(
             failure.code,
             rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
         )
-    {
+    );
+    if lock_contention {
         return OpenIssue::Fatal(IndexError::Storage(error.to_string()));
     }
     OpenIssue::Corrupt(error.to_string())
@@ -168,12 +170,11 @@ fn replace_index_file(config: &IndexConfig) -> Result<(), IndexError> {
     if target.as_os_str().is_empty() {
         return Err(IndexError::Storage("empty index path".into()));
     }
-    if let Ok(parent) = target
+    let parent_in_vault = target
         .parent()
-        .ok_or(())
-        .and_then(|parent| parent.canonicalize().map_err(|_| ()))
-        && parent.starts_with(&config.canonical_vault_root)
-    {
+        .and_then(|parent| parent.canonicalize().ok())
+        .is_some_and(|parent| parent.starts_with(&config.canonical_vault_root));
+    if parent_in_vault {
         return Err(IndexError::Storage(
             "refusing to rebuild an index inside the vault".into(),
         ));
