@@ -407,3 +407,74 @@ pub fn racing_services() -> RacingService {
         _index_dir: index_dir,
     }
 }
+
+pub struct ManyNotesService {
+    pub service: IndexService,
+    vault: TempDir,
+    _index_dir: TempDir,
+}
+
+impl ManyNotesService {
+    pub fn add_note(&self, name: &str, body: &str) {
+        std::fs::write(self.vault.path().join(name), body).expect("write note");
+    }
+}
+
+pub fn service_with_many_notes(count: usize) -> ManyNotesService {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index_dir = TempDir::new().expect("index tempdir");
+    for index in 0..count {
+        std::fs::write(
+            vault.path().join(format!("Note-{index}.md")),
+            format!("# Note {index}\n"),
+        )
+        .expect("write note");
+    }
+    let config = IndexConfig::explicit(vault.path(), index_dir.path().join("index.sqlite3"))
+        .expect("many-notes config");
+    let service = IndexService::open(config).expect("many-notes service");
+    ManyNotesService {
+        service,
+        vault,
+        _index_dir: index_dir,
+    }
+}
+
+pub struct QueriesFixture {
+    pub service: IndexService,
+    pub config: IndexConfig,
+    _vault: TempDir,
+    _index_dir: TempDir,
+}
+
+/// A small vault exercising every resolution state: resolved, unresolved,
+/// ambiguous, missing subpath, and a non-vault reference; the target note
+/// carries a `title` property while the source only has a heading.
+pub fn queries_fixture() -> QueriesFixture {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index_dir = TempDir::new().expect("index tempdir");
+    std::fs::write(
+        vault.path().join("Source.md"),
+        "# Source\n\n[[Target]] [[Missing]] [[Foo]] [[Target#Absent]]\n\n[site](https://example.com)\n",
+    )
+    .expect("write Source");
+    std::fs::write(
+        vault.path().join("Target.md"),
+        "---\ntitle: The Target\n---\n# Target\n",
+    )
+    .expect("write Target");
+    std::fs::create_dir_all(vault.path().join("Ambiguous")).expect("create Ambiguous");
+    std::fs::create_dir_all(vault.path().join("Other")).expect("create Other");
+    std::fs::write(vault.path().join("Ambiguous/Foo.md"), "one\n").expect("write Foo one");
+    std::fs::write(vault.path().join("Other/Foo.md"), "two\n").expect("write Foo two");
+
+    let config = IndexConfig::explicit(vault.path(), index_dir.path().join("index.sqlite3"))
+        .expect("queries config");
+    let service = IndexService::open(config.clone()).expect("queries service");
+    QueriesFixture {
+        service,
+        config,
+        _vault: vault,
+        _index_dir: index_dir,
+    }
+}

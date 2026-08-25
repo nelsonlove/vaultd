@@ -335,14 +335,14 @@ impl IndexStore {
              WHERE r.note_path = ?1 ORDER BY r.ordinal",
         )?;
         let rows = statement
-            .query_map(params![path.as_str()], reference_row)?
+            .query_map(params![path.as_str()], reference_row_prefix)?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(|row| self.resolved_reference_from_row(path.clone(), row))
             .collect()
     }
 
-    fn resolved_reference_from_row(
+    pub(crate) fn resolved_reference_from_row(
         &self,
         source: VaultPath,
         row: ReferenceRow,
@@ -630,26 +630,27 @@ impl IndexStore {
     }
 }
 
-struct ReferenceRow {
-    id: i64,
-    kind: String,
-    origin: String,
-    raw_target: String,
-    file_target: Option<String>,
-    subpath_kind: Option<String>,
-    subpath_value: Option<String>,
-    display: Option<String>,
-    span_start: i64,
-    span_end: i64,
-    target_span_start: i64,
-    target_span_end: i64,
-    resolution_kind: String,
-    resolution_target: Option<String>,
-    resolution_subpath_kind: Option<String>,
-    resolution_subpath_value: Option<String>,
+#[derive(Clone)]
+pub(crate) struct ReferenceRow {
+    pub(crate) id: i64,
+    pub(crate) kind: String,
+    pub(crate) origin: String,
+    pub(crate) raw_target: String,
+    pub(crate) file_target: Option<String>,
+    pub(crate) subpath_kind: Option<String>,
+    pub(crate) subpath_value: Option<String>,
+    pub(crate) display: Option<String>,
+    pub(crate) span_start: i64,
+    pub(crate) span_end: i64,
+    pub(crate) target_span_start: i64,
+    pub(crate) target_span_end: i64,
+    pub(crate) resolution_kind: String,
+    pub(crate) resolution_target: Option<String>,
+    pub(crate) resolution_subpath_kind: Option<String>,
+    pub(crate) resolution_subpath_value: Option<String>,
 }
 
-fn reference_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
+pub(crate) fn reference_row_prefix(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
     Ok(ReferenceRow {
         id: row.get(0)?,
         kind: row.get(1)?,
