@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vault-core"]
+members = ["crates/vault-core", "crates/vault-protocol"]
 resolver = "3"
 
 [workspace.package]
