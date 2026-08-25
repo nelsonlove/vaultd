@@ -7,6 +7,7 @@ mod parse;
 mod property;
 mod semantic;
 mod source;
+mod vault_source;
 
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use domain::{DomainError, NoteId, NoteRef, Revision, SourceSpan, VaultPath};
@@ -16,3 +17,6 @@ pub use semantic::{
     Alias, BlockId, Heading, ParsedNote, Reference, ReferenceKind, ReferenceOrigin, Subpath, Tag,
 };
 pub use source::{SourceDocument, SourceError, Spanned};
+pub use vault_source::{
+    FileSystemVaultSource, ScanError, VaultDocuments, VaultListing, VaultSource, read_documents,
+};
