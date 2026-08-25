@@ -59,10 +59,13 @@ fn property_strings_can_contribute_references() {
 fn malformed_wikilinks_are_diagnostics_not_panics() {
     let parsed = parse("Before [[never closed\nAfter\n");
 
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| { diagnostic.code == DiagnosticCode::MalformedWikilink })
+    let diagnostic = parsed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == DiagnosticCode::MalformedWikilink)
+        .expect("malformed wikilink diagnostic");
+    assert_eq!(
+        diagnostic.path.as_ref().map(VaultPath::as_str),
+        Some("Notes/Source.md")
     );
 }

@@ -27,6 +27,11 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     note.diagnostics.extend(markdown.diagnostics);
     note.diagnostics.extend(body.diagnostics);
     note.diagnostics.extend(property_diagnostics);
+    for diagnostic in &mut note.diagnostics {
+        if diagnostic.path.is_none() {
+            diagnostic.path = Some(note.source.path().clone());
+        }
+    }
 
     note.aliases
         .sort_by(|a, b| (a.span, &a.value).cmp(&(b.span, &b.value)));
