@@ -44,6 +44,10 @@ impl FileSystemVaultSource {
         &self.root
     }
 
+    pub fn canonical_root(&self) -> &Path {
+        &self.canonical_root
+    }
+
     fn vault_path_for(&self, absolute: &Path) -> Option<VaultPath> {
         let relative = absolute.strip_prefix(&self.root).ok()?;
         let mut parts = Vec::new();

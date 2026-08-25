@@ -24,9 +24,11 @@ pub struct ScanReport {
 
 pub fn scan_vault(source: &impl VaultSource) -> Result<ScanReport, ScanError> {
     let documents = read_documents(source)?;
-    let mut diagnostics = documents.diagnostics;
+    let notes = documents.documents.into_iter().map(parse_note).collect();
+    Ok(build_graph(notes, documents.diagnostics))
+}
 
-    let notes: Vec<ParsedNote> = documents.documents.into_iter().map(parse_note).collect();
+pub fn build_graph(notes: Vec<ParsedNote>, mut diagnostics: Vec<Diagnostic>) -> ScanReport {
     let resolver = Resolver::new(&notes);
 
     let mut outgoing: BTreeMap<VaultPath, Vec<ResolvedReference>> = BTreeMap::new();
@@ -133,7 +135,7 @@ pub fn scan_vault(source: &impl VaultSource) -> Result<ScanReport, ScanError> {
         ambiguous,
         diagnostics: diagnostics.clone(),
     };
-    Ok(ScanReport { graph, diagnostics })
+    ScanReport { graph, diagnostics }
 }
 
 fn sort_references(references: &mut [ResolvedReference]) {

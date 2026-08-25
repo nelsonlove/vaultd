@@ -28,6 +28,76 @@ pub struct ResolvedReference {
     pub resolution: Resolution,
 }
 
+/// The lightweight per-note inputs resolution actually needs: the path plus
+/// heading and block identity. A resolver can be rebuilt from these without
+/// reparsing any note body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionNote {
+    pub path: VaultPath,
+    pub headings: Vec<String>,
+    pub blocks: Vec<String>,
+}
+
+impl From<&ParsedNote> for ResolutionNote {
+    fn from(note: &ParsedNote) -> Self {
+        Self {
+            path: note.source.path().clone(),
+            headings: note
+                .headings
+                .iter()
+                .map(|heading| heading.text.clone())
+                .collect(),
+            blocks: note
+                .blocks
+                .iter()
+                .map(|block| block.value.clone())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkTarget {
+    pub raw_target: String,
+    pub file_target: Option<String>,
+    pub subpath: Option<Subpath>,
+}
+
+impl LinkTarget {
+    pub fn parse(destination: impl Into<String>) -> Self {
+        let raw_target = destination.into();
+        let (file, fragment) = match raw_target.split_once('#') {
+            Some((file, fragment)) => (file, Some(fragment)),
+            None => (raw_target.as_str(), None),
+        };
+        let file_target = (!file.is_empty()).then(|| file.to_string());
+        let subpath = fragment.and_then(|fragment| {
+            if fragment.is_empty() {
+                None
+            } else if let Some(block) = fragment.strip_prefix('^') {
+                Some(Subpath::Block(block.to_string()))
+            } else {
+                Some(Subpath::Heading(fragment.to_string()))
+            }
+        });
+        Self {
+            raw_target,
+            file_target,
+            subpath,
+        }
+    }
+}
+
+impl From<&Reference> for LinkTarget {
+    fn from(reference: &Reference) -> Self {
+        Self {
+            raw_target: reference.raw_target.clone(),
+            file_target: reference.file_target.clone(),
+            subpath: reference.subpath.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct NoteSubpaths {
     heading_keys: BTreeSet<String>,
@@ -43,6 +113,10 @@ pub struct Resolver {
 
 impl Resolver {
     pub fn new(notes: &[ParsedNote]) -> Self {
+        Self::from_catalog(notes.iter().map(ResolutionNote::from))
+    }
+
+    pub fn from_catalog(notes: impl IntoIterator<Item = ResolutionNote>) -> Self {
         let mut resolver = Self {
             paths: BTreeSet::new(),
             filename_ci: BTreeMap::new(),
@@ -50,7 +124,7 @@ impl Resolver {
             subpaths: BTreeMap::new(),
         };
         for note in notes {
-            let path = note.source.path().clone();
+            let path = note.path;
             let filename = path
                 .as_str()
                 .rsplit('/')
@@ -71,11 +145,11 @@ impl Resolver {
                 .insert(path.clone());
 
             let entry = resolver.subpaths.entry(path.clone()).or_default();
-            for heading in &note.headings {
-                entry.heading_keys.insert(heading.text.to_lowercase());
+            for heading in note.headings {
+                entry.heading_keys.insert(heading.to_lowercase());
             }
-            for block in &note.blocks {
-                entry.block_ids.insert(block.value.clone());
+            for block in note.blocks {
+                entry.block_ids.insert(block);
             }
             resolver.paths.insert(path);
         }
@@ -89,32 +163,32 @@ impl Resolver {
                 source: note.source.path().clone(),
                 source_span: reference.span,
                 reference: reference.clone(),
-                resolution: self.resolve(note.source.path(), reference),
+                resolution: self.resolve_target(note.source.path(), &LinkTarget::from(reference)),
             })
             .collect()
     }
 
-    fn resolve(&self, source: &VaultPath, reference: &Reference) -> Resolution {
-        if has_uri_scheme(&reference.raw_target) {
+    pub fn resolve_target(&self, source: &VaultPath, target: &LinkTarget) -> Resolution {
+        if has_uri_scheme(&target.raw_target) {
             return Resolution::NonVault;
         }
 
-        let Some(file_target) = reference.file_target.as_deref() else {
-            return self.with_subpath(source.clone(), reference.subpath.clone());
+        let Some(file_target) = target.file_target.as_deref() else {
+            return self.with_subpath(source.clone(), target.subpath.clone());
         };
 
         if file_target.starts_with("./") || file_target.starts_with("../") {
             return match normalize_relative(source, file_target) {
                 Some(candidate) => match self.exact_lookup(&candidate) {
-                    Some(target) => self.with_subpath(target, reference.subpath.clone()),
+                    Some(resolved) => self.with_subpath(resolved, target.subpath.clone()),
                     None => Resolution::Unresolved,
                 },
                 None => Resolution::Unresolved,
             };
         }
 
-        if let Some(target) = self.exact_lookup(file_target) {
-            return self.with_subpath(target, reference.subpath.clone());
+        if let Some(resolved) = self.exact_lookup(file_target) {
+            return self.with_subpath(resolved, target.subpath.clone());
         }
 
         let key = file_target.to_lowercase();
@@ -132,7 +206,7 @@ impl Resolver {
                     .into_iter()
                     .next()
                     .expect("one candidate is present"),
-                reference.subpath.clone(),
+                target.subpath.clone(),
             ),
             _ => Resolution::Ambiguous {
                 candidates: candidates.into_iter().collect(),

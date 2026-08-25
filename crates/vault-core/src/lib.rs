@@ -13,10 +13,10 @@ mod vault_source;
 
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use domain::{DomainError, NoteId, NoteRef, Revision, SourceSpan, VaultPath};
-pub use graph::{ScanReport, SemanticGraph, scan_vault};
+pub use graph::{ScanReport, SemanticGraph, build_graph, scan_vault};
 pub use parse::parse_note;
 pub use property::{Property, PropertyValue};
-pub use resolver::{Resolution, ResolvedReference, Resolver};
+pub use resolver::{LinkTarget, Resolution, ResolutionNote, ResolvedReference, Resolver};
 pub use semantic::{
     Alias, BlockId, Heading, ParsedNote, Reference, ReferenceKind, ReferenceOrigin, Subpath, Tag,
 };
