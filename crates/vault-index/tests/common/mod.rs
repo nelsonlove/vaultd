@@ -478,3 +478,114 @@ pub fn queries_fixture() -> QueriesFixture {
         _index_dir: index_dir,
     }
 }
+
+#[derive(Debug, PartialEq)]
+pub struct SemanticSnapshot {
+    pub notes: Vec<vault_core::ParsedNote>,
+    pub outgoing: Vec<(vault_core::VaultPath, Vec<vault_core::ResolvedReference>)>,
+    pub backlinks: Vec<(vault_core::VaultPath, Vec<vault_core::ResolvedReference>)>,
+    pub unresolved: Vec<vault_core::ResolvedReference>,
+    pub ambiguous: Vec<vault_core::ResolvedReference>,
+    pub diagnostics: Vec<vault_core::Diagnostic>,
+}
+
+pub fn snapshot_from_scan(report: &vault_core::ScanReport) -> SemanticSnapshot {
+    let graph = &report.graph;
+    SemanticSnapshot {
+        notes: graph.notes().cloned().collect(),
+        outgoing: graph
+            .note_paths()
+            .into_iter()
+            .map(|path| (path.clone(), graph.outgoing(path).to_vec()))
+            .collect(),
+        backlinks: graph
+            .note_paths()
+            .into_iter()
+            .map(|path| (path.clone(), graph.backlinks(path).to_vec()))
+            .collect(),
+        unresolved: graph.unresolved().to_vec(),
+        ambiguous: graph.ambiguous().to_vec(),
+        diagnostics: report.diagnostics.clone(),
+    }
+}
+
+/// Extract the same shape through the PRODUCTION public query API only:
+/// pagination, exact-path note loads, backlinks, status-filtered reference
+/// listings, and unfiltered diagnostics. Never scans the vault.
+pub fn snapshot_from_index(service: &vault_index::IndexService) -> SemanticSnapshot {
+    let mut paths = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = service
+            .list_notes(cursor.as_deref(), Some(3))
+            .expect("list notes page");
+        paths.extend(page.items.iter().map(|item| item.path.clone()));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    let mut notes = Vec::new();
+    let mut outgoing = Vec::new();
+    let mut backlinks = Vec::new();
+    for path in &paths {
+        let indexed = service.get_note(path).expect("indexed note");
+        notes.push(indexed.note);
+        outgoing.push((path.clone(), indexed.outgoing));
+
+        let mut incoming = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = service
+                .get_backlinks(path, cursor.as_deref(), Some(3))
+                .expect("backlinks page");
+            incoming.extend(page.items);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        backlinks.push((path.clone(), incoming));
+    }
+
+    let collect_status = |status: vault_index::ReferenceStatus| {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = service
+                .list_references(None, Some(status), cursor.as_deref(), Some(3))
+                .expect("references page");
+            items.extend(page.items);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        items
+    };
+    let unresolved = collect_status(vault_index::ReferenceStatus::Unresolved);
+    let ambiguous = collect_status(vault_index::ReferenceStatus::Ambiguous);
+
+    let mut diagnostics = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = service
+            .get_diagnostics(None, None, cursor.as_deref(), Some(3))
+            .expect("diagnostics page");
+        diagnostics.extend(page.items);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    SemanticSnapshot {
+        notes,
+        outgoing,
+        backlinks,
+        unresolved,
+        ambiguous,
+        diagnostics,
+    }
+}
