@@ -2,6 +2,7 @@ mod diagnostic;
 mod domain;
 mod frontmatter;
 mod markdown;
+mod obsidian;
 mod parse;
 mod property;
 mod semantic;
