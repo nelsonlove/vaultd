@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "vault-bench"
+path = "src/bin/vault-bench.rs"
+
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
@@ -12,10 +16,10 @@ filetime.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 vault-core = { path = "../vault-core" }
 xdg.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-tempfile.workspace = true
