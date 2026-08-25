@@ -67,16 +67,30 @@ pub(crate) fn open_connection(config: &IndexConfig) -> Result<Connection, IndexE
     }
 }
 
+/// Classify an open-time SQLite failure. Lock contention from a concurrent
+/// process is retryable storage pressure, never evidence of corruption — a
+/// busy healthy cache must not be deleted and rebuilt.
+fn open_issue_from(error: rusqlite::Error) -> OpenIssue {
+    if let rusqlite::Error::SqliteFailure(failure, _) = &error
+        && matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    {
+        return OpenIssue::Fatal(IndexError::Storage(error.to_string()));
+    }
+    OpenIssue::Corrupt(error.to_string())
+}
+
 fn try_open(config: &IndexConfig) -> Result<Connection, OpenIssue> {
     let connection = Connection::open(&config.index_path)
         .map_err(|error| OpenIssue::Fatal(IndexError::Storage(error.to_string())))?;
-    configure(&connection).map_err(|error| OpenIssue::Corrupt(error.to_string()))?;
+    configure(&connection).map_err(open_issue_from)?;
 
     let user_version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| OpenIssue::Corrupt(error.to_string()))?;
-    let has_metadata =
-        has_metadata_table(&connection).map_err(|error| OpenIssue::Corrupt(error.to_string()))?;
+        .map_err(open_issue_from)?;
+    let has_metadata = has_metadata_table(&connection).map_err(open_issue_from)?;
 
     if user_version == 0 && !has_metadata {
         initialize(&connection, config).map_err(OpenIssue::Fatal)?;
@@ -95,7 +109,12 @@ fn try_open(config: &IndexConfig) -> Result<Connection, OpenIssue> {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|error| OpenIssue::Corrupt(format!("missing metadata: {error}")))?;
+        .map_err(|error| match open_issue_from(error) {
+            OpenIssue::Corrupt(message) => {
+                OpenIssue::Corrupt(format!("missing metadata: {message}"))
+            }
+            other => other,
+        })?;
     if identity != config.vault_identity {
         return Err(OpenIssue::Fatal(IndexError::IncompatibleIndex(
             "index belongs to another vault".into(),

@@ -191,3 +191,45 @@ fn no_completed_generation_is_unavailable() {
         IndexState::Unavailable { .. }
     ));
 }
+
+#[test]
+fn a_busy_healthy_derived_cache_is_not_deleted_as_corrupt() {
+    let vault = tempdir().unwrap();
+    let index_dir = tempdir().unwrap();
+    fs::write(vault.path().join("Note.md"), "# Note\n").unwrap();
+    let index_path = index_dir.path().join("derived.sqlite3");
+    let mut config = IndexConfig::explicit(vault.path(), &index_path).unwrap();
+    config.location = IndexLocation::Derived;
+    {
+        let mut service = IndexService::open(config.clone()).unwrap();
+        service.refresh(false).unwrap();
+    }
+
+    let blocker = rusqlite::Connection::open(&index_path).unwrap();
+    blocker
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .unwrap();
+    blocker
+        .execute_batch(
+            "BEGIN IMMEDIATE; UPDATE index_metadata SET last_refresh_error = NULL WHERE 0 = 1;",
+        )
+        .unwrap();
+
+    let error = match IndexService::open(config.clone()) {
+        Ok(_) => panic!("a busy database must not open"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, IndexError::Storage(_)),
+        "busy must be retryable, not corruption: {error:?}"
+    );
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    let service = IndexService::open(config).unwrap();
+    assert_eq!(
+        service.current_generation().unwrap(),
+        Some(Generation::new(1)),
+        "the healthy database must survive with its generation intact"
+    );
+}

@@ -117,3 +117,23 @@ fn verified_refresh_reads_every_body_when_nothing_changed() {
     assert_eq!(report.reparsed, 0);
     assert_eq!(report.previous_generation, Some(report.generation));
 }
+
+#[test]
+fn persistently_invalid_note_advances_the_generation_exactly_once() {
+    let mut fixture = common::counting_service_with_two_notes();
+    fixture.service.refresh(false).expect("cold build");
+    std::fs::write(fixture.vault.path().join("Bad.md"), [0xff, 0xfe]).expect("write invalid note");
+
+    let appeared = fixture.service.refresh(false).expect("diagnostic appears");
+    let settled = appeared.generation;
+    assert_eq!(
+        settled,
+        Generation::new(appeared.previous_generation.unwrap().get() + 1)
+    );
+
+    for _ in 0..3 {
+        let report = fixture.service.refresh(false).expect("steady refresh");
+        assert_eq!(report.generation, settled);
+        assert_eq!(report.previous_generation, Some(settled));
+    }
+}

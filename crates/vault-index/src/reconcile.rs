@@ -110,13 +110,9 @@ impl IndexService {
 
         let mut unchanged_paths = Vec::new();
         let mut to_read: Vec<VaultPath> = Vec::new();
-        let mut added_paths: BTreeSet<VaultPath> = BTreeSet::new();
         for (path, fingerprint) in &first.entries {
             match stored.get(path) {
-                None => {
-                    added_paths.insert(path.clone());
-                    to_read.push(path.clone());
-                }
+                None => to_read.push(path.clone()),
                 Some(known) if known == fingerprint => {
                     unchanged_paths.push(path.clone());
                     if verify {
@@ -140,8 +136,12 @@ impl IndexService {
         let mut changed = 0u64;
         let mut unchanged = unchanged_paths.len() as u64;
         let mut reparsed = 0u64;
-        let mut semantic_change =
-            previous.is_none() || !added_paths.is_empty() || !deleted.is_empty();
+        // A path that is merely enumerated does not by itself change client
+        // state: an added file that never becomes a usable note must not
+        // advance the generation on every refresh. Content replacement,
+        // removal, deletion, and the scan-diagnostics diff are the real
+        // signals.
+        let mut semantic_change = previous.is_none() || !deleted.is_empty();
 
         for path in &to_read {
             let fingerprint = first.entries[path];
