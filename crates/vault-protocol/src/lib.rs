@@ -16,5 +16,6 @@ pub use operations::{
 pub use semantic::{
     AliasDto, BlockDto, DiagnosticDto, HeadingDto, IndexStateDto, NoteDto, NoteSummaryDto,
     PropertyDto, PropertyMappingEntryDto, PropertyValueDto, ReferenceDto, ReferenceKindDto,
-    ReferenceOriginDto, ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, TagDto,
+    ReferenceOriginDto, ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, SubpathDto,
+    TagDto,
 };
