@@ -5,7 +5,8 @@ use vault_server::Server;
 
 #[test]
 fn server_dispatches_health_requests() {
-    let response = Server.handle(RequestEnvelope::new("health-1", Request::Health));
+    let mut server = Server::health_only();
+    let response = server.handle(RequestEnvelope::new("health-1", Request::Health));
 
     assert_eq!(response.id, "health-1");
     match response.outcome {
@@ -22,7 +23,8 @@ fn server_rejects_incompatible_versions_before_dispatch() {
     let mut request = RequestEnvelope::new("health-2", Request::Health);
     request.version = PROTOCOL_VERSION + 1;
 
-    let response = Server.handle(request);
+    let mut server = Server::health_only();
+    let response = server.handle(request);
     match response.outcome {
         ResponseOutcome::Err(error) => {
             assert_eq!(error.code, ErrorCode::IncompatibleVersion);

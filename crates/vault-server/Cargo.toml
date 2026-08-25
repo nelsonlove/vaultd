@@ -9,6 +9,13 @@ name = "vaultd"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+vault-core = { path = "../vault-core" }
+vault-index = { path = "../vault-index" }
 vault-protocol = { path = "../vault-protocol" }
+
+[dev-dependencies]
+tempfile.workspace = true

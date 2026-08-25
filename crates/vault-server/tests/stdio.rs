@@ -6,8 +6,9 @@ use vault_protocol::{
     ResponseOutcome,
 };
 
-fn run_vaultd_with_lines(lines: &[&str]) -> Output {
+fn run_vaultd(arguments: &[&str], lines: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_vaultd"))
+        .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -73,10 +74,13 @@ fn vaultd_serves_a_health_request_over_stdio() {
 fn vaultd_answers_future_versions_with_incompatible_version_and_stays_alive() {
     let health = serde_json::to_string(&RequestEnvelope::new("after-1", Request::Health))
         .expect("serialize health request");
-    let output = run_vaultd_with_lines(&[
-        r#"{"version":2,"id":"future-1","request":{"method":"get_note"}}"#,
-        &health,
-    ]);
+    let output = run_vaultd(
+        &[],
+        &[
+            r#"{"version":2,"id":"future-1","request":{"method":"get_note"}}"#,
+            &health,
+        ],
+    );
 
     assert!(
         output.status.success(),
@@ -111,10 +115,13 @@ fn vaultd_answers_future_versions_with_incompatible_version_and_stays_alive() {
 fn vaultd_answers_unknown_methods_with_invalid_request_and_stays_alive() {
     let health = serde_json::to_string(&RequestEnvelope::new("after-2", Request::Health))
         .expect("serialize health request");
-    let output = run_vaultd_with_lines(&[
-        r#"{"version":1,"id":"unknown-1","request":{"method":"get_note"}}"#,
-        &health,
-    ]);
+    let output = run_vaultd(
+        &[],
+        &[
+            r#"{"version":1,"id":"unknown-1","request":{"method":"get_note"}}"#,
+            &health,
+        ],
+    );
 
     assert!(
         output.status.success(),
@@ -172,4 +179,41 @@ fn vaultd_rejects_malformed_input_with_a_clear_failure() {
         output.stdout.is_empty(),
         "no response may precede the failure"
     );
+}
+
+#[test]
+fn vaultd_with_explicit_vault_serves_note_then_refresh_requests() {
+    let vault = tempfile::tempdir().expect("vault");
+    let index = tempfile::tempdir().expect("index");
+    std::fs::write(vault.path().join("Note.md"), "# Note\n").unwrap();
+    let index_path = index.path().join("index.sqlite3");
+    let requests = [
+        r#"{"version":1,"id":"n","request":{"method":"get_note","params":{"path":"Note.md"}}}"#,
+        r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{"verify":false}}}"#,
+    ];
+    let output = run_vaultd(
+        &[
+            "--vault",
+            vault.path().to_str().unwrap(),
+            "--index",
+            index_path.to_str().unwrap(),
+        ],
+        &requests,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = parse_responses(&output);
+    assert_eq!(responses.len(), 2);
+    assert!(matches!(
+        responses[0].outcome,
+        ResponseOutcome::Ok(Response::GetNote(_))
+    ));
+    assert!(matches!(
+        responses[1].outcome,
+        ResponseOutcome::Ok(Response::RefreshIndex(_))
+    ));
 }

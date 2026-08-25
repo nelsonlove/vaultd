@@ -808,8 +808,13 @@ dependencies = [
 name = "vault-server"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "vault-core",
+ "vault-index",
  "vault-protocol",
 ]
 
