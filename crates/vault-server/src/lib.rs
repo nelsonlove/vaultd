@@ -1,4 +1,7 @@
-use vault_protocol::{Request, RequestEnvelope, Response, ResponseEnvelope, validate_version};
+use vault_protocol::{
+    ErrorCode, ProtocolError, Request, RequestEnvelope, Response, ResponseEnvelope,
+    validate_version,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct Server;
@@ -12,6 +15,15 @@ impl Server {
 
         match request.request {
             Request::Health => ResponseEnvelope::success(id, Response::health("vaultd")),
+            _ => ResponseEnvelope::error(
+                id,
+                ProtocolError {
+                    code: ErrorCode::IndexUnavailable,
+                    message: "no vault is configured".into(),
+                    supported_version: None,
+                    current_generation: None,
+                },
+            ),
         }
     }
 }

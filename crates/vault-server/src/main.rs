@@ -58,6 +58,7 @@ fn respond(server: &Server, raw: RawRequestEnvelope) -> ResponseEnvelope {
                 code: ErrorCode::InvalidRequest,
                 message: format!("invalid request: {error}"),
                 supported_version: None,
+                current_generation: None,
             },
         ),
     }
