@@ -1,0 +1,9 @@
+[package]
+name = "vault-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+vault-protocol = { path = "../vault-protocol" }
