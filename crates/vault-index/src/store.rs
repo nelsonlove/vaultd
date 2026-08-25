@@ -15,6 +15,17 @@ pub(crate) enum PublishOutcome {
     GenerationChanged,
 }
 
+/// Everything one compare-and-swap publication replaces.
+pub(crate) struct Publication<'a> {
+    pub expected: Option<Generation>,
+    pub notes: &'a [(ParsedNote, FileFingerprint)],
+    pub deleted: &'a [VaultPath],
+    pub fingerprint_updates: &'a [(VaultPath, FileFingerprint)],
+    pub graph: &'a SemanticGraph,
+    pub scan_diagnostics: &'a [Diagnostic],
+    pub diagnostics: &'a [Diagnostic],
+}
+
 pub(crate) fn usize_to_i64(value: usize, field: &str) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| IndexError::Storage(format!("{field} exceeds i64 range")))
 }
@@ -436,13 +447,17 @@ impl IndexStore {
     /// stamp the refresh time.
     pub(crate) fn publish(
         &mut self,
-        expected: Option<Generation>,
-        notes: &[(ParsedNote, FileFingerprint)],
-        deleted: &[VaultPath],
-        graph: &SemanticGraph,
-        scan_diagnostics: &[Diagnostic],
-        diagnostics: &[Diagnostic],
+        publication: Publication<'_>,
     ) -> Result<PublishOutcome, IndexError> {
+        let Publication {
+            expected,
+            notes,
+            deleted,
+            fingerprint_updates,
+            graph,
+            scan_diagnostics,
+            diagnostics,
+        } = publication;
         let transaction = self.connection.transaction()?;
         let current: Option<i64> = transaction.query_row(
             "SELECT generation FROM index_metadata WHERE singleton = 1",
@@ -460,6 +475,9 @@ impl IndexStore {
         for (note, fingerprint) in notes {
             Self::replace_note(&transaction, note, *fingerprint)?;
         }
+        for (path, fingerprint) in fingerprint_updates {
+            update_fingerprint(&transaction, path, *fingerprint)?;
+        }
         Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
 
         let next = Generation::new(expected.map_or(0, Generation::get) + 1);
@@ -473,6 +491,86 @@ impl IndexStore {
         )?;
         transaction.commit()?;
         Ok(PublishOutcome::Committed(next))
+    }
+
+    pub(crate) fn stored_fingerprints(
+        &self,
+    ) -> Result<std::collections::BTreeMap<VaultPath, FileFingerprint>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, observed_size, observed_mtime_seconds, observed_mtime_nanos FROM notes",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut fingerprints = std::collections::BTreeMap::new();
+        for (path, size, seconds, nanos) in rows {
+            fingerprints.insert(
+                codec::decode_path(&path)?,
+                FileFingerprint {
+                    size: u64::try_from(size).map_err(|_| {
+                        IndexError::IncompatibleIndex("negative observed size".into())
+                    })?,
+                    modified_seconds: seconds,
+                    modified_nanos: u32::try_from(nanos).map_err(|_| {
+                        IndexError::IncompatibleIndex("mtime nanos out of range".into())
+                    })?,
+                },
+            );
+        }
+        Ok(fingerprints)
+    }
+
+    pub(crate) fn stored_revision(&self, path: &VaultPath) -> Result<Option<String>, IndexError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT content_revision FROM notes WHERE path = ?1",
+                params![path.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Operational update after an unchanged refresh: refresh fingerprints and
+    /// the refresh timestamp without touching the semantic generation.
+    pub(crate) fn touch(
+        &mut self,
+        fingerprint_updates: &[(VaultPath, FileFingerprint)],
+    ) -> Result<(), IndexError> {
+        let transaction = self.connection.transaction()?;
+        for (path, fingerprint) in fingerprint_updates {
+            update_fingerprint(&transaction, path, *fingerprint)?;
+        }
+        transaction.execute(
+            "UPDATE index_metadata SET refreshed_at_unix_ms = ?1, last_refresh_error = NULL \
+             WHERE singleton = 1",
+            params![schema::now_unix_ms()?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn last_refresh_error(&self) -> Result<Option<String>, IndexError> {
+        Ok(self.connection.query_row(
+            "SELECT last_refresh_error FROM index_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn record_refresh_failure(&mut self, message: &str) -> Result<(), IndexError> {
+        self.connection.execute(
+            "UPDATE index_metadata SET last_refresh_error = ?1 WHERE singleton = 1",
+            params![message],
+        )?;
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -865,4 +963,22 @@ fn load_note_with(
     }
 
     Ok(Some(note))
+}
+
+fn update_fingerprint(
+    transaction: &Transaction<'_>,
+    path: &VaultPath,
+    fingerprint: FileFingerprint,
+) -> Result<(), IndexError> {
+    transaction.execute(
+        "UPDATE notes SET observed_size = ?1, observed_mtime_seconds = ?2, \
+         observed_mtime_nanos = ?3 WHERE path = ?4",
+        params![
+            u64_to_i64(fingerprint.size, "observed size")?,
+            fingerprint.modified_seconds,
+            i64::from(fingerprint.modified_nanos),
+            path.as_str(),
+        ],
+    )?;
+    Ok(())
 }

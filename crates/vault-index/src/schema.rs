@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-use crate::config::IndexConfig;
+use crate::config::{IndexConfig, IndexLocation};
 use crate::error::IndexError;
 
 pub const SQL_SCHEMA_VERSION: u32 = 1;
@@ -18,26 +18,96 @@ pub(crate) fn now_unix_ms() -> Result<i64, IndexError> {
         .map_err(|_| IndexError::Storage("current time exceeds the epoch range".into()))
 }
 
-/// Open the index database at the configured path, creating the schema when
-/// the database is new and validating versions and vault identity otherwise.
+/// How an open attempt failed, so the recovery policy can distinguish an
+/// unreadable database from an obsolete-but-identified one.
+enum OpenIssue {
+    /// The file is not a readable SQLite database with our metadata.
+    Corrupt(String),
+    /// Readable, correct vault identity, but obsolete SQL or semantic version.
+    Obsolete,
+    /// A refusal or failure recovery must not paper over.
+    Fatal(IndexError),
+}
+
+/// Open the index database, creating the schema when new and applying the
+/// recovery policy otherwise: corrupt or obsolete DERIVED caches are rebuilt
+/// in place (the vault is never a recovery target); an obsolete explicit
+/// index with the right identity is rebuilt as well; a corrupt explicit index
+/// or a wrong vault identity is refused.
 pub(crate) fn open_connection(config: &IndexConfig) -> Result<Connection, IndexError> {
     if let Some(parent) = config.index_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let connection = Connection::open(&config.index_path)?;
-    configure(&connection)?;
+    match try_open(config) {
+        Ok(connection) => Ok(connection),
+        Err(OpenIssue::Corrupt(message)) => match config.location {
+            IndexLocation::Derived => {
+                replace_index_file(config)?;
+                match try_open(config) {
+                    Ok(connection) => Ok(connection),
+                    Err(OpenIssue::Fatal(error)) => Err(error),
+                    Err(_) => Err(IndexError::Storage(
+                        "derived index could not be rebuilt".into(),
+                    )),
+                }
+            }
+            IndexLocation::Explicit => Err(IndexError::IncompatibleIndex(message)),
+        },
+        Err(OpenIssue::Obsolete) => {
+            replace_index_file(config)?;
+            match try_open(config) {
+                Ok(connection) => Ok(connection),
+                Err(OpenIssue::Fatal(error)) => Err(error),
+                Err(_) => Err(IndexError::Storage(
+                    "obsolete index could not be rebuilt".into(),
+                )),
+            }
+        }
+        Err(OpenIssue::Fatal(error)) => Err(error),
+    }
+}
 
-    let user_version: u32 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if user_version == 0 && !has_metadata_table(&connection)? {
-        initialize(&connection, config)?;
-    } else {
-        validate(&connection, config, user_version)?;
+fn try_open(config: &IndexConfig) -> Result<Connection, OpenIssue> {
+    let connection = Connection::open(&config.index_path)
+        .map_err(|error| OpenIssue::Fatal(IndexError::Storage(error.to_string())))?;
+    configure(&connection).map_err(|error| OpenIssue::Corrupt(error.to_string()))?;
+
+    let user_version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| OpenIssue::Corrupt(error.to_string()))?;
+    let has_metadata =
+        has_metadata_table(&connection).map_err(|error| OpenIssue::Corrupt(error.to_string()))?;
+
+    if user_version == 0 && !has_metadata {
+        initialize(&connection, config).map_err(OpenIssue::Fatal)?;
+        return Ok(connection);
+    }
+    if !has_metadata {
+        return Err(OpenIssue::Corrupt(
+            "index database has no metadata table".into(),
+        ));
+    }
+
+    let (semantic_version, identity): (u32, String) = connection
+        .query_row(
+            "SELECT semantic_format_version, vault_identity FROM index_metadata \
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| OpenIssue::Corrupt(format!("missing metadata: {error}")))?;
+    if identity != config.vault_identity {
+        return Err(OpenIssue::Fatal(IndexError::IncompatibleIndex(
+            "index belongs to another vault".into(),
+        )));
+    }
+    if user_version != SQL_SCHEMA_VERSION || semantic_version != SEMANTIC_FORMAT_VERSION {
+        return Err(OpenIssue::Obsolete);
     }
     Ok(connection)
 }
 
-fn configure(connection: &Connection) -> Result<(), IndexError> {
+fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -45,7 +115,7 @@ fn configure(connection: &Connection) -> Result<(), IndexError> {
     Ok(())
 }
 
-fn has_metadata_table(connection: &Connection) -> Result<bool, IndexError> {
+fn has_metadata_table(connection: &Connection) -> Result<bool, rusqlite::Error> {
     let count: u32 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'index_metadata'",
         [],
@@ -71,32 +141,33 @@ fn initialize(connection: &Connection, config: &IndexConfig) -> Result<(), Index
     Ok(())
 }
 
-fn validate(
-    connection: &Connection,
-    config: &IndexConfig,
-    user_version: u32,
-) -> Result<(), IndexError> {
-    if user_version != SQL_SCHEMA_VERSION {
-        return Err(IndexError::IncompatibleIndex(format!(
-            "sql schema version {user_version} does not match {SQL_SCHEMA_VERSION}"
-        )));
+/// Replace exactly the configured index file plus its `-wal`/`-shm` sidecars.
+/// The target must be the configured index path and must sit outside the
+/// canonical vault root; nothing else is ever deleted.
+fn replace_index_file(config: &IndexConfig) -> Result<(), IndexError> {
+    let target = &config.index_path;
+    if target.as_os_str().is_empty() {
+        return Err(IndexError::Storage("empty index path".into()));
     }
-    let (semantic_version, identity): (u32, String) = connection
-        .query_row(
-            "SELECT semantic_format_version, vault_identity FROM index_metadata WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| IndexError::IncompatibleIndex(format!("missing metadata: {error}")))?;
-    if semantic_version != SEMANTIC_FORMAT_VERSION {
-        return Err(IndexError::IncompatibleIndex(format!(
-            "semantic format version {semantic_version} does not match {SEMANTIC_FORMAT_VERSION}"
-        )));
-    }
-    if identity != config.vault_identity {
-        return Err(IndexError::IncompatibleIndex(
-            "index belongs to another vault".into(),
+    if let Ok(parent) = target
+        .parent()
+        .ok_or(())
+        .and_then(|parent| parent.canonicalize().map_err(|_| ()))
+        && parent.starts_with(&config.canonical_vault_root)
+    {
+        return Err(IndexError::Storage(
+            "refusing to rebuild an index inside the vault".into(),
         ));
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate = target.as_os_str().to_owned();
+        candidate.push(suffix);
+        let candidate = std::path::PathBuf::from(candidate);
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(IndexError::Storage(error.to_string())),
+        }
     }
     Ok(())
 }

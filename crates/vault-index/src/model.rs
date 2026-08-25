@@ -23,3 +23,10 @@ impl Generation {
         })
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexState {
+    Ready,
+    Stale { last_error: String },
+    Unavailable { last_error: Option<String> },
+}
