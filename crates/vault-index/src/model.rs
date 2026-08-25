@@ -16,4 +16,10 @@ impl Generation {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    pub(crate) fn from_db(value: i64) -> Result<Self, crate::IndexError> {
+        u64::try_from(value).map(Self).map_err(|_| {
+            crate::IndexError::IncompatibleIndex(format!("negative generation {value}"))
+        })
+    }
 }

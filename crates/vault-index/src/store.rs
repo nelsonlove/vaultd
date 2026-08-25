@@ -7,8 +7,13 @@ use vault_core::{
 use crate::codec;
 use crate::config::IndexConfig;
 use crate::error::IndexError;
-use crate::model::FileFingerprint;
+use crate::model::{FileFingerprint, Generation};
 use crate::schema;
+
+pub(crate) enum PublishOutcome {
+    Committed(Generation),
+    GenerationChanged,
+}
 
 pub(crate) fn usize_to_i64(value: usize, field: &str) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| IndexError::Storage(format!("{field} exceeds i64 range")))
@@ -356,6 +361,118 @@ impl IndexStore {
             reference,
             resolution,
         })
+    }
+
+    pub(crate) fn current_generation(&self) -> Result<Option<Generation>, IndexError> {
+        let value: Option<i64> = self.connection.query_row(
+            "SELECT generation FROM index_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        value.map(Generation::from_db).transpose()
+    }
+
+    pub(crate) fn stored_paths(&self) -> Result<Vec<VaultPath>, IndexError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM notes ORDER BY path")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter().map(|path| codec::decode_path(path)).collect()
+    }
+
+    /// Load the lightweight resolution inputs (path, heading texts, block
+    /// identifiers) without touching source bytes.
+    pub(crate) fn load_resolution_catalog(
+        &self,
+    ) -> Result<Vec<vault_core::ResolutionNote>, IndexError> {
+        let mut catalog: Vec<vault_core::ResolutionNote> = Vec::new();
+        for path in self.stored_paths()? {
+            catalog.push(vault_core::ResolutionNote {
+                path,
+                headings: Vec::new(),
+                blocks: Vec::new(),
+            });
+        }
+        let by_path: std::collections::BTreeMap<String, usize> = catalog
+            .iter()
+            .enumerate()
+            .map(|(index, note)| (note.path.as_str().to_string(), index))
+            .collect();
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT note_path, text FROM headings ORDER BY note_path, ordinal")?;
+        let heading_rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (path, text) in heading_rows {
+            if let Some(&index) = by_path.get(&path) {
+                catalog[index].headings.push(text);
+            }
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT note_path, identifier FROM blocks ORDER BY note_path, ordinal")?;
+        let block_rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (path, identifier) in block_rows {
+            if let Some(&index) = by_path.get(&path) {
+                catalog[index].blocks.push(identifier);
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// One compare-and-swap publication transaction: verify the expected
+    /// generation, replace note and graph rows, advance the generation, and
+    /// stamp the refresh time.
+    pub(crate) fn publish(
+        &mut self,
+        expected: Option<Generation>,
+        notes: &[(ParsedNote, FileFingerprint)],
+        deleted: &[VaultPath],
+        graph: &SemanticGraph,
+        scan_diagnostics: &[Diagnostic],
+        diagnostics: &[Diagnostic],
+    ) -> Result<PublishOutcome, IndexError> {
+        let transaction = self.connection.transaction()?;
+        let current: Option<i64> = transaction.query_row(
+            "SELECT generation FROM index_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current = current.map(Generation::from_db).transpose()?;
+        if current != expected {
+            return Ok(PublishOutcome::GenerationChanged);
+        }
+
+        for path in deleted {
+            transaction.execute("DELETE FROM notes WHERE path = ?1", params![path.as_str()])?;
+        }
+        for (note, fingerprint) in notes {
+            Self::replace_note(&transaction, note, *fingerprint)?;
+        }
+        Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
+
+        let next = Generation::new(expected.map_or(0, Generation::get) + 1);
+        transaction.execute(
+            "UPDATE index_metadata SET generation = ?1, refreshed_at_unix_ms = ?2, \
+             last_refresh_error = NULL WHERE singleton = 1",
+            params![
+                u64_to_i64(next.get(), "generation")?,
+                schema::now_unix_ms()?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(PublishOutcome::Committed(next))
     }
 
     #[doc(hidden)]

@@ -39,6 +39,74 @@ impl FixtureStore {
     }
 }
 
+pub struct FixtureService {
+    pub service: vault_index::IndexService,
+    pub scan: ScanReport,
+    digests_before: std::collections::BTreeMap<String, blake3::Hash>,
+    _index_dir: TempDir,
+}
+
+pub fn open_fixture_service() -> FixtureService {
+    let index_dir = TempDir::new().expect("index tempdir");
+    let config = IndexConfig::explicit(
+        fixture_vault_root(),
+        index_dir.path().join("fixture-index.sqlite3"),
+    )
+    .expect("fixture config");
+    let service = vault_index::IndexService::open(config).expect("open fixture service");
+    let source = FileSystemVaultSource::new(fixture_vault_root()).expect("fixture source");
+    let scan = scan_vault(&source).expect("scan fixture vault");
+    FixtureService {
+        service,
+        scan,
+        digests_before: digest_tree(&fixture_vault_root()),
+        _index_dir: index_dir,
+    }
+}
+
+fn digest_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, blake3::Hash> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        digests: &mut std::collections::BTreeMap<String, blake3::Hash>,
+    ) {
+        for entry in std::fs::read_dir(directory).expect("read fixture directory") {
+            let entry = entry.expect("fixture directory entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, digests);
+            } else if path.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("inside fixture root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = std::fs::read(&path).expect("read fixture file");
+                digests.insert(relative, blake3::hash(&bytes));
+            }
+        }
+    }
+    let mut digests = std::collections::BTreeMap::new();
+    visit(root, root, &mut digests);
+    digests
+}
+
+pub fn assert_semantically_equivalent(indexed: &ScanReport, scan: &ScanReport) {
+    assert_eq!(indexed.diagnostics, scan.diagnostics);
+    assert_eq!(indexed.graph.note_paths(), scan.graph.note_paths());
+    for path in scan.graph.note_paths() {
+        assert_eq!(indexed.graph.note(path), scan.graph.note(path));
+        assert_eq!(indexed.graph.outgoing(path), scan.graph.outgoing(path));
+        assert_eq!(indexed.graph.backlinks(path), scan.graph.backlinks(path));
+    }
+    assert_eq!(indexed.graph.unresolved(), scan.graph.unresolved());
+    assert_eq!(indexed.graph.ambiguous(), scan.graph.ambiguous());
+}
+
+pub fn assert_vault_digest_unchanged(fixture: &FixtureService) {
+    assert_eq!(digest_tree(&fixture_vault_root()), fixture.digests_before);
+}
+
 pub fn open_fixture_store() -> FixtureStore {
     let index_dir = TempDir::new().expect("index tempdir");
     let config = IndexConfig::explicit(
