@@ -31,6 +31,18 @@ fn note(path: &str, text: &str) -> ParsedNote {
 /// produced by `changes`, resolves only those against a resolver built from
 /// `after`, and checks the result against the complete `after` resolution.
 /// Fails if any reference whose complete answer changed was not selected.
+///
+/// References are paired between `before` and `after` by `(raw_target,
+/// source_span)`, not by list position: when a note's own body changes, its
+/// outgoing-reference list can differ in length or order from the one
+/// computed before the change, and pairing by index would silently truncate
+/// (dropping a trailing reference outright) or compare mismatched pairs
+/// (masking a real change behind an unrelated one at the same index). A
+/// reference whose raw target and source span are unchanged between the two
+/// graphs is the same syntactic reference; one with no match in `after` was
+/// itself edited away or moved and is outside what this dependency-key
+/// harness checks (a source note's own edit is always fully re-resolved by
+/// the ordinary changed-note path, independent of dependency-key selection).
 fn assert_selected_matches_complete(
     before: &[ParsedNote],
     after: &[ParsedNote],
@@ -50,7 +62,14 @@ fn assert_selected_matches_complete(
         let before_refs = before_report.graph.outgoing(path);
         let after_refs = after_report.graph.outgoing(path);
 
-        for (before_ref, after_ref) in before_refs.iter().zip(after_refs.iter()) {
+        for before_ref in before_refs {
+            let Some(after_ref) = after_refs.iter().find(|candidate| {
+                candidate.reference.raw_target == before_ref.reference.raw_target
+                    && candidate.source_span == before_ref.source_span
+            }) else {
+                continue;
+            };
+
             checked_any = true;
             let target = LinkTarget::from(&before_ref.reference);
             let keys = reference_dependencies(path, &target, &before_ref.resolution);
@@ -90,6 +109,51 @@ fn adding_a_note_resolves_previously_unresolved_references() {
     let mut after = before.clone();
     let new_note = note("Missing note.md", "# Missing note\n");
     after.push(new_note.clone());
+
+    let change = ResolutionIdentityChange {
+        old: None,
+        new: Some(ResolutionNote::from(&new_note)),
+    };
+
+    assert_selected_matches_complete(&before, &after, &[change]);
+}
+
+#[test]
+fn adding_a_note_is_detected_even_when_a_referencing_notes_own_reference_list_grows() {
+    let before = load_notes();
+    let mut after = before.clone();
+
+    // Add the note that resolves the existing "[[Missing note]]" reference
+    // in Wikilinks.md.
+    let new_note = note("Missing note.md", "# Missing note\n");
+    after.push(new_note.clone());
+
+    // Also grow Wikilinks.md's own outgoing-reference list by inserting an
+    // unrelated new reference BETWEEN two of its existing references (right
+    // before "[[Foo]]", after "[[Missing note]]"). Wikilinks.md already has
+    // outgoing references — including the one that must be re-selected
+    // above — so this both changes that note's reference count AND shifts
+    // the byte offset of every reference after the insertion point between
+    // `before` and `after`. Pairing by list position would misalign here:
+    // "[[Foo]]" (unaffected) would be compared against the new "[[Tags]]"
+    // reference at the same index, producing a spurious mismatch, while the
+    // still-unaffected "[[Foo]]" pair and the real "[[Missing note]]"
+    // change risk being masked or dropped by truncation.
+    let wikilinks_path = VaultPath::new("Wikilinks.md").expect("valid path");
+    let index = after
+        .iter()
+        .position(|candidate| candidate.source.path() == &wikilinks_path)
+        .expect("fixture contains Wikilinks.md");
+    let original_text = after[index].source.text().to_string();
+    let split_point = original_text
+        .find("[[Foo]]")
+        .expect("Wikilinks.md fixture contains [[Foo]]");
+    let grown_text = format!(
+        "{}[[Tags]]\n{}",
+        &original_text[..split_point],
+        &original_text[split_point..]
+    );
+    after[index] = note("Wikilinks.md", &grown_text);
 
     let change = ResolutionIdentityChange {
         old: None,
