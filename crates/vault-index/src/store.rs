@@ -431,6 +431,52 @@ impl IndexStore {
         load_outgoing_with(&self.connection, path)
     }
 
+    /// `path`'s outgoing references keyed by the ordinal they are actually
+    /// stored under.
+    ///
+    /// `load_outgoing` hands back a positional list, and the join to
+    /// `resolutions` is an INNER JOIN: a reference whose resolution row is
+    /// missing is *absent* from the result, not present as a hole. Indexing
+    /// that list by ordinal therefore pairs a requested ordinal with a
+    /// different reference as soon as anything earlier is missing — a silent
+    /// wrong answer, since the delta writer resolves the reference id from the
+    /// ordinal it was asked for, which still exists.
+    ///
+    /// Any caller that holds ordinals rather than positions — the incremental
+    /// engine's selected references — must use this and must treat an absent
+    /// key as a broken invariant, never as a reference to skip.
+    pub(crate) fn load_outgoing_by_ordinal(
+        &self,
+        path: &VaultPath,
+    ) -> Result<std::collections::BTreeMap<u32, ResolvedReference>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, r.kind, r.origin, r.raw_target, r.file_target, r.subpath_kind, \
+                    r.subpath_value, r.display, r.span_start, r.span_end, \
+                    r.target_span_start, r.target_span_end, \
+                    s.kind, s.target_path, s.subpath_kind, s.subpath_value, r.ordinal \
+             FROM note_references r JOIN resolutions s ON s.reference_id = r.id \
+             WHERE r.note_path = ?1 ORDER BY r.ordinal",
+        )?;
+        let rows = statement
+            .query_map(params![path.as_str()], |row| {
+                Ok((reference_row_prefix(row)?, row.get::<_, i64>(16)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut references = std::collections::BTreeMap::new();
+        for (row, ordinal) in rows {
+            let ordinal =
+                u32::try_from(i64_to_usize(ordinal, "reference ordinal")?).map_err(|_| {
+                    IndexError::IncompatibleIndex("reference ordinal exceeds u32 range".into())
+                })?;
+            references.insert(
+                ordinal,
+                resolved_reference_from_row_with(&self.connection, path.clone(), row)?,
+            );
+        }
+        Ok(references)
+    }
+
     pub(crate) fn current_generation(&self) -> Result<Option<Generation>, IndexError> {
         let value: Option<i64> = self.connection.query_row(
             "SELECT generation FROM index_metadata WHERE singleton = 1",

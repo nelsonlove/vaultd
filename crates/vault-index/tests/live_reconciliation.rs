@@ -510,11 +510,12 @@ fn a_dirty_path_that_never_existed_publishes_nothing() {
 /// A reference the impact plan selected but the store cannot produce is a
 /// broken invariant, not a reference to quietly skip: skipping it would leave
 /// a selected reference un-re-resolved, which is the one forbidden direction.
-/// The store is corrupted out of band here — one resolution row dropped, so
-/// `Peer.md`'s reference vanishes from `load_outgoing` while the published
-/// live graph still selects it.
-#[test]
-fn a_selected_reference_missing_from_the_stored_index_fails_loudly() {
+///
+/// The store is corrupted out of band here — one `resolutions` row dropped.
+/// `load_outgoing`'s join to `resolutions` is an INNER JOIN, so the affected
+/// reference does not come back as a hole; it is simply absent. Both shapes
+/// must fail loudly and publish nothing.
+fn drop_one_resolution_and_reconcile(note: &str, ordinal: u32) {
     let mut fixture = live_fixture();
     let before = fixture.generation();
     let dropped = fixture
@@ -522,13 +523,14 @@ fn a_selected_reference_missing_from_the_stored_index_fails_loudly() {
         .connection_for_test()
         .execute(
             "DELETE FROM resolutions WHERE reference_id IN \
-             (SELECT id FROM note_references WHERE note_path = 'Peer.md' AND ordinal = 0)",
-            [],
+             (SELECT id FROM note_references WHERE note_path = ?1 AND ordinal = ?2)",
+            rusqlite::params![note, ordinal],
         )
         .expect("drop the stored resolution");
     assert_eq!(dropped, 1, "the fixture must have had a row to drop");
 
-    // A heading change on `Sub.md` selects `Peer.md`'s reference.
+    // A heading change on `Sub.md` selects every reference that resolves
+    // against it — including `{note}`'s.
     fixture.write("Sub.md", "# Section\n\n# Absent\n\ntext ^block\n");
     let error = fixture
         .try_refresh_paths(&["Sub.md"])
@@ -543,6 +545,25 @@ fn a_selected_reference_missing_from_the_stored_index_fails_loudly() {
         before,
         "a failed reconciliation must publish nothing"
     );
+}
+
+/// The single-reference shape: `Peer.md` has exactly one outgoing reference,
+/// so dropping its resolution leaves an empty result with nothing to mispair.
+#[test]
+fn a_selected_reference_missing_from_the_stored_index_fails_loudly() {
+    drop_one_resolution_and_reconcile("Peer.md", 0);
+}
+
+/// The shape that positional indexing gets *wrong* rather than merely
+/// skipping: `Hub.md` has seven outgoing references and the dropped one is in
+/// the middle, so every later row shifts down a slot. Indexing the result by
+/// position would hand ordinal 1 the reference stored at ordinal 2, resolve
+/// the wrong target, and commit that answer under ordinal 1 — a silent wrong
+/// answer, not a missing one, because the delta writer looks the reference id
+/// up by the ordinal it was *asked* for, which exists.
+#[test]
+fn a_missing_middle_resolution_never_mispairs_later_ordinals() {
+    drop_one_resolution_and_reconcile("Hub.md", 1);
 }
 
 /// `refresh_paths` builds on a published generation; it has no baseline to be
