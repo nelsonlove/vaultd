@@ -211,7 +211,11 @@ impl FixtureService {
     }
 }
 
-fn digest_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, blake3::Hash> {
+/// Content digests for every file under `root`, keyed by vault-relative
+/// path. The mechanism behind "vaultd never writes to the vault": a caller
+/// digests before and after handing the vault to the index, and any
+/// difference is a write the index had no business making.
+pub fn digest_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, blake3::Hash> {
     fn visit(
         root: &std::path::Path,
         directory: &std::path::Path,
@@ -236,6 +240,19 @@ fn digest_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, bla
     let mut digests = std::collections::BTreeMap::new();
     visit(root, root, &mut digests);
     digests
+}
+
+/// The resolver a clean scan implies: every note the scan found, with the
+/// heading and block identities resolution actually consults. The ground
+/// truth every live `resolve_link` answer is compared against.
+pub fn resolver_from_scan(report: &ScanReport) -> vault_core::Resolver {
+    vault_core::Resolver::from_catalog(
+        report
+            .graph
+            .notes()
+            .map(vault_core::ResolutionNote::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub fn assert_semantically_equivalent(indexed: &ScanReport, scan: &ScanReport) {

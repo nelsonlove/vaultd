@@ -468,6 +468,11 @@ impl IndexService {
             }
         };
 
+        // The bytes are in hand and the second fingerprint has not been taken.
+        // A test that rewrites the file from here makes the rejection below
+        // deterministic rather than a matter of timing.
+        self.reach(crate::HookPoint::AfterBodyRead);
+
         let after = self
             .source
             .fingerprint(path)
@@ -678,6 +683,7 @@ impl IndexService {
         // The last thing before the barrier: every path this delta claims to
         // create, replace, or delete must still be in the state the plan
         // assumed. One point fingerprint each — no inventory.
+        self.reach(crate::HookPoint::BeforePresenceCheck);
         self.confirm_planned_presence(batch, &replaced, &removed)?;
 
         let notes: Vec<NoteReplacement> = replaced

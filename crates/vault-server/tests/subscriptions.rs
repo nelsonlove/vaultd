@@ -5,16 +5,26 @@
 //! contract for the two dispatcher-produced resync reasons (`subscriber_lag`
 //! and `oversized_change_set`), which no runtime notice can ever carry.
 
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
+
 use vault_core::VaultPath;
 use vault_index::{
-    ChangeCause, Generation, LiveRefreshReport, LiveState, PathChanges, PublishedStatus,
-    ReconcileMetrics,
+    ChangeCause, Generation, IndexConfig, IndexService, LiveRefreshReport, LiveState, PathChanges,
+    PublishedStatus, ReconcileMetrics,
 };
 use vault_protocol::{
     ChangeSetDto, ErrorCode, EventEnvelope, GenerationCauseDto, LiveStateDto, PROTOCOL_VERSION,
-    ResyncReasonDto, RuntimeEventDto,
+    Request, RequestEnvelope, Response, ResponseOutcome, ResyncReasonDto, RuntimeEventDto,
+    SubscribeEventsParams, SubscribeEventsResponse,
 };
-use vault_server::runtime::{ResyncReason, RuntimeNotice};
+use vault_server::Server;
+use vault_server::runtime::{
+    ResyncReason, Runtime, RuntimeHook, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
+};
 use vault_server::subscriptions::{DETAILED_PATH_LIMIT, SUBSCRIBER_CAPACITY, SubscriptionRegistry};
 
 fn status(generation: Option<u64>, live_state: LiveState) -> PublishedStatus {
@@ -489,4 +499,443 @@ fn a_state_change_arriving_at_capacity_survives_the_collapse() {
         }
         other => panic!("expected a subscriber_lag marker last, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The registry driven against a live runtime
+// ---------------------------------------------------------------------------
+//
+// `stdio::dispatch` is private and `stdio::run` owns real stdin and stdout,
+// so these drive the same loop in process from the same public pieces the
+// dispatcher uses: pre-drain, `Server::handle`, `activate_new`, then
+// `enqueue_notice` + drain for every notice. That is the sanctioned route to
+// `subscriber_lag`, which the shipped stdio transport cannot reach because it
+// drains after every single notice.
+
+/// A vault plus its cache directory, kept alive for the whole test.
+struct LiveFixture {
+    vault: tempfile::TempDir,
+    _index: tempfile::TempDir,
+    config: IndexConfig,
+}
+
+fn live_fixture() -> LiveFixture {
+    let vault = tempfile::tempdir().expect("vault");
+    let index = tempfile::tempdir().expect("index");
+    fs::write(vault.path().join("Note.md"), "# Note\n\n[[Other]]\n").expect("write note");
+    fs::write(vault.path().join("Other.md"), "# Other\n").expect("write other");
+    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
+        .expect("index config");
+    // Build generation 1 and hand the writer lease back, so a runtime opens
+    // the same cache warm and its startup catch-up publishes nothing.
+    let mut service = IndexService::open(config.clone()).expect("open service");
+    service.refresh(false).expect("cold build");
+    drop(service);
+    LiveFixture {
+        vault,
+        _index: index,
+        config,
+    }
+}
+
+impl LiveFixture {
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.vault.path().join(name)
+    }
+}
+
+fn quiet_options() -> RuntimeOptions {
+    RuntimeOptions {
+        watch: false,
+        reconcile_interval: None,
+        ..RuntimeOptions::default()
+    }
+}
+
+/// Block until the startup catch-up has finished and the runtime has settled.
+fn wait_for_settled(handle: &vault_server::runtime::RuntimeHandle) {
+    wait_for("the runtime to settle", || {
+        let status = handle.reader().published_status().expect("status");
+        (status.live_state == LiveState::PollingFallback).then_some(())
+    });
+}
+
+fn wait_for<T>(label: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn paths_hint(names: &[&str]) -> vault_watch::ChangeHint {
+    vault_watch::ChangeHint::Paths(
+        names
+            .iter()
+            .map(|name| VaultPath::new(*name).expect("vault path"))
+            .collect(),
+    )
+}
+
+/// One `subscribe_events` request through the same sequence the dispatcher
+/// uses: pre-drain, handle, hand the response to the writer, activate.
+fn subscribe_through_dispatcher(
+    server: &Server,
+    registry: &mut SubscriptionRegistry,
+) -> SubscribeEventsResponse {
+    let pre_drain = drain(registry);
+    assert!(
+        pre_drain.is_empty(),
+        "these tests subscribe before any event is queued"
+    );
+    let envelope = server.handle(
+        RequestEnvelope::new(
+            "req-subscribe",
+            Request::SubscribeEvents(SubscribeEventsParams {}),
+        ),
+        registry,
+    );
+    registry.activate_new();
+    match envelope.outcome {
+        ResponseOutcome::Ok(Response::SubscribeEvents(response)) => response,
+        other => panic!("expected a subscribe_events response, got {other:?}"),
+    }
+}
+
+/// Move every notice waiting on the runtime's sink through the registry, and
+/// return the events the dispatcher would have written.
+fn pump(
+    registry: &mut SubscriptionRegistry,
+    notices: &Receiver<RuntimeNotice>,
+) -> Vec<EventEnvelope> {
+    let mut written = Vec::new();
+    while let Ok(notice) = notices.try_recv() {
+        registry.enqueue_notice(notice);
+        written.extend(drain(registry));
+    }
+    written
+}
+
+/// Hooks that park the coordinator inside one chosen mutation. `enter` fires
+/// before the call into the `IndexService`, `exit` immediately after it — and
+/// after a targeted reconciliation that is the commit boundary itself: the
+/// publication barrier has moved, and the notice has not been emitted yet.
+fn park_at_mutation(sequence: usize, at_exit: bool) -> (RuntimeTestHooks, Arc<Barrier>) {
+    let gate = Arc::new(Barrier::new(2));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let hook: RuntimeHook = {
+        let gate = Arc::clone(&gate);
+        let seen = Arc::clone(&seen);
+        Arc::new(move || {
+            if seen.fetch_add(1, Ordering::AcqRel) == sequence {
+                gate.wait();
+                gate.wait();
+            }
+        })
+    };
+    let hooks = if at_exit {
+        RuntimeTestHooks {
+            mutation_exit: Some(hook),
+            ..RuntimeTestHooks::default()
+        }
+    } else {
+        RuntimeTestHooks {
+            mutation_enter: Some(hook),
+            ..RuntimeTestHooks::default()
+        }
+    };
+    (hooks, gate)
+}
+
+/// A subscription registered at the commit boundary — after the barrier moved
+/// to `G + 1`, before the coordinator emitted anything about it — is promised
+/// `G + 1` and must never then be *delivered* `G + 1`. The client already has
+/// that generation; delivering it would run its `previous_generation` chain
+/// backwards from its own start point.
+///
+/// This is the race the `started_at` filter exists for, forced rather than
+/// hoped for: the coordinator is parked inside `mutation_exit`, which is
+/// exactly the window between the publication and its notice.
+#[test]
+fn a_subscription_registered_at_the_commit_boundary_is_never_delivered_its_own_start_generation() {
+    let fixture = live_fixture();
+    // Sequence 0 is the startup catch-up; sequence 1 is the targeted
+    // reconciliation the hint below causes.
+    let (hooks, gate) = park_at_mutation(1, true);
+
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    let server = Server::for_runtime(handle.clone());
+    let mut registry = SubscriptionRegistry::new();
+
+    // Catch-up must finish first, or it — not the hint below — would be the
+    // mutation that publishes, and the parked window would be the wrong one.
+    wait_for_settled(&handle);
+    while notices.try_recv().is_ok() {}
+
+    fs::write(fixture.path("Third.md"), "# Third\n\n[[Note]]\n").expect("write third");
+    assert!(handle.hint(paths_hint(&["Third.md"])));
+
+    // The coordinator is parked with generation 2 published and its notice
+    // not yet emitted.
+    gate.wait();
+    let response = subscribe_through_dispatcher(&server, &mut registry);
+    assert_eq!(
+        response.generation,
+        Some(2),
+        "the barrier has already moved, so the subscription starts at the new generation"
+    );
+    gate.wait();
+
+    // The notice for generation 2 now arrives. It must be filtered out.
+    let notice = notices
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the coordinator emits generation 2 after the parked window");
+    assert!(
+        matches!(&notice, RuntimeNotice::Generation(report) if report.generation.get() == 2),
+        "expected the generation-2 notice, got {notice:?}"
+    );
+    registry.enqueue_notice(notice);
+    let delivered = drain(&mut registry);
+    assert!(
+        delivered.is_empty(),
+        "a generation at or below the promised start point must never be delivered: {delivered:?}"
+    );
+
+    // The next generation is delivered, and its chain continues from the
+    // start point the client was promised.
+    fs::write(fixture.path("Fourth.md"), "# Fourth\n").expect("write fourth");
+    assert!(handle.hint(paths_hint(&["Fourth.md"])));
+    let committed = wait_for("generation 3", || {
+        pump(&mut registry, &notices)
+            .into_iter()
+            .find_map(|envelope| match envelope.event {
+                RuntimeEventDto::GenerationCommitted(committed) => Some(committed),
+                _ => None,
+            })
+    });
+    assert_eq!(committed.generation, 3);
+    assert_eq!(
+        committed.previous_generation,
+        Some(2),
+        "the chain must continue from the promised start point, with no gap and no repeat"
+    );
+
+    handle.shutdown();
+}
+
+/// The other arm of the same race: a subscription registered *before* the
+/// commit is promised `G`, and must then receive `G + 1` exactly once.
+#[test]
+fn a_subscription_registered_before_the_commit_receives_the_next_generation_once() {
+    let fixture = live_fixture();
+    // Park before the call, so the barrier still shows the old generation.
+    let (hooks, gate) = park_at_mutation(1, false);
+
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    let server = Server::for_runtime(handle.clone());
+    let mut registry = SubscriptionRegistry::new();
+
+    wait_for_settled(&handle);
+    while notices.try_recv().is_ok() {}
+
+    fs::write(fixture.path("Third.md"), "# Third\n\n[[Note]]\n").expect("write third");
+    assert!(handle.hint(paths_hint(&["Third.md"])));
+
+    gate.wait();
+    let response = subscribe_through_dispatcher(&server, &mut registry);
+    assert_eq!(
+        response.generation,
+        Some(1),
+        "the publication has not happened yet, so the start point is the old generation"
+    );
+    gate.wait();
+
+    let notice = notices
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the coordinator emits generation 2 after the parked window");
+    registry.enqueue_notice(notice);
+    let committed: Vec<u64> = drain(&mut registry)
+        .into_iter()
+        .filter_map(|envelope| match envelope.event {
+            RuntimeEventDto::GenerationCommitted(committed) => Some(committed.generation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(committed, vec![2], "delivered exactly once");
+    assert!(
+        pump(&mut registry, &notices).is_empty(),
+        "nothing follows a single targeted publication"
+    );
+
+    handle.shutdown();
+}
+
+/// A subscriber that never drains, against a runtime that keeps publishing.
+/// The queue must stay bounded and collapse onto one marker naming the newest
+/// generation — never grow, never drop a generation silently, never stall the
+/// coordinator.
+///
+/// The registry's own bound is a *component* bound: the shipped stdio
+/// dispatcher drains after every notice and cannot reach it. This drives the
+/// registry the way an embedder that batches notices would, which is the
+/// sanctioned way that branch is proven.
+#[test]
+fn a_subscriber_that_never_drains_is_bounded_against_a_live_runtime() {
+    let fixture = live_fixture();
+    let (sink, notices) = sync_channel(256);
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        quiet_options(),
+        sink,
+        RuntimeTestHooks::default(),
+    )
+    .expect("start runtime");
+    let server = Server::for_runtime(handle.clone());
+    let mut registry = SubscriptionRegistry::new();
+
+    wait_for_settled(&handle);
+    let response = subscribe_through_dispatcher(&server, &mut registry);
+    let id = response.subscription_id;
+
+    // Far more generations than the queue can hold, enqueued without a
+    // single drain in between.
+    let rounds = SUBSCRIBER_CAPACITY + 20;
+    for round in 0..rounds {
+        let name = format!("Bulk-{round}.md");
+        fs::write(fixture.path(&name), format!("# Bulk {round}\n\n[[Note]]\n"))
+            .expect("write bulk note");
+        assert!(handle.hint(paths_hint(&[name.as_str()])));
+        wait_for(&format!("generation {}", round + 2), || {
+            let status = handle.reader().published_status().expect("status");
+            status
+                .generation
+                .filter(|generation| generation.get() as usize >= round + 2)
+                .map(|_| ())
+        });
+        while let Ok(notice) = notices.try_recv() {
+            registry.enqueue_notice(notice);
+        }
+        assert!(
+            registry.queue_len(&id).expect("subscription exists") <= SUBSCRIBER_CAPACITY,
+            "a subscriber queue must never exceed {SUBSCRIBER_CAPACITY} events"
+        );
+    }
+
+    let final_generation = handle
+        .reader()
+        .published_status()
+        .expect("status")
+        .generation
+        .expect("published")
+        .get();
+    assert_eq!(
+        final_generation,
+        rounds as u64 + 1,
+        "the coordinator published every generation while the subscriber never drained"
+    );
+
+    while let Ok(notice) = notices.try_recv() {
+        registry.enqueue_notice(notice);
+    }
+    let events = drain(&mut registry);
+    assert!(events.len() <= SUBSCRIBER_CAPACITY);
+    match &events.last().expect("at least the lag marker").event {
+        RuntimeEventDto::ResyncRequired(resync) => {
+            assert_eq!(resync.reason, ResyncReasonDto::SubscriberLag);
+            assert_eq!(
+                resync.current_generation,
+                Some(final_generation),
+                "the marker must name the newest committed generation, not the one that overflowed"
+            );
+        }
+        other => panic!("expected a subscriber_lag marker last, got {other:?}"),
+    }
+
+    handle.shutdown();
+}
+
+/// A change set too large to carry as paths becomes counts plus a marker,
+/// over a real runtime rather than a synthesised notice — so the bound is
+/// proven against the change sets the engine actually produces.
+#[test]
+fn a_real_oversized_generation_is_reported_as_counts_plus_a_marker() {
+    let fixture = live_fixture();
+    let (sink, notices) = sync_channel(256);
+    let mut options = quiet_options();
+    // The coordinator's own pending set is capped by the watcher's ceiling,
+    // so it has to be lifted above the transport's detail limit for one
+    // generation to carry more paths than the transport will spell out.
+    options.watch_config.max_dirty_paths = DETAILED_PATH_LIMIT * 4;
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        options,
+        sink,
+        RuntimeTestHooks::default(),
+    )
+    .expect("start runtime");
+    let server = Server::for_runtime(handle.clone());
+    let mut registry = SubscriptionRegistry::new();
+
+    wait_for_settled(&handle);
+    subscribe_through_dispatcher(&server, &mut registry);
+
+    let bulk = DETAILED_PATH_LIMIT + 1;
+    let mut names = Vec::with_capacity(bulk);
+    for index in 0..bulk {
+        let name = format!("Wide-{index}.md");
+        fs::write(fixture.path(&name), format!("# Wide {index}\n")).expect("write wide note");
+        names.push(name);
+    }
+    let hint = vault_watch::ChangeHint::Paths(
+        names
+            .iter()
+            .map(|name| VaultPath::new(name.as_str()).expect("vault path"))
+            .collect(),
+    );
+    assert!(handle.hint(hint));
+
+    let events = wait_for("the oversized generation", || {
+        let written = pump(&mut registry, &notices);
+        written
+            .iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEventDto::GenerationCommitted(_)))
+            .then_some(written)
+    });
+    let committed = events
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            RuntimeEventDto::GenerationCommitted(committed) => Some(committed),
+            _ => None,
+        })
+        .expect("a generation_committed event");
+    match committed.changes {
+        ChangeSetDto::CountsOnly {
+            created,
+            modified,
+            deleted,
+        } => {
+            assert_eq!(created, bulk as u64);
+            assert_eq!(modified, 0);
+            assert_eq!(deleted, 0);
+        }
+        ref other => panic!("expected a counts-only change set, got {other:?}"),
+    }
+    assert_eq!(committed.affected_note_count, bulk as u64);
+    assert!(
+        events.iter().any(|envelope| matches!(
+            envelope.event,
+            RuntimeEventDto::ResyncRequired(ref resync)
+                if resync.reason == ResyncReasonDto::OversizedChangeSet
+        )),
+        "an oversized change set must be followed by its marker: {events:?}"
+    );
+
+    handle.shutdown();
 }

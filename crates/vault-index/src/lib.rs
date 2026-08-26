@@ -13,6 +13,7 @@ mod reader;
 mod reconcile;
 mod schema;
 mod store;
+mod test_hook;
 
 pub use config::{IndexConfig, IndexLocation};
 pub use error::IndexError;
@@ -40,6 +41,8 @@ pub use store::{
     DeltaPublication, DeltaPublishOutcome, DeltaPublishTimings, DeltaWriteCounts, IndexStore,
     NoteReplacement, ResolutionReplacement,
 };
+#[doc(hidden)]
+pub use test_hook::{HookPoint, TestHook};
 
 #[doc(hidden)]
 pub fn open_index_for_test(config: &IndexConfig) -> Result<rusqlite::Connection, IndexError> {

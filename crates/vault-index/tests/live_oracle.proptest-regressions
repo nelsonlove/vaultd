@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Provenance of the seed below: it was drawn while this oracle was being
+# validated against a deliberately broken engine — `select_impact` was made to
+# return no incoming references, i.e. the exact under-selection the module
+# forbids. The seed shrank to the smallest input that catches it: one new note
+# appearing where an existing reference was waiting for it. Keeping it means
+# every run re-checks that case before generating anything novel.
+cc 58ec420fb18125371dd229fcc711f082ffb9d8dc7d841c2053008b4143775c62 # shrinks to batches = [[Write { path: "Gamma.md", body: "# Heading\n\ntext ^block\n" }]]

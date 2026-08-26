@@ -84,6 +84,45 @@ fn duplicate_paths_are_inserted_once() {
     }
 }
 
+/// The order a backend happens to deliver events in is a property of the
+/// backend, never of the batch. The same three paths delivered forwards, and
+/// delivered reversed with every one repeated, must produce one identical
+/// hint — and exactly one, with nothing left over for the next window.
+///
+/// This is where "one deterministic batch" is enforced: everything
+/// downstream (the coordinator's pending set, `refresh_paths`' dirty set) is
+/// a `BTreeSet` precisely because this holds here first.
+#[test]
+fn duplicate_and_reversed_paths_collapse_into_one_identical_batch() {
+    fn collect(deliveries: &[&str]) -> (ChangeHint, Option<ChangeHint>) {
+        let base = Instant::now();
+        let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
+        for (step, name) in deliveries.iter().enumerate() {
+            debouncer.observe_path(path(name), base + Duration::from_millis(step as u64));
+        }
+        let ready = base + Duration::from_millis(deliveries.len() as u64 + 100);
+        let hint = debouncer.poll(ready).expect("ready");
+        let leftover = debouncer.poll(ready + Duration::from_millis(200));
+        (hint, leftover)
+    }
+
+    let (forward, forward_leftover) = collect(&["A.md", "B.md", "C.md"]);
+    let (reversed, reversed_leftover) = collect(&["C.md", "B.md", "A.md", "C.md", "A.md", "B.md"]);
+
+    assert_eq!(forward, reversed, "delivery order must not reach the hint");
+    assert_eq!(
+        forward,
+        ChangeHint::Paths(
+            [path("A.md"), path("B.md"), path("C.md")]
+                .into_iter()
+                .collect()
+        ),
+        "the batch is sorted and deduplicated"
+    );
+    assert_eq!(forward_leftover, None, "exactly one batch, not two");
+    assert_eq!(reversed_leftover, None, "exactly one batch, not two");
+}
+
 #[test]
 fn exceeding_max_dirty_paths_emits_a_single_overflow_hint() {
     let base = Instant::now();

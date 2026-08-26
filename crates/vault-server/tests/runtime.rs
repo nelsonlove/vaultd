@@ -1153,3 +1153,327 @@ fn a_dropped_notice_stays_owed_while_its_generation_is_unknown() {
 
     handle.shutdown();
 }
+
+/// A manual verified refresh queued *while* a watcher publication is in
+/// flight. The coordinator is parked inside the watcher's own mutation
+/// window, so the refresh is provably queued during it — and must still run
+/// strictly afterwards. One mutation owner means one mutation at a time, and
+/// `MutationCounter` is what would catch a second.
+#[test]
+fn a_verified_refresh_queued_during_a_watcher_publication_never_overlaps_it() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    let counter = MutationCounter::default();
+    let base = counter.hooks();
+    let count_enter = base
+        .mutation_enter
+        .clone()
+        .expect("the counter installs one");
+    let gate = Arc::new(Barrier::new(2));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let hooks = RuntimeTestHooks {
+        mutation_enter: Some({
+            let gate = Arc::clone(&gate);
+            let seen = Arc::clone(&seen);
+            Arc::new(move || {
+                count_enter();
+                // Sequence 0 is the startup catch-up; sequence 1 is the
+                // targeted reconciliation the hint below causes.
+                if seen.fetch_add(1, Ordering::AcqRel) == 1 {
+                    gate.wait();
+                    gate.wait();
+                }
+            })
+        }),
+        mutation_exit: base.mutation_exit.clone(),
+        ..RuntimeTestHooks::default()
+    };
+
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    // Catch-up first, or it — not the hint — would be the publication the
+    // refresh races.
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    fs::write(fixture.path("Third.md"), "# Third\n\n[[Note]]\n").expect("write third");
+    assert!(handle.hint(paths_hint(&["Third.md"])));
+
+    // The coordinator is inside the watcher publication's mutation window.
+    gate.wait();
+    let (reply, replies) = sync_channel(1);
+    assert_eq!(
+        handle.send_command(RuntimeCommand::Refresh {
+            verify: true,
+            reply
+        }),
+        Dispatch::Accepted,
+        "the verified refresh is queued while the watcher publication is in flight"
+    );
+    gate.wait();
+
+    let verified = replies
+        .recv_timeout(Duration::from_secs(10))
+        .expect("verified refresh reply")
+        .expect("verified refresh");
+    assert!(verified.verified);
+    assert_eq!(
+        verified.generation.get(),
+        2,
+        "the verified refresh observes what the watcher publication committed"
+    );
+    assert_eq!(
+        verified.previous_generation.map(|it| it.get()),
+        Some(2),
+        "the watcher publication already landed, so the refresh publishes nothing new"
+    );
+    assert_eq!(
+        counter.max(),
+        1,
+        "the coordinator is the only mutation owner: no two mutations may overlap"
+    );
+
+    handle.shutdown();
+}
+
+/// A notice sink that is never drained must cost dropped notices, never a
+/// stalled writer. The coordinator keeps publishing generation after
+/// generation into a one-slot sink; once there is room again, the gap it
+/// created is announced as a resync naming the generation to re-read at.
+///
+/// This is the reason `emit` may only ever `try_send`. A blocking send here
+/// would wedge the writer behind whatever is not draining, and nothing on
+/// either side has a timeout.
+#[test]
+fn a_saturated_notice_sink_never_stalls_the_coordinator_and_the_gap_is_announced() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    // One slot: everything after the first notice is dropped and latched.
+    let (sink, notices) = sync_channel(1);
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        quiet_options(),
+        sink,
+        RuntimeTestHooks::default(),
+    )
+    .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+
+    // Five publications with nothing ever taken off the sink. Reaching
+    // generation 6 at all is the proof that no emission blocked.
+    for round in 0..5u64 {
+        let name = format!("Bulk-{round}.md");
+        fs::write(fixture.path(&name), format!("# Bulk {round}\n\n[[Note]]\n"))
+            .expect("write bulk note");
+        assert!(handle.hint(paths_hint(&[name.as_str()])));
+        wait_for_generation(&handle, round + 2);
+    }
+
+    // With room again, the next emission must lead with the gap
+    // announcement — and it must name a generation, or no observer could act
+    // on it.
+    let _ = drain(&notices);
+    fs::write(fixture.path("After.md"), "# After\n").expect("write after");
+    assert!(handle.hint(paths_hint(&["After.md"])));
+    wait_for_generation(&handle, 7);
+
+    let announced = wait_for("the gap announcement", || {
+        drain(&notices).into_iter().find_map(|notice| match notice {
+            RuntimeNotice::ResyncRequired {
+                generation: Some(generation),
+                reason: ResyncReason::RuntimeRecovered,
+            } => Some(generation.get()),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        announced, 7,
+        "the announcement must name the generation an observer has to re-read at"
+    );
+
+    handle.shutdown();
+}
+
+/// An atomic save that straddles the deletion grace window — the file
+/// disappears and comes back with byte-identical content — must publish
+/// **nothing**. Not a deletion, not a modification, not a generation: no
+/// client-visible state moved, and a generation pair a client could see the
+/// file missing in is exactly what the grace window exists to prevent.
+#[test]
+fn an_atomic_save_with_identical_content_publishes_no_generation_at_all() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    let (sink, notices) = sync_channel(64);
+    let mut options = quiet_options();
+    options.watch_config.debounce = Duration::from_millis(300);
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        options,
+        sink,
+        RuntimeTestHooks::default(),
+    )
+    .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    let body = fs::read_to_string(fixture.path("Note.md")).expect("read note");
+    fs::remove_file(fixture.path("Note.md")).expect("remove note");
+    assert!(handle.hint(paths_hint(&["Note.md"])));
+    fs::write(fixture.path("Note.md"), &body).expect("restore note");
+    assert!(handle.hint(paths_hint(&["Note.md"])));
+
+    // A second, genuinely new path gives the test something to wait *for*,
+    // so the "nothing was published" claim is not a race against a sleep.
+    fs::write(fixture.path("Third.md"), "# Third\n").expect("write third");
+    assert!(handle.hint(paths_hint(&["Third.md"])));
+    wait_for_generation(&handle, 2);
+
+    // Well past the grace window the deletion would have matured in.
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(
+        handle
+            .reader()
+            .published_status()
+            .expect("status")
+            .generation
+            .map(|generation| generation.get()),
+        Some(2),
+        "an atomic save with identical content must not publish a generation of its own"
+    );
+
+    for notice in drain(&notices) {
+        if let RuntimeNotice::Generation(report) = notice {
+            assert!(
+                !report
+                    .changes
+                    .deleted
+                    .iter()
+                    .any(|path| path.as_str() == "Note.md"),
+                "a path that came back must never publish as deleted: {report:?}"
+            );
+            assert!(
+                !report
+                    .changes
+                    .modified
+                    .iter()
+                    .any(|path| path.as_str() == "Note.md"),
+                "byte-identical content is not a modification: {report:?}"
+            );
+        }
+    }
+
+    handle.shutdown();
+}
+
+/// Everything the runtime's reader answers, against a clean scan of the same
+/// vault. Used where a *complete* reconciliation is what repaired the state,
+/// so "it converged" means the same thing it means in `vault-index`'s own
+/// oracle rather than "the generation moved".
+fn assert_reader_matches_scan(handle: &RuntimeHandle, root: &std::path::Path) {
+    let source = vault_core::FileSystemVaultSource::new(root).expect("scan source");
+    let fresh = vault_core::scan_vault(&source).expect("scan vault");
+    let reader = handle.reader();
+
+    let mut indexed = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = reader
+            .list_notes(cursor.as_deref(), Some(50))
+            .expect("list notes");
+        indexed.extend(page.items.iter().map(|item| item.path.clone()));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let scanned: Vec<VaultPath> = fresh.graph.note_paths().into_iter().cloned().collect();
+    assert_eq!(
+        indexed, scanned,
+        "the indexed note set diverged from a scan"
+    );
+
+    let resolver = vault_core::Resolver::from_catalog(
+        fresh
+            .graph
+            .notes()
+            .map(vault_core::ResolutionNote::from)
+            .collect::<Vec<_>>(),
+    );
+    for path in &scanned {
+        let note = reader.get_note(path).expect("indexed note");
+        assert_eq!(
+            note.outgoing,
+            fresh.graph.outgoing(path),
+            "stored resolutions for {} diverged from a scan",
+            path.as_str()
+        );
+        for destination in ["Note", "Other", "Third", "Nowhere", "Note#Note"] {
+            let (_, live) = reader
+                .resolve_link(path, destination)
+                .expect("resolve link");
+            assert_eq!(
+                live,
+                resolver.resolve_target(path, &vault_core::LinkTarget::parse(destination)),
+                "live resolution of {destination:?} from {} diverged from a scan",
+                path.as_str()
+            );
+        }
+    }
+}
+
+/// The escalation both watcher-detail failures share: whatever the reason,
+/// the complete reconciliation it triggers must land on exactly the state a
+/// clean scan produces — including the change nobody ever hinted, which is
+/// the whole reason the escalation exists.
+#[test]
+fn an_escalated_complete_reconciliation_converges_on_a_clean_scan() {
+    for (label, hint, expected) in [
+        (
+            "overflow",
+            vault_watch::ChangeHint::Overflow,
+            ResyncReason::WatcherOverflow,
+        ),
+        (
+            "root invalidation",
+            vault_watch::ChangeHint::RootInvalidated,
+            ResyncReason::RootInvalidated,
+        ),
+    ] {
+        let fixture = fixture();
+        fixture.build_generation_one();
+
+        let (sink, notices) = sync_channel(64);
+        let handle = Runtime::start_with_hooks(
+            fixture.config.clone(),
+            quiet_options(),
+            sink,
+            RuntimeTestHooks::default(),
+        )
+        .expect("start runtime");
+        wait_for_state(&handle, LiveState::PollingFallback);
+        let _ = drain(&notices);
+
+        // A change no hint will ever name, plus a change to an existing note
+        // whose reference answer moves because of it.
+        fs::write(fixture.path("Third.md"), "# Third\n\n[[Note]]\n").expect("write third");
+        fs::write(fixture.path("Note.md"), "# Note\n\n[[Other]]\n[[Third]]\n")
+            .expect("change note");
+        assert!(handle.hint(hint));
+
+        wait_for_generation(&handle, 2);
+        let reason = wait_for(&format!("a {label} resync notice"), || {
+            drain(&notices).into_iter().find_map(|notice| match notice {
+                RuntimeNotice::ResyncRequired { reason, .. } => Some(reason),
+                _ => None,
+            })
+        });
+        assert_eq!(reason, expected, "{label} must keep its own reason");
+        assert_reader_matches_scan(&handle, fixture.vault.path());
+
+        handle.shutdown();
+    }
+}

@@ -61,6 +61,9 @@ pub struct IndexService {
     /// fallback branch can be exercised without a ten-thousand-reference
     /// vault.
     pub(crate) live_threshold_override: Option<usize>,
+    /// Test-only rendezvous points inside one reconciliation cycle. `None`
+    /// in every production build; see [`crate::test_hook`].
+    pub(crate) test_hook: crate::test_hook::InstalledHook,
 }
 
 enum TryOutcome {
@@ -133,6 +136,7 @@ impl IndexService {
             row_write_pause: None,
             last_metrics: None,
             live_threshold_override: None,
+            test_hook: None,
         })
     }
 
@@ -194,6 +198,21 @@ impl IndexService {
     #[doc(hidden)]
     pub fn set_complete_resolution_threshold_for_test(&mut self, threshold: usize) {
         self.live_threshold_override = Some(threshold);
+    }
+
+    /// Install the rendezvous hook every [`crate::HookPoint`] fires into.
+    /// Test-only: production leaves the slot empty and pays one `Option`
+    /// check per point.
+    #[doc(hidden)]
+    pub fn install_test_hook(&mut self, hook: std::sync::Arc<dyn crate::TestHook>) {
+        self.test_hook = Some(hook);
+    }
+
+    /// Fire one hook point, if a test installed a hook.
+    pub(crate) fn reach(&self, point: crate::HookPoint) {
+        if let Some(hook) = &self.test_hook {
+            hook.reach(point);
+        }
     }
 
     pub fn state(&self) -> Result<IndexState, IndexError> {
@@ -698,6 +717,9 @@ impl IndexService {
             )?
         };
         let prepare = prepare_start.elapsed();
+        // Everything fallible is prepared and nothing is committed: the last
+        // instant at which a foreign writer can still steal this generation.
+        self.reach(crate::HookPoint::BeforeDeltaPublication);
 
         let mut published = write_published(&self.published)?;
         let outcome = self.store.publish_delta(publication)?;
