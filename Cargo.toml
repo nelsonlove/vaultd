@@ -4,6 +4,7 @@ members = [
     "crates/vault-index",
     "crates/vault-protocol",
     "crates/vault-server",
+    "crates/vault-watch",
 ]
 resolver = "3"
 
@@ -21,6 +22,7 @@ blake3 = "1.8"
 clap = { version = "4.6.6", features = ["derive"] }
 filetime = "0.2.29"
 fs2 = "0.4.3"
+notify = "8.2.0"
 rusqlite = { version = "0.32.1", features = ["bundled", "trace"] }
 xdg = "3.0"
 markdown = "1.0"

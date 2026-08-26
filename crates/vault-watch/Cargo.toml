@@ -1,0 +1,13 @@
+[package]
+name = "vault-watch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notify.workspace = true
+thiserror.workspace = true
+vault-core = { path = "../vault-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
