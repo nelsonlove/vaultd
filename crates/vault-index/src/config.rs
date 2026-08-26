@@ -26,60 +26,97 @@ impl IndexConfig {
             .ok_or_else(|| {
                 IndexError::Storage("cannot determine the XDG cache directory".into())
             })?;
-        reject_if_inside_vault(&index_path, &canonical_vault_root)?;
+        let resolved_index_path = resolve_against_existing_ancestor(&index_path)?;
+        reject_if_inside_vault(&resolved_index_path, &canonical_vault_root)?;
         Ok(Self {
             canonical_vault_root,
             vault_identity,
-            index_path,
+            index_path: resolved_index_path,
             location: IndexLocation::Derived,
         })
     }
 
-    /// Configure an explicit cache path. The path is resolved to an absolute,
-    /// lexically-normalized form and rejected if that form sits inside the
-    /// vault — but nothing is created here, and nothing on disk is touched:
-    /// a path that only *resolves* into the vault through a not-yet-existing
-    /// symlink cannot be caught lexically. `prepare_storage` catches that
-    /// case once the path can actually be canonicalized.
+    /// Configure an explicit cache path. The path is resolved against its
+    /// deepest *existing* ancestor — canonicalizing that ancestor, then
+    /// reattaching whatever tail doesn't exist yet — and rejected if the
+    /// result sits inside the vault. Comparing canonical-to-canonical this
+    /// way (rather than a purely lexical comparison against the canonical
+    /// vault root) is what catches a vault root reached through a symlinked
+    /// ancestor, which is every macOS temp directory (`/tmp` ->
+    /// `/private/tmp`): a lexical index path built from that same
+    /// non-canonical prefix would otherwise never appear to start with the
+    /// canonicalized vault root. Nothing is created here, and nothing on
+    /// disk is touched — a symlink planted *after* this call, or a final
+    /// component that is itself a not-yet-resolvable symlink, cannot be
+    /// caught here; `prepare_storage` re-checks both once the path can
+    /// actually be walked.
     pub fn explicit(
         vault_root: impl AsRef<Path>,
         index_path: impl AsRef<Path>,
     ) -> Result<Self, IndexError> {
         let canonical_vault_root = canonical_root(vault_root.as_ref())?;
         let vault_identity = identity_for(&canonical_vault_root);
-        let absolute_index_path = lexically_absolute(index_path.as_ref())?;
-        reject_if_inside_vault(&absolute_index_path, &canonical_vault_root)?;
+        let resolved_index_path = resolve_against_existing_ancestor(index_path.as_ref())?;
+        reject_if_inside_vault(&resolved_index_path, &canonical_vault_root)?;
         Ok(Self {
             canonical_vault_root,
             vault_identity,
-            index_path: absolute_index_path,
+            index_path: resolved_index_path,
             location: IndexLocation::Explicit,
         })
     }
 
-    /// Create the cache's parent directory if needed, then re-validate it
-    /// against the vault root after canonicalizing — catching a parent that
-    /// resolves into the vault through a symlink the lexical check in
-    /// `explicit`/`derived` could not see (because it didn't exist yet). On
-    /// success, `index_path` is replaced with `canonical_parent.join(file_name)`,
-    /// so every later open works from a fully resolved path.
+    /// Create the cache's parent directory, validating before *and* after.
+    ///
+    /// The pre-check resolves the projected parent against its deepest
+    /// existing ancestor (the same technique `explicit`/`derived` use) and
+    /// refuses before `create_dir_all` runs — otherwise a symlink planted
+    /// between construction and this call redirects that very call into
+    /// creating directories inside the vault before anything notices. The
+    /// post-check re-canonicalizes the now-created parent (catching any
+    /// remaining race) and, finally, canonicalizes the full index path
+    /// itself: the final component can be a symlink into the vault that
+    /// only resolves once its target exists, which the parent-only checks
+    /// above cannot see. A final component that still doesn't resolve (a
+    /// symlink dangling because nothing has created its target yet) is left
+    /// alone here — there is nothing to canonicalize yet — but it can never
+    /// silently point past this into the vault: `IndexStore::open` performs
+    /// no filesystem creation of its own beyond what `prepare_storage`
+    /// already validated, so a dangling symlink here is refused the moment
+    /// SQLite (or a repeat `prepare_storage`) makes it resolvable, before it
+    /// is ever written through.
     ///
     /// Idempotent: calling this again on an already-prepared config
-    /// canonicalizes the same directory to itself.
+    /// canonicalizes the same directory (and file, if it now exists) to
+    /// itself.
     pub fn prepare_storage(&mut self) -> Result<(), IndexError> {
-        let parent = self.index_path.parent().ok_or_else(|| {
-            IndexError::InvalidIndexPath("index path has no parent directory".into())
-        })?;
         let file_name = self
             .index_path
             .file_name()
-            .ok_or_else(|| IndexError::InvalidIndexPath("index path has no file name".into()))?;
-        std::fs::create_dir_all(parent)?;
+            .ok_or_else(|| IndexError::InvalidIndexPath("index path has no file name".into()))?
+            .to_os_string();
+        let parent = self
+            .index_path
+            .parent()
+            .ok_or_else(|| {
+                IndexError::InvalidIndexPath("index path has no parent directory".into())
+            })?
+            .to_path_buf();
+
+        let projected_parent = resolve_against_existing_ancestor(&parent)?;
+        reject_if_inside_vault(&projected_parent, &self.canonical_vault_root)?;
+
+        std::fs::create_dir_all(&parent)?;
         let canonical_parent = parent
             .canonicalize()
             .map_err(|error| IndexError::Storage(format!("{}: {error}", parent.display())))?;
         reject_if_inside_vault(&canonical_parent, &self.canonical_vault_root)?;
-        self.index_path = canonical_parent.join(file_name);
+        self.index_path = canonical_parent.join(&file_name);
+
+        if let Ok(canonical_file) = self.index_path.canonicalize() {
+            reject_if_inside_vault(&canonical_file, &self.canonical_vault_root)?;
+        }
+
         Ok(())
     }
 
@@ -114,6 +151,44 @@ fn reject_if_inside_vault(
         )));
     }
     Ok(())
+}
+
+/// Resolve `path` to a canonical-as-far-as-possible absolute form: make it
+/// lexically absolute (join-with-cwd plus `.`/`..` normalization, touching
+/// no filesystem state), then walk upward to the deepest ancestor that
+/// actually exists, canonicalize *that* (resolving every symlink in it,
+/// including one the vault root itself traverses), and reattach whatever
+/// tail doesn't exist yet, unchanged.
+///
+/// This is the one place a not-yet-fully-materialized index path gets
+/// compared apples-to-apples against a canonical vault root: canonicalizing
+/// only the vault root (as a lexical comparison against the index path
+/// would) misses a shared symlinked ancestor entirely, because the index
+/// path keeps the non-canonical prefix while the vault root does not.
+fn resolve_against_existing_ancestor(path: &Path) -> Result<PathBuf, IndexError> {
+    let absolute = lexically_absolute(path)?;
+    let mut existing = absolute.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                existing.pop();
+            }
+            // Reached the filesystem root without finding anything that
+            // exists — nothing left to pop. `canonicalize` below will
+            // surface the underlying I/O error.
+            None => break,
+        }
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| IndexError::Storage(format!("{}: {error}", existing.display())))?;
+    let mut resolved = canonical_existing;
+    for component in tail.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 /// Make `path` absolute without touching the filesystem: join it to the

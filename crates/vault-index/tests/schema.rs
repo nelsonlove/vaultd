@@ -19,10 +19,16 @@ fn derived_config_uses_xdg_cache_and_binds_the_canonical_vault() {
         None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
     }
     assert_eq!(config.location, IndexLocation::Derived);
+    // `derived` resolves the cache path against its deepest existing
+    // ancestor and canonicalizes it (so a symlinked ancestor — e.g. macOS's
+    // `/tmp` -> `/private/tmp` — can't hide a path that actually lands
+    // inside the vault); compare against the canonicalized cache root too,
+    // rather than `cache.path()`'s possibly-non-canonical form.
+    let canonical_cache = cache.path().canonicalize().expect("canonicalize cache dir");
     assert!(
         config
             .index_path
-            .starts_with(cache.path().join("vaultd/vaults"))
+            .starts_with(canonical_cache.join("vaultd/vaults"))
     );
     assert_eq!(
         config
@@ -31,7 +37,7 @@ fn derived_config_uses_xdg_cache_and_binds_the_canonical_vault() {
             .and_then(|value| value.to_str()),
         Some("semantic-v1.sqlite3")
     );
-    assert!(!config.index_path.starts_with(vault.path()));
+    assert!(!config.index_path.starts_with(&config.canonical_vault_root));
 }
 
 #[test]
