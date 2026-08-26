@@ -3,6 +3,7 @@ mod config;
 mod cursor;
 mod error;
 mod inventory;
+mod live_graph;
 mod metrics;
 mod model;
 mod query;
@@ -13,6 +14,10 @@ mod store;
 pub use config::{IndexConfig, IndexLocation};
 pub use error::IndexError;
 pub use inventory::{FileSystemIndexSource, InventoryEntry, InventorySnapshot, ReconcileSource};
+pub use live_graph::{
+    HydratedNote, HydratedReference, ImpactPlan, LiveGraph, NoteId, PreparedGraphDelta,
+    ReferenceKey,
+};
 pub use metrics::{ReconcileMetrics, StageDurations, WorkCounts};
 pub use model::{FileFingerprint, Generation, IndexState};
 pub use query::{

@@ -9,6 +9,7 @@ use vault_core::{
 use crate::config::IndexConfig;
 use crate::error::IndexError;
 use crate::inventory::{FileSystemIndexSource, InventorySnapshot, ReconcileSource};
+use crate::live_graph::LiveGraph;
 use crate::metrics::ReconcileMetrics;
 use crate::model::{FileFingerprint, Generation, IndexState};
 use crate::store::{IndexStore, Publication, PublishOutcome};
@@ -399,6 +400,16 @@ impl IndexService {
     #[doc(hidden)]
     pub fn snapshot_for_test(&self) -> Result<ScanReport, IndexError> {
         self.store.load_graph_for_test()
+    }
+
+    /// Hydrate a compact live resolution graph from the current committed
+    /// generation. Fails with `IndexError::IndexUnavailable` before the
+    /// first successful `refresh`.
+    pub fn hydrate_live_graph(&self) -> Result<LiveGraph, IndexError> {
+        let generation = self
+            .current_generation()?
+            .ok_or(IndexError::IndexUnavailable)?;
+        self.store.hydrate_live_graph(generation)
     }
 }
 

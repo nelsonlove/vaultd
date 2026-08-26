@@ -6,9 +6,12 @@ use vault_core::{
     SemanticGraph, SourceDocument, Tag, VaultPath, build_graph,
 };
 
+mod hydrate;
+
 use crate::codec;
 use crate::config::IndexConfig;
 use crate::error::IndexError;
+use crate::live_graph::LiveGraph;
 use crate::model::{FileFingerprint, Generation};
 use crate::schema;
 
@@ -637,6 +640,17 @@ impl IndexStore {
         let _ = Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Build a compact live resolution graph from narrow SQL: paths,
+    /// headings, block ids, reference target columns, stored resolution
+    /// columns, and ambiguous candidates only. Never touches `source_bytes`,
+    /// `properties`, `aliases`, or `tags`.
+    pub(crate) fn hydrate_live_graph(
+        &self,
+        generation: Generation,
+    ) -> Result<LiveGraph, IndexError> {
+        hydrate::hydrate_live_graph(&self.connection, generation)
     }
 
     /// Verification facade: rebuild the graph from persisted notes and prove

@@ -479,6 +479,51 @@ pub fn queries_fixture() -> QueriesFixture {
     }
 }
 
+pub struct LiveGraphFixture {
+    pub service: vault_index::IndexService,
+    vault: TempDir,
+    _index_dir: TempDir,
+}
+
+impl LiveGraphFixture {
+    pub fn write_note(&self, name: &str, body: &str) {
+        std::fs::write(self.vault.path().join(name), body).expect("write note");
+    }
+
+    pub fn delete_note(&self, name: &str) {
+        std::fs::remove_file(self.vault.path().join(name)).expect("delete note");
+    }
+}
+
+/// A small vault exercising the live-graph impact matrix: `Sub.md` carries a
+/// heading and a block that other notes reference by subpath and by plain
+/// file link; `Hub.md` reaches `Sub.md` both ways plus an unresolved `[[Foo]]`
+/// and a resolved `[[Other]]`; `Peer.md` also links `Sub.md` (to prove
+/// source-scoped invalidation does not leak across notes); `Unrelated.md`
+/// stands alone.
+pub fn live_graph_fixture() -> LiveGraphFixture {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index_dir = TempDir::new().expect("index tempdir");
+    std::fs::write(vault.path().join("Sub.md"), "# Heading\n^block\n").expect("write Sub");
+    std::fs::write(
+        vault.path().join("Hub.md"),
+        "[[Sub]]\n[[Sub#Heading]]\n[[Foo]]\n[[Other]]\n",
+    )
+    .expect("write Hub");
+    std::fs::write(vault.path().join("Other.md"), "# Other\n").expect("write Other");
+    std::fs::write(vault.path().join("Peer.md"), "[[Sub]]\n").expect("write Peer");
+    std::fs::write(vault.path().join("Unrelated.md"), "# Unrelated\n").expect("write Unrelated");
+
+    let config = IndexConfig::explicit(vault.path(), index_dir.path().join("index.sqlite3"))
+        .expect("live graph config");
+    let service = vault_index::IndexService::open(config).expect("live graph service");
+    LiveGraphFixture {
+        service,
+        vault,
+        _index_dir: index_dir,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct SemanticSnapshot {
     pub notes: Vec<vault_core::ParsedNote>,
