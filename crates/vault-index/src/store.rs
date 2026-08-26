@@ -505,13 +505,12 @@ impl IndexStore {
         Ok(catalog)
     }
 
-    /// One compare-and-swap publication transaction: verify the expected
+    /// Start one compare-and-swap publication: verify the expected
     /// generation, replace note and graph rows, advance the generation, and
-    /// stamp the refresh time.
-    /// Compare-and-swap and write one complete snapshot, leaving the
-    /// transaction open for the caller to commit. Nothing written here is
-    /// visible to another connection until that commit, so this runs with no
-    /// publication barrier held.
+    /// stamp the refresh time — then stop, leaving the transaction open for
+    /// the caller to commit. Nothing written here is visible to another
+    /// connection until that commit, so this runs with no publication
+    /// barrier held.
     pub(crate) fn begin_publish(
         &mut self,
         publication: Publication<'_>,

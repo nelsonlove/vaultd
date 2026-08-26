@@ -451,14 +451,34 @@ impl IndexService {
         // The commit is the one place a lock is deliberately held across
         // SQLite I/O, because that is the whole point: rows and live graph
         // become visible together or not at all, so no reader can catch a
-        // generation whose two halves disagree. The install after it is a
-        // pointer swap.
+        // generation whose two halves disagree.
+        //
+        // Not a cheap section, and not claimed to be: `wal_autocheckpoint`
+        // defaults to 1000 pages, so a whole-vault snapshot's commit runs a
+        // passive checkpoint here. The exclusive section is therefore commit
+        // plus checkpoint I/O proportional to the snapshot just written,
+        // then a pointer swap for the install — strictly smaller than before
+        // the begin/commit split, which held the barrier across the row
+        // writes as well. Tuning `wal_autocheckpoint` (or checkpointing
+        // deliberately outside the barrier) is a known follow-up.
         //
         // Lock order here is SQLite write transaction -> publication
         // barrier, the reverse of a reader's barrier -> SQLite read
-        // snapshot. That cannot deadlock: under WAL a reader never waits on
-        // a writer, so a reader holding the barrier always makes progress
-        // and releases it.
+        // snapshot. That cannot deadlock, for three reasons, none of which
+        // is "WAL readers never block":
+        //
+        // (a) A thread waiting on the barrier holds no SQLite lock at all.
+        //     `IndexReader::read` takes the barrier guard first, then the
+        //     connection mutex, then begins its transaction, and unwinds in
+        //     the reverse order — so the commit below never waits on a
+        //     thread that is itself waiting for the barrier.
+        // (b) Reader connections are `query_only` and use `BEGIN DEFERRED`,
+        //     so an in-flight read never contends for the writer's lock in
+        //     the ordinary path.
+        // (c) The corner cases where a WAL reader does take a lock (shm
+        //     recovery, a checkpointer holding read marks) are bounded by
+        //     `busy_timeout(5s)`: they can stall a publication, never wedge
+        //     it.
         let mut published = write_published(&self.published)?;
         let (generation, publish_metrics) = pending.commit()?;
         if let Some(hook) = &self.publication_pause {
@@ -498,11 +518,24 @@ impl IndexService {
     /// generation included — would install the wrong identities. Preparing
     /// here makes that mistake unrepresentable.
     ///
-    /// Same barrier discipline as the full path: the delta is prepared —
-    /// every fallible allocation included — before the write guard is taken,
-    /// and the guard then spans the commit and the install alone, so both
-    /// halves land together or neither does. A lost compare-and-swap leaves
-    /// the published graph exactly as it was.
+    /// The graph delta is prepared — every fallible allocation included —
+    /// before the write guard is taken. The guard then spans the *whole* row
+    /// delta, not just its commit: unlike the full path, this holds the
+    /// barrier across `IndexStore::publish_delta` in its entirety (the
+    /// compare-and-swap read, every scoped write, and the commit), because
+    /// that path owns its transaction from open to commit and has no
+    /// begin/commit split.
+    ///
+    /// That is a deliberate asymmetry, not an oversight. A delta's writes
+    /// are bounded by the delta itself — every statement is scoped by an
+    /// explicit `note_path` or `reference_id` drawn from the caller's own
+    /// change set — so the exclusive section scales with what changed, not
+    /// with the size of the vault. The full path had to be split because a
+    /// whole-vault rewrite under the barrier would freeze every reader for
+    /// the length of that rewrite; a delta has no such window to remove.
+    ///
+    /// Either way both halves land together or neither does, and a lost
+    /// compare-and-swap leaves the published graph exactly as it was.
     pub fn publish_delta(
         &mut self,
         publication: DeltaPublication<'_>,
