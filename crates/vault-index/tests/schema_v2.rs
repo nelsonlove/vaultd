@@ -127,8 +127,13 @@ fn diagnostic_pagination_covers_every_owner_kind_without_duplication_or_gaps() {
         .expect("insert note diagnostic");
     }
 
-    let service =
-        vault_index::IndexService::open(fixture.config.clone()).expect("reopen against cache");
+    // Reopen against the same cache to read back rows inserted through a raw
+    // connection above. Under the exclusive writer lease, that requires the
+    // fixture's own service to let go of the cache first — but not the rest
+    // of the fixture, whose `TempDir`s must outlive this reopen.
+    let config = fixture.config.clone();
+    drop(fixture.service);
+    let service = vault_index::IndexService::open(config).expect("reopen against cache");
 
     let mut collected = Vec::new();
     let mut cursor: Option<String> = None;

@@ -35,9 +35,12 @@ enum OpenIssue {
 /// index with the right identity is rebuilt as well; a corrupt explicit index
 /// or a wrong vault identity is refused.
 pub(crate) fn open_connection(config: &IndexConfig) -> Result<Connection, IndexError> {
-    if let Some(parent) = config.index_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Parent-directory creation lives in `IndexConfig::prepare_storage`,
+    // which every production open runs before this: by the time a real
+    // writer reaches here, the directory exists, is canonicalized, and has
+    // already been checked against the vault root. Direct test-only entry
+    // points that skip `prepare_storage` are expected to pass a path whose
+    // parent already exists.
     match try_open(config) {
         Ok(connection) => Ok(connection),
         Err(OpenIssue::Corrupt(message)) => match config.location {

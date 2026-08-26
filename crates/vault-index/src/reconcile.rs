@@ -10,6 +10,7 @@ use vault_core::{
 use crate::config::IndexConfig;
 use crate::error::IndexError;
 use crate::inventory::{FileSystemIndexSource, InventorySnapshot, ReconcileSource};
+use crate::lease::IndexLease;
 use crate::live_graph::{HydratedNote, HydratedReference, LiveGraph};
 use crate::metrics::ReconcileMetrics;
 use crate::model::{
@@ -39,6 +40,11 @@ pub struct IndexService {
     pub(crate) config: IndexConfig,
     pub(crate) store: IndexStore,
     pub(crate) source: Box<dyn ReconcileSource>,
+    /// The exclusive writer lease for this cache, held for as long as this
+    /// service exists. `None` only for `open_unleased_for_cas_test`, which
+    /// exists so a compare-and-swap test can put two writers on the same
+    /// cache on purpose; every production constructor populates it.
+    _lease: Option<IndexLease>,
     published: PublicationBarrier,
     /// The service's own reader, backing the compatibility query methods in
     /// `query.rs`. A separate query-only connection, exactly like one a
@@ -68,8 +74,13 @@ impl IndexService {
         Self::open_with_source(config, Box::new(source))
     }
 
+    /// Open a production service: validate and prepare the cache's storage
+    /// location, take its exclusive writer lease, then open (and recover, if
+    /// needed) the SQLite database and wire up the reader. A second
+    /// production service for the same cache fails here — at the lease —
+    /// before SQLite recovery ever runs.
     pub fn open_with_source(
-        config: IndexConfig,
+        mut config: IndexConfig,
         source: Box<dyn ReconcileSource>,
     ) -> Result<Self, IndexError> {
         let source_root = source
@@ -83,6 +94,30 @@ impl IndexService {
                 config.canonical_vault_root.display()
             )));
         }
+        config.prepare_storage()?;
+        let lease = IndexLease::acquire(&config)?;
+        Self::assemble(config, source, Some(lease))
+    }
+
+    /// Open a service against the same cache another production
+    /// `IndexService` already holds the lease for, bypassing lease
+    /// acquisition entirely. Exists only for the compare-and-swap defense
+    /// test in `tests/recovery.rs` (`racing_services`), which puts two
+    /// writers on one cache on purpose to prove `publish`'s
+    /// compare-and-swap — not the lease — is what keeps a lost race safe.
+    /// Storage-path validation still runs.
+    #[doc(hidden)]
+    pub fn open_unleased_for_cas_test(mut config: IndexConfig) -> Result<Self, IndexError> {
+        config.prepare_storage()?;
+        let source = FileSystemIndexSource::new(&config.canonical_vault_root)?;
+        Self::assemble(config, Box::new(source), None)
+    }
+
+    fn assemble(
+        config: IndexConfig,
+        source: Box<dyn ReconcileSource>,
+        lease: Option<IndexLease>,
+    ) -> Result<Self, IndexError> {
         let store = IndexStore::open(&config)?;
         let published: PublicationBarrier = Arc::new(RwLock::new(PublishedState::starting()));
         seed_published(&store, &published)?;
@@ -91,6 +126,7 @@ impl IndexService {
             config,
             store,
             source,
+            _lease: lease,
             published,
             reader,
             publication_pause: None,

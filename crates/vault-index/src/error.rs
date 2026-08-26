@@ -33,6 +33,18 @@ pub enum IndexError {
     Storage(String),
     #[error("delta publication left {0} with a reference row that has no resolution row")]
     IncompleteResolutionCoverage(String),
+    /// An index path (or a path it lexically or symlink-resolves through)
+    /// sits inside the canonical vault root. The vault is read-only
+    /// production input, never a location for derived storage — refused
+    /// before anything is created, never repaired after the fact.
+    #[error("invalid index path: {0}")]
+    InvalidIndexPath(String),
+    /// Another process (or another `IndexService` in this one) already holds
+    /// the exclusive writer lease for this cache. Never a hang, never
+    /// evidence of damage — exactly one writer lease can exist at a time by
+    /// construction.
+    #[error("index storage is already in use by another writer")]
+    IndexInUse,
 }
 
 impl From<std::io::Error> for IndexError {

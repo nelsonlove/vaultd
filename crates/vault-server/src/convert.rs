@@ -310,6 +310,17 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::StorageFailure;
             error.message = "the vault root became unavailable".into();
         }
+        IndexError::InvalidIndexPath(message) => {
+            error.code = ErrorCode::InvalidPath;
+            error.message = format!("invalid index path: {message}");
+        }
+        // Interim mapping: `IndexInUse` gets its own dedicated protocol code
+        // in Task 11/12. Until then it deliberately shares `StorageFailure`
+        // rather than smuggling a new code into this task.
+        IndexError::IndexInUse => {
+            error.code = ErrorCode::StorageFailure;
+            error.message = "index storage failed".into();
+        }
     }
     error
 }

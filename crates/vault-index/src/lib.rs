@@ -3,6 +3,7 @@ mod config;
 mod cursor;
 mod error;
 mod inventory;
+mod lease;
 mod live_graph;
 mod live_reconcile;
 mod metrics;
@@ -16,6 +17,7 @@ mod store;
 pub use config::{IndexConfig, IndexLocation};
 pub use error::IndexError;
 pub use inventory::{FileSystemIndexSource, InventoryEntry, InventorySnapshot, ReconcileSource};
+pub use lease::IndexLease;
 pub use live_graph::{
     HydratedNote, HydratedReference, ImpactPlan, LiveGraph, NoteId, PreparedGraphDelta,
     ReferenceKey,

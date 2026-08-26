@@ -565,7 +565,12 @@ pub fn racing_services() -> RacingService {
     let hook = Box::new(move || {
         std::fs::write(vault_path.join("Racer.md"), "# Racer\n").expect("write Racer");
         let config = IndexConfig::explicit(&vault_path, &other_index_path).expect("racer config");
-        let mut other = IndexService::open(config).expect("racer service");
+        // A second writer against the very cache `service` below already
+        // holds the lease for — deliberately: this proves the
+        // compare-and-swap in `publish` (not the lease) is what keeps a
+        // lost race safe. `open_unleased_for_cas_test` is exactly the
+        // escape hatch for that, and only for that.
+        let mut other = IndexService::open_unleased_for_cas_test(config).expect("racer service");
         other.refresh(false).expect("racer refresh");
         std::fs::write(vault_path.join("Racer2.md"), "# Racer two\n").expect("write Racer2");
     });
