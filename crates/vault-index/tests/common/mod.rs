@@ -10,6 +10,87 @@ pub fn fixture_vault_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/semantic-read-path/basic-vault")
 }
 
+// ---------------------------------------------------------------------------
+// Rendezvous
+// ---------------------------------------------------------------------------
+
+/// How long a test waits for a hook to arrive before failing by name.
+const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a parked hook waits to be released before giving up and carrying
+/// on. Only ever reached once the test has already failed, and it exists so
+/// that a failing test cannot wedge the thread it was driving — a hook that
+/// blocks forever would hang the runtime's shutdown join and turn a named
+/// assertion failure back into a silent CI timeout.
+const HOOK_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A one-shot, two-phase rendezvous with a **named** timeout on the test's
+/// side.
+///
+/// A `Barrier` is the obvious tool here and the wrong one. Every hook these
+/// tests park on is reached by position — the second mutation, the first body
+/// read — and a position can shift: one `Busy` retry inside the startup
+/// catch-up renumbers every mutation after it. With a `Barrier` that shift
+/// blocks both sides forever and CI reports a timeout with no output at all.
+/// Here the test fails saying exactly which rendezvous never fired, and
+/// neither side can block indefinitely.
+pub struct Rendezvous {
+    label: &'static str,
+    reached: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::SyncSender<()>,
+}
+
+impl Rendezvous {
+    /// Block until the hook has arrived and parked.
+    pub fn arrived(&self) {
+        self.reached
+            .recv_timeout(RENDEZVOUS_TIMEOUT)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the {} rendezvous never fired within {RENDEZVOUS_TIMEOUT:?} — \
+                     the hook it is gated on was never reached",
+                    self.label
+                )
+            });
+    }
+
+    /// Let the parked hook continue.
+    pub fn release(&self) {
+        let _ = self.release.try_send(());
+    }
+}
+
+/// A rendezvous and the hook that parks on it. The hook fires exactly once:
+/// a later visit returns immediately, so a service whose hook stays installed
+/// cannot park a second time on a rendezvous nobody is waiting at.
+///
+/// The returned handle is `Arc<dyn Fn() + Send + Sync>`, which is what both
+/// `vault_index::PauseHook` and `vault_server`'s `RuntimeHook` are.
+pub fn rendezvous(label: &'static str) -> (Rendezvous, std::sync::Arc<dyn Fn() + Send + Sync>) {
+    let (reached_tx, reached) = std::sync::mpsc::sync_channel(1);
+    let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        // Capacity one and `try_send`, so announcing arrival can never block
+        // even if the test has already given up and gone away.
+        let _ = reached_tx.try_send(());
+        let guard = release_rx.lock().unwrap_or_else(|error| error.into_inner());
+        let _ = guard.recv_timeout(HOOK_RELEASE_TIMEOUT);
+    });
+    (
+        Rendezvous {
+            label,
+            reached,
+            release,
+        },
+        hook,
+    )
+}
+
 pub struct FixtureStore {
     pub store: IndexStore,
     pub scan: ScanReport,

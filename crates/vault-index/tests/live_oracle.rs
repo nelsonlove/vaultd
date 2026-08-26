@@ -32,9 +32,16 @@ use tempfile::TempDir;
 use vault_core::{FileSystemVaultSource, LinkTarget, ScanReport, VaultPath, scan_vault};
 use vault_index::{ChangeCause, IndexConfig, IndexService};
 
-/// Two spellings per stem plus a deeper nesting level, so relative links,
+/// Several spellings per stem across three nesting levels, so relative links,
 /// duplicate stems, and ambiguity transitions are all reachable from one
 /// small slot set.
+///
+/// `Alpha` deliberately has **three** spellings, one of them at the root. An
+/// exact vault path wins outright, so while root `Alpha.md` exists `[[Alpha]]`
+/// resolves to it and nothing is ambiguous; ambiguity appears only once the
+/// root spelling is gone and the two nested ones are left competing. Two
+/// spellings alone can never produce it, which
+/// `the_generators_reach_every_interesting_state` is what caught.
 const SLOTS: &[&str] = &[
     "Alpha.md",
     "Beta.md",
@@ -42,6 +49,7 @@ const SLOTS: &[&str] = &[
     "Nested/Alpha.md",
     "Nested/Beta.md",
     "Nested/Deep/Gamma.md",
+    "Other/Alpha.md",
 ];
 
 /// Destinations spanning every lookup route the resolver knows: exact path,
@@ -196,31 +204,47 @@ struct Oracle {
     /// "advanced exactly once iff something changed" comparison.
     expected: common::SemanticSnapshot,
     generation: u64,
+    /// How many batches actually took the complete-resolution fallback. The
+    /// witness that forcing the threshold to zero did what it claims: without
+    /// it, "the fallback is equivalent to a scan" could pass while never
+    /// entering the branch at all.
+    complete_resolutions: usize,
     _vault: TempDir,
     _index: TempDir,
 }
 
 impl Oracle {
     fn open() -> Self {
+        Self::open_with(false)
+    }
+
+    /// An oracle whose every selecting batch abandons the incremental plan
+    /// and re-resolves every reference the compact graph holds.
+    ///
+    /// This is the conservative-invalidation safety net — the branch taken
+    /// when selection stops paying for itself — and the production threshold
+    /// (`max(10_000, references / 4)`) puts it far out of reach of any
+    /// fixture small enough to assert on. Forcing it to zero is what makes
+    /// the branch reachable, and every claim `run_batch` checks then applies
+    /// to it unchanged.
+    fn open_forcing_complete_resolution() -> Self {
+        Self::open_with(true)
+    }
+
+    fn open_with(force_complete_resolution: bool) -> Self {
         let vault = TempDir::new().expect("vault tempdir");
         let index = TempDir::new().expect("index tempdir");
         let root = vault.path().to_path_buf();
 
-        // A note that is never generated against, so every batch is checked
-        // against stable incoming references as well as its own outgoing ones.
-        write_file(
-            &root,
-            "Seed.md",
-            "# Seed\n[[Alpha]]\n[[Beta#Heading]]\n[[Gamma#^block]]\n[[Nested/Alpha.md]]\n\
-             [[Nowhere]]\n[site](https://example.com)\n",
-        );
-        write_file(&root, "Alpha.md", "# Heading\n\ntext ^block\n");
-        write_file(&root, "Beta.md", "# Heading\n[[Alpha]]\n");
+        seed_vault(&root);
 
         let config = IndexConfig::explicit(&root, index.path().join("index.sqlite3"))
             .expect("oracle config");
         let mut service = IndexService::open(config).expect("oracle service");
         service.refresh(false).expect("cold build");
+        if force_complete_resolution {
+            service.set_complete_resolution_threshold_for_test(0);
+        }
         let generation = service
             .current_generation()
             .expect("generation")
@@ -233,6 +257,7 @@ impl Oracle {
             root,
             expected,
             generation,
+            complete_resolutions: 0,
             _vault: vault,
             _index: index,
         }
@@ -290,6 +315,9 @@ impl Oracle {
             batch
         );
 
+        if report.complete_resolution {
+            self.complete_resolutions += 1;
+        }
         self.expected = expected;
         self.generation = report.generation.get();
         Ok(())
@@ -336,6 +364,20 @@ impl Oracle {
             .expect("published")
             .get()
     }
+}
+
+/// The starting vault every oracle run shares. `Seed.md` is never generated
+/// against, so every batch is checked against stable *incoming* references as
+/// well as its own outgoing ones.
+fn seed_vault(root: &Path) {
+    write_file(
+        root,
+        "Seed.md",
+        "# Seed\n[[Alpha]]\n[[Beta#Heading]]\n[[Gamma#^block]]\n[[Nested/Alpha.md]]\n\
+         [[Nowhere]]\n[site](https://example.com)\n",
+    );
+    write_file(root, "Alpha.md", "# Heading\n\ntext ^block\n");
+    write_file(root, "Beta.md", "# Heading\n[[Alpha]]\n");
 }
 
 fn scan(root: &Path) -> ScanReport {
@@ -410,10 +452,8 @@ fn batch() -> impl Strategy<Value = Vec<Operation>> {
 /// only reproduces against the exact generator it was drawn from, so it stops
 /// meaning anything the moment the strategies here are tuned. A scripted
 /// scenario keeps its meaning.
-#[test]
-fn the_regression_scenario_stays_equivalent_to_a_fresh_scan() {
-    let mut oracle = Oracle::open();
-    let scenario: Vec<Vec<Operation>> = vec![
+fn regression_scenario() -> Vec<Vec<Operation>> {
+    vec![
         // A brand-new note resolves a reference that was waiting for it.
         vec![Operation::Write {
             path: "Gamma.md".into(),
@@ -469,13 +509,40 @@ fn the_regression_scenario_stays_equivalent_to_a_fresh_scan() {
                 body: "[[./Alpha]]\n[[../Alpha]]\n".into(),
             },
         ],
-    ];
+    ]
+}
 
-    for batch in &scenario {
+fn run_regression_scenario(oracle: &mut Oracle) {
+    for batch in regression_scenario() {
         oracle
-            .run_batch(batch)
+            .run_batch(&batch)
             .unwrap_or_else(|error| panic!("regression scenario failed: {error}"));
     }
+}
+
+#[test]
+fn the_regression_scenario_stays_equivalent_to_a_fresh_scan() {
+    let mut oracle = Oracle::open();
+    run_regression_scenario(&mut oracle);
+}
+
+/// The same scenario with the complete-resolution fallback forced on.
+///
+/// The fallback is the conservative-invalidation safety net: when selection
+/// stops paying for itself the plan is abandoned and every reference the
+/// compact graph holds is re-resolved. It has to land on exactly the state
+/// the selective path lands on, or the "safety net" is a source of divergence
+/// rather than a defence against one — and the production threshold
+/// (`max(10_000, references / 4)`) puts it out of reach of every fixture in
+/// this workspace.
+#[test]
+fn the_regression_scenario_stays_equivalent_under_the_complete_resolution_fallback() {
+    let mut oracle = Oracle::open_forcing_complete_resolution();
+    run_regression_scenario(&mut oracle);
+    assert!(
+        oracle.complete_resolutions > 0,
+        "the fallback branch was never entered, so this proved nothing"
+    );
 }
 
 /// The bounds every generated body respects, asserted rather than assumed:
@@ -508,6 +575,20 @@ proptest! {
         batches in prop::collection::vec(batch(), 1..=8)
     ) {
         let mut oracle = Oracle::open();
+        for batch in &batches {
+            oracle.run_batch(batch)?;
+        }
+    }
+
+    /// The same sweep with the complete-resolution fallback forced on, so the
+    /// safety net gets the identical ground-truth comparison the selective
+    /// path gets. Every claim in this module's header applies unchanged: the
+    /// fallback re-resolves far more, and must still answer the same.
+    #[test]
+    fn the_complete_resolution_fallback_matches_a_fresh_scan_after_every_batch(
+        batches in prop::collection::vec(batch(), 1..=8)
+    ) {
+        let mut oracle = Oracle::open_forcing_complete_resolution();
         for batch in &batches {
             oracle.run_batch(batch)?;
         }
@@ -552,5 +633,151 @@ fn the_destination_set_reaches_the_slot_set() {
     assert!(
         reachable >= DESTINATIONS.len() - 1,
         "every destination but `Nowhere` must reach a slot: {resolved:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Generator reachability
+// ---------------------------------------------------------------------------
+
+/// The states this oracle exists to exercise. A generator that stops reaching
+/// one of these keeps passing while quietly testing less, which is the
+/// failure mode a randomized suite is worst at reporting on its own.
+const INTERESTING_STATES: &[&str] = &[
+    "a reference is ambiguous",
+    "a reference is unresolved",
+    "a note is not valid UTF-8",
+    "a referenced note is deleted",
+    "a note is renamed to a different path",
+    "content moves while the fingerprint does not",
+    "an unresolved reference becomes resolved without its own note changing",
+    "a resolved reference becomes unresolved without its own note changing",
+];
+
+/// Whether any reference belonging to a note that did **not** itself change
+/// flipped its resolution answer. Restricting to unchanged notes is what
+/// makes this honest: ordinals are then stable, so a flip is necessarily
+/// caused by some *other* note moving — the invalidation case the whole
+/// engine is built around.
+fn stable_resolution_flips(before: &ScanReport, after: &ScanReport) -> (bool, bool) {
+    let (mut gained, mut lost) = (false, false);
+    for path in after.graph.note_paths() {
+        let old_note = match before.graph.note(path) {
+            Some(note) => note,
+            None => continue,
+        };
+        let new_note = match after.graph.note(path) {
+            Some(note) => note,
+            None => continue,
+        };
+        if old_note.source.revision().as_str() != new_note.source.revision().as_str() {
+            continue;
+        }
+        let old = before.graph.outgoing(path);
+        let new = after.graph.outgoing(path);
+        if old.len() != new.len() {
+            continue;
+        }
+        for (was, is) in old.iter().zip(new.iter()) {
+            let was = matches!(was.resolution, vault_core::Resolution::Resolved { .. });
+            let is = matches!(is.resolution, vault_core::Resolution::Resolved { .. });
+            gained |= !was && is;
+            lost |= was && !is;
+        }
+    }
+    (gained, lost)
+}
+
+/// The generators actually reach every state the oracle claims to cover.
+///
+/// Written in the style of `every_generated_body_is_ascii`: a deterministic
+/// runner samples batches, applies them to a scratch vault, and records which
+/// interesting states the resulting vault passed through. Without this, tuning
+/// a weight or a body strategy could silently stop producing ambiguity flips
+/// or invalid UTF-8 and nothing would ever say so — the oracle would keep
+/// passing on a strictly smaller world.
+#[test]
+fn the_generators_reach_every_interesting_state() {
+    const SAMPLES: usize = 300;
+
+    let vault = TempDir::new().expect("vault tempdir");
+    let root = vault.path().to_path_buf();
+    seed_vault(&root);
+
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    let strategy = batch();
+    let mut reached: BTreeSet<&'static str> = BTreeSet::new();
+    let mut before = scan(&root);
+
+    for _ in 0..SAMPLES {
+        let batch = strategy
+            .new_tree(&mut runner)
+            .expect("generate a batch")
+            .current();
+
+        for operation in &batch {
+            // Observations that need the world as it stands *before* the
+            // operation lands.
+            match operation {
+                Operation::Delete { path } => {
+                    let vault_path = VaultPath::new(path).expect("valid vault path");
+                    let is_note = before.graph.note(&vault_path).is_some();
+                    if is_note && !before.graph.backlinks(&vault_path).is_empty() {
+                        reached.insert("a referenced note is deleted");
+                    }
+                    apply(&root, operation);
+                }
+                Operation::Rename { from, to } => {
+                    if from != to && root.join(from).is_file() {
+                        reached.insert("a note is renamed to a different path");
+                    }
+                    apply(&root, operation);
+                }
+                Operation::PreserveFingerprintWrite { path, .. } => {
+                    let bytes = std::fs::read(root.join(path)).ok();
+                    apply(&root, operation);
+                    if bytes.is_some() && bytes != std::fs::read(root.join(path)).ok() {
+                        reached.insert("content moves while the fingerprint does not");
+                    }
+                }
+                _ => {
+                    apply(&root, operation);
+                }
+            }
+        }
+
+        let after = scan(&root);
+        if !after.graph.ambiguous().is_empty() {
+            reached.insert("a reference is ambiguous");
+        }
+        if !after.graph.unresolved().is_empty() {
+            reached.insert("a reference is unresolved");
+        }
+        if after
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == vault_core::DiagnosticCode::InvalidUtf8)
+        {
+            reached.insert("a note is not valid UTF-8");
+        }
+        let (gained, lost) = stable_resolution_flips(&before, &after);
+        if gained {
+            reached
+                .insert("an unresolved reference becomes resolved without its own note changing");
+        }
+        if lost {
+            reached.insert("a resolved reference becomes unresolved without its own note changing");
+        }
+        before = after;
+    }
+
+    let missed: Vec<&&str> = INTERESTING_STATES
+        .iter()
+        .filter(|state| !reached.contains(**state))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "the generators no longer reach {missed:?} within {SAMPLES} batches — \
+         the oracle is now testing a smaller world than it claims to"
     );
 }

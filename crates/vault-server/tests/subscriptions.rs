@@ -5,10 +5,10 @@
 //! contract for the two dispatcher-produced resync reasons (`subscriber_lag`
 //! and `oversized_change_set`), which no runtime notice can ever carry.
 
+mod common;
+
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use vault_core::VaultPath;
@@ -23,7 +23,7 @@ use vault_protocol::{
 };
 use vault_server::Server;
 use vault_server::runtime::{
-    ResyncReason, Runtime, RuntimeHook, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
+    ResyncReason, Runtime, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
 };
 use vault_server::subscriptions::{DETAILED_PATH_LIMIT, SUBSCRIBER_CAPACITY, SubscriptionRegistry};
 
@@ -619,37 +619,6 @@ fn pump(
     written
 }
 
-/// Hooks that park the coordinator inside one chosen mutation. `enter` fires
-/// before the call into the `IndexService`, `exit` immediately after it — and
-/// after a targeted reconciliation that is the commit boundary itself: the
-/// publication barrier has moved, and the notice has not been emitted yet.
-fn park_at_mutation(sequence: usize, at_exit: bool) -> (RuntimeTestHooks, Arc<Barrier>) {
-    let gate = Arc::new(Barrier::new(2));
-    let seen = Arc::new(AtomicUsize::new(0));
-    let hook: RuntimeHook = {
-        let gate = Arc::clone(&gate);
-        let seen = Arc::clone(&seen);
-        Arc::new(move || {
-            if seen.fetch_add(1, Ordering::AcqRel) == sequence {
-                gate.wait();
-                gate.wait();
-            }
-        })
-    };
-    let hooks = if at_exit {
-        RuntimeTestHooks {
-            mutation_exit: Some(hook),
-            ..RuntimeTestHooks::default()
-        }
-    } else {
-        RuntimeTestHooks {
-            mutation_enter: Some(hook),
-            ..RuntimeTestHooks::default()
-        }
-    };
-    (hooks, gate)
-}
-
 /// A subscription registered at the commit boundary — after the barrier moved
 /// to `G + 1`, before the coordinator emitted anything about it — is promised
 /// `G + 1` and must never then be *delivered* `G + 1`. The client already has
@@ -664,7 +633,11 @@ fn a_subscription_registered_at_the_commit_boundary_is_never_delivered_its_own_s
     let fixture = live_fixture();
     // Sequence 0 is the startup catch-up; sequence 1 is the targeted
     // reconciliation the hint below causes.
-    let (hooks, gate) = park_at_mutation(1, true);
+    let (hooks, parked) = common::park_at_mutation(
+        "coordinator at the commit boundary of the hinted reconciliation",
+        1,
+        true,
+    );
 
     let (sink, notices) = sync_channel(64);
     let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
@@ -682,14 +655,14 @@ fn a_subscription_registered_at_the_commit_boundary_is_never_delivered_its_own_s
 
     // The coordinator is parked with generation 2 published and its notice
     // not yet emitted.
-    gate.wait();
+    parked.arrived();
     let response = subscribe_through_dispatcher(&server, &mut registry);
     assert_eq!(
         response.generation,
         Some(2),
         "the barrier has already moved, so the subscription starts at the new generation"
     );
-    gate.wait();
+    parked.release();
 
     // The notice for generation 2 now arrives. It must be filtered out.
     let notice = notices
@@ -734,7 +707,8 @@ fn a_subscription_registered_at_the_commit_boundary_is_never_delivered_its_own_s
 fn a_subscription_registered_before_the_commit_receives_the_next_generation_once() {
     let fixture = live_fixture();
     // Park before the call, so the barrier still shows the old generation.
-    let (hooks, gate) = park_at_mutation(1, false);
+    let (hooks, parked) =
+        common::park_at_mutation("coordinator entering the hinted reconciliation", 1, false);
 
     let (sink, notices) = sync_channel(64);
     let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
@@ -748,14 +722,14 @@ fn a_subscription_registered_before_the_commit_receives_the_next_generation_once
     fs::write(fixture.path("Third.md"), "# Third\n\n[[Note]]\n").expect("write third");
     assert!(handle.hint(paths_hint(&["Third.md"])));
 
-    gate.wait();
+    parked.arrived();
     let response = subscribe_through_dispatcher(&server, &mut registry);
     assert_eq!(
         response.generation,
         Some(1),
         "the publication has not happened yet, so the start point is the old generation"
     );
-    gate.wait();
+    parked.release();
 
     let notice = notices
         .recv_timeout(Duration::from_secs(10))

@@ -1,5 +1,7 @@
 //! The runtime coordinator: one writer thread owns every mutation.
 
+mod common;
+
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -1166,26 +1168,16 @@ fn a_verified_refresh_queued_during_a_watcher_publication_never_overlaps_it() {
 
     let counter = MutationCounter::default();
     let base = counter.hooks();
-    let count_enter = base
-        .mutation_enter
-        .clone()
-        .expect("the counter installs one");
-    let gate = Arc::new(Barrier::new(2));
-    let seen = Arc::new(AtomicUsize::new(0));
+    // Sequence 0 is the startup catch-up; sequence 1 is the targeted
+    // reconciliation the hint below causes. The counter's own enter hook runs
+    // on every mutation, parked or not.
+    let (parked, enter) = common::park_at(
+        "coordinator inside the watcher publication's mutation window",
+        1,
+        base.mutation_enter.clone(),
+    );
     let hooks = RuntimeTestHooks {
-        mutation_enter: Some({
-            let gate = Arc::clone(&gate);
-            let seen = Arc::clone(&seen);
-            Arc::new(move || {
-                count_enter();
-                // Sequence 0 is the startup catch-up; sequence 1 is the
-                // targeted reconciliation the hint below causes.
-                if seen.fetch_add(1, Ordering::AcqRel) == 1 {
-                    gate.wait();
-                    gate.wait();
-                }
-            })
-        }),
+        mutation_enter: Some(enter),
         mutation_exit: base.mutation_exit.clone(),
         ..RuntimeTestHooks::default()
     };
@@ -1202,7 +1194,7 @@ fn a_verified_refresh_queued_during_a_watcher_publication_never_overlaps_it() {
     assert!(handle.hint(paths_hint(&["Third.md"])));
 
     // The coordinator is inside the watcher publication's mutation window.
-    gate.wait();
+    parked.arrived();
     let (reply, replies) = sync_channel(1);
     assert_eq!(
         handle.send_command(RuntimeCommand::Refresh {
@@ -1212,7 +1204,7 @@ fn a_verified_refresh_queued_during_a_watcher_publication_never_overlaps_it() {
         Dispatch::Accepted,
         "the verified refresh is queued while the watcher publication is in flight"
     );
-    gate.wait();
+    parked.release();
 
     let verified = replies
         .recv_timeout(Duration::from_secs(10))
@@ -1320,51 +1312,68 @@ fn an_atomic_save_with_identical_content_publishes_no_generation_at_all() {
     wait_for_state(&handle, LiveState::PollingFallback);
     let _ = drain(&notices);
 
+    // Every generation the runtime publishes for the whole episode, in order.
+    // Absence is proven by what the *next* publication is numbered, not by a
+    // sleep: if the atomic save consumed a generation, the witness below
+    // lands on 4 instead of 3 and the sequence is `[2, 4]`.
+    let mut published: Vec<u64> = Vec::new();
+    let collect = |notices: &Receiver<RuntimeNotice>, published: &mut Vec<u64>| {
+        for notice in drain(notices) {
+            if let RuntimeNotice::Generation(report) = notice {
+                assert!(
+                    !report
+                        .changes
+                        .deleted
+                        .iter()
+                        .any(|path| path.as_str() == "Note.md"),
+                    "a path that came back must never publish as deleted: {report:?}"
+                );
+                assert!(
+                    !report
+                        .changes
+                        .modified
+                        .iter()
+                        .any(|path| path.as_str() == "Note.md"),
+                    "byte-identical content is not a modification: {report:?}"
+                );
+                published.push(report.generation.get());
+            }
+        }
+    };
+
     let body = fs::read_to_string(fixture.path("Note.md")).expect("read note");
     fs::remove_file(fixture.path("Note.md")).expect("remove note");
     assert!(handle.hint(paths_hint(&["Note.md"])));
     fs::write(fixture.path("Note.md"), &body).expect("restore note");
     assert!(handle.hint(paths_hint(&["Note.md"])));
 
-    // A second, genuinely new path gives the test something to wait *for*,
-    // so the "nothing was published" claim is not a race against a sleep.
+    // A genuinely new path gives the test something to wait *for*, so the
+    // "nothing was published" claim is never a race against a sleep.
     fs::write(fixture.path("Third.md"), "# Third\n").expect("write third");
     assert!(handle.hint(paths_hint(&["Third.md"])));
     wait_for_generation(&handle, 2);
+    collect(&notices, &mut published);
 
-    // Well past the grace window the deletion would have matured in.
+    // Well past the grace window the deletion would have matured in, so a
+    // runtime that was going to publish it has had every chance to.
     std::thread::sleep(Duration::from_millis(900));
-    assert_eq!(
-        handle
-            .reader()
-            .published_status()
-            .expect("status")
-            .generation
-            .map(|generation| generation.get()),
-        Some(2),
-        "an atomic save with identical content must not publish a generation of its own"
-    );
+    collect(&notices, &mut published);
 
-    for notice in drain(&notices) {
-        if let RuntimeNotice::Generation(report) = notice {
-            assert!(
-                !report
-                    .changes
-                    .deleted
-                    .iter()
-                    .any(|path| path.as_str() == "Note.md"),
-                "a path that came back must never publish as deleted: {report:?}"
-            );
-            assert!(
-                !report
-                    .changes
-                    .modified
-                    .iter()
-                    .any(|path| path.as_str() == "Note.md"),
-                "byte-identical content is not a modification: {report:?}"
-            );
-        }
-    }
+    // The positive witness. A third unrelated note must take generation 3 —
+    // which is only true if the atomic save consumed no generation at all.
+    // This is what makes the claim load-independent: a slow machine delays
+    // the witness, it cannot make it pass wrongly.
+    fs::write(fixture.path("Fourth.md"), "# Fourth\n").expect("write fourth");
+    assert!(handle.hint(paths_hint(&["Fourth.md"])));
+    wait_for_generation(&handle, 3);
+    collect(&notices, &mut published);
+
+    assert_eq!(
+        published,
+        vec![2, 3],
+        "the atomic save must consume no generation: the observed publications \
+         must be exactly the two real changes"
+    );
 
     handle.shutdown();
 }

@@ -21,7 +21,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -207,21 +207,6 @@ fn once_at(point: HookPoint, action: impl Fn() + Send + Sync + 'static) -> Arc<d
     })
 }
 
-/// Two rendezvous points around one publication: the first releases the test
-/// once the writer is parked between its SQLite commit and its live-state
-/// installation, the second lets the writer finish.
-fn pause_pair() -> (Arc<Barrier>, Arc<Barrier>, vault_index::PauseHook) {
-    let reached = Arc::new(Barrier::new(2));
-    let release = Arc::new(Barrier::new(2));
-    let hook_reached = Arc::clone(&reached);
-    let hook_release = Arc::clone(&release);
-    let hook: vault_index::PauseHook = Arc::new(move || {
-        hook_reached.wait();
-        hook_release.wait();
-    });
-    (reached, release, hook)
-}
-
 // ---------------------------------------------------------------------------
 // Crash and publication boundaries
 // ---------------------------------------------------------------------------
@@ -298,7 +283,7 @@ fn a_read_begun_before_a_delta_publication_finishes_at_the_old_generation() {
     let before = fixture.generation();
     let path = VaultPath::new("Hub.md").expect("path");
 
-    let (reached, release, hook) = pause_pair();
+    let (parked, hook) = common::rendezvous("read holding the publication barrier");
     let mut reader = fixture.service().reader().expect("reader");
     reader.pause_reads_for_test(hook);
     let reader = Arc::new(reader);
@@ -308,7 +293,7 @@ fn a_read_begun_before_a_delta_publication_finishes_at_the_old_generation() {
     let read = thread::spawn(move || reading.get_note(&reading_path));
 
     // The read now holds the publication read guard.
-    reached.wait();
+    parked.arrived();
 
     fixture.write("Hub.md", "# Hub\n[[Target]]\n[[Lonely]]\n");
     let mut service = fixture.take_service();
@@ -326,7 +311,7 @@ fn a_read_begun_before_a_delta_publication_finishes_at_the_old_generation() {
         "a publication must not overtake a read that already holds the barrier"
     );
 
-    release.wait();
+    parked.release();
     let during = read
         .join()
         .expect("reader thread")
@@ -358,7 +343,7 @@ fn a_read_begun_inside_the_publication_window_waits_and_answers_at_the_new_gener
     let reader = Arc::new(fixture.service().reader().expect("reader"));
     fixture.write("Hub.md", "# Hub\n[[Target]]\n[[Lonely]]\n");
 
-    let (reached, release, hook) = pause_pair();
+    let (parked, hook) = common::rendezvous("writer between its commit and its live install");
     fixture.service().pause_publication_for_test(hook);
 
     let mut service = fixture.take_service();
@@ -370,7 +355,7 @@ fn a_read_begun_inside_the_publication_window_waits_and_answers_at_the_new_gener
     });
 
     // The rows are committed; the live graph is not installed yet.
-    reached.wait();
+    parked.arrived();
 
     let (finished, answered) = mpsc::channel();
     let reading = Arc::clone(&reader);
@@ -385,7 +370,7 @@ fn a_read_begun_inside_the_publication_window_waits_and_answers_at_the_new_gener
         "a read must never observe a generation whose live state is not installed yet"
     );
 
-    release.wait();
+    parked.release();
     let after = blocked
         .join()
         .expect("reader thread")
