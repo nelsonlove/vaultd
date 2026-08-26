@@ -73,6 +73,11 @@ const MAX_MUTATION_ATTEMPTS: usize = 3;
 /// continuously.
 const MAX_CONSECUTIVE_REHINTS: usize = 5;
 
+/// The ceiling on the backoff between retries of a failed escalation. Long
+/// enough that a persistently broken vault costs nothing to keep trying,
+/// short enough that recovery is noticed promptly.
+const MAX_ESCALATION_BACKOFF: Duration = Duration::from_secs(30);
+
 /// A test-only rendezvous callback. Production never installs one.
 #[doc(hidden)]
 pub type RuntimeHook = Arc<dyn Fn() + Send + Sync>;
@@ -146,6 +151,17 @@ pub enum RuntimeNotice {
         generation: Option<Generation>,
         reason: ResyncReason,
     },
+}
+
+/// How specific a resync reason is, for merging two outstanding escalations.
+/// A named cause outranks the generic one, and a vault whose root moved
+/// outranks lost events.
+fn resync_severity(reason: ResyncReason) -> u8 {
+    match reason {
+        ResyncReason::RuntimeRecovered => 0,
+        ResyncReason::WatcherOverflow => 1,
+        ResyncReason::RootInvalidated => 2,
+    }
 }
 
 /// Why per-path detail is unavailable for a generation move.
@@ -288,6 +304,8 @@ impl Runtime {
             next_deletion: None,
             retry_at: None,
             rehints: 0,
+            escalation: None,
+            escalation_failures: 0,
             watching: watch_installed,
             watch_alive: Arc::clone(&watch_alive),
             watch_error,
@@ -673,6 +691,16 @@ struct Coordinator {
     /// deleted. An atomic save (write temp, rename over) makes a path vanish
     /// for microseconds; publishing that as a deletion would emit a
     /// generation pair no client should ever have seen.
+    ///
+    /// The one collection here whose bound is emergent rather than declared.
+    /// It holds at most the unique absent paths hinted within one grace
+    /// window: entries are keyed by path so a repeated hint coalesces rather
+    /// than accumulating, and `mature_deletions` drains everything at or past
+    /// its deadline on *every* loop iteration. So the ceiling is (distinct
+    /// absent paths a producer can hint in `debounce`), and a producer that
+    /// exceeds what the coordinator can drain saturates the command mailbox
+    /// first — which latches overflow and escalates to a complete
+    /// reconciliation that clears this map outright.
     pending_deletions: BTreeMap<VaultPath, Instant>,
     /// The earliest deadline in `pending_deletions`, tracked rather than
     /// rescanned: the map is keyed by path, so finding the minimum costs a
@@ -682,6 +710,17 @@ struct Coordinator {
     /// When a re-hinted batch may be retried.
     retry_at: Option<Instant>,
     rehints: usize,
+    /// A complete reconciliation that is owed but has not succeeded, with the
+    /// instant it may next be attempted.
+    ///
+    /// `full_reconcile` clears the pending sets and the overflow latch is
+    /// consumed before it runs, so once it starts, nothing else in the
+    /// coordinator remembers that it was demanded. If it then fails, this is
+    /// the only thing that does.
+    escalation: Option<(ResyncReason, Instant)>,
+    /// Consecutive failed escalations, for backoff. Reset by any complete
+    /// reconciliation that succeeds.
+    escalation_failures: u32,
     /// Whether a watcher is installed and healthy.
     watching: bool,
     /// Whether the forwarder thread is alive. Set when it is spawned and
@@ -710,10 +749,22 @@ impl Coordinator {
                 self.settle();
                 continue;
             }
+            let now = Instant::now();
+            // A complete reconciliation that was demanded and then failed.
+            // Nothing else remembers it, so retrying it outranks ordinary
+            // work — an escalation exists precisely because the incremental
+            // view can no longer be trusted.
+            if let Some((reason, at)) = self.escalation {
+                if at <= now {
+                    self.escalation = None;
+                    self.full_reconcile(reason);
+                    self.settle();
+                    continue;
+                }
+            }
             // Checked every iteration, not only on an idle timeout: under
             // sustained command traffic the loop may never time out, and a
             // held-back deletion must not starve behind it.
-            let now = Instant::now();
             self.mature_deletions(now);
             match self.commands.recv_timeout(self.next_timeout(now)) {
                 Ok(RuntimeCommand::Stop) => break,
@@ -760,6 +811,9 @@ impl Coordinator {
         if let Some(deadline) = self.next_deletion {
             timeout = timeout.min(deadline.saturating_duration_since(now));
         }
+        if let Some((_, at)) = self.escalation {
+            timeout = timeout.min(at.saturating_duration_since(now));
+        }
         timeout
     }
 
@@ -793,6 +847,15 @@ impl Coordinator {
                         }
                         Ok(None) => {
                             let deadline = now + self.debounce;
+                            // The mirror of the present case above: a path
+                            // that was queued for the next batch while it
+                            // existed must leave that batch when it stops
+                            // existing, or it would be published as a
+                            // deletion with no grace window at all — the
+                            // batch may already be waiting behind a
+                            // `retry_at` backoff that fires before this
+                            // deadline.
+                            self.pending.remove(&path);
                             // A later hint coalesces onto the same entry
                             // rather than adding another.
                             self.pending_deletions.insert(path, deadline);
@@ -978,6 +1041,14 @@ impl Coordinator {
     /// Complete metadata reconciliation, plus whatever resolution the
     /// dirty-set engine decides is conservative. Everything pending is
     /// discarded first: this covers it all.
+    ///
+    /// Because it discards them, a failure here cannot simply be recorded and
+    /// forgotten the way an ordinary error can. The dirty sets are gone, the
+    /// overflow latch that demanded this was consumed before the call, and
+    /// with no `reconcile_interval` configured nothing else would ever come
+    /// back. So a failure both **announces** the loss it could not repair and
+    /// **re-arms** the escalation, exactly as `reconcile_paths` re-hints a
+    /// batch it could not publish.
     fn full_reconcile(&mut self, reason: ResyncReason) {
         self.pending.clear();
         self.pending_deletions.clear();
@@ -990,6 +1061,9 @@ impl Coordinator {
         match self.refresh_with_retries(false) {
             Ok(report) => {
                 self.clear_reconcile_error();
+                // Whatever was owed is now paid, whichever escalation asked.
+                self.escalation = None;
+                self.escalation_failures = 0;
                 let advanced = Some(report.generation) != before;
                 // A lost-detail reason is always announced, even when the
                 // generation did not move: the observer's incremental view is
@@ -1001,8 +1075,52 @@ impl Coordinator {
                     });
                 }
             }
-            Err(error) => self.fail(&error),
+            Err(error) => {
+                self.fail(&error);
+                // Announce first. An observer whose incremental view just
+                // became untrustworthy needs to know that now — it is true
+                // whether or not this runtime can repair it, and the repair
+                // may be many backoffs away.
+                if reason != ResyncReason::RuntimeRecovered {
+                    let generation = self.committed_generation();
+                    self.emit(RuntimeNotice::ResyncRequired { generation, reason });
+                }
+                self.escalation_failures = self.escalation_failures.saturating_add(1);
+                let at = Instant::now() + self.escalation_backoff();
+                self.arm_escalation(reason, at);
+            }
         }
+    }
+
+    /// How long to wait before retrying a failed escalation: the debounce
+    /// window, doubled per consecutive failure, capped. `refresh_with_retries`
+    /// burns its three attempts in microseconds when the error is
+    /// `VaultChangedDuringRefresh` — which is exactly what a write storm
+    /// produces — so without this the retry would spin against the storm that
+    /// caused it.
+    fn escalation_backoff(&self) -> Duration {
+        let doublings = self.escalation_failures.saturating_sub(1).min(8);
+        self.debounce
+            .saturating_mul(1u32 << doublings)
+            .min(MAX_ESCALATION_BACKOFF)
+    }
+
+    /// Record that a complete reconciliation is owed. Keeps the most
+    /// informative reason and the earliest deadline, so a second escalation
+    /// arriving while one is outstanding can only make the response sooner
+    /// and more specific, never later or vaguer.
+    fn arm_escalation(&mut self, reason: ResyncReason, at: Instant) {
+        self.escalation = Some(match self.escalation {
+            Some((owed, owed_at)) => {
+                let reason = if resync_severity(reason) > resync_severity(owed) {
+                    reason
+                } else {
+                    owed
+                };
+                (reason, owed_at.min(at))
+            }
+            None => (reason, at),
+        });
     }
 
     /// A refresh asked for by a client or by the periodic timer. Reports

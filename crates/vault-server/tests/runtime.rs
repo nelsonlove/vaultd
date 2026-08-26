@@ -882,6 +882,117 @@ fn a_vault_change_during_refresh_returns_the_entire_batch() {
     );
 }
 
+/// An escalation whose complete reconciliation fails is not allowed to
+/// vanish. `full_reconcile` has already cleared the pending sets and the
+/// overflow latch was consumed before it ran, so nothing else remembers it
+/// was owed — and with no `reconcile_interval` nothing else would ever come
+/// back. It must still announce the loss, and it must still converge.
+#[test]
+fn a_failed_escalation_is_announced_and_retried() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    // Sequence 0 is the startup catch-up. 1, 2 and 3 are the three attempts
+    // `refresh_with_retries` makes for the escalation, all of which fail
+    // with the error a write storm actually produces — and which it retries
+    // with no backoff at all, so all three burn in microseconds.
+    let (hooks, _mutations) = faulty_hooks(|sequence| {
+        (1..=3)
+            .contains(&sequence)
+            .then_some(IndexError::VaultChangedDuringRefresh)
+    });
+
+    let (sink, notices) = sync_channel(256);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    fs::write(fixture.path("Third.md"), "# Third\n\n[[Note]]\n").expect("write third");
+    assert!(handle.hint(vault_watch::ChangeHint::Overflow));
+
+    // Converges: the re-armed escalation runs again and publishes.
+    wait_for_generation(&handle, 2);
+
+    // Announced twice: once by the attempt that failed — the loss is true
+    // whether or not it can be repaired — and once by the retry that
+    // succeeded. Exactly one would mean the failure was swallowed.
+    let overflows = wait_for("both overflow announcements", || {
+        let seen = drain(&notices)
+            .into_iter()
+            .filter(|notice| {
+                matches!(
+                    notice,
+                    RuntimeNotice::ResyncRequired {
+                        reason: ResyncReason::WatcherOverflow,
+                        ..
+                    }
+                )
+            })
+            .count();
+        (seen >= 2).then_some(seen)
+    });
+    assert!(overflows >= 2, "announced {overflows} times");
+}
+
+/// The mirror of `a_path_that_reappears_in_the_grace_window_is_a_modification`:
+/// a path already queued for the next batch, which then disappears, must
+/// leave that batch and take a grace window — not ride the batch's own
+/// `retry_at` backoff out and publish as an ungraced deletion.
+#[test]
+fn a_path_that_disappears_after_being_queued_takes_the_grace_window() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    // Fail the first `refresh_paths` so the batch is re-hinted and sits
+    // behind a `retry_at` backoff — the window in which the queued path can
+    // disappear underneath it.
+    let (hooks, _mutations) =
+        faulty_hooks(|sequence| (sequence == 1).then_some(IndexError::VaultChangedDuringRefresh));
+
+    let (sink, notices) = sync_channel(64);
+    let mut options = quiet_options();
+    options.watch_config.debounce = Duration::from_millis(500);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), options, sink, hooks)
+        .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    // Queued while it exists; the flush fails and re-hints it at T0 + 500ms.
+    fs::write(fixture.path("Note.md"), "# Note\n\n[[Other]]\n[[Third]]\n").expect("change note");
+    assert!(handle.hint(paths_hint(&["Note.md"])));
+
+    std::thread::sleep(Duration::from_millis(400));
+    fs::remove_file(fixture.path("Note.md")).expect("remove note");
+    assert!(handle.hint(paths_hint(&["Note.md"])));
+
+    // The re-hinted batch's own backoff fires around here. If the path is
+    // still riding it, the deletion publishes now — with no grace at all.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle
+            .reader()
+            .published_status()
+            .expect("status")
+            .generation
+            .map(|generation| generation.get()),
+        Some(1),
+        "a queued path that disappeared must take a grace window, not the batch's backoff"
+    );
+
+    wait_for_generation(&handle, 2);
+    let deleted = wait_for("a deletion notice", || {
+        notices.try_recv().ok().and_then(|notice| match notice {
+            RuntimeNotice::Generation(report) => Some(report.changes.deleted.clone()),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        deleted.iter().map(VaultPath::as_str).collect::<Vec<_>>(),
+        vec!["Note.md"]
+    );
+}
+
 /// A held-back deletion must publish on schedule even while hints keep
 /// arriving: maturity is checked every cycle, not only when the coordinator
 /// happens to go idle.
