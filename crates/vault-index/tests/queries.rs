@@ -379,6 +379,40 @@ WITH all_diagnostics AS ( \
         "diagnostics plan: {diagnostics_plan}"
     );
 
+    // Every branch must be an indexed SEARCH on its severity index, not a
+    // full SCAN — this is the property the fix restores (v1 had
+    // `diagnostics_severity_order`; schema v2 initially shipped with no
+    // per-branch severity index at all, forcing a SCAN of all three
+    // tables). The final cross-branch merge still needs a temp b-tree to
+    // produce one globally ordered stream from three independently-sorted
+    // arms (SQLite does not merge-sort pre-sorted UNION ALL arms) — that is
+    // an inherent cost of the union-of-three-tables design already accepted
+    // for the path-filtered case below (`LAST 6 TERMS OF ORDER BY`), not
+    // something a severity index can or should remove, so it is not
+    // asserted away here.
+    let severity_plan = plan(&format!(
+        "{DIAGNOSTIC_UNION_CTE} SELECT code FROM all_diagnostics WHERE severity = 'warning' \
+         ORDER BY path, span_start, span_end, code, message, owner_kind, owner_id LIMIT 10"
+    ));
+    assert!(
+        severity_plan.contains("note_diagnostics_severity"),
+        "severity plan (note branch): {severity_plan}"
+    );
+    assert!(
+        severity_plan.contains("resolution_diagnostics_severity"),
+        "severity plan (resolution branch): {severity_plan}"
+    );
+    assert!(
+        severity_plan.contains("scan_diagnostics_severity"),
+        "severity plan (scan branch): {severity_plan}"
+    );
+    assert!(
+        !severity_plan.contains("SCAN note_diagnostics")
+            && !severity_plan.contains("SCAN resolution_diagnostics")
+            && !severity_plan.contains("SCAN scan_diagnostics"),
+        "severity plan must not scan any diagnostic table: {severity_plan}"
+    );
+
     let dependency_lookup_plan = plan(
         "SELECT reference_id FROM resolution_dependencies \
          WHERE dependency_kind = 'exact_path' AND comparison_key = 'Target.md' \
@@ -407,6 +441,7 @@ WITH all_diagnostics AS ( \
         &backlinks_plan,
         &status_plan,
         &diagnostics_plan,
+        &severity_plan,
         &dependency_lookup_plan,
         &dependency_cleanup_plan,
         &diagnostic_cleanup_plan,

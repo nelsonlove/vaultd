@@ -166,3 +166,7 @@ CREATE INDEX resolution_dependencies_reference
     ON resolution_dependencies(reference_id, dependency_kind, comparison_key);
 CREATE INDEX resolution_diagnostics_order
     ON resolution_diagnostics(path, span_start, span_end, code, message, reference_id);
+CREATE INDEX resolution_diagnostics_severity
+    ON resolution_diagnostics(severity, path, span_start, span_end, code, message, reference_id);
+CREATE INDEX note_diagnostics_severity ON note_diagnostics(severity, note_path, ordinal);
+CREATE INDEX scan_diagnostics_severity ON scan_diagnostics(severity, ordinal);
