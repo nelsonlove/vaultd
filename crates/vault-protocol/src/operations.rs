@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::events::LiveStateDto;
 use crate::semantic::{
     DiagnosticDto, IndexStateDto, NoteDto, NoteSummaryDto, ReferenceDto, ResolutionDto, SeverityDto,
 };
@@ -16,6 +17,8 @@ pub enum Request {
     ListReferences(ListReferencesParams),
     GetDiagnostics(GetDiagnosticsParams),
     RefreshIndex(RefreshIndexParams),
+    SubscribeEvents(SubscribeEventsParams),
+    Unsubscribe(UnsubscribeParams),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,6 +87,14 @@ pub struct RefreshIndexParams {
     pub verify: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscribeEventsParams {}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UnsubscribeParams {
+    pub subscription_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Response {
@@ -96,6 +107,8 @@ pub enum Response {
     ListReferences(PageResponse<ReferenceDto>),
     GetDiagnostics(PageResponse<DiagnosticDto>),
     RefreshIndex(RefreshIndexResponse),
+    SubscribeEvents(SubscribeEventsResponse),
+    Unsubscribe(UnsubscribeResponse),
 }
 
 impl Response {
@@ -128,6 +141,8 @@ pub struct GetVaultInfoResponse {
     pub state: IndexStateDto,
     pub note_count: u64,
     pub refreshed_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_state: Option<LiveStateDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,4 +167,16 @@ pub struct RefreshIndexResponse {
     pub unchanged: u64,
     pub reparsed: u64,
     pub verified: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscribeEventsResponse {
+    pub subscription_id: String,
+    pub generation: Option<u64>,
+    pub live_state: LiveStateDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UnsubscribeResponse {
+    pub subscription_id: String,
 }

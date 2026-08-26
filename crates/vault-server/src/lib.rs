@@ -241,6 +241,20 @@ impl Server {
                     }
                 },
             },
+            // Task 11 defines the wire shapes for these two requests; wiring
+            // them to a live subscription dispatcher (per-subscription
+            // queues, runtime notice conversion, backpressure) is Task 12's
+            // job. Until then, respond with a stable, honest error rather
+            // than panicking on an unhandled variant.
+            Request::SubscribeEvents(_) | Request::Unsubscribe(_) => ResponseEnvelope::error(
+                id,
+                ProtocolError {
+                    code: ErrorCode::RuntimeNotReady,
+                    message: "event subscriptions are not yet available".into(),
+                    supported_version: None,
+                    current_generation: None,
+                },
+            ),
         }
     }
 }

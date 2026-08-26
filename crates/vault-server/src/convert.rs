@@ -248,6 +248,10 @@ pub(crate) fn vault_info(value: VaultInfo) -> GetVaultInfoResponse {
         state: index_state(value.state),
         note_count: value.note_count,
         refreshed_at_unix_ms: value.refreshed_at_unix_ms,
+        // Task 11 adds the field to the wire shape only. Populating it from
+        // the live runtime's actual `LiveState` is Task 12/13's dispatcher
+        // wiring, once `GetVaultInfo` has a path to the runtime coordinator.
+        live_state: None,
     }
 }
 

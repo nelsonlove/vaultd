@@ -1,5 +1,6 @@
 mod envelope;
 mod error;
+mod events;
 mod operations;
 mod semantic;
 
@@ -7,11 +8,16 @@ pub use envelope::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, ResponseOutcome, validate_version,
 };
 pub use error::{ErrorCode, ProtocolError};
+pub use events::{
+    ChangeSetDto, EventEnvelope, GenerationCauseDto, GenerationCommittedEventDto, LiveStateDto,
+    ResyncReasonDto, ResyncRequiredEventDto, RuntimeEventDto, RuntimeStateChangedEventDto,
+};
 pub use operations::{
     GetDiagnosticsParams, GetNoteResponse, GetVaultInfoResponse, HealthResponse,
     ListReferencesParams, NotePathParams, PageParams, PageResponse, PathPageParams,
     ReferenceStatusFilter, RefreshIndexParams, RefreshIndexResponse, Request, ResolveLinkParams,
-    ResolveLinkResponse, Response,
+    ResolveLinkResponse, Response, SubscribeEventsParams, SubscribeEventsResponse,
+    UnsubscribeParams, UnsubscribeResponse,
 };
 pub use semantic::{
     AliasDto, BlockDto, DiagnosticDto, HeadingDto, IndexStateDto, NoteDto, NoteSummaryDto,

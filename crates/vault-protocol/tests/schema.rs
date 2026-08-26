@@ -33,3 +33,48 @@ fn health_response_round_trips_without_core_types() {
         ResponseOutcome::Ok(Response::Health(_))
     ));
 }
+
+#[test]
+fn task_11_error_codes_are_stable_snake_case_values() {
+    let cases = [
+        (ErrorCode::IndexInUse, "\"index_in_use\""),
+        (ErrorCode::WatchUnavailable, "\"watch_unavailable\""),
+        (
+            ErrorCode::SubscriptionNotFound,
+            "\"subscription_not_found\"",
+        ),
+        (ErrorCode::RuntimeNotReady, "\"runtime_not_ready\""),
+        (ErrorCode::RuntimeOverloaded, "\"runtime_overloaded\""),
+    ];
+    for (code, expected) in cases {
+        let json = serde_json::to_string(&code).expect("serialize error code");
+        assert_eq!(json, expected);
+        let decoded: ErrorCode = serde_json::from_str(&json).expect("deserialize error code");
+        assert_eq!(decoded, code);
+    }
+}
+
+#[test]
+fn existing_error_code_spellings_are_unchanged() {
+    // Guards against accidental reordering/renaming of pre-Task-11 codes
+    // when the enum was extended.
+    let cases = [
+        (ErrorCode::IncompatibleVersion, "\"incompatible_version\""),
+        (ErrorCode::InvalidRequest, "\"invalid_request\""),
+        (ErrorCode::InvalidPath, "\"invalid_path\""),
+        (ErrorCode::InvalidCursor, "\"invalid_cursor\""),
+        (ErrorCode::NoteNotFound, "\"note_not_found\""),
+        (ErrorCode::IndexUnavailable, "\"index_unavailable\""),
+        (ErrorCode::GenerationMismatch, "\"generation_mismatch\""),
+        (
+            ErrorCode::VaultChangedDuringRefresh,
+            "\"vault_changed_during_refresh\"",
+        ),
+        (ErrorCode::IncompatibleIndex, "\"incompatible_index\""),
+        (ErrorCode::StorageFailure, "\"storage_failure\""),
+        (ErrorCode::Internal, "\"internal\""),
+    ];
+    for (code, expected) in cases {
+        assert_eq!(serde_json::to_string(&code).unwrap(), expected);
+    }
+}

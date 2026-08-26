@@ -528,7 +528,7 @@ runtime_state_changed
 
 resync_required
   current_generation
-  reason: subscriber_lag | oversized_change_set | runtime_recovered
+  reason: subscriber_lag | oversized_change_set | runtime_recovered | watcher_overflow | root_invalidated
 ```
 
 Detailed path changes contain deterministic, disjoint `created`, `modified`, and `deleted` lists. They describe note-file membership/source changes, not every backlink whose answer changed. An event contains detailed paths only when the total is at most 1,024. Larger generations use a counts-only summary followed by `resync_required { reason: oversized_change_set }`.

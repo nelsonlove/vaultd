@@ -24,4 +24,9 @@ pub enum ErrorCode {
     IncompatibleIndex,
     StorageFailure,
     Internal,
+    IndexInUse,
+    WatchUnavailable,
+    SubscriptionNotFound,
+    RuntimeNotReady,
+    RuntimeOverloaded,
 }
