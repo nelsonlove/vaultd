@@ -178,6 +178,13 @@ pub struct RuntimeTestHooks {
     /// Fail watcher installation as though the backend refused, without
     /// having to break a real directory.
     pub fail_watch_install: bool,
+    /// Consulted before every call into the `IndexService`, with that call's
+    /// zero-based sequence number. Returning `Some(error)` makes the call
+    /// fail without running, which is the only way to exercise the error
+    /// routing for faults a test cannot provoke on a real filesystem —
+    /// SQLite lock contention, a foreign writer moving the cache, a vault
+    /// that changes mid-refresh.
+    pub mutation_fault: Option<Arc<dyn Fn(usize) -> Option<IndexError> + Send + Sync>>,
 }
 
 /// The runtime's entry point. Not a value: `start` hands back a
@@ -224,8 +231,9 @@ impl Runtime {
         // while catch-up runs is already queued when it finishes. Ordering
         // by construction: the forwarder is spawned here, the coordinator
         // below.
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let watch_alive = Arc::new(AtomicBool::new(false));
         let mut watch_error = None;
-        let mut watch_installed = false;
         if options.watch {
             match start_watch(
                 &config,
@@ -234,26 +242,32 @@ impl Runtime {
                 &commands,
                 &overflow,
                 &running,
+                &watch_alive,
             ) {
-                Ok(handle) => {
-                    watch_installed = true;
-                    threads.push(handle);
-                }
+                Ok(handle) => threads.push(handle),
                 Err(message) => watch_error = Some(message),
             }
         }
+        let watch_installed = watch_alive.load(Ordering::Acquire);
 
-        let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let tick_pending = Arc::new(AtomicBool::new(false));
         if let Some(interval) = options.reconcile_interval.filter(|it| !it.is_zero()) {
-            threads.push(spawn_timer(
+            match spawn_timer(
                 interval,
                 Arc::clone(&wake),
                 Arc::clone(&running),
                 Arc::clone(&tick_pending),
                 commands.clone(),
                 Arc::clone(&overflow),
-            )?);
+            ) {
+                Ok(handle) => threads.push(handle),
+                // A thread already spawned must never outlive this failed
+                // start: stop it and wait for it before reporting.
+                Err(error) => {
+                    abandon(&running, &wake, threads);
+                    return Err(error.into());
+                }
+            }
         }
 
         let coordinator = Coordinator {
@@ -266,14 +280,16 @@ impl Runtime {
             tick_pending: Arc::clone(&tick_pending),
             gate: hooks.before_catch_up.clone(),
             hooks,
+            mutations: 0,
             debounce: options.watch_config.debounce,
+            max_dirty_paths: options.watch_config.max_dirty_paths.max(1),
             pending: BTreeSet::new(),
             pending_deletions: BTreeMap::new(),
             next_deletion: None,
             retry_at: None,
             rehints: 0,
             watching: watch_installed,
-            watch_installed,
+            watch_alive: Arc::clone(&watch_alive),
             watch_error,
             reconcile_error: None,
             // The coordinator's own view starts where the service did, so
@@ -285,11 +301,16 @@ impl Runtime {
             published_error: None,
             notices_dropped: false,
         };
-        threads.push(
-            std::thread::Builder::new()
-                .name("vaultd-coordinator".into())
-                .spawn(move || coordinator.run())?,
-        );
+        match std::thread::Builder::new()
+            .name("vaultd-coordinator".into())
+            .spawn(move || coordinator.run())
+        {
+            Ok(handle) => threads.push(handle),
+            Err(error) => {
+                abandon(&running, &wake, threads);
+                return Err(error.into());
+            }
+        }
 
         Ok(RuntimeHandle {
             inner: Arc::new(RuntimeInner {
@@ -300,9 +321,25 @@ impl Runtime {
                 reader,
                 threads: Mutex::new(threads),
                 stopped: AtomicBool::new(false),
-                watch_installed,
+                watch_alive,
             }),
         })
+    }
+}
+
+/// Stop and join threads spawned by a `start` that then failed. Without
+/// this, a failed start would leave a forwarder or timer running with no
+/// handle to stop it — an orphan for the life of the process.
+fn abandon(running: &AtomicBool, wake: &(Mutex<bool>, Condvar), threads: Vec<JoinHandle<()>>) {
+    running.store(false, Ordering::Release);
+    let (lock, condvar) = wake;
+    {
+        let mut stop = lock.lock().unwrap_or_else(|error| error.into_inner());
+        *stop = true;
+        condvar.notify_all();
+    }
+    for thread in threads {
+        let _ = thread.join();
     }
 }
 
@@ -316,6 +353,7 @@ fn start_watch(
     commands: &SyncSender<RuntimeCommand>,
     overflow: &Arc<AtomicBool>,
     running: &Arc<AtomicBool>,
+    alive: &Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, String> {
     if force_failure {
         return Err("watcher installation was refused".into());
@@ -325,19 +363,29 @@ fn start_watch(
     let commands = commands.clone();
     let overflow = Arc::clone(overflow);
     let running = Arc::clone(running);
+    let thread_alive = Arc::clone(alive);
+    // Set before the spawn, so `start` observes a live watch the moment the
+    // spawn succeeds and never races the thread's first instruction.
+    alive.store(true, Ordering::Release);
     std::thread::Builder::new()
         .name("vaultd-watch-forwarder".into())
-        .spawn(move || forward_hints(stream, commands, overflow, running))
+        .spawn(move || forward_hints(stream, commands, overflow, running, thread_alive))
+        .inspect_err(|_| alive.store(false, Ordering::Release))
         .map_err(|error| error.to_string())
 }
 
 /// Turn watch hints into commands. Owns the `WatchStream` and nothing else;
 /// it performs no file reads, no parsing, and no index access.
+/// `alive` is cleared on *every* exit — the loop's own, a closed mailbox, and
+/// a dead backend alike. Once this thread is gone nothing is watching, and
+/// the coordinator must not be able to conclude otherwise from a hint that
+/// reached it some other way.
 fn forward_hints(
     mut stream: WatchStream,
     commands: SyncSender<RuntimeCommand>,
     overflow: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Acquire) {
         match stream.recv_timeout(WATCH_POLL) {
@@ -347,6 +395,7 @@ fn forward_hints(
                 {
                     // The coordinator is gone; there is nothing left to
                     // forward hints to.
+                    alive.store(false, Ordering::Release);
                     return;
                 }
             }
@@ -354,7 +403,10 @@ fn forward_hints(
             Err(error) => {
                 // The backend died. This obligates a full reconciliation —
                 // never a silent log line — so hand it over as a hint and
-                // stop: the stream cannot produce anything further.
+                // stop: the stream cannot produce anything further. The flag
+                // is cleared *before* the hint, so the coordinator can never
+                // process it while this thread still looks alive.
+                alive.store(false, Ordering::Release);
                 dispatch(
                     &commands,
                     &overflow,
@@ -364,6 +416,7 @@ fn forward_hints(
             }
         }
     }
+    alive.store(false, Ordering::Release);
 }
 
 fn spawn_timer(
@@ -467,7 +520,7 @@ struct RuntimeInner {
     reader: Arc<IndexReader>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
-    watch_installed: bool,
+    watch_alive: Arc<AtomicBool>,
 }
 
 impl RuntimeInner {
@@ -574,9 +627,11 @@ impl RuntimeHandle {
         self.inner.stopped.load(Ordering::Acquire)
     }
 
-    /// Whether the filesystem watcher was installed at startup.
+    /// Whether a filesystem watcher is installed *and* its forwarder thread
+    /// is still running. Goes false if the backend dies, because at that
+    /// point nothing is watching regardless of how startup went.
     pub fn watch_installed(&self) -> bool {
-        self.inner.watch_installed
+        self.inner.watch_alive.load(Ordering::Acquire)
     }
 
     #[doc(hidden)]
@@ -604,7 +659,14 @@ struct Coordinator {
     tick_pending: Arc<AtomicBool>,
     gate: Option<RuntimeHook>,
     hooks: RuntimeTestHooks,
+    /// How many calls into the `IndexService` this coordinator has made.
+    /// Only ever read by the fault hook, which needs a stable way to name
+    /// "the third one".
+    mutations: usize,
     debounce: Duration,
+    /// The watcher's own ceiling on one dirty set. The coordinator's pending
+    /// set must not grow past what a single hint could have carried.
+    max_dirty_paths: usize,
     /// Paths waiting to go into the next targeted batch.
     pending: BTreeSet<VaultPath>,
     /// Paths last seen absent, with the instant they may be treated as
@@ -622,9 +684,10 @@ struct Coordinator {
     rehints: usize,
     /// Whether a watcher is installed and healthy.
     watching: bool,
-    /// Whether a watcher was installed at startup at all. Fixed for the
-    /// runtime's lifetime.
-    watch_installed: bool,
+    /// Whether the forwarder thread is alive. Set when it is spawned and
+    /// cleared by the forwarder itself before every return, so a dead
+    /// forwarder can never be mistaken for a working watch.
+    watch_alive: Arc<AtomicBool>,
     watch_error: Option<String>,
     reconcile_error: Option<String>,
     state: LiveState,
@@ -669,6 +732,11 @@ impl Coordinator {
     /// claim to be watching while a startup backlog is still unprocessed.
     fn drain_backlog(&mut self) {
         loop {
+            // A shutdown during catch-up must not be made to wait out a
+            // whole startup backlog first.
+            if !self.running.load(Ordering::Acquire) {
+                return;
+            }
             match self.commands.try_recv() {
                 Ok(RuntimeCommand::Stop) => {
                     self.running.store(false, Ordering::Release);
@@ -741,12 +809,19 @@ impl Coordinator {
                         }
                     }
                 }
+                if self.pending.len() >= self.max_dirty_paths {
+                    // The pending set has reached the ceiling one hint could
+                    // have carried. Publish now rather than let it grow
+                    // unbounded waiting for the mailbox to go quiet.
+                    self.flush();
+                }
                 // A hint from a stream that exists is proof it works again.
-                // Gated on the watcher having actually been installed: a
-                // runtime that never had one (watching disabled, or
-                // installation refused) can still be fed hints in-process,
-                // and those must never let it claim to be watching.
-                if self.watch_installed && self.watch_error.is_some() {
+                // Gated on a *live* forwarder, not merely a successful
+                // install: a runtime that never had a watcher, or whose
+                // watcher thread has since died, can still be fed hints
+                // in-process, and those must never let it claim to be
+                // watching.
+                if self.watch_alive.load(Ordering::Acquire) && self.watch_error.is_some() {
                     self.watch_error = None;
                     self.watching = true;
                     self.settle();
@@ -806,8 +881,12 @@ impl Coordinator {
         if self.pending.is_empty() {
             return;
         }
+        // A re-hinted batch waits out its backoff — unless the pending set
+        // has grown to the ceiling one hint could have carried, in which
+        // case waiting only lets it grow further.
+        let full = self.pending.len() >= self.max_dirty_paths;
         if let Some(at) = self.retry_at {
-            if Instant::now() < at {
+            if !full && Instant::now() < at {
                 return;
             }
         }
@@ -816,10 +895,23 @@ impl Coordinator {
         self.reconcile_paths(batch);
     }
 
+    /// Reconcile one dirty batch, and never lose it.
+    ///
+    /// Exactly two ways out: the batch published, or the batch comes back.
+    /// Every failure — retryable or not, exhausted or not — leaves the loop
+    /// through the single `rehint` below, because a dropped batch is a
+    /// permanently missing change: with no `reconcile_interval` configured,
+    /// nothing else would ever revisit those paths. `rehint` caps consecutive
+    /// re-hints and escalates to a complete reconciliation, so this cannot
+    /// spin.
+    ///
+    /// The one early return is `IndexUnavailable`, and only because the
+    /// complete reconciliation it triggers covers these paths and every
+    /// other one besides.
     fn reconcile_paths(&mut self, batch: BTreeSet<VaultPath>) {
         for attempt in 0..MAX_MUTATION_ATTEMPTS {
-            let paths = batch.clone();
             let last = attempt + 1 == MAX_MUTATION_ATTEMPTS;
+            let paths = batch.clone();
             match self.mutation(|index| index.refresh_paths(paths, ChangeCause::Watcher)) {
                 Ok(report) => {
                     self.rehints = 0;
@@ -829,22 +921,31 @@ impl Coordinator {
                     }
                     return;
                 }
-                Err(IndexError::Busy(_)) if !last => std::thread::sleep(BUSY_BACKOFF),
-                Err(IndexError::LiveStateStale(_)) if !last => {
+                // Lock contention, not damage. Retry until the attempts run
+                // out, then hand the batch back rather than consuming it.
+                Err(IndexError::Busy(_)) => {
+                    if last {
+                        break;
+                    }
+                    std::thread::sleep(BUSY_BACKOFF);
+                }
+                // A writer this process does not own moved the cache. Adopt
+                // what it committed, then retry.
+                Err(IndexError::LiveStateStale(_)) => {
+                    if last {
+                        break;
+                    }
                     if let Err(error) = self.mutation(IndexService::resync_published) {
                         self.fail(&error);
-                        return;
+                        break;
                     }
                 }
                 // Reads happen before the publication attempt, and one moved
                 // path aborts the whole batch — so the whole batch is what
                 // has to come back, not the path that moved.
-                Err(IndexError::VaultChangedDuringRefresh) => {
-                    self.rehint(batch);
-                    return;
-                }
+                Err(IndexError::VaultChangedDuringRefresh) => break,
                 // No generation to be incremental against yet: the cold
-                // build has to run first.
+                // build has to run first, and it covers these paths.
                 Err(IndexError::IndexUnavailable) => {
                     self.full_reconcile(ResyncReason::RuntimeRecovered);
                     self.settle();
@@ -852,7 +953,7 @@ impl Coordinator {
                 }
                 Err(error) => {
                     self.fail(&error);
-                    return;
+                    break;
                 }
             }
         }
@@ -966,13 +1067,20 @@ impl Coordinator {
     ) -> Result<T, IndexError> {
         let enter = self.hooks.mutation_enter.clone();
         let exit = self.hooks.mutation_exit.clone();
+        let fault = self.hooks.mutation_fault.clone();
         if let Some(hook) = &enter {
             hook();
         }
         if let Some(gate) = self.gate.take() {
             gate();
         }
-        let outcome = work(&mut self.index);
+        let sequence = self.mutations;
+        self.mutations += 1;
+        let injected = fault.and_then(|fault| fault(sequence));
+        let outcome = match injected {
+            Some(error) => Err(error),
+            None => work(&mut self.index),
+        };
         if let Some(hook) = &exit {
             hook();
         }
@@ -1027,13 +1135,22 @@ impl Coordinator {
         if self.state == state && self.published_error == error {
             return;
         }
+        // The bookkeeping below is only updated once the barrier actually
+        // took the write. Recording it after a failed write would make the
+        // coordinator believe a state it never published, and the early
+        // return above would then suppress every future attempt to publish
+        // it — the runtime would be permanently misreported. Leaving the
+        // bookkeeping behind reality is the safe direction: the next cycle
+        // simply tries again.
         if let Err(failure) = self.index.set_live_state(state) {
             // The barrier is poisoned or unreachable; there is nothing left
             // to report it through, and no reason to abandon the loop.
             self.reconcile_error = Some(failure.to_string());
+            return;
         }
         if let Err(failure) = self.index.set_runtime_error(error.clone()) {
             self.reconcile_error = Some(failure.to_string());
+            return;
         }
         self.state = state;
         self.published_error = error.clone();
@@ -1049,6 +1166,18 @@ impl Coordinator {
     /// slow observer must never stall indexing: a notice that will not fit
     /// is dropped, and the gap is announced as a resync before the next one
     /// that does fit.
+    ///
+    /// **This must only ever `try_send`, never `send`.** The property is
+    /// load-bearing, not stylistic. Notices are emitted from inside the
+    /// coordinator's own command handling — including while it is servicing
+    /// a `RuntimeCommand::Refresh` whose caller is blocked in
+    /// `replies.recv()`. Once Task 12's subscription dispatcher is the thing
+    /// on the other end of this sink, a blocking `send` here would wait for
+    /// that dispatcher while the dispatcher's own `refresh_index` caller
+    /// waits for this coordinator: a two-party deadlock with no timeout on
+    /// either side, reachable from an ordinary slow subscriber. Dropping a
+    /// notice and announcing the gap is always the correct trade, because a
+    /// gap is recoverable and a wedged writer is not.
     fn emit(&mut self, notice: RuntimeNotice) {
         if self.notices_dropped {
             let generation = self.committed_generation();

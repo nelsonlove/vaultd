@@ -7,7 +7,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use vault_index::{IndexConfig, IndexService, LiveState};
+use vault_core::VaultPath;
+use vault_index::{IndexConfig, IndexError, IndexService, LiveState};
 use vault_server::runtime::{
     ResyncReason, Runtime, RuntimeCommand, RuntimeHandle, RuntimeNotice, RuntimeOptions,
     RuntimeTestHooks,
@@ -77,6 +78,22 @@ fn wait_for_generation(handle: &RuntimeHandle, wanted: u64) {
             .filter(|generation| generation.get() == wanted)
             .map(|_| ())
     });
+}
+
+/// Shut down and prove it did not wait out a reconcile interval. A timer
+/// that checks its stop flag only *after* entering `wait_timeout` misses the
+/// wake-up entirely and holds the join for the whole interval — which is
+/// sixty seconds with the production default. Whether that lands on a given
+/// handle is a scheduling race, so every shutdown in a test that configures
+/// an interval has to be bounded, not just one.
+fn bounded_shutdown(handle: &RuntimeHandle, label: &str) {
+    let started = Instant::now();
+    handle.shutdown();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutting down the {label} runtime must not wait out its reconcile interval, took {elapsed:?}"
+    );
 }
 
 fn drain(notices: &Receiver<RuntimeNotice>) -> Vec<RuntimeNotice> {
@@ -622,7 +639,7 @@ fn only_the_configured_threads_are_started() {
         1,
         "a runtime that neither watches nor ticks is one coordinator thread"
     );
-    bare.shutdown();
+    bounded_shutdown(&bare, "bare");
 
     let (sink, _notices) = sync_channel(64);
     let timed = Runtime::start_with_hooks(
@@ -637,7 +654,7 @@ fn only_the_configured_threads_are_started() {
     )
     .expect("start timed runtime");
     assert_eq!(timed.thread_count_for_test(), 2);
-    timed.shutdown();
+    bounded_shutdown(&timed, "timed");
 
     let (sink, _notices) = sync_channel(64);
     let watched = Runtime::start_with_hooks(
@@ -652,7 +669,7 @@ fn only_the_configured_threads_are_started() {
     )
     .expect("start watched runtime");
     assert_eq!(watched.thread_count_for_test(), 3);
-    watched.shutdown();
+    bounded_shutdown(&watched, "watched");
 }
 
 /// Shutdown joins every thread, records `Stopped`, and releases the writer
@@ -706,6 +723,228 @@ fn shutdown_joins_every_thread_and_releases_the_lease() {
     assert!(!handle.hint(vault_watch::ChangeHint::Overflow));
     // Idempotent.
     handle.shutdown();
+}
+
+/// Options for a runtime that neither watches nor ticks, so the only
+/// mutations are the ones the test causes and their sequence numbers are
+/// stable: sequence 0 is the startup catch-up, sequence 1 the first
+/// `refresh_paths`.
+fn quiet_options() -> RuntimeOptions {
+    RuntimeOptions {
+        watch: false,
+        reconcile_interval: None,
+        ..RuntimeOptions::default()
+    }
+}
+
+fn path(name: &str) -> VaultPath {
+    VaultPath::new(name).expect("vault path")
+}
+
+fn paths_hint(names: &[&str]) -> vault_watch::ChangeHint {
+    vault_watch::ChangeHint::Paths(names.iter().map(|name| path(name)).collect())
+}
+
+/// Hooks that fail specific mutations, and count every mutation the
+/// coordinator makes.
+fn faulty_hooks(
+    fault: impl Fn(usize) -> Option<IndexError> + Send + Sync + 'static,
+) -> (RuntimeTestHooks, Arc<AtomicUsize>) {
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&mutations);
+    let hooks = RuntimeTestHooks {
+        mutation_enter: Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::AcqRel);
+        })),
+        mutation_fault: Some(Arc::new(fault)),
+        ..RuntimeTestHooks::default()
+    };
+    (hooks, mutations)
+}
+
+/// Retries running out must never consume the batch. With no
+/// `reconcile_interval` configured — a supported configuration — nothing
+/// else would ever revisit these paths, so a dropped batch is a permanently
+/// missing change.
+#[test]
+fn a_dirty_batch_survives_exhausted_busy_retries() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    // Sequence 0 is the startup catch-up and must succeed; 1, 2 and 3 are
+    // the three attempts `reconcile_paths` makes, all of which fail.
+    let (hooks, mutations) = faulty_hooks(|sequence| {
+        (1..=3)
+            .contains(&sequence)
+            .then(|| IndexError::Busy("injected lock contention".into()))
+    });
+
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    fs::write(fixture.path("Note.md"), "# Note\n\n[[Other]]\n[[Third]]\n").expect("change note");
+    assert!(handle.hint(paths_hint(&["Note.md"])));
+
+    // Three Busy failures, then the batch comes back and publishes.
+    wait_for_generation(&handle, 2);
+    assert!(
+        mutations.load(Ordering::Acquire) >= 5,
+        "three failed attempts plus at least one successful retry"
+    );
+    let modified = wait_for("the re-hinted batch to publish", || {
+        notices.try_recv().ok().and_then(|notice| match notice {
+            RuntimeNotice::Generation(report) => Some(report.changes.modified.clone()),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        modified.iter().map(VaultPath::as_str).collect::<Vec<_>>(),
+        vec!["Note.md"]
+    );
+}
+
+/// A foreign writer moving the cache is curable in place: adopt what it
+/// committed, then retry the same batch.
+#[test]
+fn a_stale_live_state_is_resynced_and_the_retry_succeeds() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    let (hooks, mutations) = faulty_hooks(|sequence| {
+        (sequence == 1).then(|| IndexError::LiveStateStale("injected foreign writer".into()))
+    });
+
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    fs::write(fixture.path("Note.md"), "# Note\n\n[[Other]]\n[[Third]]\n").expect("change note");
+    assert!(handle.hint(paths_hint(&["Note.md"])));
+    wait_for_generation(&handle, 2);
+
+    // Exactly four mutations: the catch-up (0), the faulted attempt (1),
+    // `resync_published` (2), and the successful retry (3). Three would mean
+    // the retry ran without adopting the foreign generation first — the one
+    // thing `LiveStateStale` requires.
+    wait_for("the resync and retry to settle", || {
+        (mutations.load(Ordering::Acquire) >= 4).then_some(())
+    });
+    assert_eq!(mutations.load(Ordering::Acquire), 4);
+    assert!(
+        handle
+            .reader()
+            .published_status()
+            .expect("status")
+            .runtime_error
+            .is_none(),
+        "a cured stale state is not an error the operator should see"
+    );
+}
+
+/// `refresh_paths` reads every path before it publishes, so one path moving
+/// mid-cycle aborts the whole batch. The whole batch is therefore what must
+/// come back — re-hinting only the path that moved would silently drop the
+/// rest.
+#[test]
+fn a_vault_change_during_refresh_returns_the_entire_batch() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    let (hooks, _mutations) =
+        faulty_hooks(|sequence| (sequence == 1).then_some(IndexError::VaultChangedDuringRefresh));
+
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(fixture.config.clone(), quiet_options(), sink, hooks)
+        .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    fs::write(fixture.path("Note.md"), "# Note\n\n[[Other]]\n[[Third]]\n").expect("change note");
+    fs::write(fixture.path("Other.md"), "# Other\n\n[[Note]]\n").expect("change other");
+    assert!(handle.hint(paths_hint(&["Note.md", "Other.md"])));
+
+    wait_for_generation(&handle, 2);
+    let modified = wait_for("the re-hinted batch to publish", || {
+        notices.try_recv().ok().and_then(|notice| match notice {
+            RuntimeNotice::Generation(report) => Some(report.changes.modified.clone()),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        modified.iter().map(VaultPath::as_str).collect::<Vec<_>>(),
+        vec!["Note.md", "Other.md"],
+        "both paths must come back, not only the one the failure was blamed on"
+    );
+}
+
+/// A held-back deletion must publish on schedule even while hints keep
+/// arriving: maturity is checked every cycle, not only when the coordinator
+/// happens to go idle.
+#[test]
+fn a_deletion_publishes_on_schedule_under_hint_traffic() {
+    let fixture = fixture();
+    fixture.build_generation_one();
+
+    let (sink, notices) = sync_channel(256);
+    let mut options = quiet_options();
+    options.watch_config.debounce = Duration::from_millis(500);
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        options,
+        sink,
+        RuntimeTestHooks::default(),
+    )
+    .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+    let _ = drain(&notices);
+
+    fs::remove_file(fixture.path("Other.md")).expect("remove other");
+    let started = Instant::now();
+    assert!(handle.hint(paths_hint(&["Other.md"])));
+
+    // Keep the coordinator busy for the whole grace window with hints for a
+    // path that has not changed. Those publish nothing, so anything that
+    // does publish came from the held-back deletion.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spammer = {
+        let handle = handle.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                handle.hint(paths_hint(&["Note.md"]));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+
+    wait_for_generation(&handle, 2);
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Release);
+    spammer.join().expect("join spammer");
+
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the grace window must still be honoured, published after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the deletion must not starve behind hint traffic, published after {elapsed:?}"
+    );
+    let deleted = wait_for("a deletion notice", || {
+        notices.try_recv().ok().and_then(|notice| match notice {
+            RuntimeNotice::Generation(report) => Some(report.changes.deleted.clone()),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        deleted.iter().map(VaultPath::as_str).collect::<Vec<_>>(),
+        vec!["Other.md"]
+    );
 }
 
 /// Dropping the last handle stops the runtime just as `shutdown` does — no
