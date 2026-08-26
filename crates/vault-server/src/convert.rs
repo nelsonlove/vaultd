@@ -325,10 +325,12 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
         // `Busy` and `LiveStateStale` are distinct *internally* — one is
         // retryable lock contention, the other is cured by
         // `resync_published` — but both deliberately keep the existing
-        // `StorageFailure` code and message here. Protocol output must stay
-        // byte-identical to what a single `Storage` variant produced;
-        // dedicated codes are Task 11's job, and adding them here would be a
-        // protocol change smuggled into a refactor.
+        // `StorageFailure` code and message here. The protocol work that
+        // added dedicated codes considered these and kept this mapping:
+        // both faults are invisible to a well-behaved client (the runtime
+        // retries or resyncs before answering), so a distinct wire code
+        // would document noise, and protocol output stays byte-identical
+        // to what a single `Storage` variant produced.
         IndexError::Busy(_) | IndexError::LiveStateStale(_) | IndexError::Storage(_) => {
             error.code = ErrorCode::StorageFailure;
             error.message = "index storage failed".into();
