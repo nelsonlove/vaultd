@@ -8,10 +8,17 @@ rust-version.workspace = true
 name = "vaultd"
 path = "src/main.rs"
 
+[[bin]]
+name = "vault-live-bench"
+path = "src/bin/vault-live-bench.rs"
+
 [dependencies]
 clap.workspace = true
+filetime.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 vault-core = { path = "../vault-core" }
 vault-index = { path = "../vault-index" }

@@ -459,12 +459,15 @@ fn regression_scenario() -> Vec<Vec<Operation>> {
             path: "Gamma.md".into(),
             body: "# Heading\n\ntext ^block\n".into(),
         }],
-        // A second spelling of the same stem makes `[[Alpha]]` ambiguous.
+        // A second spelling of the same stem appears alongside the root
+        // spelling. Exact-path-wins keeps `[[Alpha]]` resolving to root
+        // `Alpha.md` — this is not the ambiguity transition, just a second
+        // candidate coexisting harmlessly with the exact match.
         vec![Operation::Write {
             path: "Nested/Alpha.md".into(),
             body: "# Heading\n[[../Beta]]\n".into(),
         }],
-        // ...and removing it resolves the reference again.
+        // ...and removing it again leaves the resolution unchanged.
         vec![Operation::Delete {
             path: "Nested/Alpha.md".into(),
         }],

@@ -22,6 +22,7 @@ blake3 = "1.8"
 clap = { version = "4.6.6", features = ["derive"] }
 filetime = "0.2.29"
 fs2 = "0.4.3"
+libc = "0.2.189"
 notify = "8.2.0"
 rusqlite = { version = "0.32.1", features = ["bundled", "trace"] }
 xdg = "3.0"

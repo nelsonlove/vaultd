@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,8 +7,8 @@ use std::time::Instant;
 use clap::Parser;
 use vault_core::VaultPath;
 use vault_index::{
-    FileSystemIndexSource, IndexConfig, IndexService, InventorySnapshot, ReconcileMetrics,
-    ReconcileSource, StageDurations,
+    ChangeCause, FileSystemIndexSource, IndexConfig, IndexService, InventorySnapshot,
+    ReconcileMetrics, ReconcileSource, StageDurations,
 };
 
 /// Deterministic benchmark for the persistent read paths. Emits exactly one
@@ -22,6 +23,48 @@ struct Args {
     repeats: usize,
     #[arg(long, value_name = "PATH")]
     vault: Option<PathBuf>,
+    /// Also run the Task 14 internal live-incremental cases (body-only edit,
+    /// outgoing-reference edit, heading fan-out, filename-resolution
+    /// transitions, delete reversals, rename, a 100-note burst, the complete
+    /// fallback, and compact-graph hydration). Skipped in `--vault` mode,
+    /// which performs no source writes.
+    #[arg(long, default_value_t = false)]
+    live: bool,
+}
+
+/// Peak resident set size in bytes since process start.
+///
+/// `ru_maxrss` is platform-dependent: bytes on macOS/BSD, kibibytes on
+/// Linux. `getrusage` never resets the high-water mark mid-process, so this
+/// is a running peak — meaningful as "the largest this process has grown so
+/// far", which is exactly what the compact-graph-hydration case (the
+/// heaviest working set, run last) wants to report against the 512 MiB
+/// design target. `None` on non-Unix platforms, where `getrusage` does not
+/// exist.
+#[cfg(unix)]
+fn peak_rss_bytes() -> Option<u64> {
+    // SAFETY: `usage` is a plain-old-data struct that `getrusage` fully
+    // populates on success before any field is read; zero-initializing it
+    // first is sound because every field is an integer type with no
+    // validity invariant narrower than "any bit pattern".
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return None;
+        }
+        usage
+    };
+    let raw = u64::try_from(usage.ru_maxrss).ok()?;
+    if cfg!(target_os = "macos") {
+        Some(raw)
+    } else {
+        Some(raw.saturating_mul(1024))
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> Option<u64> {
+    None
 }
 
 #[derive(serde::Serialize)]
@@ -33,6 +76,26 @@ struct BenchmarkReport {
     timings_ms: BenchmarkTimings,
     work: BenchmarkWork,
     stages: BenchmarkStages,
+    /// The Task 14 internal live-incremental cases, one entry per named
+    /// case. Empty unless `--live` was passed, and always empty in
+    /// `--vault` mode (real-vault runs perform no source writes).
+    live_cases: Vec<CaseReport>,
+}
+
+/// One live-incremental case: a single measured operation (a targeted
+/// `refresh_paths` call, or a graph hydration), repeated `--repeats` times.
+/// `stages_ms` and `work` mirror `ReconcileMetrics` field-for-field, exactly
+/// as `BenchmarkStages`/`StructuralWork` already do for the persistent-index
+/// cases above.
+#[derive(serde::Serialize)]
+struct CaseReport {
+    case: String,
+    notes: usize,
+    affected_references: u64,
+    timings_ms: Distribution,
+    stages_ms: StageDistributions,
+    work: StructuralWork,
+    peak_rss_bytes: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -230,6 +293,415 @@ fn open_counting_service(vault_root: &Path, index_path: &Path) -> (IndexService,
     (service, body_reads)
 }
 
+// ---------------------------------------------------------------------------
+// Task 14 live-incremental cases
+// ---------------------------------------------------------------------------
+//
+// Every case below drives `IndexService::refresh_paths` directly — the same
+// engine `--vault`'s ordinary watcher-driven refresh uses — against small,
+// dedicated `Bench-*` fixture notes layered on top of the numbered synthetic
+// vault. `refresh_paths` re-reads and re-fingerprints every given path
+// unconditionally, so no fixture needs an mtime bump: a changed body is
+// enough to make `classify` see a moved content revision.
+
+/// One measured `refresh_paths` call.
+struct CaseSample {
+    elapsed_ms: f64,
+    metrics: ReconcileMetrics,
+    affected_references: u64,
+}
+
+/// Write one fixture note's body, creating any parent directory the fixture
+/// needs, and return its `VaultPath`.
+fn write_note_body(vault_root: &Path, rel: &str, body: &str) -> VaultPath {
+    let path = vault_root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create fixture directory");
+    }
+    std::fs::write(&path, body).expect("write fixture note");
+    VaultPath::new(rel).expect("valid vault path")
+}
+
+fn remove_note(vault_root: &Path, rel: &str) {
+    std::fs::remove_file(vault_root.join(rel)).expect("remove fixture note");
+}
+
+/// The body a toggle case should write next: whichever of `primary`/
+/// `secondary` differs from what is on disk right now. Reading current
+/// content rather than alternating on the repeat index makes every toggle
+/// case robust to whatever state an earlier case (or a run with an odd
+/// `--repeats`) left the fixture in — a fixture reused across two cases
+/// (`complete_fallback_after_overflow` reuses `heading_fanout_10`'s hub)
+/// would otherwise risk writing a no-op body that never advances the
+/// generation at all.
+fn toggle_body(vault_root: &Path, rel: &str, primary: &str, secondary: &str) -> String {
+    let current = std::fs::read_to_string(vault_root.join(rel)).unwrap_or_default();
+    if current == primary {
+        secondary.to_string()
+    } else {
+        primary.to_string()
+    }
+}
+
+/// Seed one or more fixture paths into the index without timing it — every
+/// case's own measured loop times only the transition under test, never the
+/// fixture's first appearance.
+fn seed(service: &mut IndexService, paths: impl IntoIterator<Item = VaultPath>) {
+    let set: BTreeSet<VaultPath> = paths.into_iter().collect();
+    service
+        .refresh_paths(set, ChangeCause::Manual)
+        .expect("seed live-case fixtures");
+}
+
+fn measure(service: &mut IndexService, paths: BTreeSet<VaultPath>) -> CaseSample {
+    let start = Instant::now();
+    let report = service
+        .refresh_paths(paths, ChangeCause::Manual)
+        .expect("refresh_paths");
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+    CaseSample {
+        elapsed_ms,
+        metrics: report.metrics,
+        affected_references: report.affected_reference_count,
+    }
+}
+
+fn case_report(name: &str, notes: usize, samples: &[CaseSample]) -> CaseReport {
+    let affected_references = samples.last().map(|s| s.affected_references).unwrap_or(0);
+    let timings: Vec<f64> = samples.iter().map(|s| s.elapsed_ms).collect();
+    let metrics: Vec<ReconcileMetrics> = samples.iter().map(|s| s.metrics.clone()).collect();
+    CaseReport {
+        case: name.to_string(),
+        notes,
+        affected_references,
+        timings_ms: distribution(timings),
+        stages_ms: stage_distributions(&metrics),
+        work: aggregate_work(&metrics),
+        peak_rss_bytes: peak_rss_bytes(),
+    }
+}
+
+/// Body-only edit with zero outgoing references and zero incoming fan-in: a
+/// change with no reference to re-resolve at all.
+fn case_body_only_edit(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let isolated = write_note_body(vault_root, "Bench-Isolated.md", "seed body\n");
+    seed(service, [isolated.clone()]);
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let body = toggle_body(
+            vault_root,
+            "Bench-Isolated.md",
+            "seed body\n",
+            "alternate body text\n",
+        );
+        write_note_body(vault_root, "Bench-Isolated.md", &body);
+        samples.push(measure(service, BTreeSet::from([isolated.clone()])));
+    }
+    case_report("body_only_edit", notes, &samples)
+}
+
+/// Editing which note an outgoing reference targets: exactly one reference
+/// (the source's own) is re-resolved.
+fn case_outgoing_reference_edit(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let target_a = write_note_body(vault_root, "Bench-OutgoingTargetA.md", "# A\n");
+    let target_b = write_note_body(vault_root, "Bench-OutgoingTargetB.md", "# B\n");
+    let source = write_note_body(
+        vault_root,
+        "Bench-OutgoingSource.md",
+        "[[Bench-OutgoingTargetA]]\n",
+    );
+    seed(service, [target_a, target_b, source.clone()]);
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let body = toggle_body(
+            vault_root,
+            "Bench-OutgoingSource.md",
+            "[[Bench-OutgoingTargetA]]\n",
+            "[[Bench-OutgoingTargetB]]\n",
+        );
+        write_note_body(vault_root, "Bench-OutgoingSource.md", &body);
+        samples.push(measure(service, BTreeSet::from([source.clone()])));
+    }
+    case_report("outgoing_reference_edit", notes, &samples)
+}
+
+/// Adding and removing a heading under a fan-out of `fanout` subpath
+/// references, at labels `0`, `10`, `100`, and `high` (1,000): every
+/// referencing note's incoming reference must be re-resolved each toggle.
+fn case_heading_fanout(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+    label: &str,
+    fanout: usize,
+) -> CaseReport {
+    let hub_rel = format!("Bench-Hub-{label}.md");
+    let hub = write_note_body(vault_root, &hub_rel, "## Shared\nhub body\n");
+    let mut seed_paths = vec![hub.clone()];
+    for index in 0..fanout {
+        let rel = format!("Bench-FanIn-{label}-{index:04}.md");
+        let body = format!("[[Bench-Hub-{label}#Shared]]\n");
+        seed_paths.push(write_note_body(vault_root, &rel, &body));
+    }
+    seed(service, seed_paths);
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let body = toggle_body(vault_root, &hub_rel, "## Shared\nhub body\n", "hub body\n");
+        write_note_body(vault_root, &hub_rel, &body);
+        samples.push(measure(service, BTreeSet::from([hub.clone()])));
+    }
+    case_report(&format!("heading_fanout_{label}"), notes, &samples)
+}
+
+/// The appearance of the first nested spelling of an otherwise-unused stem
+/// resolves a bare-filename reference from `Unresolved` to `Resolved`
+/// against a single candidate; a second nested spelling then makes the same
+/// reference `Ambiguous`; deleting each nested spelling again walks both
+/// transitions backward. Neither nested path is ever an exact match for the
+/// reference's own bare spelling, so no candidate ever wins by exact path —
+/// the same three-way pattern `tests/live_oracle.rs`'s `SLOTS` fixture uses.
+fn case_filename_resolution_transitions(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> Vec<CaseReport> {
+    let source = write_note_body(
+        vault_root,
+        "Bench-Filename-Source.md",
+        "[[Bench-Filename-Target]]\n",
+    );
+    seed(service, [source]);
+
+    let candidate_a_rel = "Bench-Dir1/Bench-Filename-Target.md";
+    let candidate_a = VaultPath::new(candidate_a_rel).expect("valid vault path");
+    let candidate_b_rel = "Bench-Dir2/Bench-Filename-Target.md";
+    let candidate_b = VaultPath::new(candidate_b_rel).expect("valid vault path");
+
+    let reset_absent =
+        |vault_root: &Path, service: &mut IndexService, rel: &str, path: &VaultPath| {
+            if vault_root.join(rel).exists() {
+                remove_note(vault_root, rel);
+                service
+                    .refresh_paths(BTreeSet::from([path.clone()]), ChangeCause::Manual)
+                    .expect("reset fixture to absent");
+            }
+        };
+    let reset_present =
+        |vault_root: &Path, service: &mut IndexService, rel: &str, path: &VaultPath| {
+            if !vault_root.join(rel).exists() {
+                write_note_body(vault_root, rel, "# Target\n");
+                service
+                    .refresh_paths(BTreeSet::from([path.clone()]), ChangeCause::Manual)
+                    .expect("reset fixture to present");
+            }
+        };
+
+    let mut unresolved_to_resolved = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        reset_absent(vault_root, service, candidate_a_rel, &candidate_a);
+        write_note_body(vault_root, candidate_a_rel, "# Target\n");
+        unresolved_to_resolved.push(measure(service, BTreeSet::from([candidate_a.clone()])));
+    }
+
+    let mut resolved_to_ambiguous = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        reset_absent(vault_root, service, candidate_b_rel, &candidate_b);
+        write_note_body(vault_root, candidate_b_rel, "# Target\n");
+        resolved_to_ambiguous.push(measure(service, BTreeSet::from([candidate_b.clone()])));
+    }
+
+    let mut delete_reversals = Vec::with_capacity(repeats * 2);
+    for _ in 0..repeats {
+        reset_present(vault_root, service, candidate_b_rel, &candidate_b);
+        remove_note(vault_root, candidate_b_rel);
+        delete_reversals.push(measure(service, BTreeSet::from([candidate_b.clone()])));
+
+        reset_present(vault_root, service, candidate_a_rel, &candidate_a);
+        remove_note(vault_root, candidate_a_rel);
+        delete_reversals.push(measure(service, BTreeSet::from([candidate_a.clone()])));
+    }
+
+    vec![
+        case_report("unresolved_to_resolved", notes, &unresolved_to_resolved),
+        case_report("resolved_to_ambiguous", notes, &resolved_to_ambiguous),
+        case_report("delete_reversals", notes, &delete_reversals),
+    ]
+}
+
+/// A rename delivered as one coalesced batch: the old path deleted and the
+/// new path created in the same `refresh_paths` call, exactly as the
+/// runtime coordinator batches a paired watcher hint.
+fn case_rename(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let first_rel = "Bench-Rename-A.md";
+    let second_rel = "Bench-Rename-B.md";
+    write_note_body(vault_root, first_rel, "# Rename\nbody\n");
+    seed(
+        service,
+        [VaultPath::new(first_rel).expect("valid vault path")],
+    );
+
+    let mut current_rel = first_rel;
+    let mut other_rel = second_rel;
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let body =
+            std::fs::read_to_string(vault_root.join(current_rel)).expect("read rename source");
+        remove_note(vault_root, current_rel);
+        write_note_body(vault_root, other_rel, &body);
+        let old = VaultPath::new(current_rel).expect("valid vault path");
+        let new = VaultPath::new(other_rel).expect("valid vault path");
+        samples.push(measure(service, BTreeSet::from([old, new])));
+        std::mem::swap(&mut current_rel, &mut other_rel);
+    }
+    case_report("rename", notes, &samples)
+}
+
+/// One hundred notes changed in a single batch, as a debounced burst of
+/// editor saves would arrive.
+fn case_burst_100_notes(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let burst_count = notes.min(100);
+    let burst_paths: Vec<VaultPath> = (0..burst_count)
+        .map(|index| VaultPath::new(format!("Note-{index:06}.md")).expect("valid vault path"))
+        .collect();
+    let mut samples = Vec::with_capacity(repeats);
+    for repeat in 0..repeats {
+        for (index, path) in burst_paths.iter().enumerate() {
+            let mut body = synthetic_note(index, notes);
+            if repeat % 2 == 0 {
+                body.push_str("\nBurst variant\n");
+            }
+            std::fs::write(vault_root.join(path.as_str()), body).expect("write burst note");
+        }
+        samples.push(measure(service, burst_paths.iter().cloned().collect()));
+    }
+    // Restore, so the burst leaves no lingering variant behind for whatever
+    // runs next.
+    for (index, path) in burst_paths.iter().enumerate() {
+        std::fs::write(vault_root.join(path.as_str()), synthetic_note(index, notes))
+            .expect("restore burst note");
+    }
+    service
+        .refresh_paths(burst_paths.into_iter().collect(), ChangeCause::Manual)
+        .expect("settle burst notes");
+    case_report("burst_100_notes", notes, &samples)
+}
+
+/// Forces the internal complete-resolution fallback inside `refresh_paths`
+/// (`select_impact`'s selected-count threshold, the same branch
+/// `set_complete_resolution_threshold_for_test` exists to make reachable
+/// without a ten-thousand-reference vault) by lowering the threshold to 1
+/// and reusing the 10-fan-in heading hub.
+///
+/// This is **not** the runtime's watcher-overflow full reconciliation (a
+/// separate, whole-vault code path in `vault-server`'s coordinator, exercised
+/// by `vault-live-bench`'s runtime-level cases) — it is the internal
+/// resolution-scope fallback the design calls out under "Large or uncertain
+/// changes". Named to match the brief's case list; the distinction is
+/// disclosed here and in the performance report for benchmark honesty.
+fn case_complete_fallback(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    service.set_complete_resolution_threshold_for_test(1);
+    let hub_rel = "Bench-Hub-10.md";
+    let hub = VaultPath::new(hub_rel).expect("valid vault path");
+    let mut samples = Vec::with_capacity(repeats);
+    let mut every_attempt_forced_complete = true;
+    for _ in 0..repeats {
+        let body = toggle_body(vault_root, hub_rel, "## Shared\nhub body\n", "hub body\n");
+        write_note_body(vault_root, hub_rel, &body);
+        let start = Instant::now();
+        let report = service
+            .refresh_paths(BTreeSet::from([hub.clone()]), ChangeCause::Manual)
+            .expect("refresh_paths");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        every_attempt_forced_complete &= report.complete_resolution;
+        samples.push(CaseSample {
+            elapsed_ms,
+            metrics: report.metrics,
+            affected_references: report.affected_reference_count,
+        });
+    }
+    assert!(
+        every_attempt_forced_complete,
+        "the forced-threshold case never reached the complete-resolution fallback"
+    );
+    case_report("complete_fallback_after_overflow", notes, &samples)
+}
+
+/// Hydrating the compact live graph from SQLite: no source body is read.
+/// Run last, so its `peak_rss_bytes` — the largest working-set moment in
+/// this process — is the figure compared against the design's 512 MiB
+/// target.
+fn case_compact_graph_hydration(
+    service: &IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let start = Instant::now();
+        let graph = service.hydrate_live_graph().expect("hydrate live graph");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        samples.push(CaseSample {
+            elapsed_ms,
+            metrics: ReconcileMetrics::default(),
+            affected_references: graph.reference_count() as u64,
+        });
+    }
+    case_report("compact_graph_hydration", notes, &samples)
+}
+
+fn run_live_cases(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> Vec<CaseReport> {
+    let mut cases = Vec::new();
+    cases.push(case_body_only_edit(vault_root, service, notes, repeats));
+    cases.push(case_outgoing_reference_edit(
+        vault_root, service, notes, repeats,
+    ));
+    for (label, fanout) in [("0", 0usize), ("10", 10), ("100", 100), ("high", 1_000)] {
+        cases.push(case_heading_fanout(
+            vault_root, service, notes, repeats, label, fanout,
+        ));
+    }
+    cases.extend(case_filename_resolution_transitions(
+        vault_root, service, notes, repeats,
+    ));
+    cases.push(case_rename(vault_root, service, notes, repeats));
+    cases.push(case_burst_100_notes(vault_root, service, notes, repeats));
+    cases.push(case_complete_fallback(vault_root, service, notes, repeats));
+    cases.push(case_compact_graph_hydration(service, notes, repeats));
+    cases
+}
+
 fn main() {
     let args = Args::parse();
     assert!(args.notes > 0, "--notes must be greater than zero");
@@ -388,6 +860,16 @@ fn main() {
         }));
     }
 
+    let live_cases = if args.live && mode == "synthetic" {
+        eprintln!("measuring live-incremental cases...");
+        run_live_cases(&vault_root, &mut service, args.notes, args.repeats)
+    } else {
+        if args.live {
+            eprintln!("real-vault mode performs no source writes; live cases are skipped");
+        }
+        Vec::new()
+    };
+
     let note_count = usize::try_from(service.vault_info().expect("vault info").note_count)
         .expect("note count fits usize");
     let report = BenchmarkReport {
@@ -416,6 +898,7 @@ fn main() {
             warm_startup: stage_distributions(&warm_metrics),
             one_file_refresh: stage_distributions(&one_file_metrics),
         },
+        live_cases,
     };
     println!(
         "{}",

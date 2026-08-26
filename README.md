@@ -43,7 +43,9 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 - every queue is bounded and every overflow degrades into a `resync_required` marker rather than into silence: the registry enforces **bounded per-subscriber** queues of 64 events (`subscriber_lag`) and 1024 paths of change-set detail per generation (`oversized_change_set`);
 - reconciliation is never stalled by a client — the coordinator offers notices without ever waiting and drops what will not fit, so a client that stops reading its own stdout meets backpressure and is later told `resync_required { runtime_recovered }`, rather than slowing indexing or losing a change. Subscriptions on one connection share a writer, though, so such a client does delay its peers on that connection until it resumes.
 
-See `docs/protocol.md`.
+10,000- and 100,000-note synthetic benchmarks, structural work proofs, and an honest comparison against the design's timing targets are in `docs/performance/live-incremental-baseline.md`. The recommended next milestone is the MCP and CLI consumer surface over these now-stable read and event contracts.
+
+See `docs/protocol.md` and `docs/design/live-incremental-runtime.md`.
 
 ### Completed: persistent index and daemon read API
 
