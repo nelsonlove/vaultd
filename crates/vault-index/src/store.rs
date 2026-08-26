@@ -383,52 +383,7 @@ impl IndexStore {
         &self,
         path: &VaultPath,
     ) -> Result<Vec<ResolvedReference>, IndexError> {
-        let mut statement = self.connection.prepare(
-            "SELECT r.id, r.kind, r.origin, r.raw_target, r.file_target, r.subpath_kind, \
-                    r.subpath_value, r.display, r.span_start, r.span_end, \
-                    r.target_span_start, r.target_span_end, \
-                    s.kind, s.target_path, s.subpath_kind, s.subpath_value \
-             FROM note_references r JOIN resolutions s ON s.reference_id = r.id \
-             WHERE r.note_path = ?1 ORDER BY r.ordinal",
-        )?;
-        let rows = statement
-            .query_map(params![path.as_str()], reference_row_prefix)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|row| self.resolved_reference_from_row(path.clone(), row))
-            .collect()
-    }
-
-    pub(crate) fn resolved_reference_from_row(
-        &self,
-        source: VaultPath,
-        row: ReferenceRow,
-    ) -> Result<ResolvedReference, IndexError> {
-        let candidates = if row.resolution_kind == "ambiguous" {
-            let mut statement = self.connection.prepare(
-                "SELECT candidate_path FROM resolution_candidates \
-                 WHERE reference_id = ?1 ORDER BY ordinal",
-            )?;
-            statement
-                .query_map(params![row.id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
-        let reference = decode_reference(&row)?;
-        let resolution = codec::decode_resolution(
-            &row.resolution_kind,
-            row.resolution_target.as_deref(),
-            row.resolution_subpath_kind.as_deref(),
-            row.resolution_subpath_value.as_deref(),
-            candidates,
-        )?;
-        Ok(ResolvedReference {
-            source,
-            source_span: reference.span,
-            reference,
-            resolution,
-        })
+        load_outgoing_with(&self.connection, path)
     }
 
     pub(crate) fn current_generation(&self) -> Result<Option<Generation>, IndexError> {
@@ -440,6 +395,10 @@ impl IndexStore {
         value.map(Generation::from_db).transpose()
     }
 
+    /// Test-only since the live graph became the resolution catalog's
+    /// source: production resolution answers now come from the published
+    /// `LiveGraph`, never from a SQL catalog rebuild.
+    #[cfg(test)]
     pub(crate) fn stored_paths(&self) -> Result<Vec<VaultPath>, IndexError> {
         let mut statement = self
             .connection
@@ -451,7 +410,9 @@ impl IndexStore {
     }
 
     /// Load the lightweight resolution inputs (path, heading texts, block
-    /// identifiers) without touching source bytes.
+    /// identifiers) without touching source bytes. Test-only: see
+    /// `stored_paths`.
+    #[cfg(test)]
     pub(crate) fn load_resolution_catalog(
         &self,
     ) -> Result<Vec<vault_core::ResolutionNote>, IndexError> {
@@ -816,7 +777,62 @@ fn load_diagnostic_rows(connection: &Connection, sql: &str) -> Result<Vec<Diagno
         .collect()
 }
 
-fn load_note_with(
+/// `path`'s outgoing references against an arbitrary connection — the
+/// writer's own, or a reader's transaction (`&Transaction` derefs to
+/// `&Connection`), so both sides run byte-identical SQL.
+pub(crate) fn load_outgoing_with(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Vec<ResolvedReference>, IndexError> {
+    let mut statement = connection.prepare(
+        "SELECT r.id, r.kind, r.origin, r.raw_target, r.file_target, r.subpath_kind, \
+                r.subpath_value, r.display, r.span_start, r.span_end, \
+                r.target_span_start, r.target_span_end, \
+                s.kind, s.target_path, s.subpath_kind, s.subpath_value \
+         FROM note_references r JOIN resolutions s ON s.reference_id = r.id \
+         WHERE r.note_path = ?1 ORDER BY r.ordinal",
+    )?;
+    let rows = statement
+        .query_map(params![path.as_str()], reference_row_prefix)?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|row| resolved_reference_from_row_with(connection, path.clone(), row))
+        .collect()
+}
+
+pub(crate) fn resolved_reference_from_row_with(
+    connection: &Connection,
+    source: VaultPath,
+    row: ReferenceRow,
+) -> Result<ResolvedReference, IndexError> {
+    let candidates = if row.resolution_kind == "ambiguous" {
+        let mut statement = connection.prepare(
+            "SELECT candidate_path FROM resolution_candidates \
+             WHERE reference_id = ?1 ORDER BY ordinal",
+        )?;
+        statement
+            .query_map(params![row.id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let reference = decode_reference(&row)?;
+    let resolution = codec::decode_resolution(
+        &row.resolution_kind,
+        row.resolution_target.as_deref(),
+        row.resolution_subpath_kind.as_deref(),
+        row.resolution_subpath_value.as_deref(),
+        candidates,
+    )?;
+    Ok(ResolvedReference {
+        source,
+        source_span: reference.span,
+        reference,
+        resolution,
+    })
+}
+
+pub(crate) fn load_note_with(
     connection: &Connection,
     path: &VaultPath,
 ) -> Result<Option<ParsedNote>, IndexError> {

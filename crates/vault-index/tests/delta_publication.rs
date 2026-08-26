@@ -308,6 +308,13 @@ fn a_concurrent_generation_advance_yields_generation_changed_with_no_committed_r
         fixture.reference_storage_identity("Stable.md", 0),
         before_stable
     );
+    // The raw connection's bump is a foreign publication: adopt it before
+    // reading, or this service's readers refuse to answer for a generation
+    // they never installed live state for.
+    fixture
+        .service
+        .resync_published()
+        .expect("adopt the foreign generation");
     let changed_note = fixture
         .service
         .get_note(&changed_path)

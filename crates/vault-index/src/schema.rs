@@ -128,6 +128,53 @@ fn try_open(config: &IndexConfig) -> Result<Connection, OpenIssue> {
     Ok(connection)
 }
 
+/// Open a query-only handle on an existing cache.
+///
+/// Unlike `open_connection` this never creates, initializes, rebuilds, or
+/// deletes anything: a missing, corrupt, obsolete, or foreign cache is an
+/// error, because a reader has no authority to decide a cache's fate. The
+/// handle is opened read/write at the OS level (WAL readers must be able to
+/// write the `-shm` index) but is pinned `query_only`, so no statement
+/// issued through it can modify the database.
+pub(crate) fn open_reader(config: &IndexConfig) -> Result<Connection, IndexError> {
+    let connection = Connection::open_with_flags(
+        &config.index_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| IndexError::Storage(error.to_string()))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+
+    let user_version: u32 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !has_metadata_table(&connection)? {
+        return Err(IndexError::IncompatibleIndex(
+            "index database has no metadata table".into(),
+        ));
+    }
+    let (semantic_version, identity): (u32, String) = connection.query_row(
+        "SELECT semantic_format_version, vault_identity FROM index_metadata WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if identity != config.vault_identity {
+        return Err(IndexError::IncompatibleIndex(
+            "index belongs to another vault".into(),
+        ));
+    }
+    if user_version != SQL_SCHEMA_VERSION || semantic_version != SEMANTIC_FORMAT_VERSION {
+        return Err(IndexError::IncompatibleIndex(format!(
+            "index is at SQL version {user_version} semantic version {semantic_version}, \
+             expected {SQL_SCHEMA_VERSION}/{SEMANTIC_FORMAT_VERSION}"
+        )));
+    }
+
+    // Last, so the validation reads above still run against a database that
+    // needs no recovery: from here on the handle cannot write at all.
+    connection.pragma_update(None, "query_only", "ON")?;
+    Ok(connection)
+}
+
 fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;

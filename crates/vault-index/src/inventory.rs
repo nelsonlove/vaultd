@@ -21,7 +21,9 @@ pub struct InventorySnapshot {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub trait ReconcileSource {
+/// `Send`, because the writer that owns a source is moved onto the runtime's
+/// own thread while readers answer from another.
+pub trait ReconcileSource: Send {
     fn canonical_root(&self) -> &Path;
     fn inventory(&self) -> Result<InventorySnapshot, IndexError>;
     fn read_bytes(&self, path: &VaultPath) -> Result<Vec<u8>, ScanError>;

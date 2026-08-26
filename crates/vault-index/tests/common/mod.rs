@@ -198,6 +198,14 @@ impl FixtureService {
             })
             .expect("publish delta");
         drop(store);
+        // The delta was published through a store handle the fixture's
+        // service does not own, so the service's published state is a
+        // generation behind — exactly the case `resync_published` exists
+        // for. Without it the service's readers would (correctly) refuse to
+        // answer from rows whose live state they never installed.
+        self.service
+            .resync_published()
+            .expect("resync after an out-of-band delta");
         self.scan = scan;
         outcome
     }
@@ -483,7 +491,7 @@ pub fn service_with_injected_refresh_failure() -> FailingService {
 
 struct RaceOnInventorySource {
     inner: FileSystemIndexSource,
-    hook: std::cell::RefCell<Option<Box<dyn FnMut()>>>,
+    hook: std::cell::RefCell<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl ReconcileSource for RaceOnInventorySource {

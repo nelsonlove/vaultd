@@ -1,0 +1,530 @@
+//! Generation-consistent reads: a reader answers entirely from one
+//! published generation, and a publication becomes client-visible only once
+//! its SQLite rows AND its live graph are both in place.
+
+mod common;
+
+use std::sync::{Arc, Barrier, mpsc};
+use std::thread;
+use std::time::Duration;
+
+use tempfile::TempDir;
+use vault_core::{Resolution, Resolver, VaultPath};
+use vault_index::{IndexConfig, IndexError, IndexService, LiveState};
+
+/// A privately-owned vault plus its service, with the service held in an
+/// `Option` so a test can move it onto a writer thread and take it back.
+struct LiveFixture {
+    service: Option<IndexService>,
+    config: IndexConfig,
+    vault: TempDir,
+    _index_dir: TempDir,
+}
+
+impl LiveFixture {
+    fn service(&mut self) -> &mut IndexService {
+        self.service.as_mut().expect("service is on this thread")
+    }
+
+    fn take_service(&mut self) -> IndexService {
+        self.service.take().expect("service is on this thread")
+    }
+
+    fn write_note(&self, name: &str, body: &str) {
+        std::fs::write(self.vault.path().join(name), body).expect("write note");
+    }
+}
+
+/// `Source.md -> [[Target]]` plus two standalone notes: enough for a
+/// resolution answer to exist, and for a body edit to change exactly one
+/// note's revision.
+fn live_fixture() -> LiveFixture {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index_dir = TempDir::new().expect("index tempdir");
+    std::fs::write(vault.path().join("Source.md"), "# Source\n[[Target]]\n").expect("write Source");
+    std::fs::write(vault.path().join("Target.md"), "# Target\n").expect("write Target");
+    std::fs::write(vault.path().join("Other.md"), "# Other\n").expect("write Other");
+
+    let config = IndexConfig::explicit(vault.path(), index_dir.path().join("index.sqlite3"))
+        .expect("live fixture config");
+    let service = IndexService::open(config.clone()).expect("live fixture service");
+    LiveFixture {
+        service: Some(service),
+        config,
+        vault,
+        _index_dir: index_dir,
+    }
+}
+
+fn source_path() -> VaultPath {
+    VaultPath::new("Source.md").expect("valid path")
+}
+
+/// Two rendezvous points around one publication: `reached` releases the test
+/// once the writer is paused between its SQLite commit and its live-state
+/// installation, and `release` lets the writer finish.
+fn pause_pair() -> (Arc<Barrier>, Arc<Barrier>, vault_index::PauseHook) {
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_reached = Arc::clone(&reached);
+    let hook_release = Arc::clone(&release);
+    let hook: vault_index::PauseHook = Arc::new(move || {
+        hook_reached.wait();
+        hook_release.wait();
+    });
+    (reached, release, hook)
+}
+
+#[test]
+fn a_read_started_during_publication_waits_for_the_whole_publication() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let old_generation = fixture
+        .service()
+        .current_generation()
+        .expect("generation")
+        .expect("cold build published a generation");
+
+    let reader = Arc::new(fixture.service().reader().expect("reader"));
+    let old_read = reader.get_note(&source_path()).expect("old read");
+    assert_eq!(old_read.generation.get(), old_generation.get());
+
+    fixture.write_note("Source.md", "# Source changed\n[[Target]]\n");
+    let (reached, release, hook) = pause_pair();
+    fixture.service().pause_publication_for_test(hook);
+
+    let mut service = fixture.take_service();
+    let writer = thread::spawn(move || {
+        service.refresh(false).expect("warm publish");
+        service
+    });
+
+    // The writer is now holding the publication barrier: its rows are
+    // committed, its live graph is not installed yet.
+    reached.wait();
+
+    let (finished, blocked_read) = mpsc::channel();
+    let reading = Arc::clone(&reader);
+    let blocked = thread::spawn(move || {
+        let read = reading.get_note(&source_path());
+        finished.send(()).ok();
+        read
+    });
+    assert!(
+        blocked_read
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "a read must not observe a generation whose live state is not installed yet"
+    );
+
+    release.wait();
+    let new_read = blocked.join().expect("reader thread").expect("new read");
+    fixture.service = Some(writer.join().expect("writer thread"));
+
+    assert_eq!(new_read.generation.get(), old_generation.get() + 1);
+    assert_ne!(
+        old_read.note.source.revision().as_str(),
+        new_read.note.source.revision().as_str()
+    );
+}
+
+#[test]
+fn a_read_started_before_the_writer_acquires_the_barrier_finishes_at_the_old_generation() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let old_generation = fixture
+        .service()
+        .current_generation()
+        .expect("generation")
+        .expect("cold build published a generation");
+    let old_revision = fixture
+        .service()
+        .get_note(&source_path())
+        .expect("old note")
+        .note
+        .source
+        .revision()
+        .as_str()
+        .to_string();
+
+    let (reached, release, hook) = pause_pair();
+    let mut reader = fixture.service().reader().expect("reader");
+    reader.pause_reads_for_test(hook);
+    let reader = Arc::new(reader);
+
+    let reading = Arc::clone(&reader);
+    let read = thread::spawn(move || reading.get_note(&source_path()));
+
+    // The read now holds the publication barrier, before the writer has
+    // asked for it.
+    reached.wait();
+
+    fixture.write_note("Source.md", "# Source changed\n[[Target]]\n");
+    let mut service = fixture.take_service();
+    let writer = thread::spawn(move || {
+        service.refresh(false).expect("warm publish");
+        service
+    });
+    // Give the writer every chance to reach (and block on) the barrier.
+    thread::sleep(Duration::from_millis(150));
+
+    release.wait();
+    let old_read = read.join().expect("reader thread").expect("old read");
+    fixture.service = Some(writer.join().expect("writer thread"));
+
+    assert_eq!(old_read.generation.get(), old_generation.get());
+    assert_eq!(old_read.note.source.revision().as_str(), old_revision);
+    assert_eq!(
+        fixture
+            .service()
+            .current_generation()
+            .expect("generation")
+            .expect("published"),
+        vault_index::Generation::new(old_generation.get() + 1)
+    );
+}
+
+#[test]
+fn opening_a_reader_never_creates_a_cache() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index_dir = TempDir::new().expect("index tempdir");
+    std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
+    let index_path = index_dir.path().join("absent.sqlite3");
+    let config = IndexConfig::explicit(vault.path(), &index_path).expect("config");
+
+    let error = vault_index::open_reader_for_test(&config).expect_err("no cache to open");
+    assert!(
+        matches!(
+            error,
+            IndexError::Storage(_) | IndexError::IncompatibleIndex(_)
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        !index_path.exists(),
+        "opening a reader must never create a cache file"
+    );
+}
+
+#[test]
+fn a_reader_connection_refuses_writes() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+
+    let connection = vault_index::open_reader_for_test(&fixture.config).expect("reader connection");
+    let error = connection
+        .execute("DELETE FROM notes", [])
+        .expect_err("a reader connection must refuse writes");
+    assert!(
+        error.to_string().to_lowercase().contains("readonly"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn the_published_graph_resolves_exactly_like_a_fresh_hydration() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    fixture.write_note("Ambiguous.md", "[[Target]]\n[[Missing]]\n");
+    fixture.service().refresh(false).expect("warm publish");
+
+    let hydrated = fixture.service().hydrate_live_graph().expect("hydrate");
+    let catalog: Vec<vault_core::ResolutionNote> = hydrated
+        .note_paths()
+        .into_iter()
+        .map(|path| {
+            let note = hydrated.note(&path).expect("hydrated note");
+            vault_core::ResolutionNote {
+                path,
+                headings: note.headings,
+                blocks: note.blocks,
+            }
+        })
+        .collect();
+    let expected = Resolver::from_catalog(catalog);
+
+    let reader = fixture.service().reader().expect("reader");
+    for destination in ["Target", "Missing", "Other", "Target#Target", "Source"] {
+        let (generation, resolution) = reader
+            .resolve_link(&source_path(), destination)
+            .expect("resolve link");
+        assert_eq!(generation.get(), 2);
+        assert_eq!(
+            resolution,
+            expected.resolve_target(&source_path(), &vault_core::LinkTarget::parse(destination)),
+            "published graph disagreed with a fresh hydration for {destination}"
+        );
+    }
+}
+
+#[test]
+fn a_delta_publication_advances_rows_and_live_graph_together() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let reader = fixture.service().reader().expect("reader");
+    let expected = fixture
+        .service()
+        .current_generation()
+        .expect("generation")
+        .expect("cold build published a generation");
+
+    // A brand-new note, published as a delta: its row must appear, and the
+    // published live graph must start offering it as a resolution target.
+    let path = VaultPath::new("New.md").expect("valid path");
+    let note = vault_core::parse_note(vault_core::SourceDocument::new(
+        path.clone(),
+        "# New\n".to_string(),
+    ));
+    let notes = vec![vault_index::NoteReplacement {
+        note,
+        fingerprint: vault_index::FileFingerprint {
+            size: 6,
+            modified_seconds: 1,
+            modified_nanos: 0,
+        },
+    }];
+    let graph_notes = vec![vault_index::HydratedNote {
+        path: path.clone(),
+        headings: vec!["New".to_string()],
+        blocks: Vec::new(),
+    }];
+
+    assert!(matches!(
+        reader
+            .resolve_link(&source_path(), "New")
+            .expect("resolve before"),
+        (_, Resolution::Unresolved)
+    ));
+
+    let outcome = fixture
+        .service()
+        .publish_delta(
+            vault_index::DeltaPublication {
+                expected,
+                notes: &notes,
+                deleted: &[],
+                fingerprint_updates: &[],
+                resolutions: &[],
+                scan_diagnostics: None,
+            },
+            &graph_notes,
+            &[],
+            &[],
+        )
+        .expect("publish delta");
+    let generation = match outcome {
+        vault_index::DeltaPublishOutcome::Committed { generation, .. } => generation,
+        other => panic!("expected a committed delta, got {other:?}"),
+    };
+    assert_eq!(generation.get(), expected.get() + 1);
+
+    let indexed = reader.get_note(&path).expect("delta row is readable");
+    assert_eq!(indexed.generation, generation);
+    let (resolved_generation, resolution) = reader
+        .resolve_link(&source_path(), "New")
+        .expect("resolve after");
+    assert_eq!(resolved_generation, generation);
+    assert!(
+        matches!(resolution, Resolution::Resolved { ref target, .. } if target == &path),
+        "the live graph installed with this generation must know the new note: {resolution:?}"
+    );
+}
+
+#[test]
+fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let reader = fixture.service().reader().expect("reader");
+    let stale = fixture
+        .service()
+        .current_generation()
+        .expect("generation")
+        .expect("cold build published a generation");
+
+    // Another writer moves the cache on between this service's last
+    // publication and its next one: the delta's `expected` still matches the
+    // published live graph, but no longer matches the stored generation.
+    let raw = rusqlite::Connection::open(&fixture.config.index_path).expect("raw open");
+    raw.execute(
+        "UPDATE index_metadata SET generation = generation + 1 WHERE singleton = 1",
+        [],
+    )
+    .expect("advance generation");
+    drop(raw);
+
+    let path = VaultPath::new("New.md").expect("valid path");
+    let note = vault_core::parse_note(vault_core::SourceDocument::new(
+        path.clone(),
+        "# New\n".to_string(),
+    ));
+    let notes = vec![vault_index::NoteReplacement {
+        note,
+        fingerprint: vault_index::FileFingerprint {
+            size: 6,
+            modified_seconds: 1,
+            modified_nanos: 0,
+        },
+    }];
+    let graph_notes = vec![vault_index::HydratedNote {
+        path: path.clone(),
+        headings: vec!["New".to_string()],
+        blocks: Vec::new(),
+    }];
+
+    let outcome = fixture
+        .service()
+        .publish_delta(
+            vault_index::DeltaPublication {
+                expected: stale,
+                notes: &notes,
+                deleted: &[],
+                fingerprint_updates: &[],
+                resolutions: &[],
+                scan_diagnostics: None,
+            },
+            &graph_notes,
+            &[],
+            &[],
+        )
+        .expect("publish delta");
+    assert!(matches!(
+        outcome,
+        vault_index::DeltaPublishOutcome::GenerationChanged
+    ));
+
+    // Neither half moved: the published state is still the generation this
+    // service published, and the live graph still does not know `New.md`.
+    assert_eq!(
+        reader
+            .published_state()
+            .expect("published state")
+            .generation,
+        Some(stale)
+    );
+    assert!(matches!(
+        reader
+            .resolve_link(&source_path(), "New")
+            .expect("resolve after"),
+        (_, Resolution::Unresolved)
+    ));
+
+    // And no row was written either — adopting the foreign generation makes
+    // the rows readable again, and `New.md` is not among them.
+    fixture
+        .service()
+        .resync_published()
+        .expect("adopt the foreign generation");
+    assert!(matches!(
+        reader.get_note(&path),
+        Err(IndexError::NoteNotFound(_))
+    ));
+}
+
+#[test]
+fn a_reader_sees_the_writers_live_state() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let reader = fixture.service().reader().expect("reader");
+
+    assert_eq!(
+        reader
+            .published_state()
+            .expect("published state")
+            .live_state,
+        LiveState::Starting
+    );
+
+    fixture
+        .service()
+        .set_live_state(LiveState::Watching)
+        .expect("set live state");
+    let state = reader.published_state().expect("published state");
+    assert_eq!(state.live_state, LiveState::Watching);
+    assert_eq!(state.runtime_error, None);
+    assert_eq!(
+        state.generation,
+        fixture.service().current_generation().expect("generation")
+    );
+
+    fixture
+        .service()
+        .set_runtime_error(Some("watcher fell back to polling".to_string()))
+        .expect("set runtime error");
+    assert_eq!(
+        reader
+            .published_state()
+            .expect("published state")
+            .runtime_error
+            .as_deref(),
+        Some("watcher fell back to polling")
+    );
+    // Neither call disturbed the published generation or its graph: reads
+    // still answer.
+    assert!(reader.get_note(&source_path()).is_ok());
+}
+
+#[test]
+fn a_reader_answers_before_the_first_publication_with_index_unavailable() {
+    let mut fixture = live_fixture();
+    let reader = fixture.service().reader().expect("reader");
+    assert!(matches!(
+        reader.get_note(&source_path()),
+        Err(IndexError::IndexUnavailable)
+    ));
+    assert!(matches!(
+        reader.resolve_link(&source_path(), "Target"),
+        Err(IndexError::IndexUnavailable)
+    ));
+}
+
+#[test]
+fn reader_queries_match_the_service_query_api() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let reader = fixture.service().reader().expect("reader");
+    let path = source_path();
+
+    assert_eq!(
+        reader.list_notes(None, None).expect("reader list"),
+        fixture.service().list_notes(None, None).expect("list")
+    );
+    assert_eq!(
+        reader.get_note(&path).expect("reader note"),
+        fixture.service().get_note(&path).expect("note")
+    );
+    assert_eq!(
+        reader
+            .get_backlinks(&VaultPath::new("Target.md").unwrap(), None, None)
+            .expect("reader backlinks"),
+        fixture
+            .service()
+            .get_backlinks(&VaultPath::new("Target.md").unwrap(), None, None)
+            .expect("backlinks")
+    );
+    assert_eq!(
+        reader
+            .list_references(None, None, None, None)
+            .expect("reader references"),
+        fixture
+            .service()
+            .list_references(None, None, None, None)
+            .expect("references")
+    );
+    assert_eq!(
+        reader
+            .get_diagnostics(None, None, None, None)
+            .expect("reader diagnostics"),
+        fixture
+            .service()
+            .get_diagnostics(None, None, None, None)
+            .expect("diagnostics")
+    );
+    assert_eq!(
+        reader.vault_info().expect("reader vault info"),
+        fixture.service().vault_info().expect("vault info")
+    );
+    assert!(matches!(
+        reader.resolve_link(&path, "Target").expect("resolve").1,
+        Resolution::Resolved { .. }
+    ));
+}

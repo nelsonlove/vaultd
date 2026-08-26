@@ -1,0 +1,198 @@
+//! Generation-consistent reads.
+//!
+//! An `IndexReader` owns its own query-only SQLite handle and a shared
+//! handle on the publication barrier. Every query runs the same sequence:
+//!
+//! 1. acquire the publication read guard;
+//! 2. lock the reader connection;
+//! 3. begin a SQLite read transaction;
+//! 4. read the generation inside that transaction;
+//! 5. require equality with the guard's generation;
+//! 6. run the complete query and drop the transaction;
+//! 7. release both locks.
+//!
+//! Steps 1 and 5 are what make a read generation-consistent. The barrier
+//! keeps the writer out for the whole read, so the rows cannot move under
+//! it; the equality check catches the one case the barrier cannot cover — a
+//! *different process* publishing into the same cache file — and refuses to
+//! answer rather than mixing a foreign generation's rows with this
+//! process's live graph.
+//!
+//! Lock order is always `publication barrier -> reader connection` and
+//! `publication barrier -> resolver cache`. The connection and resolver
+//! locks are leaves: neither is ever held while acquiring anything else,
+//! and the writer never takes either of them. Poisoning surfaces as
+//! `IndexError::Storage`; nothing here unwraps a lock.
+
+use std::sync::{Arc, Mutex, RwLockReadGuard, RwLockWriteGuard};
+
+use rusqlite::{Connection, Transaction};
+use vault_core::Resolver;
+
+use crate::config::IndexConfig;
+use crate::error::IndexError;
+use crate::model::{Generation, PublicationBarrier, PublishedState};
+
+/// A test-only rendezvous callback. Production code never installs one, so
+/// the only cost on a real read or publication is one `Option` check.
+#[doc(hidden)]
+pub type PauseHook = Arc<dyn Fn() + Send + Sync>;
+
+pub(crate) fn read_published(
+    barrier: &PublicationBarrier,
+) -> Result<RwLockReadGuard<'_, PublishedState>, IndexError> {
+    barrier
+        .read()
+        .map_err(|error| IndexError::Storage(format!("publication barrier is poisoned: {error}")))
+}
+
+pub(crate) fn write_published(
+    barrier: &PublicationBarrier,
+) -> Result<RwLockWriteGuard<'_, PublishedState>, IndexError> {
+    barrier
+        .write()
+        .map_err(|error| IndexError::Storage(format!("publication barrier is poisoned: {error}")))
+}
+
+const GENERATION_SQL: &str = "SELECT generation FROM index_metadata WHERE singleton = 1";
+
+/// A snapshot-consistent view of one published generation: query methods
+/// live in `query.rs`, the locking discipline lives here.
+pub struct IndexReader {
+    config: IndexConfig,
+    connection: Mutex<Connection>,
+    published: PublicationBarrier,
+    /// The resolver for the currently published generation, built once per
+    /// generation from the published live graph's own note identities. Not
+    /// shared with the writer: a reader that never resolves never builds
+    /// one.
+    resolver: Mutex<Option<(Generation, Arc<Resolver>)>>,
+    pause: Option<PauseHook>,
+}
+
+impl std::fmt::Debug for IndexReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexReader")
+            .field("index_path", &self.config.index_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndexReader {
+    pub(crate) fn open(
+        config: &IndexConfig,
+        published: PublicationBarrier,
+    ) -> Result<Self, IndexError> {
+        Ok(Self {
+            config: config.clone(),
+            connection: Mutex::new(crate::schema::open_reader(config)?),
+            published,
+            resolver: Mutex::new(None),
+            pause: None,
+        })
+    }
+
+    pub(crate) fn config(&self) -> &IndexConfig {
+        &self.config
+    }
+
+    /// A copy of the publication state as of this instant: the published
+    /// generation, the live graph installed with it, the runtime's live
+    /// state, and its last runtime error.
+    pub fn published_state(&self) -> Result<PublishedState, IndexError> {
+        Ok(read_published(&self.published)?.clone())
+    }
+
+    /// Pause every read this reader performs at step 1/2 — after the
+    /// publication read guard is held, before the connection is locked.
+    /// Test-only; the hook is what lets a test hold the barrier open while
+    /// a writer tries to publish.
+    #[doc(hidden)]
+    pub fn pause_reads_for_test(&mut self, hook: PauseHook) {
+        self.pause = Some(hook);
+    }
+
+    /// Run `query` against one published generation, following the seven
+    /// steps documented at the top of this module.
+    pub(crate) fn read<T>(
+        &self,
+        query: impl FnOnce(&Transaction<'_>, Generation) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
+        let published = read_published(&self.published)?;
+        let generation = published.generation.ok_or(IndexError::IndexUnavailable)?;
+        if let Some(hook) = &self.pause {
+            hook();
+        }
+
+        let connection = self.connection.lock().map_err(|error| {
+            IndexError::Storage(format!("reader connection is poisoned: {error}"))
+        })?;
+        // A deferred read transaction: its first read pins a WAL snapshot
+        // for every statement that follows, so the generation checked below
+        // is the generation the rest of the query reads from.
+        let transaction = connection.unchecked_transaction()?;
+        let stored: Option<i64> = transaction.query_row(GENERATION_SQL, [], |row| row.get(0))?;
+        let stored = stored.map(Generation::from_db).transpose()?;
+        if stored != Some(generation) {
+            return Err(IndexError::Storage(format!(
+                "stored generation {} does not match the published generation {}",
+                stored.map_or_else(|| "none".to_string(), |value| value.get().to_string()),
+                generation.get()
+            )));
+        }
+
+        let answer = query(&transaction, generation);
+        // Read-only: nothing to commit, and dropping rolls back a
+        // transaction that wrote nothing.
+        drop(transaction);
+        drop(connection);
+        drop(published);
+        answer
+    }
+
+    /// The resolver for the published generation, built from the published
+    /// live graph rather than from SQL.
+    ///
+    /// The graph `Arc` deliberately never escapes the read guard: the writer
+    /// installs a delta by mutating the published graph in place (which is
+    /// only possible while it is the sole owner), so a reader that kept a
+    /// clone alive would force the writer into a whole-graph copy. Building
+    /// the resolver under the guard costs one pass over the note identities,
+    /// once per generation per reader.
+    pub(crate) fn resolver(&self) -> Result<(Generation, Arc<Resolver>), IndexError> {
+        let published = read_published(&self.published)?;
+        let generation = published.generation.ok_or(IndexError::IndexUnavailable)?;
+        let mut cache = self
+            .resolver
+            .lock()
+            .map_err(|error| IndexError::Storage(format!("resolver cache is poisoned: {error}")))?;
+        if let Some((cached, resolver)) = cache.as_ref() {
+            if *cached == generation {
+                return Ok((generation, Arc::clone(resolver)));
+            }
+        }
+
+        let graph = published
+            .graph
+            .as_ref()
+            .ok_or(IndexError::IndexUnavailable)?;
+        if graph.generation() != generation {
+            return Err(IndexError::Storage(format!(
+                "published live graph is at generation {} but the published generation is {}",
+                graph.generation().get(),
+                generation.get()
+            )));
+        }
+        let catalog = graph.note_paths().into_iter().filter_map(|path| {
+            graph.note(&path).map(|note| vault_core::ResolutionNote {
+                path,
+                headings: note.headings,
+                blocks: note.blocks,
+            })
+        });
+        let resolver = Arc::new(Resolver::from_catalog(catalog));
+        *cache = Some((generation, Arc::clone(&resolver)));
+        Ok((generation, resolver))
+    }
+}

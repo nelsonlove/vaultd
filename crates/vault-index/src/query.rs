@@ -11,7 +11,9 @@ use crate::codec;
 use crate::cursor::{CursorPosition, decode_cursor, encode_cursor};
 use crate::error::IndexError;
 use crate::model::{Generation, IndexState};
+use crate::reader::IndexReader;
 use crate::reconcile::IndexService;
+use crate::store::{load_note_with, load_outgoing_with, resolved_reference_from_row_with};
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 1_000;
@@ -65,37 +67,41 @@ fn effective_limit(limit: Option<u32>) -> Result<u32, IndexError> {
     Ok(limit)
 }
 
-impl IndexService {
-    fn required_generation(&self) -> Result<Generation, IndexError> {
-        self.current_generation()?
-            .ok_or(IndexError::IndexUnavailable)
-    }
-
+impl IndexReader {
     pub fn vault_info(&self) -> Result<VaultInfo, IndexError> {
-        let generation = self.required_generation()?;
-        let state = self.state()?;
-        let note_count: i64 =
-            self.store
-                .connection
-                .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))?;
-        let refreshed_at: Option<i64> = self.store.connection.query_row(
-            "SELECT refreshed_at_unix_ms FROM index_metadata WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(VaultInfo {
-            canonical_root: self.config.canonical_vault_root.clone(),
-            vault_identity: self.config.vault_identity.clone(),
-            state,
-            generation,
-            note_count: u64::try_from(note_count)
-                .map_err(|_| IndexError::IncompatibleIndex("negative note count".into()))?,
-            refreshed_at_unix_ms: refreshed_at
-                .map(|value| {
-                    u64::try_from(value)
-                        .map_err(|_| IndexError::IncompatibleIndex("negative refresh time".into()))
-                })
-                .transpose()?,
+        let config = self.config();
+        self.read(|transaction, generation| {
+            let last_error: Option<String> = transaction.query_row(
+                "SELECT last_refresh_error FROM index_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let state = match last_error {
+                None => IndexState::Ready,
+                Some(last_error) => IndexState::Stale { last_error },
+            };
+            let note_count: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))?;
+            let refreshed_at: Option<i64> = transaction.query_row(
+                "SELECT refreshed_at_unix_ms FROM index_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(VaultInfo {
+                canonical_root: config.canonical_vault_root.clone(),
+                vault_identity: config.vault_identity.clone(),
+                state,
+                generation,
+                note_count: u64::try_from(note_count)
+                    .map_err(|_| IndexError::IncompatibleIndex("negative note count".into()))?,
+                refreshed_at_unix_ms: refreshed_at
+                    .map(|value| {
+                        u64::try_from(value).map_err(|_| {
+                            IndexError::IncompatibleIndex("negative refresh time".into())
+                        })
+                    })
+                    .transpose()?,
+            })
         })
     }
 
@@ -105,9 +111,18 @@ impl IndexService {
         limit: Option<u32>,
     ) -> Result<Page<NoteSummary>, IndexError> {
         let limit = effective_limit(limit)?;
-        let transaction = self.store.connection.unchecked_transaction()?;
-        let generation = self.required_generation()?;
+        self.read(|transaction, generation| {
+            self.list_notes_in(transaction, generation, cursor, limit)
+        })
+    }
 
+    fn list_notes_in(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        generation: Generation,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<NoteSummary>, IndexError> {
         let after = match cursor {
             None => None,
             Some(cursor) => match decode_cursor(cursor, generation, "list_notes")? {
@@ -186,35 +201,31 @@ impl IndexService {
     }
 
     pub fn get_note(&self, path: &VaultPath) -> Result<IndexedNote, IndexError> {
-        let transaction = self.store.connection.unchecked_transaction()?;
-        let generation = self.required_generation()?;
-        let note = self
-            .store
-            .load_note(path)?
-            .ok_or_else(|| IndexError::NoteNotFound(path.as_str().to_string()))?;
-        let outgoing = self.store.load_outgoing(path)?;
-        let diagnostics = diagnostics::note_diagnostics(&transaction, path.as_str())?;
+        self.read(|transaction, generation| {
+            let note = load_note_with(transaction, path)?
+                .ok_or_else(|| IndexError::NoteNotFound(path.as_str().to_string()))?;
+            let outgoing = load_outgoing_with(transaction, path)?;
+            let diagnostics = diagnostics::note_diagnostics(transaction, path.as_str())?;
 
-        Ok(IndexedNote {
-            generation,
-            note,
-            diagnostics,
-            outgoing,
+            Ok(IndexedNote {
+                generation,
+                note,
+                diagnostics,
+                outgoing,
+            })
         })
     }
 
+    /// Answered entirely from the published live graph — no SQLite at all.
+    /// The graph installed with a generation is by construction the graph
+    /// that generation's rows describe, so this needs neither the reader
+    /// connection nor `&mut self`.
     pub fn resolve_link(
-        &mut self,
+        &self,
         source: &VaultPath,
         destination: &str,
     ) -> Result<(Generation, Resolution), IndexError> {
-        let generation = self.required_generation()?;
-        self.reload_resolver(generation)?;
-        let (cached_generation, resolver) = self
-            .resolver
-            .as_ref()
-            .expect("reload_resolver always caches a resolver");
-        debug_assert_eq!(*cached_generation, generation);
+        let (generation, resolver) = self.resolver()?;
         let target = LinkTarget::parse(destination);
         Ok((generation, resolver.resolve_target(source, &target)))
     }
@@ -276,88 +287,19 @@ impl IndexService {
         limit: Option<u32>,
         query: &str,
         where_clause: &str,
-        mut arguments: Vec<Box<dyn rusqlite::ToSql>>,
+        arguments: Vec<Box<dyn rusqlite::ToSql>>,
     ) -> Result<Page<ResolvedReference>, IndexError> {
         let limit = effective_limit(limit)?;
-        let transaction = self.store.connection.unchecked_transaction()?;
-        let generation = self.required_generation()?;
-
-        let mut where_clause = where_clause.to_string();
-        if let Some(cursor) = cursor {
-            let CursorPosition::Reference {
-                source,
-                start,
-                end,
-                id,
-            } = decode_cursor(cursor, generation, query)?
-            else {
-                return Err(IndexError::InvalidCursor(
-                    "cursor position does not fit a reference listing".into(),
-                ));
-            };
-            arguments.push(Box::new(source));
-            let source_index = arguments.len();
-            arguments.push(Box::new(u64_to_i64_cursor(start)?));
-            let start_index = arguments.len();
-            arguments.push(Box::new(u64_to_i64_cursor(end)?));
-            let end_index = arguments.len();
-            arguments.push(Box::new(id));
-            let id_index = arguments.len();
-            where_clause.push_str(&format!(
-                " AND (r.note_path, r.span_start, r.span_end, r.id) > \
-                 (?{source_index}, ?{start_index}, ?{end_index}, ?{id_index})"
-            ));
-        }
-
-        let sql = format!(
-            "SELECT r.id, r.kind, r.origin, r.raw_target, r.file_target, r.subpath_kind, \
-                    r.subpath_value, r.display, r.span_start, r.span_end, \
-                    r.target_span_start, r.target_span_end, \
-                    s.kind, s.target_path, s.subpath_kind, s.subpath_value, r.note_path \
-             FROM resolutions s JOIN note_references r ON r.id = s.reference_id \
-             WHERE {where_clause} \
-             ORDER BY r.note_path, r.span_start, r.span_end, r.id LIMIT {}",
-            i64::from(limit) + 1
-        );
-        let mut statement = transaction.prepare(&sql)?;
-        let parameters: Vec<&dyn rusqlite::ToSql> =
-            arguments.iter().map(|argument| argument.as_ref()).collect();
-        let rows = statement
-            .query_map(parameters.as_slice(), |row| {
-                Ok((
-                    crate::store::reference_row_prefix(row)?,
-                    row.get::<_, String>(16)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut items = Vec::with_capacity(rows.len().min(limit as usize));
-        for (row, note_path) in rows.iter().take(limit as usize) {
-            let source = codec::decode_path(note_path)?;
-            items.push(
-                self.store
-                    .resolved_reference_from_row(source, row.clone())?,
-            );
-        }
-        let next_cursor = if rows.len() > limit as usize {
-            let (last_row, last_path) = &rows[items.len() - 1];
-            Some(encode_cursor(
+        self.read(|transaction, generation| {
+            reference_page_in(
+                transaction,
                 generation,
+                cursor,
+                limit,
                 query,
-                CursorPosition::Reference {
-                    source: last_path.clone(),
-                    start: i64_to_u64_cursor(last_row.span_start)?,
-                    end: i64_to_u64_cursor(last_row.span_end)?,
-                    id: last_row.id,
-                },
-            )?)
-        } else {
-            None
-        };
-        Ok(Page {
-            generation,
-            items,
-            next_cursor,
+                where_clause,
+                arguments,
+            )
         })
     }
 
@@ -369,38 +311,191 @@ impl IndexService {
         limit: Option<u32>,
     ) -> Result<Page<Diagnostic>, IndexError> {
         let limit = effective_limit(limit)?;
-        let transaction = self.store.connection.unchecked_transaction()?;
-        let generation = self.required_generation()?;
-        let query = format!(
-            "diagnostics:path={}:severity={}",
-            path.map(VaultPath::as_str).unwrap_or_default(),
-            severity.map(codec::encode_severity).unwrap_or_default()
-        );
+        self.read(|transaction, generation| {
+            let query = format!(
+                "diagnostics:path={}:severity={}",
+                path.map(VaultPath::as_str).unwrap_or_default(),
+                severity.map(codec::encode_severity).unwrap_or_default()
+            );
 
-        let after = match cursor {
-            None => None,
-            Some(cursor) => Some(decode_cursor(cursor, generation, &query)?),
-        };
+            let after = match cursor {
+                None => None,
+                Some(cursor) => Some(decode_cursor(cursor, generation, &query)?),
+            };
 
-        let page = diagnostics::diagnostic_page(
-            &transaction,
-            diagnostics::DiagnosticFilter {
-                path: path.map(VaultPath::as_str),
-                severity,
-            },
-            after,
-            limit,
-        )?;
+            let page = diagnostics::diagnostic_page(
+                transaction,
+                diagnostics::DiagnosticFilter {
+                    path: path.map(VaultPath::as_str),
+                    severity,
+                },
+                after,
+                limit,
+            )?;
 
-        let next_cursor = page
-            .next
-            .map(|position| encode_cursor(generation, &query, position))
-            .transpose()?;
-        Ok(Page {
-            generation,
-            items: page.items,
-            next_cursor,
+            let next_cursor = page
+                .next
+                .map(|position| encode_cursor(generation, &query, position))
+                .transpose()?;
+            Ok(Page {
+                generation,
+                items: page.items,
+                next_cursor,
+            })
         })
+    }
+}
+
+/// The paginated reference query itself, run inside a reader snapshot.
+#[allow(clippy::too_many_arguments)]
+fn reference_page_in(
+    transaction: &rusqlite::Transaction<'_>,
+    generation: Generation,
+    cursor: Option<&str>,
+    limit: u32,
+    query: &str,
+    where_clause: &str,
+    mut arguments: Vec<Box<dyn rusqlite::ToSql>>,
+) -> Result<Page<ResolvedReference>, IndexError> {
+    let mut where_clause = where_clause.to_string();
+    if let Some(cursor) = cursor {
+        let CursorPosition::Reference {
+            source,
+            start,
+            end,
+            id,
+        } = decode_cursor(cursor, generation, query)?
+        else {
+            return Err(IndexError::InvalidCursor(
+                "cursor position does not fit a reference listing".into(),
+            ));
+        };
+        arguments.push(Box::new(source));
+        let source_index = arguments.len();
+        arguments.push(Box::new(u64_to_i64_cursor(start)?));
+        let start_index = arguments.len();
+        arguments.push(Box::new(u64_to_i64_cursor(end)?));
+        let end_index = arguments.len();
+        arguments.push(Box::new(id));
+        let id_index = arguments.len();
+        where_clause.push_str(&format!(
+            " AND (r.note_path, r.span_start, r.span_end, r.id) > \
+             (?{source_index}, ?{start_index}, ?{end_index}, ?{id_index})"
+        ));
+    }
+
+    let sql = format!(
+        "SELECT r.id, r.kind, r.origin, r.raw_target, r.file_target, r.subpath_kind, \
+                r.subpath_value, r.display, r.span_start, r.span_end, \
+                r.target_span_start, r.target_span_end, \
+                s.kind, s.target_path, s.subpath_kind, s.subpath_value, r.note_path \
+         FROM resolutions s JOIN note_references r ON r.id = s.reference_id \
+         WHERE {where_clause} \
+         ORDER BY r.note_path, r.span_start, r.span_end, r.id LIMIT {}",
+        i64::from(limit) + 1
+    );
+    let mut statement = transaction.prepare(&sql)?;
+    let parameters: Vec<&dyn rusqlite::ToSql> =
+        arguments.iter().map(|argument| argument.as_ref()).collect();
+    let rows = statement
+        .query_map(parameters.as_slice(), |row| {
+            Ok((
+                crate::store::reference_row_prefix(row)?,
+                row.get::<_, String>(16)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut items = Vec::with_capacity(rows.len().min(limit as usize));
+    for (row, note_path) in rows.iter().take(limit as usize) {
+        let source = codec::decode_path(note_path)?;
+        items.push(resolved_reference_from_row_with(
+            transaction,
+            source,
+            row.clone(),
+        )?);
+    }
+    let next_cursor = if rows.len() > limit as usize {
+        let (last_row, last_path) = &rows[items.len() - 1];
+        Some(encode_cursor(
+            generation,
+            query,
+            CursorPosition::Reference {
+                source: last_path.clone(),
+                start: i64_to_u64_cursor(last_row.span_start)?,
+                end: i64_to_u64_cursor(last_row.span_end)?,
+                id: last_row.id,
+            },
+        )?)
+    } else {
+        None
+    };
+    Ok(Page {
+        generation,
+        items,
+        next_cursor,
+    })
+}
+
+/// Compatibility surface: the query API still hangs off `IndexService`, but
+/// every call is answered by the service's own `IndexReader` — the same
+/// barrier, the same generation check, the same query-only connection a
+/// server-owned reader uses. Nothing here reads through the writer's
+/// connection.
+impl IndexService {
+    pub fn vault_info(&self) -> Result<VaultInfo, IndexError> {
+        self.reader_handle().vault_info()
+    }
+
+    pub fn list_notes(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Page<NoteSummary>, IndexError> {
+        self.reader_handle().list_notes(cursor, limit)
+    }
+
+    pub fn get_note(&self, path: &VaultPath) -> Result<IndexedNote, IndexError> {
+        self.reader_handle().get_note(path)
+    }
+
+    pub fn resolve_link(
+        &self,
+        source: &VaultPath,
+        destination: &str,
+    ) -> Result<(Generation, Resolution), IndexError> {
+        self.reader_handle().resolve_link(source, destination)
+    }
+
+    pub fn get_backlinks(
+        &self,
+        path: &VaultPath,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Page<ResolvedReference>, IndexError> {
+        self.reader_handle().get_backlinks(path, cursor, limit)
+    }
+
+    pub fn list_references(
+        &self,
+        source: Option<&VaultPath>,
+        status: Option<ReferenceStatus>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Page<ResolvedReference>, IndexError> {
+        self.reader_handle()
+            .list_references(source, status, cursor, limit)
+    }
+
+    pub fn get_diagnostics(
+        &self,
+        path: Option<&VaultPath>,
+        severity: Option<vault_core::Severity>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Page<Diagnostic>, IndexError> {
+        self.reader_handle()
+            .get_diagnostics(path, severity, cursor, limit)
     }
 }
 

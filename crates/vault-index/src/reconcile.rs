@@ -1,18 +1,24 @@
 use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use vault_core::{
-    Diagnostic, DiagnosticCode, ParsedNote, Resolution, Resolver, ScanError, ScanReport, Severity,
-    SourceDocument, SourceError, VaultPath, build_graph, parse_note,
+    Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution, ScanError, ScanReport,
+    SemanticGraph, Severity, SourceDocument, SourceError, VaultPath, build_graph, parse_note,
 };
 
 use crate::config::IndexConfig;
 use crate::error::IndexError;
 use crate::inventory::{FileSystemIndexSource, InventorySnapshot, ReconcileSource};
-use crate::live_graph::LiveGraph;
+use crate::live_graph::{HydratedNote, HydratedReference, LiveGraph};
 use crate::metrics::ReconcileMetrics;
-use crate::model::{FileFingerprint, Generation, IndexState};
-use crate::store::{IndexStore, Publication, PublishOutcome};
+use crate::model::{
+    FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
+};
+use crate::reader::{IndexReader, PauseHook, write_published};
+use crate::store::{
+    DeltaPublication, DeltaPublishOutcome, IndexStore, Publication, PublishOutcome,
+};
 
 const MAX_RECONCILE_RETRIES: usize = 3;
 
@@ -28,13 +34,21 @@ pub struct RefreshReport {
     pub verified: bool,
 }
 
+/// The writer. Owns the vault source, the writer's SQLite connection, and
+/// the publication barrier; hands out `IndexReader`s that answer from
+/// whatever it has last published.
 pub struct IndexService {
-    // Read by vault_info in the query layer.
-    #[allow(dead_code)]
     pub(crate) config: IndexConfig,
     pub(crate) store: IndexStore,
     pub(crate) source: Box<dyn ReconcileSource>,
-    pub(crate) resolver: Option<(Generation, Resolver)>,
+    published: PublicationBarrier,
+    /// The service's own reader, backing the compatibility query methods in
+    /// `query.rs`. A separate query-only connection, exactly like one a
+    /// server would own — the writer's connection answers no queries.
+    reader: IndexReader,
+    /// Test-only pause between the SQLite commit and the live-state
+    /// installation, invoked while the publication write guard is held.
+    publication_pause: Option<PauseHook>,
     last_metrics: Option<ReconcileMetrics>,
 }
 
@@ -65,17 +79,59 @@ impl IndexService {
             )));
         }
         let store = IndexStore::open(&config)?;
+        let published: PublicationBarrier = Arc::new(RwLock::new(PublishedState::starting()));
+        seed_published(&store, &published)?;
+        let reader = IndexReader::open(&config, Arc::clone(&published))?;
         Ok(Self {
             config,
             store,
             source,
-            resolver: None,
+            published,
+            reader,
+            publication_pause: None,
             last_metrics: None,
         })
     }
 
     pub fn current_generation(&self) -> Result<Option<Generation>, IndexError> {
         self.store.current_generation()
+    }
+
+    /// A fresh reader over the same cache and the same publication barrier,
+    /// for a server or runtime that owns its reads. Each reader carries its
+    /// own query-only connection, so readers never contend with the writer
+    /// for a connection lock.
+    pub fn reader(&self) -> Result<IndexReader, IndexError> {
+        IndexReader::open(&self.config, Arc::clone(&self.published))
+    }
+
+    pub(crate) fn reader_handle(&self) -> &IndexReader {
+        &self.reader
+    }
+
+    /// Record what the live runtime is currently doing. Observational only:
+    /// it never changes the published generation or graph.
+    pub fn set_live_state(&mut self, state: LiveState) -> Result<(), IndexError> {
+        let mut published = write_published(&self.published)?;
+        published.live_state = state;
+        Ok(())
+    }
+
+    /// Record (or clear) the runtime's last error, alongside the state it
+    /// was in. Observational only.
+    pub fn set_runtime_error(&mut self, error: Option<String>) -> Result<(), IndexError> {
+        let mut published = write_published(&self.published)?;
+        published.runtime_error = error;
+        Ok(())
+    }
+
+    /// Pause every publication between its SQLite commit and its live-state
+    /// installation, while the publication write guard is held. Test-only:
+    /// it is what lets a test prove a read cannot observe the half-installed
+    /// generation in between.
+    #[doc(hidden)]
+    pub fn pause_publication_for_test(&mut self, hook: PauseHook) {
+        self.publication_pause = Some(hook);
     }
 
     pub fn state(&self) -> Result<IndexState, IndexError> {
@@ -267,7 +323,7 @@ impl IndexService {
 
         if !semantic_change {
             self.store.touch(&fingerprint_updates)?;
-            self.reload_resolver(previous_generation)?;
+            self.republish_current(previous_generation)?;
             return Ok(TryOutcome::Done(RefreshReport {
                 previous_generation: Some(previous_generation),
                 generation: previous_generation,
@@ -353,15 +409,39 @@ impl IndexService {
             return Err(IndexError::VaultChangedDuringRefresh);
         }
 
-        match self.store.publish(Publication {
+        // Everything fallible about the new live state happens here, before
+        // the barrier: the generation a successful publication will claim is
+        // already determined by the compare-and-swap's `expected`, so the
+        // matching graph can be built (and can fail) outside the section
+        // that must stay short.
+        let next_generation = Generation::new(previous.map_or(0, Generation::get) + 1);
+        let prepared = Arc::new(live_graph_from_semantic(next_generation, &report.graph)?);
+
+        // The publication barrier is held across the SQLite commit — the one
+        // place a lock is deliberately held across SQLite I/O. That is the
+        // whole point: rows and live graph become visible together or not at
+        // all, so no reader can catch a generation whose two halves
+        // disagree. Nothing else runs inside the guard: the commit is the
+        // writer's own connection, and the install below is a pointer swap.
+        let mut published = write_published(&self.published)?;
+        let outcome = self.store.publish(Publication {
             expected: previous,
             notes: &replaced,
             deleted: &removed,
             fingerprint_updates: &fingerprint_updates,
             graph: &report.graph,
             scan_diagnostics: &scan_diagnostics,
-        })? {
+        })?;
+        match outcome {
             PublishOutcome::Committed(generation, publish_metrics) => {
+                debug_assert_eq!(generation, next_generation);
+                if let Some(hook) = &self.publication_pause {
+                    hook();
+                }
+                published.generation = Some(generation);
+                published.graph = Some(prepared);
+                drop(published);
+
                 metrics.stages.sqlite_write += publish_metrics.sqlite_write;
                 metrics.stages.sqlite_commit += publish_metrics.sqlite_commit;
                 metrics.work.resolution_rows_written +=
@@ -370,7 +450,6 @@ impl IndexService {
                     publish_metrics.graph_write.dependency_rows_written;
                 metrics.work.diagnostic_rows_written +=
                     publish_metrics.graph_write.diagnostic_rows_written;
-                self.reload_resolver(generation)?;
                 Ok(TryOutcome::Done(RefreshReport {
                     previous_generation: previous,
                     generation,
@@ -382,19 +461,141 @@ impl IndexService {
                     verified: counts.verified,
                 }))
             }
-            PublishOutcome::GenerationChanged => Ok(TryOutcome::Retry),
+            PublishOutcome::GenerationChanged => {
+                drop(published);
+                Ok(TryOutcome::Retry)
+            }
         }
     }
 
-    pub(crate) fn reload_resolver(&mut self, generation: Generation) -> Result<(), IndexError> {
-        if self
-            .resolver
-            .as_ref()
-            .is_none_or(|(cached, _)| *cached != generation)
-        {
-            let catalog = self.store.load_resolution_catalog()?;
-            self.resolver = Some((generation, Resolver::from_catalog(catalog)));
+    /// Apply one delta to both halves of the published state at once: the
+    /// row delta to SQLite, the matching graph delta to the published live
+    /// graph.
+    ///
+    /// The graph delta is described by its inputs rather than handed over
+    /// pre-prepared, and this method prepares it from the published graph
+    /// itself. That is not a convenience: a `PreparedGraphDelta` carries
+    /// `NoteId`s allocated by the graph it was prepared from, and each
+    /// graph numbers notes by its own build history, so a delta prepared
+    /// against any other instance — a fresh hydration of the same
+    /// generation included — would install the wrong identities. Preparing
+    /// here makes that mistake unrepresentable.
+    ///
+    /// Same barrier discipline as the full path: the delta is prepared —
+    /// every fallible allocation included — before the write guard is taken,
+    /// and the guard then spans the commit and the install alone, so both
+    /// halves land together or neither does. A lost compare-and-swap leaves
+    /// the published graph exactly as it was.
+    pub fn publish_delta(
+        &mut self,
+        publication: DeltaPublication<'_>,
+        replacement_notes: &[HydratedNote],
+        removed_paths: &[VaultPath],
+        replacement_references: &[HydratedReference],
+    ) -> Result<DeltaPublishOutcome, IndexError> {
+        let expected = publication.expected;
+        // Prepared outside the barrier. The borrowed handle is released
+        // again before the guard is taken, so the writer is once more the
+        // graph's only owner when it installs — nothing here forces a copy.
+        // Only this method publishes, and it needs `&mut self`, so no other
+        // in-process writer can move the published graph in between; a
+        // foreign process that moves the *cache* is caught by the
+        // compare-and-swap below.
+        let delta = {
+            let graph = self.published_graph(expected)?;
+            graph.prepare_delta(
+                expected,
+                replacement_notes,
+                removed_paths,
+                replacement_references,
+            )?
+        };
+
+        let mut published = write_published(&self.published)?;
+        let outcome = self.store.publish_delta(publication)?;
+        match outcome {
+            DeltaPublishOutcome::Committed { generation, counts } => {
+                if let Some(hook) = &self.publication_pause {
+                    hook();
+                }
+                let graph = published
+                    .graph
+                    .as_mut()
+                    .ok_or(IndexError::IndexUnavailable)?;
+                // In place whenever the writer is the graph's only owner,
+                // which is the ordinary case: readers resolve under the read
+                // guard and never let the `Arc` escape it, so a delta never
+                // copies the whole graph. The copy `make_mut` would take
+                // otherwise is a correctness fallback, not a normal cost.
+                Arc::make_mut(graph).install(delta);
+                published.generation = Some(generation);
+                drop(published);
+                Ok(DeltaPublishOutcome::Committed { generation, counts })
+            }
+            DeltaPublishOutcome::GenerationChanged => {
+                drop(published);
+                Ok(DeltaPublishOutcome::GenerationChanged)
+            }
         }
+    }
+
+    /// The published live graph, checked against the generation a caller is
+    /// about to build on. The returned handle is a temporary co-owner: drop
+    /// it before publishing, or the install has to copy the graph instead of
+    /// mutating it.
+    fn published_graph(&self, expected: Generation) -> Result<Arc<LiveGraph>, IndexError> {
+        let published = crate::reader::read_published(&self.published)?;
+        let graph = published
+            .graph
+            .as_ref()
+            .ok_or(IndexError::IndexUnavailable)?;
+        if graph.generation() != expected {
+            return Err(IndexError::Storage(format!(
+                "published live graph is at generation {} but the delta expects {}",
+                graph.generation().get(),
+                expected.get()
+            )));
+        }
+        Ok(Arc::clone(graph))
+    }
+
+    /// Adopt whatever generation this cache has already committed, by
+    /// hydrating the live graph that matches it.
+    ///
+    /// Needed when the cache was advanced by a writer this service does not
+    /// own — another process, or a delta published through a separate store
+    /// handle. Until it runs, this process's readers refuse to answer at
+    /// all, which is the intended behavior: they have rows for a generation
+    /// whose live state they never installed. Returns the generation now
+    /// published, or `None` if the cache has published nothing yet.
+    pub fn resync_published(&mut self) -> Result<Option<Generation>, IndexError> {
+        let Some(generation) = self.store.current_generation()? else {
+            return Ok(None);
+        };
+        self.republish_current(generation)?;
+        Ok(Some(generation))
+    }
+
+    /// Make the published state agree with a generation that is already
+    /// committed but was never installed here — a service that opened an
+    /// existing cache, or one whose seeding failed. Ordinarily a no-op: the
+    /// hydration below only runs when the published generation is actually
+    /// behind, and it runs before the barrier is taken.
+    fn republish_current(&mut self, generation: Generation) -> Result<(), IndexError> {
+        if crate::reader::read_published(&self.published)?.generation == Some(generation) {
+            return Ok(());
+        }
+        let graph = Arc::new(self.store.hydrate_live_graph()?);
+        if graph.generation() != generation {
+            return Err(IndexError::Storage(format!(
+                "hydrated generation {} does not match the committed generation {}",
+                graph.generation().get(),
+                generation.get()
+            )));
+        }
+        let mut published = write_published(&self.published)?;
+        published.generation = Some(generation);
+        published.graph = Some(graph);
         Ok(())
     }
 
@@ -427,4 +628,80 @@ struct RefreshCounts {
     unchanged: u64,
     reparsed: u64,
     verified: bool,
+}
+
+/// Install whatever an already-populated cache has committed, so a service
+/// that opens an existing index can serve reads before it refreshes.
+///
+/// A cache with nothing published stays unpublished (readers answer
+/// `IndexUnavailable` until the first refresh). A cache that cannot be
+/// hydrated also stays unpublished rather than failing the open: the
+/// generation is left unclaimed — so no reader can answer from rows whose
+/// live graph is missing — and the reason is recorded as the runtime error
+/// for an operator to see. The next successful refresh replaces both.
+fn seed_published(store: &IndexStore, published: &PublicationBarrier) -> Result<(), IndexError> {
+    let Some(generation) = store.current_generation()? else {
+        return Ok(());
+    };
+    let mut state = write_published(published)?;
+    match store.hydrate_live_graph() {
+        Ok(graph) if graph.generation() == generation => {
+            state.generation = Some(generation);
+            state.graph = Some(Arc::new(graph));
+        }
+        Ok(graph) => {
+            state.runtime_error = Some(format!(
+                "cache hydrated at generation {} but committed generation {}",
+                graph.generation().get(),
+                generation.get()
+            ));
+        }
+        Err(error) => state.runtime_error = Some(error.to_string()),
+    }
+    Ok(())
+}
+
+/// The live-graph counterpart of the rows a full publication is about to
+/// write, built from the same in-memory graph rather than by reading back
+/// what was just written: same paths, same heading and block identities,
+/// same per-source reference ordinals (`replace_note` numbers a note's
+/// references by their position in exactly this order).
+fn live_graph_from_semantic(
+    generation: Generation,
+    graph: &SemanticGraph,
+) -> Result<LiveGraph, IndexError> {
+    let mut notes = Vec::new();
+    let mut references = Vec::new();
+    for path in graph.note_paths() {
+        let note = graph.note(path).ok_or_else(|| {
+            IndexError::Storage(format!("graph has no note for {}", path.as_str()))
+        })?;
+        notes.push(HydratedNote {
+            path: path.clone(),
+            headings: note
+                .headings
+                .iter()
+                .map(|heading| heading.text.clone())
+                .collect(),
+            blocks: note
+                .blocks
+                .iter()
+                .map(|block| block.value.clone())
+                .collect(),
+        });
+        for (ordinal, resolved) in graph.outgoing(path).iter().enumerate() {
+            references.push(HydratedReference {
+                source_path: path.clone(),
+                ordinal: u32::try_from(ordinal).map_err(|_| {
+                    IndexError::Storage(format!(
+                        "{} has more references than a u32 ordinal can hold",
+                        path.as_str()
+                    ))
+                })?,
+                target: LinkTarget::from(&resolved.reference),
+                resolution: resolved.resolution.clone(),
+            });
+        }
+    }
+    LiveGraph::from_hydrated(generation, notes, references)
 }

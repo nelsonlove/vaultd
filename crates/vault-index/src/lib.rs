@@ -7,6 +7,7 @@ mod live_graph;
 mod metrics;
 mod model;
 mod query;
+mod reader;
 mod reconcile;
 mod schema;
 mod store;
@@ -19,10 +20,15 @@ pub use live_graph::{
     ReferenceKey,
 };
 pub use metrics::{ReconcileMetrics, StageDurations, WorkCounts};
-pub use model::{FileFingerprint, Generation, IndexState};
+pub use model::{
+    FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
+};
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus, VaultInfo,
 };
+pub use reader::IndexReader;
+#[doc(hidden)]
+pub use reader::PauseHook;
 pub use reconcile::{IndexService, RefreshReport};
 pub use schema::{SEMANTIC_FORMAT_VERSION, SQL_SCHEMA_VERSION};
 pub use store::{
@@ -33,6 +39,13 @@ pub use store::{
 #[doc(hidden)]
 pub fn open_index_for_test(config: &IndexConfig) -> Result<rusqlite::Connection, IndexError> {
     schema::open_connection(config)
+}
+
+/// Open a query-only handle the way `IndexReader` does, so tests can prove
+/// what that path refuses: creating a cache, and writing through it.
+#[doc(hidden)]
+pub fn open_reader_for_test(config: &IndexConfig) -> Result<rusqlite::Connection, IndexError> {
+    schema::open_reader(config)
 }
 
 /// Decode a stored `(dependency_kind, comparison_key)` pair back into a
