@@ -1,13 +1,15 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use vault_core::{
-    Diagnostic, DiagnosticCode, ParsedNote, Resolver, ScanError, ScanReport, Severity,
+    Diagnostic, DiagnosticCode, ParsedNote, Resolution, Resolver, ScanError, ScanReport, Severity,
     SourceDocument, SourceError, VaultPath, build_graph, parse_note,
 };
 
 use crate::config::IndexConfig;
 use crate::error::IndexError;
 use crate::inventory::{FileSystemIndexSource, InventorySnapshot, ReconcileSource};
+use crate::metrics::ReconcileMetrics;
 use crate::model::{FileFingerprint, Generation, IndexState};
 use crate::store::{IndexStore, Publication, PublishOutcome};
 
@@ -32,6 +34,7 @@ pub struct IndexService {
     pub(crate) store: IndexStore,
     pub(crate) source: Box<dyn ReconcileSource>,
     pub(crate) resolver: Option<(Generation, Resolver)>,
+    last_metrics: Option<ReconcileMetrics>,
 }
 
 enum TryOutcome {
@@ -66,6 +69,7 @@ impl IndexService {
             store,
             source,
             resolver: None,
+            last_metrics: None,
         })
     }
 
@@ -87,6 +91,13 @@ impl IndexService {
         self.store.record_refresh_failure(&error.to_string())
     }
 
+    /// Stage timings and structural work counters from the most recent
+    /// `refresh` attempt (successful or failed). `None` before the first
+    /// call.
+    pub fn last_reconcile_metrics(&self) -> Option<&ReconcileMetrics> {
+        self.last_metrics.as_ref()
+    }
+
     pub fn refresh(&mut self, verify: bool) -> Result<RefreshReport, IndexError> {
         for _ in 0..MAX_RECONCILE_RETRIES {
             match self.try_refresh(verify)? {
@@ -100,12 +111,29 @@ impl IndexService {
     }
 
     /// One reconciliation attempt against the current database generation.
+    /// Observational instrumentation only: metrics are recorded for both
+    /// successful and failed attempts, and their collection can never itself
+    /// fail a refresh.
+    fn try_refresh(&mut self, verify: bool) -> Result<TryOutcome, IndexError> {
+        let mut metrics = ReconcileMetrics::default();
+        let outcome = self.try_refresh_body(verify, &mut metrics);
+        self.last_metrics = Some(metrics);
+        outcome
+    }
+
     /// Reads only added/changed bodies in normal mode and every body in
     /// verified mode; parses only new content revisions; publishes one atomic
     /// compare-and-swap snapshot when anything client-visible changed.
-    fn try_refresh(&mut self, verify: bool) -> Result<TryOutcome, IndexError> {
+    fn try_refresh_body(
+        &mut self,
+        verify: bool,
+        metrics: &mut ReconcileMetrics,
+    ) -> Result<TryOutcome, IndexError> {
         let previous = self.current_generation()?;
+        let inventory_start = Instant::now();
         let first = self.source.inventory()?;
+        metrics.stages.inventory += inventory_start.elapsed();
+        metrics.work.complete_inventories += 1;
         let stored = self.store.stored_fingerprints()?;
 
         let mut unchanged_paths = Vec::new();
@@ -146,7 +174,11 @@ impl IndexService {
         for path in &to_read {
             let fingerprint = first.entries[path];
             let stored_fingerprint = stored.get(path).copied();
-            match self.source.read_bytes(path) {
+            let read_start = Instant::now();
+            let read_result = self.source.read_bytes(path);
+            metrics.stages.body_read += read_start.elapsed();
+            metrics.work.body_reads += 1;
+            match read_result {
                 Ok(bytes) => match SourceDocument::from_utf8(path.clone(), bytes) {
                     Ok(source) => {
                         let stored_revision = if stored_fingerprint.is_some() {
@@ -161,13 +193,18 @@ impl IndexService {
                             }
                         } else {
                             reparsed += 1;
+                            metrics.work.notes_reparsed += 1;
                             if stored_fingerprint.is_none() {
                                 added += 1;
                             } else {
                                 changed += 1;
                             }
                             semantic_change = true;
-                            replaced.push((parse_note(source), fingerprint));
+                            let parse_start = Instant::now();
+                            let parsed = parse_note(source);
+                            metrics.stages.parse += parse_start.elapsed();
+                            metrics.work.affected_references += parsed.references.len() as u64;
+                            replaced.push((parsed, fingerprint));
                         }
                     }
                     Err(SourceError::InvalidUtf8 { path, error }) => {
@@ -201,6 +238,8 @@ impl IndexService {
             }
         }
 
+        metrics.work.changed_notes = added + changed;
+
         if !semantic_change && diagnostics != self.store.load_scan_diagnostics()? {
             semantic_change = true;
         }
@@ -221,6 +260,7 @@ impl IndexService {
                     reparsed,
                     verified: verify,
                 },
+                metrics,
             );
         };
 
@@ -254,6 +294,7 @@ impl IndexService {
                 reparsed,
                 verified: verify,
             },
+            metrics,
         )
     }
 
@@ -267,6 +308,7 @@ impl IndexService {
         fingerprint_updates: Vec<(VaultPath, FileFingerprint)>,
         scan_diagnostics: Vec<Diagnostic>,
         counts: RefreshCounts,
+        metrics: &mut ReconcileMetrics,
     ) -> Result<TryOutcome, IndexError> {
         let replaced_paths: BTreeSet<VaultPath> = replaced
             .iter()
@@ -285,8 +327,27 @@ impl IndexService {
             }
         }
 
+        let resolution_start = Instant::now();
         let report = build_graph(all_notes, scan_diagnostics.clone());
+        metrics.stages.resolution += resolution_start.elapsed();
+        metrics.work.references_resolved += report
+            .graph
+            .note_paths()
+            .into_iter()
+            .map(|path| {
+                report
+                    .graph
+                    .outgoing(path)
+                    .iter()
+                    .filter(|resolved| matches!(resolved.resolution, Resolution::Resolved { .. }))
+                    .count() as u64
+            })
+            .sum::<u64>();
+
+        let inventory_start = Instant::now();
         let second = self.source.inventory()?;
+        metrics.stages.inventory += inventory_start.elapsed();
+        metrics.work.complete_inventories += 1;
         if first != second {
             return Err(IndexError::VaultChangedDuringRefresh);
         }
@@ -300,7 +361,13 @@ impl IndexService {
             scan_diagnostics: &scan_diagnostics,
             diagnostics: &report.diagnostics,
         })? {
-            PublishOutcome::Committed(generation) => {
+            PublishOutcome::Committed(generation, publish_metrics) => {
+                metrics.stages.sqlite_write += publish_metrics.sqlite_write;
+                metrics.stages.sqlite_commit += publish_metrics.sqlite_commit;
+                metrics.work.resolution_rows_written +=
+                    publish_metrics.graph_write.resolution_rows_written;
+                metrics.work.diagnostic_rows_written +=
+                    publish_metrics.graph_write.diagnostic_rows_written;
                 self.reload_resolver(generation)?;
                 Ok(TryOutcome::Done(RefreshReport {
                     previous_generation: previous,

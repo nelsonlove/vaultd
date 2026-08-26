@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use vault_core::{
     Alias, BlockId, Diagnostic, Heading, ParsedNote, Reference, ResolvedReference, ScanReport,
@@ -11,8 +13,24 @@ use crate::model::{FileFingerprint, Generation};
 use crate::schema;
 
 pub(crate) enum PublishOutcome {
-    Committed(Generation),
+    Committed(Generation, PublishMetrics),
     GenerationChanged,
+}
+
+/// Structural work and timing produced while writing one publication's graph
+/// rows, handed back so the caller can merge it into `ReconcileMetrics`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GraphWriteCounts {
+    pub(crate) resolution_rows_written: u64,
+    pub(crate) diagnostic_rows_written: u64,
+}
+
+/// Timing collected inside one `publish` transaction.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PublishMetrics {
+    pub(crate) graph_write: GraphWriteCounts,
+    pub(crate) sqlite_write: Duration,
+    pub(crate) sqlite_commit: Duration,
 }
 
 /// Everything one compare-and-swap publication replaces.
@@ -243,12 +261,13 @@ impl IndexStore {
         graph: &SemanticGraph,
         scan_diagnostics: &[Diagnostic],
         diagnostics: &[Diagnostic],
-    ) -> Result<(), IndexError> {
+    ) -> Result<GraphWriteCounts, IndexError> {
         transaction.execute("DELETE FROM resolutions", [])?;
         transaction.execute("DELETE FROM resolution_candidates", [])?;
         transaction.execute("DELETE FROM scan_diagnostics", [])?;
         transaction.execute("DELETE FROM diagnostics", [])?;
 
+        let mut resolution_rows_written = 0u64;
         for path in graph.note_paths() {
             for (ordinal, resolved) in graph.outgoing(path).iter().enumerate() {
                 let reference_id: i64 = transaction.query_row(
@@ -269,6 +288,7 @@ impl IndexStore {
                         stored.subpath_value,
                     ],
                 )?;
+                resolution_rows_written += 1;
                 for (candidate_ordinal, candidate) in stored.candidates.iter().enumerate() {
                     transaction.execute(
                         "INSERT INTO resolution_candidates \
@@ -303,7 +323,11 @@ impl IndexStore {
                 diagnostic,
             )?;
         }
-        Ok(())
+        let diagnostic_rows_written = (scan_diagnostics.len() + diagnostics.len()) as u64;
+        Ok(GraphWriteCounts {
+            resolution_rows_written,
+            diagnostic_rows_written,
+        })
     }
 
     pub(crate) fn load_scan_diagnostics(&self) -> Result<Vec<Diagnostic>, IndexError> {
@@ -478,7 +502,10 @@ impl IndexStore {
         for (path, fingerprint) in fingerprint_updates {
             update_fingerprint(&transaction, path, *fingerprint)?;
         }
-        Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
+        let write_start = Instant::now();
+        let graph_write =
+            Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
+        let sqlite_write = write_start.elapsed();
 
         let next = Generation::new(expected.map_or(0, Generation::get) + 1);
         transaction.execute(
@@ -489,8 +516,17 @@ impl IndexStore {
                 schema::now_unix_ms()?
             ],
         )?;
+        let commit_start = Instant::now();
         transaction.commit()?;
-        Ok(PublishOutcome::Committed(next))
+        let sqlite_commit = commit_start.elapsed();
+        Ok(PublishOutcome::Committed(
+            next,
+            PublishMetrics {
+                graph_write,
+                sqlite_write,
+                sqlite_commit,
+            },
+        ))
     }
 
     pub(crate) fn stored_fingerprints(
@@ -598,7 +634,7 @@ impl IndexStore {
         diagnostics: &[Diagnostic],
     ) -> Result<(), IndexError> {
         let transaction = self.connection.transaction()?;
-        Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
+        let _ = Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
         transaction.commit()?;
         Ok(())
     }

@@ -3,6 +3,7 @@ mod config;
 mod cursor;
 mod error;
 mod inventory;
+mod metrics;
 mod model;
 mod query;
 mod reconcile;
@@ -12,6 +13,7 @@ mod store;
 pub use config::{IndexConfig, IndexLocation};
 pub use error::IndexError;
 pub use inventory::{FileSystemIndexSource, InventoryEntry, InventorySnapshot, ReconcileSource};
+pub use metrics::{ReconcileMetrics, StageDurations, WorkCounts};
 pub use model::{FileFingerprint, Generation, IndexState};
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus, VaultInfo,
