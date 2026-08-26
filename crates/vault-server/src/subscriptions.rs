@@ -206,16 +206,45 @@ struct Subscription {
     /// has reached the output stream — which is what makes
     /// "response before event" structural rather than a matter of timing.
     active: bool,
+    /// The generation the `subscribe_events` response promised, while any
+    /// generation at or below it might still be delivered.
+    ///
+    /// Activation alone is not enough to make the start point mean anything.
+    /// The publication barrier moves *before* the coordinator emits, and the
+    /// notice then crosses two bounded queues, so the barrier a subscribe
+    /// reads can be several generations ahead of the notices still waiting to
+    /// be dispatched. Delivering one of those would run the client's
+    /// `previous_generation` chain backwards from the very point it was told
+    /// to start at, and a client checking continuity would answer that with a
+    /// spurious full re-read.
+    ///
+    /// Only per-path deltas are filtered. A `resync_required` or
+    /// `runtime_state_changed` naming an old generation is still news.
+    /// Cleared by the first delta that passes: generations arrive in
+    /// coordinator emission order, so nothing after it can be stale.
+    started_at: Option<u64>,
 }
 
 impl Subscription {
-    fn new(id: String) -> Self {
+    fn new(id: String, started_at: Option<u64>) -> Self {
         Self {
             id,
             queue: VecDeque::new(),
             lagged_at: None,
             lag_owed: false,
             active: false,
+            started_at,
+        }
+    }
+
+    /// Whether this event describes a generation the client was already told
+    /// it starts from — or an earlier one.
+    fn is_behind_start(&self, event: &RuntimeEventDto) -> bool {
+        match (self.started_at, event) {
+            (Some(started_at), RuntimeEventDto::GenerationCommitted(committed)) => {
+                committed.generation <= started_at
+            }
+            _ => false,
         }
     }
 
@@ -278,6 +307,14 @@ impl Subscription {
     }
 
     fn push(&mut self, event: RuntimeEventDto) {
+        // Checked before anything else, so a stale delta cannot even drag a
+        // lag marker's generation around.
+        if self.is_behind_start(&event) {
+            return;
+        }
+        if matches!(event, RuntimeEventDto::GenerationCommitted(_)) {
+            self.started_at = None;
+        }
         if self.lagged_at.is_some() || self.lag_owed {
             if let Some(generation) = event_generation(&event) {
                 self.advance_marker(generation);
@@ -328,14 +365,19 @@ impl SubscriptionRegistry {
     /// Reserve a subscription and describe where it starts. The identifier is
     /// opaque and process-scoped — a name, not a security token — and is
     /// never reused within the process.
+    ///
+    /// The generation reported here is the subscription's start point in the
+    /// strong sense: it is recorded, and no `generation_committed` at or
+    /// below it will ever be delivered.
     pub fn subscribe(&mut self, status: &PublishedStatus) -> SubscribeEventsResponse {
         self.next_id += 1;
         let id = format!("sub-{}", self.next_id);
+        let started_at = status.generation.map(vault_index::Generation::get);
         self.subscriptions
-            .insert(id.clone(), Subscription::new(id.clone()));
+            .insert(id.clone(), Subscription::new(id.clone(), started_at));
         SubscribeEventsResponse {
             subscription_id: id,
-            generation: status.generation.map(vault_index::Generation::get),
+            generation: started_at,
             live_state: live_state(status.live_state),
         }
     }

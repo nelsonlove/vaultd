@@ -140,10 +140,13 @@ impl Server {
     /// The runtime's observational state, with stopped-ness derived from the
     /// handle as well as the barrier.
     ///
-    /// Belt and braces on purpose: a coordinator that panicked never got to
-    /// publish `Stopped`, so the barrier can be left reporting `Watching`
-    /// forever. The handle knows the threads were joined, so it is the
-    /// authority on "stopped" even when the barrier disagrees.
+    /// Belt and braces on purpose. The barrier records what the coordinator
+    /// last *said*; the handle records whether it is still there to say
+    /// anything. They disagree exactly when the coordinator stopped without
+    /// announcing it — a panic unwinds it out of `run` before it can publish
+    /// `Stopped`, leaving the barrier asserting `Watching` for the life of
+    /// the process. `RuntimeHandle::is_stopped` covers that through a drop
+    /// guard on the coordinator thread, so it is the authority here.
     fn live_state(&self, live: &Live) -> Result<LiveState, IndexError> {
         let published = live.reader.published_status()?.live_state;
         if live.handle.is_stopped() {

@@ -104,6 +104,84 @@ fn a_reserved_subscription_receives_nothing_until_it_is_activated() {
     }
 }
 
+/// A `subscribe_events` response promises the generation the subscription
+/// starts from, and the client is entitled to treat that as its baseline.
+///
+/// Notices for generations at or below it may still be in flight: the
+/// publication barrier moves *before* the coordinator emits, and a notice
+/// then sits behind two bounded queues, so the barrier a subscribe reads can
+/// be several generations ahead of the notices not yet dispatched. Delivering
+/// those would run the `previous_generation` chain backwards from the
+/// client's own start point, and a client checking continuity would force a
+/// spurious resync.
+#[test]
+fn a_subscription_never_receives_a_generation_at_or_below_its_start_point() {
+    let mut registry = SubscriptionRegistry::new();
+    let response = registry.subscribe(&status(Some(5), LiveState::Watching));
+    registry.activate_new();
+    assert_eq!(response.generation, Some(5));
+
+    for generation in 3..=5 {
+        registry.enqueue_notice(generation_notice(generation, paths("Stale", 1)));
+    }
+    assert!(
+        drain(&mut registry).is_empty(),
+        "generations at or below the promised start point are already in the client's hands"
+    );
+
+    // Only per-path deltas are filtered. A resync or a state change naming an
+    // old generation is still news the client has not had.
+    registry.enqueue_notice(RuntimeNotice::ResyncRequired {
+        generation: Some(Generation::new(5)),
+        reason: ResyncReason::WatcherOverflow,
+    });
+    registry.enqueue_notice(RuntimeNotice::State {
+        generation: Some(Generation::new(5)),
+        state: LiveState::PollingFallback,
+        error: None,
+    });
+    assert_eq!(drain(&mut registry).len(), 2);
+
+    registry.enqueue_notice(generation_notice(6, paths("Fresh", 1)));
+    let events = drain(&mut registry);
+    assert_eq!(events.len(), 1);
+    match &events[0].event {
+        RuntimeEventDto::GenerationCommitted(committed) => {
+            assert_eq!(committed.generation, 6);
+            assert_eq!(
+                committed.previous_generation,
+                Some(5),
+                "the chain must continue from the promised start point"
+            );
+        }
+        other => panic!("expected generation 6, got {other:?}"),
+    }
+
+    // The filter is spent once a generation passes it: later generations are
+    // monotonic, so nothing more needs checking.
+    registry.enqueue_notice(generation_notice(7, paths("Later", 1)));
+    assert_eq!(drain(&mut registry).len(), 1);
+}
+
+/// A subscription opened before anything was ever committed has no baseline
+/// to be behind, so it filters nothing — including the cold build's own
+/// generation 1.
+#[test]
+fn a_subscription_opened_before_any_generation_filters_nothing() {
+    let mut registry = SubscriptionRegistry::new();
+    let response = registry.subscribe(&status(None, LiveState::CatchingUp));
+    registry.activate_new();
+    assert_eq!(response.generation, None);
+
+    registry.enqueue_notice(generation_notice(1, paths("Cold", 1)));
+    let events = drain(&mut registry);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].event,
+        RuntimeEventDto::GenerationCommitted(ref committed) if committed.generation == 1
+    ));
+}
+
 /// A subscriber that never drains is coalesced, never grown. The marker that
 /// replaces the lost detail names the newest generation, not the one that
 /// happened to overflow the queue.

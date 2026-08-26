@@ -16,7 +16,7 @@ use vault_protocol::{
     Response, ResponseEnvelope, ResponseOutcome, SeverityDto,
 };
 use vault_server::Server;
-use vault_server::runtime::{RuntimeNotice, RuntimeOptions};
+use vault_server::runtime::{Runtime, RuntimeNotice, RuntimeOptions, RuntimeTestHooks};
 use vault_server::subscriptions::SubscriptionRegistry;
 
 /// A runtime that neither watches nor ticks: every generation in these tests
@@ -343,4 +343,100 @@ fn a_stopped_runtime_reports_runtime_not_ready() {
         }
         other => panic!("unexpected vault info: {other:?}"),
     }
+}
+
+/// A coordinator that panics never reaches `publish_state(Stopped)`, so the
+/// publication barrier is left asserting whatever it last published —
+/// `catching_up` or `watching` — forever. Reads are still answerable from the
+/// last committed generation, and must stay answerable, but the runtime's
+/// *state* must not keep claiming to be live: a client would subscribe
+/// successfully to a stream that can never produce anything.
+///
+/// This is the case the defence-in-depth residual named: stopped-ness is
+/// derived from the runtime handle as well as the barrier.
+#[test]
+fn a_panicked_coordinator_is_reported_as_stopped() {
+    let vault = tempdir().expect("vault");
+    let index = tempdir().expect("index");
+    fs::write(vault.path().join("Note.md"), "# Note\n").expect("write note");
+    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).unwrap();
+    // Generation 1 exists before the runtime opens, so reads stay answerable
+    // after the panic and there is something for the barrier to be stale
+    // about.
+    {
+        let mut service = vault_index::IndexService::open(config.clone()).expect("open service");
+        service.refresh(false).expect("cold build");
+    }
+
+    let (sink, notices) = std::sync::mpsc::sync_channel(64);
+    let handle = Runtime::start_with_hooks(
+        config,
+        quiet_options(),
+        sink,
+        RuntimeTestHooks {
+            // Sequence 0 is the startup catch-up. Panicking there unwinds the
+            // coordinator out of `run` without it ever publishing `Stopped`.
+            mutation_fault: Some(std::sync::Arc::new(|sequence| {
+                assert_ne!(sequence, 0, "injected coordinator panic");
+                None
+            })),
+            ..RuntimeTestHooks::default()
+        },
+    )
+    .expect("start runtime");
+    std::mem::forget(vault);
+    std::mem::forget(index);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_stopped() {
+        assert!(
+            Instant::now() < deadline,
+            "a panicked coordinator must be visible as stopped"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The barrier itself is stale, which is exactly why the handle has to be
+    // consulted too.
+    let published = handle
+        .reader()
+        .published_status()
+        .expect("the barrier is not poisoned by the panic");
+    assert_ne!(
+        published.live_state,
+        LiveState::Stopped,
+        "this test is only meaningful while the barrier is stale"
+    );
+
+    let mut fixture = Fixture {
+        server: Server::for_runtime(handle),
+        _notices: notices,
+        subscriptions: SubscriptionRegistry::new(),
+    };
+
+    let info = fixture.handle(RequestEnvelope::new("panic-info", Request::GetVaultInfo));
+    match info.outcome {
+        ResponseOutcome::Ok(Response::GetVaultInfo(info)) => {
+            assert_eq!(info.generation, 1, "reads stay answerable");
+            assert_eq!(
+                info.live_state,
+                Some(LiveStateDto::Stopped),
+                "a dead coordinator must never be reported as live"
+            );
+        }
+        other => panic!("unexpected vault info: {other:?}"),
+    }
+
+    let subscribe = fixture.handle(RequestEnvelope::new(
+        "panic-subscribe",
+        Request::SubscribeEvents(vault_protocol::SubscribeEventsParams {}),
+    ));
+    assert!(
+        matches!(
+            subscribe.outcome,
+            ResponseOutcome::Err(ref error)
+                if error.code == vault_protocol::ErrorCode::RuntimeNotReady
+        ),
+        "subscribing to a stream that can never produce anything must be refused"
+    );
 }

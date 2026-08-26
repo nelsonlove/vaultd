@@ -150,6 +150,8 @@ Reconciles the vault into a new generation. A normal refresh (`verify: false`, t
 
 Opens a stream of post-commit events and answers with the subscription's opaque identifier, the generation it starts from, and the runtime's `live_state`. The identifier is a process-scoped name, not a security token, and is never reused within a process.
 
+`generation` is a strict start point, not a hint: no `generation_committed` naming that generation or an earlier one is ever delivered to this subscription. A client may therefore treat the `previous_generation` chain as continuous from its own start point, and `null` means the subscription opened before anything had been committed.
+
 ```json
 {"version":1,"id":"s","request":{"method":"subscribe_events","params":{}}}
 ```
@@ -177,6 +179,8 @@ The stdio transport carries a second top-level envelope shape alongside response
 Ordering is definite in both directions. A `subscribe_events` response is written before its subscription can receive anything, so no event precedes it. An `unsubscribe` response is written after that subscription's queue is flushed, so no event follows it.
 
 Every event is **post-commit**: the generation it names is already committed to SQLite and installed as live state, so a read issued after the event sees at least that generation.
+
+The converse also holds, and matters for a client tracking continuity. Publication moves before the event describing it is emitted, so a subscription can open at a generation whose event has not been dispatched yet. Those events are dropped rather than delivered: a `generation_committed` at or below a subscription's start point never reaches it. `resync_required` and `runtime_state_changed` are not filtered this way — an old generation is still news when the message is "re-read" or "the runtime's state changed".
 
 ### `generation_committed`
 

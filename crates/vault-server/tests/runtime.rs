@@ -1096,3 +1096,60 @@ fn dropping_the_last_handle_stops_the_runtime() {
         "dropping the last handle must release the writer lease"
     );
 }
+
+/// A dropped notice is a gap in an observer's incremental view, and the
+/// runtime owes it an announcement. The announcement names the generation to
+/// re-read at — so when the coordinator cannot establish that generation (a
+/// transient failure on the generation query, or nothing committed yet), the
+/// announcement it manages to send says nothing usable and every observer
+/// discards it.
+///
+/// The latch must therefore survive a recovery notice whose generation is
+/// unknown. Clearing it there would spend the only record that a gap ever
+/// happened on a notice nobody can act on, and nothing re-arms it.
+#[test]
+fn a_dropped_notice_stays_owed_while_its_generation_is_unknown() {
+    let fixture = fixture();
+
+    // Two slots and no draining: startup fills them, and the settle that
+    // follows is dropped. Whatever the exact interleaving, the sink is
+    // saturated by the time the refresh below is taken, so the latch is set.
+    let (sink, notices) = sync_channel(2);
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        quiet_options(),
+        sink,
+        RuntimeTestHooks {
+            blind_generation_query: true,
+            ..RuntimeTestHooks::default()
+        },
+    )
+    .expect("start runtime");
+    wait_for_state(&handle, LiveState::PollingFallback);
+
+    // Emitting into a full sink leaves the latch set either way: an unset
+    // latch is set by the drop, and a set one cannot clear because its own
+    // recovery notice will not fit either.
+    handle.refresh(false).expect("refresh with a full sink");
+    assert_eq!(drain(&notices).len(), 2, "the sink was saturated");
+
+    // With room again, every subsequent emission must lead with the gap
+    // announcement — and keep leading with it, because its generation is
+    // still unknown and no observer could have acted on the last one.
+    for round in 1..=2 {
+        handle.refresh(false).expect("refresh with a drained sink");
+        let seen = drain(&notices);
+        assert!(
+            seen.iter().any(|notice| matches!(
+                notice,
+                RuntimeNotice::ResyncRequired {
+                    generation: None,
+                    reason: ResyncReason::RuntimeRecovered,
+                }
+            )),
+            "round {round} lost the gap announcement: {seen:?}"
+        );
+    }
+
+    handle.shutdown();
+}

@@ -194,6 +194,13 @@ pub struct RuntimeTestHooks {
     /// Fail watcher installation as though the backend refused, without
     /// having to break a real directory.
     pub fail_watch_install: bool,
+    /// Make the coordinator's own generation query report "nothing
+    /// committed", as a transient `Busy` or storage failure on that query
+    /// does. There is no other way to reach the paths that must cope with an
+    /// unknown generation — the query does not run through `mutation`, so
+    /// `mutation_fault` cannot touch it, and a real transient failure cannot
+    /// be provoked on demand.
+    pub blind_generation_query: bool,
     /// Consulted before every call into the `IndexService`, with that call's
     /// zero-based sequence number. Returning `Some(error)` makes the call
     /// fail without running, which is the only way to exercise the error
@@ -319,10 +326,18 @@ impl Runtime {
             published_error: None,
             notices_dropped: false,
         };
+        let coordinator_alive = Arc::new(AtomicBool::new(true));
         match std::thread::Builder::new()
             .name("vaultd-coordinator".into())
-            .spawn(move || coordinator.run())
-        {
+            .spawn({
+                let alive = CoordinatorAlive(Arc::clone(&coordinator_alive));
+                move || {
+                    // Moved in and dropped here so it fires on *every* exit
+                    // from `run`, an unwind included.
+                    let _alive = alive;
+                    coordinator.run()
+                }
+            }) {
             Ok(handle) => threads.push(handle),
             Err(error) => {
                 abandon(&running, &wake, threads);
@@ -340,6 +355,7 @@ impl Runtime {
                 threads: Mutex::new(threads),
                 stopped: AtomicBool::new(false),
                 watch_alive,
+                coordinator_alive,
             }),
         })
     }
@@ -564,6 +580,23 @@ impl std::fmt::Display for RefreshFailure {
 
 impl std::error::Error for RefreshFailure {}
 
+/// Clears its flag when the coordinator thread leaves `run` by any route.
+///
+/// A `Drop` guard rather than a store at the end of `run`, because the route
+/// that matters most is the one no explicit store can cover: this workspace
+/// unwinds on panic, and a coordinator that panics never reaches
+/// `publish_state(Stopped)`. Without this the publication barrier would keep
+/// asserting whatever it last published — `Watching`, typically — for the
+/// life of the process, and a client would subscribe successfully to a stream
+/// that can never produce anything.
+struct CoordinatorAlive(Arc<AtomicBool>);
+
+impl Drop for CoordinatorAlive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The shared, clonable half of a running runtime.
 struct RuntimeInner {
     commands: SyncSender<RuntimeCommand>,
@@ -574,6 +607,9 @@ struct RuntimeInner {
     threads: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
     watch_alive: Arc<AtomicBool>,
+    /// Whether the coordinator thread is still inside `run`. Cleared by
+    /// [`CoordinatorAlive`] on unwind as well as on a clean exit.
+    coordinator_alive: Arc<AtomicBool>,
 }
 
 impl RuntimeInner {
@@ -685,8 +721,17 @@ impl RuntimeHandle {
         self.inner.stop();
     }
 
+    /// Whether this runtime has stopped mutating, for any reason.
+    ///
+    /// True once `shutdown` has joined every thread, and *also* once the
+    /// coordinator has left `run` on its own — including by panicking, which
+    /// no observational state it publishes could report, because it never got
+    /// to publish anything. That second clause is the authority when the two
+    /// disagree: the publication barrier records what the coordinator last
+    /// said, while this records whether it is still there to say anything.
     pub fn is_stopped(&self) -> bool {
         self.inner.stopped.load(Ordering::Acquire)
+            || !self.inner.coordinator_alive.load(Ordering::Acquire)
     }
 
     /// Whether a filesystem watcher is installed *and* its forwarder thread
@@ -1249,7 +1294,14 @@ impl Coordinator {
         outcome
     }
 
+    /// The last generation this process's cache has committed, or `None` when
+    /// nothing has been committed *or* the query itself failed. The two are
+    /// deliberately not distinguished: every caller wants "a generation I can
+    /// name", and both answers are "no".
     fn committed_generation(&self) -> Option<Generation> {
+        if self.hooks.blind_generation_query {
+            return None;
+        }
         self.index.current_generation().ok().flatten()
     }
 
@@ -1347,7 +1399,20 @@ impl Coordinator {
                 generation,
                 reason: ResyncReason::RuntimeRecovered,
             }) {
-                Ok(()) => self.notices_dropped = false,
+                // The debt is only paid if the announcement can be acted on,
+                // and an observer can only act on one that names the
+                // generation to re-read at. `committed_generation` answers
+                // from live SQLite, so a transient failure there yields
+                // `None` — and an observer discards a `None` announcement,
+                // because before the first commit there is nothing to re-read
+                // at. Clearing the latch on such a send would spend the only
+                // record that a gap ever happened on a notice nobody can use,
+                // and nothing else re-arms it: every subscriber would lose
+                // that gap permanently. So the latch is kept until the gap
+                // can be announced usefully. Correct before the first commit
+                // too — the cold build's own resync supersedes whatever
+                // accumulated.
+                Ok(()) => self.notices_dropped = generation.is_none(),
                 Err(TrySendError::Full(_)) => return,
                 Err(TrySendError::Disconnected(_)) => {
                     self.notices_dropped = false;
