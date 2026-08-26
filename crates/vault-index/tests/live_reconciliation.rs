@@ -507,6 +507,44 @@ fn a_dirty_path_that_never_existed_publishes_nothing() {
     fixture.assert_matches_scan();
 }
 
+/// A reference the impact plan selected but the store cannot produce is a
+/// broken invariant, not a reference to quietly skip: skipping it would leave
+/// a selected reference un-re-resolved, which is the one forbidden direction.
+/// The store is corrupted out of band here — one resolution row dropped, so
+/// `Peer.md`'s reference vanishes from `load_outgoing` while the published
+/// live graph still selects it.
+#[test]
+fn a_selected_reference_missing_from_the_stored_index_fails_loudly() {
+    let mut fixture = live_fixture();
+    let before = fixture.generation();
+    let dropped = fixture
+        .service
+        .connection_for_test()
+        .execute(
+            "DELETE FROM resolutions WHERE reference_id IN \
+             (SELECT id FROM note_references WHERE note_path = 'Peer.md' AND ordinal = 0)",
+            [],
+        )
+        .expect("drop the stored resolution");
+    assert_eq!(dropped, 1, "the fixture must have had a row to drop");
+
+    // A heading change on `Sub.md` selects `Peer.md`'s reference.
+    fixture.write("Sub.md", "# Section\n\n# Absent\n\ntext ^block\n");
+    let error = fixture
+        .try_refresh_paths(&["Sub.md"])
+        .expect_err("a selected reference that cannot be loaded must fail loudly");
+
+    assert!(
+        matches!(error, IndexError::Storage(_)),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        fixture.generation(),
+        before,
+        "a failed reconciliation must publish nothing"
+    );
+}
+
 /// `refresh_paths` builds on a published generation; it has no baseline to be
 /// incremental against before the first build.
 #[test]
@@ -588,6 +626,7 @@ fn body_strategy() -> impl Strategy<Value = String> {
         (0usize..3).prop_map(|slot| format!("[[Note-{slot}#Heading]]\n")),
         (0usize..3).prop_map(|slot| format!("[[Note-{slot}#^block]]\n")),
         (0usize..3).prop_map(|slot| format!("[[Note-{slot}.md]]\n^block\n")),
+        (0usize..3).prop_map(|slot| format!("[[./Note-{slot}]]\n[[../Note-{slot}]]\n")),
         Just("# Heading\n[[#Heading]]\n[[#Missing]]\n".to_string()),
         Just("---\nbroken: [\n---\n[[Absent]]\n[link](https://example.com)\n".to_string()),
     ]

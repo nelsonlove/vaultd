@@ -634,10 +634,24 @@ impl IndexService {
                 .push(reference.ordinal);
         }
         for (path, ordinals) in &by_source {
+            // Indexing by ordinal is valid because `load_outgoing` returns a
+            // note's references `ORDER BY ordinal` over the contiguous run
+            // `replace_note` writes from zero, and every one of them is
+            // guaranteed a joined `resolutions` row by the
+            // `IncompleteResolutionCoverage` check every publication runs.
             let stored = self.store.load_outgoing(path)?;
             for &ordinal in ordinals {
+                // A selected reference the store cannot produce means that
+                // guarantee has already been broken. Skipping it would leave a
+                // selected reference un-re-resolved — the one direction
+                // conservative invalidation forbids — and nothing later would
+                // notice, so it fails loudly instead (the same choice
+                // `LiveGraph::from_hydrated` makes for a torn read).
                 let Some(existing) = stored.get(ordinal as usize) else {
-                    continue;
+                    return Err(IndexError::Storage(format!(
+                        "selected reference {}#{ordinal} is absent from the stored index",
+                        path.as_str()
+                    )));
                 };
                 let target = LinkTarget::from(&existing.reference);
                 let resolution = resolver.resolve_target(path, &target);
