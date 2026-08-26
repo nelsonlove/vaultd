@@ -35,7 +35,7 @@ impl FixtureStore {
         }
         let scan_only: Vec<_> = Vec::new();
         self.store
-            .replace_graph_rows_for_test(&self.scan.graph, &scan_only, &self.scan.diagnostics)
+            .replace_graph_rows_for_test(&self.scan.graph, &scan_only)
     }
 }
 

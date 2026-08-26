@@ -353,23 +353,76 @@ fn principal_queries_use_indexed_plans() {
         "status plan: {status_plan}"
     );
 
-    let diagnostics_plan = plan(
-        "SELECT code FROM diagnostics WHERE path = 'Source.md' \
-         ORDER BY path, span_start, span_end, code, message, id LIMIT 10",
-    );
+    // The same union CTE `get_diagnostics`/`get_note` run in production
+    // (duplicated here since integration tests cannot reach a `pub(crate)`
+    // constant across the crate boundary).
+    const DIAGNOSTIC_UNION_CTE: &str = "\
+WITH all_diagnostics AS ( \
+    SELECT COALESCE(path, note_path) AS path, span_start, span_end, code, severity, message, \
+           'note' AS owner_kind, ordinal AS owner_id \
+      FROM note_diagnostics \
+    UNION ALL \
+    SELECT path, span_start, span_end, code, severity, message, \
+           'resolution' AS owner_kind, reference_id AS owner_id \
+      FROM resolution_diagnostics \
+    UNION ALL \
+    SELECT path, span_start, span_end, code, severity, message, \
+           'scan' AS owner_kind, ordinal AS owner_id \
+      FROM scan_diagnostics \
+)";
+    let diagnostics_plan = plan(&format!(
+        "{DIAGNOSTIC_UNION_CTE} SELECT code FROM all_diagnostics WHERE path = 'Source.md' \
+         ORDER BY path, span_start, span_end, code, message, owner_kind, owner_id LIMIT 10"
+    ));
     assert!(
-        diagnostics_plan.contains("diagnostics_path_order"),
+        diagnostics_plan.contains("resolution_diagnostics_order"),
         "diagnostics plan: {diagnostics_plan}"
     );
 
-    for table_plan in [&backlinks_plan, &status_plan, &diagnostics_plan] {
+    let dependency_lookup_plan = plan(
+        "SELECT reference_id FROM resolution_dependencies \
+         WHERE dependency_kind = 'exact_path' AND comparison_key = 'Target.md' \
+         ORDER BY reference_id",
+    );
+    assert!(
+        dependency_lookup_plan.contains("resolution_dependencies_lookup"),
+        "dependency lookup plan: {dependency_lookup_plan}"
+    );
+
+    let dependency_cleanup_plan =
+        plan("DELETE FROM resolution_dependencies WHERE reference_id = 1");
+    assert!(
+        dependency_cleanup_plan.contains("resolution_dependencies_reference")
+            || dependency_cleanup_plan.contains("PRIMARY KEY"),
+        "per-reference dependency cleanup plan: {dependency_cleanup_plan}"
+    );
+
+    let diagnostic_cleanup_plan = plan("DELETE FROM resolution_diagnostics WHERE reference_id = 1");
+    assert!(
+        diagnostic_cleanup_plan.contains("PRIMARY KEY"),
+        "per-reference diagnostic cleanup plan: {diagnostic_cleanup_plan}"
+    );
+
+    for table_plan in [
+        &backlinks_plan,
+        &status_plan,
+        &diagnostics_plan,
+        &dependency_lookup_plan,
+        &dependency_cleanup_plan,
+        &diagnostic_cleanup_plan,
+    ] {
         assert!(
             !table_plan.contains("SCAN resolutions\n") && !table_plan.ends_with("SCAN resolutions"),
             "unindexed relationship scan: {table_plan}"
         );
         assert!(
-            !table_plan.contains("SCAN diagnostics\n") && !table_plan.ends_with("SCAN diagnostics"),
-            "unindexed diagnostics scan: {table_plan}"
+            !table_plan.contains("SCAN notes\n") && !table_plan.ends_with("SCAN notes"),
+            "unindexed notes scan: {table_plan}"
+        );
+        assert!(
+            !table_plan.contains("SCAN note_references\n")
+                && !table_plan.ends_with("SCAN note_references"),
+            "unindexed note_references scan: {table_plan}"
         );
     }
 }

@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use vault_core::{
-    Alias, BlockId, Diagnostic, Heading, ParsedNote, Reference, ResolvedReference, ScanReport,
-    SemanticGraph, SourceDocument, Tag, VaultPath, build_graph,
+    Alias, BlockId, Diagnostic, Heading, LinkTarget, ParsedNote, Reference, ResolvedReference,
+    ScanReport, SemanticGraph, SourceDocument, Tag, VaultPath, build_graph, reference_dependencies,
+    resolution_diagnostic,
 };
 
 mod hydrate;
@@ -13,6 +14,7 @@ use crate::config::IndexConfig;
 use crate::error::IndexError;
 use crate::live_graph::LiveGraph;
 use crate::model::{FileFingerprint, Generation};
+use crate::query::diagnostics as diagnostic_union;
 use crate::schema;
 
 pub(crate) enum PublishOutcome {
@@ -25,6 +27,7 @@ pub(crate) enum PublishOutcome {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GraphWriteCounts {
     pub(crate) resolution_rows_written: u64,
+    pub(crate) dependency_rows_written: u64,
     pub(crate) diagnostic_rows_written: u64,
 }
 
@@ -44,7 +47,6 @@ pub(crate) struct Publication<'a> {
     pub fingerprint_updates: &'a [(VaultPath, FileFingerprint)],
     pub graph: &'a SemanticGraph,
     pub scan_diagnostics: &'a [Diagnostic],
-    pub diagnostics: &'a [Diagnostic],
 }
 
 pub(crate) fn usize_to_i64(value: usize, field: &str) -> Result<i64, IndexError> {
@@ -263,14 +265,16 @@ impl IndexStore {
         transaction: &Transaction<'_>,
         graph: &SemanticGraph,
         scan_diagnostics: &[Diagnostic],
-        diagnostics: &[Diagnostic],
     ) -> Result<GraphWriteCounts, IndexError> {
         transaction.execute("DELETE FROM resolutions", [])?;
         transaction.execute("DELETE FROM resolution_candidates", [])?;
+        transaction.execute("DELETE FROM resolution_dependencies", [])?;
+        transaction.execute("DELETE FROM resolution_diagnostics", [])?;
         transaction.execute("DELETE FROM scan_diagnostics", [])?;
-        transaction.execute("DELETE FROM diagnostics", [])?;
 
         let mut resolution_rows_written = 0u64;
+        let mut dependency_rows_written = 0u64;
+        let mut diagnostic_rows_written = 0u64;
         for path in graph.note_paths() {
             for (ordinal, resolved) in graph.outgoing(path).iter().enumerate() {
                 let reference_id: i64 = transaction.query_row(
@@ -303,6 +307,44 @@ impl IndexStore {
                         ],
                     )?;
                 }
+
+                let target = LinkTarget::from(&resolved.reference);
+                for key in reference_dependencies(path, &target, &resolved.resolution) {
+                    transaction.execute(
+                        "INSERT INTO resolution_dependencies \
+                         (reference_id, dependency_kind, comparison_key) VALUES (?1, ?2, ?3)",
+                        params![
+                            reference_id,
+                            codec::encode_dependency_kind(key.kind),
+                            key.comparison_key,
+                        ],
+                    )?;
+                    dependency_rows_written += 1;
+                }
+
+                if let Some(diagnostic) = resolution_diagnostic(resolved) {
+                    transaction.execute(
+                        "INSERT INTO resolution_diagnostics \
+                         (reference_id, code, severity, message, path, span_start, span_end) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            reference_id,
+                            codec::encode_diagnostic_code(diagnostic.code),
+                            codec::encode_severity(diagnostic.severity),
+                            diagnostic.message,
+                            diagnostic.path.as_ref().map(VaultPath::as_str),
+                            diagnostic
+                                .span
+                                .map(|span| usize_to_i64(span.start(), "diagnostic span start"))
+                                .transpose()?,
+                            diagnostic
+                                .span
+                                .map(|span| usize_to_i64(span.end(), "diagnostic span end"))
+                                .transpose()?,
+                        ],
+                    )?;
+                    diagnostic_rows_written += 1;
+                }
             }
         }
 
@@ -315,20 +357,11 @@ impl IndexStore {
                 ordinal,
                 diagnostic,
             )?;
+            diagnostic_rows_written += 1;
         }
-        for (ordinal, diagnostic) in diagnostics.iter().enumerate() {
-            insert_diagnostic_row(
-                transaction,
-                "INSERT INTO diagnostics \
-                 (ordinal, code, severity, message, path, span_start, span_end) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                ordinal,
-                diagnostic,
-            )?;
-        }
-        let diagnostic_rows_written = (scan_diagnostics.len() + diagnostics.len()) as u64;
         Ok(GraphWriteCounts {
             resolution_rows_written,
+            dependency_rows_written,
             diagnostic_rows_written,
         })
     }
@@ -338,14 +371,6 @@ impl IndexStore {
             &self.connection,
             "SELECT code, severity, message, path, span_start, span_end \
              FROM scan_diagnostics ORDER BY ordinal",
-        )
-    }
-
-    pub(crate) fn load_aggregate_diagnostics(&self) -> Result<Vec<Diagnostic>, IndexError> {
-        load_diagnostic_rows(
-            &self.connection,
-            "SELECT code, severity, message, path, span_start, span_end \
-             FROM diagnostics ORDER BY ordinal",
         )
     }
 
@@ -483,7 +508,6 @@ impl IndexStore {
             fingerprint_updates,
             graph,
             scan_diagnostics,
-            diagnostics,
         } = publication;
         let transaction = self.connection.transaction()?;
         let current: Option<i64> = transaction.query_row(
@@ -506,8 +530,7 @@ impl IndexStore {
             update_fingerprint(&transaction, path, *fingerprint)?;
         }
         let write_start = Instant::now();
-        let graph_write =
-            Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
+        let graph_write = Self::replace_graph_rows(&transaction, graph, scan_diagnostics)?;
         let sqlite_write = write_start.elapsed();
 
         let next = Generation::new(expected.map_or(0, Generation::get) + 1);
@@ -634,10 +657,9 @@ impl IndexStore {
         &mut self,
         graph: &SemanticGraph,
         scan_diagnostics: &[Diagnostic],
-        diagnostics: &[Diagnostic],
     ) -> Result<(), IndexError> {
         let transaction = self.connection.transaction()?;
-        let _ = Self::replace_graph_rows(&transaction, graph, scan_diagnostics, diagnostics)?;
+        let _ = Self::replace_graph_rows(&transaction, graph, scan_diagnostics)?;
         transaction.commit()?;
         Ok(())
     }
@@ -654,16 +676,18 @@ impl IndexStore {
 
     /// Verification facade: rebuild the graph from persisted notes and prove
     /// the stored resolution and diagnostic rows equal the rebuilt result.
+    /// The comparison reads through the same diagnostic union `get_diagnostics`
+    /// uses, never a bespoke aggregate query.
     #[doc(hidden)]
     pub fn load_graph_for_test(&self) -> Result<ScanReport, IndexError> {
         let notes = self.load_all_notes()?;
         let scan_diagnostics = self.load_scan_diagnostics()?;
         let report = build_graph(notes, scan_diagnostics);
 
-        let stored_diagnostics = self.load_aggregate_diagnostics()?;
+        let stored_diagnostics = diagnostic_union::all_diagnostics(&self.connection)?;
         if stored_diagnostics != report.diagnostics {
             return Err(IndexError::IncompatibleIndex(
-                "stored aggregate diagnostics do not match the rebuilt graph".into(),
+                "stored diagnostics do not match the rebuilt graph".into(),
             ));
         }
         for path in report.graph.note_paths() {

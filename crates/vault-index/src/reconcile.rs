@@ -360,13 +360,14 @@ impl IndexService {
             fingerprint_updates: &fingerprint_updates,
             graph: &report.graph,
             scan_diagnostics: &scan_diagnostics,
-            diagnostics: &report.diagnostics,
         })? {
             PublishOutcome::Committed(generation, publish_metrics) => {
                 metrics.stages.sqlite_write += publish_metrics.sqlite_write;
                 metrics.stages.sqlite_commit += publish_metrics.sqlite_commit;
                 metrics.work.resolution_rows_written +=
                     publish_metrics.graph_write.resolution_rows_written;
+                metrics.work.dependency_rows_written +=
+                    publish_metrics.graph_write.dependency_rows_written;
                 metrics.work.diagnostic_rows_written +=
                     publish_metrics.graph_write.diagnostic_rows_written;
                 self.reload_resolver(generation)?;
@@ -400,6 +401,12 @@ impl IndexService {
     #[doc(hidden)]
     pub fn snapshot_for_test(&self) -> Result<ScanReport, IndexError> {
         self.store.load_graph_for_test()
+    }
+
+    /// Raw connection access for schema-shape and query-plan assertions.
+    #[doc(hidden)]
+    pub fn connection_for_test(&self) -> &rusqlite::Connection {
+        &self.store.connection
     }
 
     /// Hydrate a compact live resolution graph from one consistent snapshot

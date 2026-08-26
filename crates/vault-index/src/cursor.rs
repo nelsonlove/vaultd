@@ -28,7 +28,8 @@ pub(crate) enum CursorPosition {
         end: Option<u64>,
         code: String,
         message: String,
-        id: i64,
+        owner_kind: String,
+        owner_id: i64,
     },
 }
 

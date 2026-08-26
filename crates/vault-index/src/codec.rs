@@ -1,6 +1,6 @@
 use vault_core::{
-    Diagnostic, DiagnosticCode, PropertyValue, Reference, ReferenceKind, ReferenceOrigin,
-    Resolution, Severity, SourceSpan, Spanned, Subpath, VaultPath,
+    DependencyKey, DependencyKind, Diagnostic, DiagnosticCode, PropertyValue, Reference,
+    ReferenceKind, ReferenceOrigin, Resolution, Severity, SourceSpan, Spanned, Subpath, VaultPath,
 };
 
 use crate::error::IndexError;
@@ -399,6 +399,41 @@ pub(crate) fn diagnostic_from_row(
         }
     }
     Ok(diagnostic)
+}
+
+pub(crate) fn encode_dependency_kind(kind: DependencyKind) -> &'static str {
+    match kind {
+        DependencyKind::ExactPath => "exact_path",
+        DependencyKind::ExactPathWithExtension => "exact_path_with_extension",
+        DependencyKind::Filename => "filename",
+        DependencyKind::Stem => "stem",
+        DependencyKind::ResolvedTarget => "resolved_target",
+    }
+}
+
+pub(crate) fn decode_dependency_kind(value: &str) -> Result<DependencyKind, IndexError> {
+    Ok(match value {
+        "exact_path" => DependencyKind::ExactPath,
+        "exact_path_with_extension" => DependencyKind::ExactPathWithExtension,
+        "filename" => DependencyKind::Filename,
+        "stem" => DependencyKind::Stem,
+        "resolved_target" => DependencyKind::ResolvedTarget,
+        other => {
+            return Err(IndexError::IncompatibleIndex(format!(
+                "unknown dependency kind {other:?}"
+            )));
+        }
+    })
+}
+
+pub(crate) fn decode_dependency_key(
+    kind: &str,
+    comparison_key: &str,
+) -> Result<DependencyKey, IndexError> {
+    Ok(DependencyKey::new(
+        decode_dependency_kind(kind)?,
+        comparison_key.to_string(),
+    ))
 }
 
 /// The lowercase filename/stem comparison keys must use the same spelling

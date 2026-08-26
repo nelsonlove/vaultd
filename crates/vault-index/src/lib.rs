@@ -31,3 +31,15 @@ pub use store::IndexStore;
 pub fn open_index_for_test(config: &IndexConfig) -> Result<rusqlite::Connection, IndexError> {
     schema::open_connection(config)
 }
+
+/// Decode a stored `(dependency_kind, comparison_key)` pair back into a
+/// `vault_core::DependencyKey`, so tests can prove stored dependency rows
+/// equal a fresh `vault_core::reference_dependencies` computation without
+/// duplicating the crate's private string encoding.
+#[doc(hidden)]
+pub fn decode_dependency_key_for_test(
+    kind: &str,
+    comparison_key: &str,
+) -> Result<vault_core::DependencyKey, IndexError> {
+    codec::decode_dependency_key(kind, comparison_key)
+}

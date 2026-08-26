@@ -3,7 +3,10 @@ mod common;
 use std::fs;
 
 use tempfile::tempdir;
-use vault_index::{Generation, IndexConfig, IndexError, IndexLocation, IndexService, IndexState};
+use vault_index::{
+    Generation, IndexConfig, IndexError, IndexLocation, IndexService, IndexState,
+    SQL_SCHEMA_VERSION,
+};
 
 #[test]
 fn vault_change_between_inventories_preserves_previous_generation() {
@@ -121,6 +124,92 @@ fn obsolete_schema_version_rebuilds_derived_data() {
         connection.pragma_update(None, "user_version", 99).unwrap();
     }
 
+    let mut service = IndexService::open(config).unwrap();
+    assert_eq!(service.current_generation().unwrap(), None);
+    let report = service.refresh(false).unwrap();
+    assert_eq!(report.generation, Generation::new(1));
+}
+
+#[test]
+fn a_genuine_version_one_derived_cache_is_replaced_by_schema_two() {
+    let vault = tempdir().unwrap();
+    let index_dir = tempdir().unwrap();
+    fs::write(vault.path().join("Note.md"), "# Note\n").unwrap();
+    let index_path = index_dir.path().join("derived.sqlite3");
+
+    let mut config = IndexConfig::explicit(vault.path(), &index_path).unwrap();
+    config.location = IndexLocation::Derived;
+    {
+        // Build an authentic version-1 cache by hand: the real version-1
+        // schema DDL, stamped with the matching vault identity and
+        // user_version = 1 — not just an artificially bumped user_version —
+        // so the rebuild path is proven against real old-shaped data, not a
+        // version number alone.
+        let connection = rusqlite::Connection::open(&index_path).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema_v1.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_metadata \
+                 (singleton, semantic_format_version, vault_identity, generation, \
+                  created_at_unix_ms) \
+                 VALUES (1, 1, ?1, NULL, 0)",
+                rusqlite::params![config.vault_identity],
+            )
+            .unwrap();
+    }
+
+    let mut service = IndexService::open(config).unwrap();
+    assert_eq!(service.current_generation().unwrap(), None);
+    let report = service.refresh(false).unwrap();
+    assert_eq!(report.generation, Generation::new(1));
+
+    let connection = rusqlite::Connection::open(&index_path).unwrap();
+    let user_version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(user_version, SQL_SCHEMA_VERSION);
+    let has_dependencies: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name = 'resolution_dependencies'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_dependencies, 1);
+}
+
+#[test]
+fn a_genuine_version_one_explicit_cache_with_matching_identity_is_replaced_by_schema_two() {
+    let vault = tempdir().unwrap();
+    let index_dir = tempdir().unwrap();
+    fs::write(vault.path().join("Note.md"), "# Note\n").unwrap();
+    let index_path = index_dir.path().join("explicit.sqlite3");
+
+    let config = IndexConfig::explicit(vault.path(), &index_path).unwrap();
+    {
+        let connection = rusqlite::Connection::open(&index_path).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema_v1.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_metadata \
+                 (singleton, semantic_format_version, vault_identity, generation, \
+                  created_at_unix_ms) \
+                 VALUES (1, 1, ?1, NULL, 0)",
+                rusqlite::params![config.vault_identity],
+            )
+            .unwrap();
+    }
+
+    // An obsolete *explicit* index with the right identity is rebuilt in
+    // place, same as a derived one — only wrong identity and corruption are
+    // refused for explicit indexes.
     let mut service = IndexService::open(config).unwrap();
     assert_eq!(service.current_generation().unwrap(), None);
     let report = service.refresh(false).unwrap();
