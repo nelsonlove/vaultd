@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::markdown::has_uri_scheme;
-use crate::{ParsedNote, Reference, SourceSpan, Subpath, VaultPath};
+use crate::{
+    Diagnostic, DiagnosticCode, ParsedNote, Reference, Severity, SourceSpan, Subpath, VaultPath,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Resolution {
@@ -250,9 +252,64 @@ impl Resolver {
     }
 }
 
+/// Construct the single diagnostic a resolved reference produces, if any.
+/// `build_graph` calls this for every reference instead of constructing
+/// diagnostics inline, so incremental resolution (which resolves a subset of
+/// references outside `build_graph`) cannot drift from the complete path's
+/// messages, codes, severities, paths, or spans.
+pub fn resolution_diagnostic(resolved: &ResolvedReference) -> Option<Diagnostic> {
+    match &resolved.resolution {
+        Resolution::Resolved { .. } | Resolution::NonVault => None,
+        Resolution::MissingSubpath { target, subpath } => {
+            let (code, kind) = match subpath {
+                Subpath::Heading(_) => (DiagnosticCode::MissingHeading, "heading"),
+                Subpath::Block(_) => (DiagnosticCode::MissingBlock, "block"),
+            };
+            Some(
+                Diagnostic::new(
+                    code,
+                    Severity::Warning,
+                    format!(
+                        "{:?} resolves to {:?} but the {kind} subpath is missing",
+                        resolved.reference.raw_target,
+                        target.as_str()
+                    ),
+                )
+                .with_path(resolved.source.clone())
+                .with_span(resolved.source_span),
+            )
+        }
+        Resolution::Unresolved => Some(
+            Diagnostic::new(
+                DiagnosticCode::UnresolvedReference,
+                Severity::Warning,
+                format!(
+                    "{:?} does not resolve to any note",
+                    resolved.reference.raw_target
+                ),
+            )
+            .with_path(resolved.source.clone())
+            .with_span(resolved.source_span),
+        ),
+        Resolution::Ambiguous { candidates } => Some(
+            Diagnostic::new(
+                DiagnosticCode::AmbiguousReference,
+                Severity::Warning,
+                format!(
+                    "{:?} matches {} notes",
+                    resolved.reference.raw_target,
+                    candidates.len()
+                ),
+            )
+            .with_path(resolved.source.clone())
+            .with_span(resolved.source_span),
+        ),
+    }
+}
+
 /// Normalize a `./` or `../` spelling against the source note's parent.
 /// Returns `None` when the path escapes above the vault root.
-fn normalize_relative(source: &VaultPath, spelling: &str) -> Option<String> {
+pub(crate) fn normalize_relative(source: &VaultPath, spelling: &str) -> Option<String> {
     let mut stack: Vec<&str> = source.as_str().split('/').collect();
     stack.pop();
 

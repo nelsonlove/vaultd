@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
+use crate::resolver::resolution_diagnostic;
 use crate::vault_source::read_documents;
 use crate::{
-    Diagnostic, DiagnosticCode, ParsedNote, Resolution, ResolvedReference, Resolver, ScanError,
-    Severity, Subpath, VaultPath, VaultSource, parse_note,
+    Diagnostic, ParsedNote, Resolution, ResolvedReference, Resolver, ScanError, VaultPath,
+    VaultSource, parse_note,
 };
 
 #[derive(Clone, Debug)]
@@ -49,67 +50,22 @@ pub fn build_graph(notes: Vec<ParsedNote>, mut diagnostics: Vec<Diagnostic>) -> 
         let resolved = resolver.resolve_note(note);
         for reference in &resolved {
             match &reference.resolution {
-                Resolution::Resolved { target, .. } => {
+                Resolution::Resolved { target, .. } | Resolution::MissingSubpath { target, .. } => {
                     backlinks
                         .entry(target.clone())
                         .or_default()
                         .push(reference.clone());
-                }
-                Resolution::MissingSubpath { target, subpath } => {
-                    backlinks
-                        .entry(target.clone())
-                        .or_default()
-                        .push(reference.clone());
-                    let (code, kind) = match subpath {
-                        Subpath::Heading(_) => (DiagnosticCode::MissingHeading, "heading"),
-                        Subpath::Block(_) => (DiagnosticCode::MissingBlock, "block"),
-                    };
-                    diagnostics.push(
-                        Diagnostic::new(
-                            code,
-                            Severity::Warning,
-                            format!(
-                                "{:?} resolves to {:?} but the {kind} subpath is missing",
-                                reference.reference.raw_target,
-                                target.as_str()
-                            ),
-                        )
-                        .with_path(reference.source.clone())
-                        .with_span(reference.source_span),
-                    );
                 }
                 Resolution::Unresolved => {
                     unresolved.push(reference.clone());
-                    diagnostics.push(
-                        Diagnostic::new(
-                            DiagnosticCode::UnresolvedReference,
-                            Severity::Warning,
-                            format!(
-                                "{:?} does not resolve to any note",
-                                reference.reference.raw_target
-                            ),
-                        )
-                        .with_path(reference.source.clone())
-                        .with_span(reference.source_span),
-                    );
                 }
-                Resolution::Ambiguous { candidates } => {
+                Resolution::Ambiguous { .. } => {
                     ambiguous.push(reference.clone());
-                    diagnostics.push(
-                        Diagnostic::new(
-                            DiagnosticCode::AmbiguousReference,
-                            Severity::Warning,
-                            format!(
-                                "{:?} matches {} notes",
-                                reference.reference.raw_target,
-                                candidates.len()
-                            ),
-                        )
-                        .with_path(reference.source.clone())
-                        .with_span(reference.source_span),
-                    );
                 }
                 Resolution::NonVault => {}
+            }
+            if let Some(diagnostic) = resolution_diagnostic(reference) {
+                diagnostics.push(diagnostic);
             }
         }
         outgoing.insert(path, resolved);

@@ -1,3 +1,4 @@
+mod dependency;
 mod diagnostic;
 mod domain;
 mod frontmatter;
@@ -11,12 +12,18 @@ mod semantic;
 mod source;
 mod vault_source;
 
+pub use dependency::{
+    DependencyKey, DependencyKind, ResolutionIdentityChange, changed_candidate_keys,
+    reference_dependencies,
+};
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use domain::{DomainError, NoteId, NoteRef, Revision, SourceSpan, VaultPath};
 pub use graph::{ScanReport, SemanticGraph, build_graph, scan_vault};
 pub use parse::parse_note;
 pub use property::{Property, PropertyValue};
-pub use resolver::{LinkTarget, Resolution, ResolutionNote, ResolvedReference, Resolver};
+pub use resolver::{
+    LinkTarget, Resolution, ResolutionNote, ResolvedReference, Resolver, resolution_diagnostic,
+};
 pub use semantic::{
     Alias, BlockId, Heading, ParsedNote, Reference, ReferenceKind, ReferenceOrigin, Subpath, Tag,
 };
