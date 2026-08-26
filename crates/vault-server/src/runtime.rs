@@ -1,0 +1,1073 @@
+//! The live runtime: one coordinator thread owns every mutation.
+//!
+//! [`IndexService`] is `Send` but not `Sync` — it holds the writer's SQLite
+//! connection, the exclusive writer lease, and the write half of the
+//! publication barrier. So exactly one thread may ever hold it, and this
+//! module is that thread. Everything else in the process talks to the cache
+//! through [`IndexReader`] (`Send + Sync`), which answers from whatever the
+//! coordinator has last published.
+//!
+//! Three threads at most, all named and all joined on shutdown:
+//!
+//! * the **coordinator**, which owns the `IndexService` and is the only
+//!   caller of `refresh`, `refresh_paths`, `resync_published`, and the
+//!   observational state setters;
+//! * the **watch forwarder**, which owns the [`WatchStream`] and turns its
+//!   hints into [`RuntimeCommand::Hint`]s. It never touches index state;
+//! * the **reconcile timer**, which queues a periodic refresh. It never
+//!   touches index state either, and is not spawned at all when no interval
+//!   is configured.
+//!
+//! Every queue between them is bounded. The command mailbox is one
+//! `sync_channel` of [`RuntimeOptions::command_capacity`]; when it saturates,
+//! the producer sets an atomic overflow latch instead of blocking, and the
+//! coordinator turns the next thing it does into a full reconciliation. The
+//! notice sink is likewise bounded and owned by the caller: a notice that
+//! cannot be delivered is dropped and the gap is announced later as a
+//! [`RuntimeNotice::ResyncRequired`], never silently swallowed and never
+//! allowed to stall indexing.
+//!
+//! Nothing here names `LiveGraph` or hydrates one. Live-state installation
+//! is `vault-index`'s business; the coordinator only asks for it — by
+//! calling `refresh`/`refresh_paths`, or `resync_published` when a foreign
+//! writer moved the cache underneath this process.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use vault_core::VaultPath;
+use vault_index::{
+    ChangeCause, FileSystemIndexSource, Generation, IndexConfig, IndexError, IndexReader,
+    IndexService, LiveRefreshReport, LiveState, ReconcileSource, RefreshReport,
+};
+use vault_watch::{ChangeHint, WatchStream};
+
+use crate::ServerStartupError;
+
+/// How long the coordinator blocks when it has nothing pending. Only bounds
+/// how quickly a `running` flip is noticed; every real wake-up is an
+/// arriving command.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// How long the forwarder blocks on the watch stream per iteration. Bounds
+/// how long `shutdown` waits for that thread, and is what turns a
+/// `WatchStream` (which cannot be interrupted) into a joinable thread.
+const WATCH_POLL: Duration = Duration::from_millis(50);
+
+/// Backoff between attempts after `IndexError::Busy`. Lock contention, not
+/// damage: another connection holds the write lock and will release it.
+const BUSY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// How many times one mutation is attempted before the coordinator gives up
+/// on it and falls back (re-hinting the batch, or recording the failure).
+const MAX_MUTATION_ATTEMPTS: usize = 3;
+
+/// How many times a dirty batch may be re-hinted for
+/// `VaultChangedDuringRefresh` before the coordinator stops trying to be
+/// incremental about it and reconciles the whole vault. Bounds what would
+/// otherwise be an unbounded retry loop against a file being rewritten
+/// continuously.
+const MAX_CONSECUTIVE_REHINTS: usize = 5;
+
+/// A test-only rendezvous callback. Production never installs one.
+#[doc(hidden)]
+pub type RuntimeHook = Arc<dyn Fn() + Send + Sync>;
+
+/// How the runtime keeps the cache up to date.
+#[derive(Clone, Debug)]
+pub struct RuntimeOptions {
+    pub watch: bool,
+    pub watch_config: vault_watch::WatchConfig,
+    pub reconcile_interval: Option<std::time::Duration>,
+    pub command_capacity: usize,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            watch: true,
+            watch_config: vault_watch::WatchConfig::default(),
+            reconcile_interval: Some(std::time::Duration::from_secs(60)),
+            command_capacity: 256,
+        }
+    }
+}
+
+/// One unit of work for the coordinator. Everything that mutates the cache
+/// arrives as one of these, through one bounded mailbox, so mailbox order is
+/// mutation order.
+pub enum RuntimeCommand {
+    Hint(vault_watch::ChangeHint),
+    Refresh {
+        verify: bool,
+        reply: std::sync::mpsc::SyncSender<Result<RefreshReport, IndexError>>,
+    },
+    Stop,
+}
+
+impl std::fmt::Debug for RuntimeCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hint(hint) => formatter.debug_tuple("Hint").field(hint).finish(),
+            Self::Refresh { verify, .. } => formatter
+                .debug_struct("Refresh")
+                .field("verify", verify)
+                .finish_non_exhaustive(),
+            Self::Stop => formatter.write_str("Stop"),
+        }
+    }
+}
+
+/// What the runtime tells an observer. Deliberately not protocol DTOs: the
+/// subscription layer converts these, and nothing here knows the wire
+/// format.
+#[derive(Clone, Debug)]
+pub enum RuntimeNotice {
+    /// One targeted reconciliation cycle published a new generation, with
+    /// the exact per-path change set it published.
+    ///
+    /// Boxed: a `LiveRefreshReport` carries its full metrics and dwarfs
+    /// every other variant, and this enum sits in a bounded queue whose
+    /// buffer is sized by the largest variant.
+    Generation(Box<LiveRefreshReport>),
+    /// The runtime's observational status changed.
+    State {
+        generation: Option<Generation>,
+        state: LiveState,
+        error: Option<String>,
+    },
+    /// The generation moved in a way no per-path change set describes. An
+    /// incremental observer must re-read rather than apply a delta.
+    ResyncRequired {
+        generation: Option<Generation>,
+        reason: ResyncReason,
+    },
+}
+
+/// Why per-path detail is unavailable for a generation move.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResyncReason {
+    /// The watcher lost events (kernel overflow, storming, or a structural
+    /// change it could not name).
+    WatcherOverflow,
+    /// The vault root itself was removed or renamed.
+    RootInvalidated,
+    /// The runtime advanced the generation through a path that produces no
+    /// per-path change set: the startup catch-up, a periodic tick, a manual
+    /// refresh, a watcher-failure recovery, or a dropped notice.
+    RuntimeRecovered,
+}
+
+/// Test-only injection points. Production code constructs
+/// [`RuntimeTestHooks::default`] and pays one `Option` check per mutation.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct RuntimeTestHooks {
+    /// Runs once, inside the startup catch-up's mutation window, before the
+    /// refresh itself. Lets a test hold catch-up open and prove what reads
+    /// answer meanwhile.
+    pub before_catch_up: Option<RuntimeHook>,
+    /// Runs immediately before every call into the `IndexService`.
+    pub mutation_enter: Option<RuntimeHook>,
+    /// Runs immediately after every call into the `IndexService`.
+    pub mutation_exit: Option<RuntimeHook>,
+    /// Fail watcher installation as though the backend refused, without
+    /// having to break a real directory.
+    pub fail_watch_install: bool,
+}
+
+/// The runtime's entry point. Not a value: `start` hands back a
+/// [`RuntimeHandle`], and the runtime itself lives in its threads.
+pub struct Runtime;
+
+impl Runtime {
+    /// Open the leased writer and its reader, publish `CatchingUp`, install
+    /// the watcher, and move the writer onto the coordinator thread.
+    ///
+    /// Returns as soon as those are established — before catch-up has run —
+    /// so the caller can serve reads from the last committed generation
+    /// immediately.
+    pub fn start(
+        config: IndexConfig,
+        options: RuntimeOptions,
+        notices: SyncSender<RuntimeNotice>,
+    ) -> Result<RuntimeHandle, ServerStartupError> {
+        Self::start_with_hooks(config, options, notices, RuntimeTestHooks::default())
+    }
+
+    #[doc(hidden)]
+    pub fn start_with_hooks(
+        config: IndexConfig,
+        options: RuntimeOptions,
+        notices: SyncSender<RuntimeNotice>,
+        hooks: RuntimeTestHooks,
+    ) -> Result<RuntimeHandle, ServerStartupError> {
+        let mut index = IndexService::open(config.clone())?;
+        // Before anything else: readers answer from the last committed
+        // generation, and say so. A caller that reads the instant `start`
+        // returns must never see `Starting`.
+        index.set_live_state(LiveState::CatchingUp)?;
+        let reader = Arc::new(index.reader()?);
+        let source = FileSystemIndexSource::new(&config.canonical_vault_root)?;
+
+        let capacity = options.command_capacity.max(1);
+        let (commands, mailbox) = sync_channel(capacity);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let mut threads: Vec<JoinHandle<()>> = Vec::new();
+
+        // The watcher is installed *before* catch-up so that a change made
+        // while catch-up runs is already queued when it finishes. Ordering
+        // by construction: the forwarder is spawned here, the coordinator
+        // below.
+        let mut watch_error = None;
+        let mut watch_installed = false;
+        if options.watch {
+            match start_watch(
+                &config,
+                &options,
+                hooks.fail_watch_install,
+                &commands,
+                &overflow,
+                &running,
+            ) {
+                Ok(handle) => {
+                    watch_installed = true;
+                    threads.push(handle);
+                }
+                Err(message) => watch_error = Some(message),
+            }
+        }
+
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let tick_pending = Arc::new(AtomicBool::new(false));
+        if let Some(interval) = options.reconcile_interval.filter(|it| !it.is_zero()) {
+            threads.push(spawn_timer(
+                interval,
+                Arc::clone(&wake),
+                Arc::clone(&running),
+                Arc::clone(&tick_pending),
+                commands.clone(),
+                Arc::clone(&overflow),
+            )?);
+        }
+
+        let coordinator = Coordinator {
+            index,
+            source,
+            commands: mailbox,
+            notices,
+            overflow: Arc::clone(&overflow),
+            running: Arc::clone(&running),
+            tick_pending: Arc::clone(&tick_pending),
+            gate: hooks.before_catch_up.clone(),
+            hooks,
+            debounce: options.watch_config.debounce,
+            pending: BTreeSet::new(),
+            pending_deletions: BTreeMap::new(),
+            next_deletion: None,
+            retry_at: None,
+            rehints: 0,
+            watching: watch_installed,
+            watch_installed,
+            watch_error,
+            reconcile_error: None,
+            // The coordinator's own view starts where the service did, so
+            // its first `CatchingUp` is a real transition and is announced.
+            // `start` has already installed `CatchingUp` on the barrier, so
+            // a caller reading the instant `start` returns never sees
+            // `Starting` either.
+            state: LiveState::Starting,
+            published_error: None,
+            notices_dropped: false,
+        };
+        threads.push(
+            std::thread::Builder::new()
+                .name("vaultd-coordinator".into())
+                .spawn(move || coordinator.run())?,
+        );
+
+        Ok(RuntimeHandle {
+            inner: Arc::new(RuntimeInner {
+                commands,
+                overflow,
+                running,
+                wake,
+                reader,
+                threads: Mutex::new(threads),
+                stopped: AtomicBool::new(false),
+                watch_installed,
+            }),
+        })
+    }
+}
+
+/// Install the watcher and spawn the thread that forwards its hints. Failure
+/// is reported as a message, never as a startup error: a runtime that cannot
+/// watch still reconciles periodically and on demand.
+fn start_watch(
+    config: &IndexConfig,
+    options: &RuntimeOptions,
+    force_failure: bool,
+    commands: &SyncSender<RuntimeCommand>,
+    overflow: &Arc<AtomicBool>,
+    running: &Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, String> {
+    if force_failure {
+        return Err("watcher installation was refused".into());
+    }
+    let stream = WatchStream::start(&config.canonical_vault_root, options.watch_config.clone())
+        .map_err(|error| error.to_string())?;
+    let commands = commands.clone();
+    let overflow = Arc::clone(overflow);
+    let running = Arc::clone(running);
+    std::thread::Builder::new()
+        .name("vaultd-watch-forwarder".into())
+        .spawn(move || forward_hints(stream, commands, overflow, running))
+        .map_err(|error| error.to_string())
+}
+
+/// Turn watch hints into commands. Owns the `WatchStream` and nothing else;
+/// it performs no file reads, no parsing, and no index access.
+fn forward_hints(
+    mut stream: WatchStream,
+    commands: SyncSender<RuntimeCommand>,
+    overflow: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    while running.load(Ordering::Acquire) {
+        match stream.recv_timeout(WATCH_POLL) {
+            Ok(Some(hint)) => {
+                if dispatch(&commands, &overflow, RuntimeCommand::Hint(hint))
+                    == Dispatch::MailboxClosed
+                {
+                    // The coordinator is gone; there is nothing left to
+                    // forward hints to.
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // The backend died. This obligates a full reconciliation —
+                // never a silent log line — so hand it over as a hint and
+                // stop: the stream cannot produce anything further.
+                dispatch(
+                    &commands,
+                    &overflow,
+                    RuntimeCommand::Hint(ChangeHint::WatcherFailed(error.to_string())),
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn spawn_timer(
+    interval: Duration,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    running: Arc<AtomicBool>,
+    tick_pending: Arc<AtomicBool>,
+    commands: SyncSender<RuntimeCommand>,
+    overflow: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, std::io::Error> {
+    std::thread::Builder::new()
+        .name("vaultd-reconcile-timer".into())
+        .spawn(move || {
+            let (lock, condvar) = &*wake;
+            loop {
+                let stop = lock.lock().unwrap_or_else(|error| error.into_inner());
+                // Check under the lock *before* waiting. `stop` may already
+                // have been set — and its `notify_all` already spent —
+                // between spawning this thread and reaching here; waiting
+                // first would then miss the wake-up entirely and hold
+                // shutdown for a whole reconcile interval.
+                if *stop || !running.load(Ordering::Acquire) {
+                    return;
+                }
+                let (stop, _) = condvar
+                    .wait_timeout(stop, interval)
+                    .unwrap_or_else(|error| error.into_inner());
+                let asked_to_stop = *stop;
+                drop(stop);
+                if asked_to_stop || !running.load(Ordering::Acquire) {
+                    return;
+                }
+                // Coalesce: one outstanding refresh at a time. The
+                // coordinator clears the flag when it takes a refresh
+                // command, so a manual refresh satisfies a due tick too.
+                if tick_pending.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                // A tick wants the work done, not the report: dropping the
+                // receiver makes the coordinator's reply a no-op.
+                let (reply, _) = sync_channel(1);
+                match dispatch(
+                    &commands,
+                    &overflow,
+                    RuntimeCommand::Refresh {
+                        verify: false,
+                        reply,
+                    },
+                ) {
+                    Dispatch::Accepted => {}
+                    // Dropped on a full mailbox, so nothing will ever clear
+                    // the coalescing flag. Release it here, or this timer
+                    // would never tick again. The change is not lost: the
+                    // latch obliges a complete reconciliation anyway.
+                    Dispatch::Overflowed => tick_pending.store(false, Ordering::Release),
+                    Dispatch::MailboxClosed => return,
+                }
+            }
+        })
+}
+
+/// What became of one offered command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dispatch {
+    Accepted,
+    /// The mailbox was full. The command was dropped and the overflow latch
+    /// set — the change it described is escalated to a complete
+    /// reconciliation, not lost.
+    Overflowed,
+    /// The coordinator has stopped. Nothing more will ever be accepted.
+    MailboxClosed,
+}
+
+/// Offer one command to the mailbox without ever blocking a producer.
+///
+/// A producer that blocked here would be a watcher callback or a timer
+/// waiting on indexing, which is exactly what the bounded-queue rule exists
+/// to prevent. Saturation is therefore handled by latching, never by
+/// waiting.
+fn dispatch(
+    commands: &SyncSender<RuntimeCommand>,
+    overflow: &AtomicBool,
+    command: RuntimeCommand,
+) -> Dispatch {
+    match commands.try_send(command) {
+        Ok(()) => Dispatch::Accepted,
+        Err(TrySendError::Full(_)) => {
+            overflow.store(true, Ordering::Release);
+            Dispatch::Overflowed
+        }
+        Err(TrySendError::Disconnected(_)) => Dispatch::MailboxClosed,
+    }
+}
+
+/// The shared, clonable half of a running runtime.
+struct RuntimeInner {
+    commands: SyncSender<RuntimeCommand>,
+    overflow: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    reader: Arc<IndexReader>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    stopped: AtomicBool,
+    watch_installed: bool,
+}
+
+impl RuntimeInner {
+    /// Stop every thread and wait for each one. Idempotent: the first caller
+    /// does the work, later callers (including `Drop`) return immediately.
+    fn stop(&self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Order matters: clear `running` first so the forwarder and timer
+        // stop producing, then wake the timer out of its wait, then ask the
+        // coordinator to finish what it is doing. `Stop` is offered rather
+        // than forced — a full mailbox already means the coordinator is
+        // awake and draining, and it also exits on `running`.
+        self.running.store(false, Ordering::Release);
+        {
+            let (lock, condvar) = &*self.wake;
+            let mut stop = lock.lock().unwrap_or_else(|error| error.into_inner());
+            *stop = true;
+            condvar.notify_all();
+        }
+        let _ = self.commands.try_send(RuntimeCommand::Stop);
+
+        let threads = {
+            let mut guard = self
+                .threads
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for thread in threads {
+            // A panicking coordinator is already reported by the thread
+            // itself; joining is what guarantees no thread outlives the
+            // runtime, and that the writer lease is released before this
+            // returns.
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for RuntimeInner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A clonable handle on a running runtime. The runtime stops when the last
+/// handle is dropped, or when `shutdown` is called.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    inner: Arc<RuntimeInner>,
+}
+
+impl std::fmt::Debug for RuntimeHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeHandle")
+            .field("stopped", &self.inner.stopped.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeHandle {
+    /// The shared reader every protocol thread answers from. `IndexReader`
+    /// is `Send + Sync`; the writer it belongs to is not, and never leaves
+    /// the coordinator thread.
+    pub fn reader(&self) -> Arc<IndexReader> {
+        Arc::clone(&self.inner.reader)
+    }
+
+    /// Queue one command. `false` means the runtime has stopped; a full
+    /// mailbox instead sets the overflow latch and still returns `true`,
+    /// because the change it describes is not lost — it is escalated to a
+    /// full reconciliation.
+    pub fn send_command(&self, command: RuntimeCommand) -> bool {
+        dispatch(&self.inner.commands, &self.inner.overflow, command) != Dispatch::MailboxClosed
+    }
+
+    /// Feed one hint in, exactly as the watcher would.
+    pub fn hint(&self, hint: ChangeHint) -> bool {
+        self.send_command(RuntimeCommand::Hint(hint))
+    }
+
+    /// Ask for a refresh and wait for its report. Hints already in the
+    /// mailbox are processed first; hints that arrive later wait.
+    pub fn refresh(&self, verify: bool) -> Result<RefreshReport, IndexError> {
+        let (reply, replies) = sync_channel(1);
+        if !self.send_command(RuntimeCommand::Refresh { verify, reply }) {
+            return Err(IndexError::IndexUnavailable);
+        }
+        replies.recv().map_err(|_| IndexError::IndexUnavailable)?
+    }
+
+    /// Stop the runtime and wait for every thread. Idempotent, and implied
+    /// by dropping the last handle.
+    ///
+    /// Never call this from inside a runtime thread (a test hook, say): it
+    /// joins, and a thread cannot join itself.
+    pub fn shutdown(&self) {
+        self.inner.stop();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.inner.stopped.load(Ordering::Acquire)
+    }
+
+    /// Whether the filesystem watcher was installed at startup.
+    pub fn watch_installed(&self) -> bool {
+        self.inner.watch_installed
+    }
+
+    #[doc(hidden)]
+    pub fn thread_count_for_test(&self) -> usize {
+        self.inner
+            .threads
+            .lock()
+            .map(|threads| threads.len())
+            .unwrap_or(0)
+    }
+}
+
+/// The one mutation owner.
+struct Coordinator {
+    index: IndexService,
+    /// A read-only view of the vault, used for exactly one thing: deciding
+    /// whether a hinted path is currently present, so an absent one can be
+    /// held for the deletion grace window instead of publishing a deletion
+    /// the next write would undo.
+    source: FileSystemIndexSource,
+    commands: Receiver<RuntimeCommand>,
+    notices: SyncSender<RuntimeNotice>,
+    overflow: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    tick_pending: Arc<AtomicBool>,
+    gate: Option<RuntimeHook>,
+    hooks: RuntimeTestHooks,
+    debounce: Duration,
+    /// Paths waiting to go into the next targeted batch.
+    pending: BTreeSet<VaultPath>,
+    /// Paths last seen absent, with the instant they may be treated as
+    /// deleted. An atomic save (write temp, rename over) makes a path vanish
+    /// for microseconds; publishing that as a deletion would emit a
+    /// generation pair no client should ever have seen.
+    pending_deletions: BTreeMap<VaultPath, Instant>,
+    /// The earliest deadline in `pending_deletions`, tracked rather than
+    /// rescanned: the map is keyed by path, so finding the minimum costs a
+    /// full scan, and a runtime under sustained command traffic checks this
+    /// on every iteration.
+    next_deletion: Option<Instant>,
+    /// When a re-hinted batch may be retried.
+    retry_at: Option<Instant>,
+    rehints: usize,
+    /// Whether a watcher is installed and healthy.
+    watching: bool,
+    /// Whether a watcher was installed at startup at all. Fixed for the
+    /// runtime's lifetime.
+    watch_installed: bool,
+    watch_error: Option<String>,
+    reconcile_error: Option<String>,
+    state: LiveState,
+    published_error: Option<String>,
+    notices_dropped: bool,
+}
+
+impl Coordinator {
+    fn run(mut self) {
+        self.publish_state(LiveState::CatchingUp, None);
+        // Startup catch-up: normal metadata reconciliation, which routes
+        // through the same dirty-set engine an ordinary refresh uses.
+        self.full_reconcile(ResyncReason::RuntimeRecovered);
+        self.drain_backlog();
+        self.settle();
+
+        while self.running.load(Ordering::Acquire) {
+            if self.overflow.swap(false, Ordering::AcqRel) {
+                self.full_reconcile(ResyncReason::WatcherOverflow);
+                self.settle();
+                continue;
+            }
+            // Checked every iteration, not only on an idle timeout: under
+            // sustained command traffic the loop may never time out, and a
+            // held-back deletion must not starve behind it.
+            let now = Instant::now();
+            self.mature_deletions(now);
+            match self.commands.recv_timeout(self.next_timeout(now)) {
+                Ok(RuntimeCommand::Stop) => break,
+                Ok(command) => self.handle(command),
+                Err(RecvTimeoutError::Timeout) => self.flush(),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let error = self.effective_error();
+        self.publish_state(LiveState::Stopped, error);
+    }
+
+    /// Process everything already queued, then flush what it produced. Runs
+    /// once, between catch-up and the first `Watching`: a runtime must not
+    /// claim to be watching while a startup backlog is still unprocessed.
+    fn drain_backlog(&mut self) {
+        loop {
+            match self.commands.try_recv() {
+                Ok(RuntimeCommand::Stop) => {
+                    self.running.store(false, Ordering::Release);
+                    return;
+                }
+                Ok(command) => self.handle(command),
+                Err(_) => break,
+            }
+        }
+        self.flush();
+    }
+
+    /// How long to block for the next command: no time at all when a batch
+    /// is ready to go, otherwise until the nearest deletion deadline.
+    fn next_timeout(&self, now: Instant) -> Duration {
+        let mut timeout = IDLE_POLL;
+        if !self.pending.is_empty() {
+            let ready = self.retry_at.unwrap_or(now);
+            timeout = timeout.min(ready.saturating_duration_since(now));
+        }
+        if let Some(deadline) = self.next_deletion {
+            timeout = timeout.min(deadline.saturating_duration_since(now));
+        }
+        timeout
+    }
+
+    fn handle(&mut self, command: RuntimeCommand) {
+        match command {
+            RuntimeCommand::Hint(hint) => self.handle_hint(hint),
+            RuntimeCommand::Refresh { verify, reply } => {
+                self.tick_pending.store(false, Ordering::Release);
+                // Mailbox order is mutation order: hints that arrived
+                // before this command are published first.
+                self.flush();
+                let result = self.foreground_refresh(verify);
+                let _ = reply.try_send(result);
+            }
+            RuntimeCommand::Stop => self.running.store(false, Ordering::Release),
+        }
+    }
+
+    fn handle_hint(&mut self, hint: ChangeHint) {
+        match hint {
+            ChangeHint::Paths(paths) => {
+                let now = Instant::now();
+                for path in paths {
+                    match self.source.fingerprint(&path) {
+                        // Present: reconcile it now, and cancel any grace
+                        // window it was waiting out — this is the coalescing
+                        // case, an atomic save landing on its final name.
+                        Ok(Some(_)) => {
+                            self.pending_deletions.remove(&path);
+                            self.pending.insert(path);
+                        }
+                        Ok(None) => {
+                            let deadline = now + self.debounce;
+                            // A later hint coalesces onto the same entry
+                            // rather than adding another.
+                            self.pending_deletions.insert(path, deadline);
+                            self.next_deletion = Some(
+                                self.next_deletion
+                                    .map_or(deadline, |earliest| earliest.min(deadline)),
+                            );
+                        }
+                        // Metadata unreadable: no basis for holding it back.
+                        // Over-selection is always safe.
+                        Err(_) => {
+                            self.pending_deletions.remove(&path);
+                            self.pending.insert(path);
+                        }
+                    }
+                }
+                // A hint from a stream that exists is proof it works again.
+                // Gated on the watcher having actually been installed: a
+                // runtime that never had one (watching disabled, or
+                // installation refused) can still be fed hints in-process,
+                // and those must never let it claim to be watching.
+                if self.watch_installed && self.watch_error.is_some() {
+                    self.watch_error = None;
+                    self.watching = true;
+                    self.settle();
+                }
+            }
+            ChangeHint::Overflow => {
+                self.full_reconcile(ResyncReason::WatcherOverflow);
+                self.settle();
+            }
+            ChangeHint::RootInvalidated => {
+                self.full_reconcile(ResyncReason::RootInvalidated);
+                self.settle();
+            }
+            ChangeHint::WatcherFailed(message) => {
+                // Never just logged: the stream stopped telling the truth,
+                // so the incremental view has to be rebuilt, and the runtime
+                // degrades to periodic and manual reconciliation.
+                self.watching = false;
+                self.watch_error = Some(message);
+                self.full_reconcile(ResyncReason::RuntimeRecovered);
+                self.settle();
+            }
+        }
+    }
+
+    /// Move every matured deletion into the next batch. `refresh_paths`
+    /// re-fingerprints (and re-reads) each path it is given, so the state
+    /// that decides "deleted" versus "modified" is read there, from one
+    /// coherent observation, rather than guessed at here.
+    fn mature_deletions(&mut self, now: Instant) {
+        // `next_deletion` is only ever too early (a removed or extended
+        // entry leaves it behind), never too late, so this early return can
+        // cost a wasted wake-up but can never miss a deadline.
+        match self.next_deletion {
+            Some(deadline) if deadline <= now => {}
+            Some(_) => return,
+            None => return,
+        }
+        let mut earliest: Option<Instant> = None;
+        let mut matured: Vec<VaultPath> = Vec::new();
+        for (path, deadline) in &self.pending_deletions {
+            if *deadline <= now {
+                matured.push(path.clone());
+            } else {
+                earliest = Some(earliest.map_or(*deadline, |it: Instant| it.min(*deadline)));
+            }
+        }
+        for path in matured {
+            self.pending_deletions.remove(&path);
+            self.pending.insert(path);
+        }
+        self.next_deletion = earliest;
+    }
+
+    /// Publish whatever is pending as one targeted batch.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if let Some(at) = self.retry_at {
+            if Instant::now() < at {
+                return;
+            }
+        }
+        self.retry_at = None;
+        let batch = std::mem::take(&mut self.pending);
+        self.reconcile_paths(batch);
+    }
+
+    fn reconcile_paths(&mut self, batch: BTreeSet<VaultPath>) {
+        for attempt in 0..MAX_MUTATION_ATTEMPTS {
+            let paths = batch.clone();
+            let last = attempt + 1 == MAX_MUTATION_ATTEMPTS;
+            match self.mutation(|index| index.refresh_paths(paths, ChangeCause::Watcher)) {
+                Ok(report) => {
+                    self.rehints = 0;
+                    self.clear_reconcile_error();
+                    if report.previous_generation != Some(report.generation) {
+                        self.emit(RuntimeNotice::Generation(Box::new(report)));
+                    }
+                    return;
+                }
+                Err(IndexError::Busy(_)) if !last => std::thread::sleep(BUSY_BACKOFF),
+                Err(IndexError::LiveStateStale(_)) if !last => {
+                    if let Err(error) = self.mutation(IndexService::resync_published) {
+                        self.fail(&error);
+                        return;
+                    }
+                }
+                // Reads happen before the publication attempt, and one moved
+                // path aborts the whole batch — so the whole batch is what
+                // has to come back, not the path that moved.
+                Err(IndexError::VaultChangedDuringRefresh) => {
+                    self.rehint(batch);
+                    return;
+                }
+                // No generation to be incremental against yet: the cold
+                // build has to run first.
+                Err(IndexError::IndexUnavailable) => {
+                    self.full_reconcile(ResyncReason::RuntimeRecovered);
+                    self.settle();
+                    return;
+                }
+                Err(error) => {
+                    self.fail(&error);
+                    return;
+                }
+            }
+        }
+        self.rehint(batch);
+    }
+
+    /// Put a batch back for another attempt, or give up on being incremental
+    /// about it. Bounded on purpose: a file rewritten in a loop would
+    /// otherwise keep this batch retrying forever.
+    fn rehint(&mut self, batch: BTreeSet<VaultPath>) {
+        self.rehints += 1;
+        if self.rehints > MAX_CONSECUTIVE_REHINTS {
+            self.rehints = 0;
+            self.full_reconcile(ResyncReason::RuntimeRecovered);
+            self.settle();
+            return;
+        }
+        self.pending.extend(batch);
+        self.retry_at = Some(Instant::now() + self.debounce);
+    }
+
+    /// Complete metadata reconciliation, plus whatever resolution the
+    /// dirty-set engine decides is conservative. Everything pending is
+    /// discarded first: this covers it all.
+    fn full_reconcile(&mut self, reason: ResyncReason) {
+        self.pending.clear();
+        self.pending_deletions.clear();
+        self.next_deletion = None;
+        self.retry_at = None;
+        let error = self.effective_error();
+        self.publish_state(LiveState::CatchingUp, error);
+
+        let before = self.committed_generation();
+        match self.refresh_with_retries(false) {
+            Ok(report) => {
+                self.clear_reconcile_error();
+                let advanced = Some(report.generation) != before;
+                // A lost-detail reason is always announced, even when the
+                // generation did not move: the observer's incremental view is
+                // what became untrustworthy, not the rows.
+                if advanced || reason != ResyncReason::RuntimeRecovered {
+                    self.emit(RuntimeNotice::ResyncRequired {
+                        generation: Some(report.generation),
+                        reason,
+                    });
+                }
+            }
+            Err(error) => self.fail(&error),
+        }
+    }
+
+    /// A refresh asked for by a client or by the periodic timer. Reports
+    /// back to its caller; announces a resync only when it actually moved
+    /// the generation, because no per-path change set describes what it did.
+    fn foreground_refresh(&mut self, verify: bool) -> Result<RefreshReport, IndexError> {
+        let before = self.committed_generation();
+        let result = self.refresh_with_retries(verify);
+        match &result {
+            Ok(report) => {
+                self.clear_reconcile_error();
+                if Some(report.generation) != before {
+                    self.emit(RuntimeNotice::ResyncRequired {
+                        generation: Some(report.generation),
+                        reason: ResyncReason::RuntimeRecovered,
+                    });
+                }
+            }
+            Err(error) => self.fail(error),
+        }
+        result
+    }
+
+    /// One refresh, retried for the errors that are retryable by
+    /// construction: lock contention, a stale live state this process can
+    /// re-sync, and a vault that moved mid-refresh.
+    fn refresh_with_retries(&mut self, verify: bool) -> Result<RefreshReport, IndexError> {
+        let mut last = None;
+        for attempt in 0..MAX_MUTATION_ATTEMPTS {
+            let final_attempt = attempt + 1 == MAX_MUTATION_ATTEMPTS;
+            match self.mutation(|index| index.refresh(verify)) {
+                Ok(report) => return Ok(report),
+                Err(error) => {
+                    let retryable = matches!(
+                        error,
+                        IndexError::Busy(_)
+                            | IndexError::LiveStateStale(_)
+                            | IndexError::VaultChangedDuringRefresh
+                    );
+                    if !retryable || final_attempt {
+                        return Err(error);
+                    }
+                    match &error {
+                        IndexError::Busy(_) => std::thread::sleep(BUSY_BACKOFF),
+                        IndexError::LiveStateStale(_) => {
+                            self.mutation(IndexService::resync_published)?;
+                        }
+                        _ => {}
+                    }
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.unwrap_or(IndexError::IndexUnavailable))
+    }
+
+    /// Every call into the `IndexService` goes through here, so "how many
+    /// mutations are in flight" is answerable — and provably one.
+    fn mutation<T>(
+        &mut self,
+        work: impl FnOnce(&mut IndexService) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
+        let enter = self.hooks.mutation_enter.clone();
+        let exit = self.hooks.mutation_exit.clone();
+        if let Some(hook) = &enter {
+            hook();
+        }
+        if let Some(gate) = self.gate.take() {
+            gate();
+        }
+        let outcome = work(&mut self.index);
+        if let Some(hook) = &exit {
+            hook();
+        }
+        outcome
+    }
+
+    fn committed_generation(&self) -> Option<Generation> {
+        self.index.current_generation().ok().flatten()
+    }
+
+    fn effective_error(&self) -> Option<String> {
+        self.watch_error
+            .clone()
+            .or_else(|| self.reconcile_error.clone())
+    }
+
+    /// The state the runtime settles into once a cycle is done: watching if
+    /// a healthy watcher is installed, polling otherwise — which covers both
+    /// a failed watcher and a runtime configured not to watch at all.
+    fn settle(&mut self) {
+        let state = if self.watching {
+            LiveState::Watching
+        } else {
+            LiveState::PollingFallback
+        };
+        let error = self.effective_error();
+        self.publish_state(state, error);
+    }
+
+    fn fail(&mut self, error: &IndexError) {
+        let _ = self.index.record_refresh_failure(error);
+        self.reconcile_error = Some(error.to_string());
+        let state = self.state;
+        let error = self.effective_error();
+        self.publish_state(state, error);
+    }
+
+    fn clear_reconcile_error(&mut self) {
+        if self.reconcile_error.is_none() {
+            return;
+        }
+        self.reconcile_error = None;
+        let state = self.state;
+        let error = self.effective_error();
+        self.publish_state(state, error);
+    }
+
+    /// Record observational status on the publication barrier and tell
+    /// observers. A no-op when nothing actually changed, so a busy runtime
+    /// does not flood the notice sink with identical states.
+    fn publish_state(&mut self, state: LiveState, error: Option<String>) {
+        if self.state == state && self.published_error == error {
+            return;
+        }
+        if let Err(failure) = self.index.set_live_state(state) {
+            // The barrier is poisoned or unreachable; there is nothing left
+            // to report it through, and no reason to abandon the loop.
+            self.reconcile_error = Some(failure.to_string());
+        }
+        if let Err(failure) = self.index.set_runtime_error(error.clone()) {
+            self.reconcile_error = Some(failure.to_string());
+        }
+        self.state = state;
+        self.published_error = error.clone();
+        let generation = self.committed_generation();
+        self.emit(RuntimeNotice::State {
+            generation,
+            state,
+            error,
+        });
+    }
+
+    /// Offer one notice. The sink is bounded and owned by the caller, so a
+    /// slow observer must never stall indexing: a notice that will not fit
+    /// is dropped, and the gap is announced as a resync before the next one
+    /// that does fit.
+    fn emit(&mut self, notice: RuntimeNotice) {
+        if self.notices_dropped {
+            let generation = self.committed_generation();
+            match self.notices.try_send(RuntimeNotice::ResyncRequired {
+                generation,
+                reason: ResyncReason::RuntimeRecovered,
+            }) {
+                Ok(()) => self.notices_dropped = false,
+                Err(TrySendError::Full(_)) => return,
+                Err(TrySendError::Disconnected(_)) => {
+                    self.notices_dropped = false;
+                    return;
+                }
+            }
+        }
+        match self.notices.try_send(notice) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.notices_dropped = true,
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}

@@ -1,4 +1,5 @@
 mod convert;
+pub mod runtime;
 
 use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexService, ReferenceStatus};
@@ -16,6 +17,10 @@ pub struct Server {
 pub enum ServerStartupError {
     #[error(transparent)]
     Index(#[from] IndexError),
+    /// A runtime thread could not be spawned. Fatal at startup: a runtime
+    /// missing its coordinator would never reconcile anything.
+    #[error("failed to start a runtime thread: {0}")]
+    Spawn(#[from] std::io::Error),
 }
 
 fn index_unavailable() -> ProtocolError {
@@ -122,7 +127,7 @@ impl Server {
                     },
                 },
             },
-            Request::ResolveLink(params) => match self.index.as_mut() {
+            Request::ResolveLink(params) => match self.index.as_ref() {
                 None => ResponseEnvelope::error(id, index_unavailable()),
                 Some(index) => match parse_path(&params.source_path) {
                     Err(error) => ResponseEnvelope::error(id, error),

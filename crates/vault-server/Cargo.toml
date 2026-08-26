@@ -16,6 +16,7 @@ thiserror.workspace = true
 vault-core = { path = "../vault-core" }
 vault-index = { path = "../vault-index" }
 vault-protocol = { path = "../vault-protocol" }
+vault-watch = { path = "../vault-watch" }
 
 [dev-dependencies]
 tempfile.workspace = true

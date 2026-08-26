@@ -921,6 +921,7 @@ dependencies = [
  "vault-core",
  "vault-index",
  "vault-protocol",
+ "vault-watch",
 ]
 
 [[package]]
