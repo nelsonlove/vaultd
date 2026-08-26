@@ -16,17 +16,27 @@ struct Cli {
     vault: Option<PathBuf>,
     #[arg(long, value_name = "PATH", requires = "vault")]
     index: Option<PathBuf>,
+    // The three tuning flags describe a runtime, and health-only mode has
+    // none, so each requires `--vault` exactly as `--index` does. Accepting
+    // them without one would silently do nothing. `requires` is evaluated
+    // only for values that came from the command line, so the defaults below
+    // still leave bare `vaultd` valid.
     /// Reconcile on demand and on the periodic tick only, installing no
     /// filesystem watcher.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, requires = "vault")]
     no_watch: bool,
     /// How long a burst of filesystem events is coalesced before it becomes
     /// one dirty batch.
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(10..=5_000))]
+    #[arg(
+        long,
+        default_value_t = 100,
+        requires = "vault",
+        value_parser = clap::value_parser!(u64).range(10..=5_000),
+    )]
     watch_debounce_ms: u64,
     /// How often the vault is reconciled completely regardless of watcher
     /// activity. `0` disables the periodic tick.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 60, requires = "vault")]
     reconcile_interval_seconds: u64,
 }
 

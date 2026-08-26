@@ -6,8 +6,7 @@
 //! cost anything. Nothing here blocks, allocates without a ceiling, or talks
 //! to the runtime.
 //!
-//! Three bounds hold at once, and every one of them degrades into a marker
-//! rather than a loss:
+//! Two bounds hold, and each degrades into a marker rather than a loss:
 //!
 //! * **Per-subscriber queue depth** — at most [`SUBSCRIBER_CAPACITY`]
 //!   events. A subscriber that stops draining has its queued generation
@@ -17,9 +16,29 @@
 //! * **Per-generation change-set detail** — at most [`DETAILED_PATH_LIMIT`]
 //!   paths. A larger generation is reported as counts, followed by
 //!   `resync_required { oversized_change_set }`.
-//! * **Subscriber independence** — every queue is private, so one client
-//!   that never reads its stdout can neither stall the runtime nor delay a
-//!   peer subscription.
+//!
+//! **These are component bounds, and only the second is reachable through
+//! the shipped stdio transport.** They bind whoever drives this registry, and
+//! [`crate::stdio`]'s dispatcher drives it in a way that never approaches the
+//! first: it drains every queued event immediately after each
+//! `enqueue_notice`, so a subscriber queue holds at most one notice's worth
+//! of events. `subscriber_lag` is therefore not what a slow stdio *client*
+//! experiences — a client that stops reading meets backpressure on the
+//! output channel instead, which ends with the coordinator's non-blocking
+//! notice send failing and the gap announced as
+//! `resync_required { runtime_recovered }`. The lag path is real for an
+//! embedder that drives this registry directly, batches notices before
+//! draining, or drains on a schedule, and is exercised by the unit tests in
+//! `tests/subscriptions.rs`. `DETAILED_PATH_LIMIT` *is* reachable over
+//! stdio, because it depends on the size of one generation rather than on
+//! how fast anyone drains.
+//!
+//! Private queues bound memory, not latency. Two subscriptions cannot
+//! displace each other's events, and neither can stall reconciliation — the
+//! coordinator never waits on this module. But on one stdio connection they
+//! share a dispatcher and a writer, so a client that stops reading does
+//! delay its peers until it resumes or disconnects. Independence of
+//! *delivery* is a property of the transport, not of this registry.
 //!
 //! One rule is about meaning rather than size: `resync_required` tells a
 //! client the generation it must re-read at, so it is withheld entirely
@@ -331,7 +350,18 @@ impl Subscription {
             return;
         }
         if self.queue.len() >= SUBSCRIBER_CAPACITY {
-            self.coalesce(event_generation(&event));
+            let generation = event_generation(&event);
+            // A state event that arrives *at* capacity is the newest state
+            // there is, so it is the one the collapse must keep. Queueing it
+            // first — one slot over the bound, for the length of this call —
+            // is what puts it in front of `coalesce`'s newest-state scan.
+            // Discarding it instead loses the transition outright whenever
+            // the queue holds nothing but deltas, and a lost `Stopped` is
+            // never re-announced.
+            if is_state_event(&event) {
+                self.queue.push_back(event);
+            }
+            self.coalesce(generation);
             return;
         }
         self.queue.push_back(event);

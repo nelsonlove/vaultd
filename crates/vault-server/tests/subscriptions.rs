@@ -429,3 +429,64 @@ fn subscription_identifiers_are_allocated_in_order_and_never_reused() {
     assert_eq!(first.subscription_id, "sub-1");
     assert_eq!(second.subscription_id, "sub-2");
 }
+
+/// State is a level, not an edge: a client's view of it stays wrong until
+/// the next transition. So the collapse that discards queued deltas must
+/// keep the newest state event — *including* the one whose arrival caused
+/// the collapse, which is by definition the newest of all.
+///
+/// The case that matters is a queue full of nothing but deltas: there is no
+/// state event already queued to fall back on, so discarding the incoming
+/// one loses the transition outright. A lost `stopped` is never re-announced,
+/// and the client waits forever on a runtime that has already gone.
+#[test]
+fn a_state_change_arriving_at_capacity_survives_the_collapse() {
+    let mut registry = SubscriptionRegistry::new();
+    registry.subscribe(&status(Some(1), LiveState::Watching));
+    registry.activate_new();
+
+    for generation in 2..=(SUBSCRIBER_CAPACITY as u64 + 1) {
+        registry.enqueue_notice(generation_notice(generation, paths("Note", 1)));
+    }
+    assert_eq!(
+        registry.queue_len("sub-1"),
+        Some(SUBSCRIBER_CAPACITY),
+        "the queue is exactly full, and holds no state event to fall back on"
+    );
+
+    registry.enqueue_notice(RuntimeNotice::State {
+        generation: Some(Generation::new(SUBSCRIBER_CAPACITY as u64 + 1)),
+        state: LiveState::Stopped,
+        error: None,
+    });
+    assert!(
+        registry.queue_len("sub-1").expect("subscription exists") <= SUBSCRIBER_CAPACITY,
+        "the bound still holds"
+    );
+
+    let events = drain(&mut registry);
+    let (state, marker) = match events.as_slice() {
+        [.., state, marker] => (&state.event, &marker.event),
+        other => panic!("expected a state event then a lag marker, got {other:?}"),
+    };
+    match state {
+        RuntimeEventDto::RuntimeStateChanged(changed) => {
+            assert_eq!(
+                changed.live_state,
+                LiveStateDto::Stopped,
+                "the transition that arrived at capacity must survive"
+            );
+        }
+        other => panic!("expected the state change to survive, got {other:?}"),
+    }
+    match marker {
+        RuntimeEventDto::ResyncRequired(resync) => {
+            assert_eq!(resync.reason, ResyncReasonDto::SubscriberLag);
+            assert_eq!(
+                resync.current_generation,
+                Some(SUBSCRIBER_CAPACITY as u64 + 1)
+            );
+        }
+        other => panic!("expected a subscriber_lag marker last, got {other:?}"),
+    }
+}

@@ -40,7 +40,8 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 - a debounced filesystem watcher drives targeted incremental reconciliation, with a periodic complete reconciliation behind it (`--no-watch`, `--watch-debounce-ms`, `--reconcile-interval-seconds`);
 - `subscribe_events` and `unsubscribe` multiplex **post-commit events** onto the stdio stream — one JSON object per line, one writer, so an event can never split a response and a client that never subscribes sees byte-identical protocol version 1 output;
 - `generation_committed` carries the exact per-path change set, `runtime_state_changed` the runtime's observational state, and `resync_required` every case where no per-path delta describes the move;
-- every queue is bounded: **bounded per-subscriber** queues of 64 events, 1024 paths of change-set detail per generation, and each overflow degrades into a `resync_required` marker (`subscriber_lag`, `oversized_change_set`) rather than into silence. A client that stops reading its own stdout can neither stall reconciliation nor delay another subscriber.
+- every queue is bounded and every overflow degrades into a `resync_required` marker rather than into silence: the registry enforces **bounded per-subscriber** queues of 64 events (`subscriber_lag`) and 1024 paths of change-set detail per generation (`oversized_change_set`);
+- reconciliation is never stalled by a client — the coordinator offers notices without ever waiting and drops what will not fit, so a client that stops reading its own stdout meets backpressure and is later told `resync_required { runtime_recovered }`, rather than slowing indexing or losing a change. Subscriptions on one connection share a writer, though, so such a client does delay its peers on that connection until it resumes.
 
 See `docs/protocol.md`.
 

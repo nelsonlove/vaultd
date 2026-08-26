@@ -12,7 +12,7 @@ vaultd --vault /path/to/vault --index /path/to.db   # explicit index path
 vaultd                                              # health-only mode
 ```
 
-Runtime tuning, valid only with `--vault`:
+Runtime tuning. Each of these requires `--vault`, exactly as `--index` does, and is refused without it rather than silently ignored:
 
 ```text
 --no-watch                          # reconcile on demand and on the tick only
@@ -59,7 +59,7 @@ Returns the canonical vault root, vault identity, index state (`ready`, `stale` 
 ```
 
 ```json
-{"version":1,"id":"v","outcome":{"status":"ok","value":{"type":"get_vault_info","value":{"generation":3,"canonical_root":"/vaults/example","vault_identity":"2f9a…","state":{"state":"ready"},"note_count":128,"refreshed_at_unix_ms":1756100000000}}}}
+{"version":1,"id":"v","outcome":{"status":"ok","value":{"type":"get_vault_info","value":{"generation":3,"canonical_root":"/vaults/example","vault_identity":"2f9a…","state":{"state":"ready"},"note_count":128,"refreshed_at_unix_ms":1756100000000,"live_state":"watching"}}}}
 ```
 
 ### `list_notes`
@@ -208,17 +208,26 @@ The generation moved in a way no per-path change set describes: an incremental c
 - `subscriber_lag` — this subscription stopped draining, so its queued detail was collapsed onto this one marker.
 - `oversized_change_set` — the preceding generation's change set exceeded the detail limit and was reported as counts.
 
+`current_generation` is nullable in the type but is never null in protocol version 1: an event that cannot name a generation to re-read at would tell a client nothing, so it is withheld rather than emitted (see the note at the end of this section). A client may treat the field as present. It stays nullable so a later version can carry the case explicitly without widening the shape again.
+
 ```json
 {"version":1,"subscription_id":"sub-1","event":{"type":"resync_required","value":{"current_generation":4,"reason":"watcher_overflow"}}}
 ```
 
 ### Bounds
 
-Every queue is bounded and every overflow degrades into a marker, never into silence.
+Every queue is bounded and every overflow degrades into a marker, never into silence. Which bound you meet depends on how events are being delivered.
 
-- **Per subscription: 64 events.** A subscriber that stops reading has its queued generation detail replaced by one `resync_required { subscriber_lag }` naming the newest generation; the newest `runtime_state_changed` survives, because state is a level rather than an edge. Detail resumes once that marker drains.
-- **Per generation: 1024 paths of detail.** Larger change sets are reported as counts plus `resync_required { oversized_change_set }`.
-- **Subscriber independence.** A client that never reads its stdout can neither stall reconciliation nor delay another subscription.
+**What a slow stdio client actually meets is backpressure.** The dispatcher drains queued events immediately after every notice, so no subscription queue holds more than one notice's worth. A client that stops reading its stdout instead backs up the output queue, which blocks the dispatcher's shared drain, which fills the input queue, at which point the coordinator's non-blocking notice send starts failing. Those drops are latched and announced, once there is a generation to name, as `resync_required { runtime_recovered }`. So the symptom of a slow stdio client is a `runtime_recovered` resync — not `subscriber_lag`.
+
+**The registry enforces two bounds** regardless of transport. They bind any embedder driving it directly — batching notices, or draining on a schedule — and only the second is reachable through the stdio dispatcher:
+
+- **Per subscription: 64 events.** A subscription whose queue fills has its queued generation detail replaced by one `resync_required { subscriber_lag }` naming the newest generation; the newest `runtime_state_changed` survives, because state is a level rather than an edge. Detail resumes once that marker drains. Not reachable through the stdio dispatcher, for the reason above.
+- **Per generation: 1024 paths of detail.** Larger change sets are reported as counts plus `resync_required { oversized_change_set }`. Reachable over stdio, because it depends on the size of one generation rather than on how fast anyone drains.
+
+**Reconciliation is never stalled by a client.** The coordinator offers notices without ever waiting and drops what will not fit, so no client — however slow, however dead — can slow indexing or cause a lost change. Only a gap, and the gap is announced.
+
+**Delivery between peers is not independent on one connection.** Subscriptions have private queues, so neither can displace the other's events. But they share a dispatcher and a writer, so a client that stops reading delays every other subscription on that same connection until it resumes or disconnects. Private queues bound memory, not latency.
 
 While no generation has ever been committed, `resync_required` is withheld: there would be nothing to re-read at. The first resync that does name a generation — after a cold build, the runtime's own `runtime_recovered` at generation 1 — supersedes every withheld predecessor.
 

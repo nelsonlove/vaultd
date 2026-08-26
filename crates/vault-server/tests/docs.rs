@@ -119,3 +119,33 @@ fn live_event_documents_declare_the_subscription_contract() {
         &["subscribe_events", "post-commit"],
     );
 }
+
+/// The bounds documentation drifted once already: it described
+/// `subscriber_lag` as what a slow stdio client experiences, which the
+/// shipped dispatcher makes unreachable. These phrases pin the corrected
+/// claims so the honest version cannot quietly revert.
+#[test]
+fn bounds_documentation_describes_the_shipped_transport() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            // The real stdio lag story, and its real symptom.
+            "backpressure",
+            "`resync_required { runtime_recovered }`",
+            // Peer delivery is not independent on one connection.
+            "Private queues bound memory, not latency.",
+            // The bounds are the registry's, not the transport's.
+            "regardless of transport",
+            // The tuning flags are enforced, not merely conventional.
+            "requires `--vault`",
+            // Nullable in the type, never null on the wire in version 1.
+            "nullable in the type",
+            // `get_vault_info` actually shows the field it promises.
+            "\"live_state\":\"watching\"",
+        ],
+    );
+    assert_document_contains(
+        "README.md",
+        &["reconciliation is never stalled by a client"],
+    );
+}

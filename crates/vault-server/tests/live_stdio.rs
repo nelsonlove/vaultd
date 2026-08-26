@@ -574,3 +574,45 @@ fn out_of_range_debounce_is_refused_at_startup() {
         "a rejected invocation writes no protocol output"
     );
 }
+
+/// The runtime tuning flags describe a runtime, and health-only mode has
+/// none. Accepting them there would silently do nothing, so they require
+/// `--vault` exactly as `--index` does.
+#[test]
+fn runtime_tuning_flags_require_a_vault() {
+    for flag in [
+        vec!["--no-watch"],
+        vec!["--watch-debounce-ms", "250"],
+        vec!["--reconcile-interval-seconds", "0"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_vaultd"))
+            .args(&flag)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run vaultd");
+        assert!(
+            !output.status.success(),
+            "{flag:?} without --vault must be refused"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "a rejected invocation writes no protocol output"
+        );
+    }
+}
+
+/// Requiring a vault for the tuning flags must not make plain health-only
+/// mode harder to reach: defaults are not the same as arguments.
+#[test]
+fn health_only_mode_needs_no_arguments_at_all() {
+    let mut daemon = Daemon::start(&[]);
+    daemon.send(&health("h"));
+    let (response, _) = daemon.response("h");
+    assert!(matches!(
+        response.outcome,
+        ResponseOutcome::Ok(Response::Health(_))
+    ));
+    daemon.finish();
+}
