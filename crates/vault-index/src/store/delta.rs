@@ -48,12 +48,15 @@ pub struct DeltaPublication<'a> {
     pub fingerprint_updates: &'a [(VaultPath, FileFingerprint)],
     pub resolutions: &'a [ResolutionReplacement],
     /// `None` means "no scan-diagnostic input this cycle, leave the table
-    /// alone"; `Some` is compared against what is already stored and the
-    /// table is only touched (delete-all, reinsert) when it actually
-    /// changed. Scan diagnostics have no per-item owner id to scope a write
-    /// by — unlike every other table this path touches — so a changed set is
-    /// necessarily a whole-table replace; an unchanged or absent set never
-    /// executes a single statement against it.
+    /// alone": no statement, read or write, touches `scan_diagnostics` at
+    /// all. `Some` always costs one read (a comparison against what is
+    /// already stored — there is no cheaper way to know whether anything
+    /// changed), but only *writes* (delete-all, reinsert) when the compared
+    /// set actually differs. Scan diagnostics have no per-item owner id to
+    /// scope a write by — unlike every other table this path touches — so a
+    /// changed set is necessarily a whole-table replace; an unchanged set
+    /// commits with the read-only comparison as its only statement against
+    /// the table.
     pub scan_diagnostics: Option<&'a [Diagnostic]>,
 }
 
@@ -227,6 +230,32 @@ impl IndexStore {
                     ],
                 )?;
                 counts.diagnostics_replaced += 1;
+            }
+        }
+
+        // Every reference `replace_note` (re)created above must end up with a
+        // resolution row before this transaction commits: both read paths
+        // (`store/hydrate.rs`, `query.rs`) `INNER JOIN resolutions`, so a
+        // reference left without one would not fail loudly — it would just
+        // silently vanish from every query. `replace_note` gives each
+        // recreated reference a brand-new `note_references.id`, so a caller
+        // must supply a matching `ResolutionReplacement` for every one of a
+        // replaced note's own references; this check is the transaction's
+        // own proof that they did, at a cost proportional to the changed
+        // notes' own reference counts (indexed by `note_path`).
+        for replacement in notes {
+            let path = replacement.note.source.path();
+            let missing: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM note_references r \
+                 LEFT JOIN resolutions s ON s.reference_id = r.id \
+                 WHERE r.note_path = ?1 AND s.reference_id IS NULL",
+                params![path.as_str()],
+                |row| row.get(0),
+            )?;
+            if missing > 0 {
+                return Err(IndexError::IncompleteResolutionCoverage(
+                    path.as_str().to_string(),
+                ));
             }
         }
 
@@ -413,5 +442,116 @@ mod tests {
             )
             .expect("stable reference id after delta");
         assert_eq!(before_reference_id, after_reference_id);
+    }
+
+    /// The only branch that can violate row-targeting (`scan_diagnostics` has
+    /// no per-item owner id, so a genuine change is necessarily a
+    /// whole-table replace) previously had zero coverage: every call site in
+    /// the rest of this task's tests passes `None`. This exercises the full
+    /// read, the `Vec` vs `&[Diagnostic]` comparison, the delete, and the
+    /// ordinal-reinsert loop on a real change, then proves republishing the
+    /// identical set issues no write statement against the table at all.
+    #[test]
+    fn republishing_the_identical_scan_diagnostic_set_writes_nothing() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index_dir = tempfile::TempDir::new().expect("index tempdir");
+        std::fs::write(vault.path().join("Note.md"), "# Note\n").expect("write Note");
+
+        let config = IndexConfig::explicit(vault.path(), index_dir.path().join("index.sqlite3"))
+            .expect("scan diagnostics config");
+        let mut service = IndexService::open(config).expect("scan diagnostics service");
+        service.refresh(false).expect("cold build");
+
+        let diagnostic = vault_core::Diagnostic::new(
+            vault_core::DiagnosticCode::InaccessibleVaultRoot,
+            vault_core::Severity::Error,
+            "synthetic scan diagnostic".to_string(),
+        );
+        let diagnostics = vec![diagnostic];
+
+        let scan_diagnostics_count = |service: &IndexService| -> i64 {
+            service
+                .store
+                .connection
+                .query_row("SELECT COUNT(*) FROM scan_diagnostics", [], |row| {
+                    row.get(0)
+                })
+                .expect("scan diagnostics count")
+        };
+        assert_eq!(scan_diagnostics_count(&service), 0);
+
+        let first_expected = service
+            .store
+            .current_generation()
+            .expect("current generation")
+            .expect("prior generation");
+        let first_outcome = service
+            .store
+            .publish_delta(DeltaPublication {
+                expected: first_expected,
+                notes: &[],
+                deleted: &[],
+                fingerprint_updates: &[],
+                resolutions: &[],
+                scan_diagnostics: Some(&diagnostics),
+            })
+            .expect("first scan-diagnostics publish");
+        let second_expected = match first_outcome {
+            DeltaPublishOutcome::Committed { generation, .. } => generation,
+            DeltaPublishOutcome::GenerationChanged => panic!("unexpected generation conflict"),
+        };
+        assert_eq!(
+            scan_diagnostics_count(&service),
+            1,
+            "the first publish must have actually stored the diagnostic"
+        );
+
+        service.store.connection.trace(Some(record_sql));
+        let second_outcome = service
+            .store
+            .publish_delta(DeltaPublication {
+                expected: second_expected,
+                notes: &[],
+                deleted: &[],
+                fingerprint_updates: &[],
+                resolutions: &[],
+                scan_diagnostics: Some(&diagnostics),
+            })
+            .expect("second, identical scan-diagnostics publish");
+        service.store.connection.trace(None);
+        assert!(matches!(
+            second_outcome,
+            DeltaPublishOutcome::Committed { .. }
+        ));
+
+        TRACE.with(|log| {
+            let log = log.borrow();
+            assert!(
+                !log.is_empty(),
+                "trace collector recorded nothing; the check below would be vacuous"
+            );
+            assert!(
+                log.iter().any(|sql| sql.contains("scan_diagnostics")),
+                "the comparison read itself must still run: {log:?}"
+            );
+            let writes: Vec<&String> = log
+                .iter()
+                .filter(|sql| {
+                    let upper = sql.to_uppercase();
+                    upper.contains("SCAN_DIAGNOSTICS")
+                        && (upper.starts_with("DELETE") || upper.starts_with("INSERT"))
+                })
+                .collect();
+            assert!(
+                writes.is_empty(),
+                "republishing an identical set must not write scan_diagnostics: {writes:?}"
+            );
+        });
+
+        assert_eq!(
+            scan_diagnostics_count(&service),
+            1,
+            "the unchanged republish must not have duplicated or dropped the row"
+        );
     }
 }

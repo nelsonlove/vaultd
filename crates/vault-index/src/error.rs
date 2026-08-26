@@ -18,6 +18,8 @@ pub enum IndexError {
     IncompatibleIndex(String),
     #[error("storage failure: {0}")]
     Storage(String),
+    #[error("delta publication left {0} with a reference row that has no resolution row")]
+    IncompleteResolutionCoverage(String),
 }
 
 impl From<std::io::Error> for IndexError {

@@ -295,6 +295,10 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::StorageFailure;
             error.message = "index storage failed".into();
         }
+        IndexError::IncompleteResolutionCoverage(_) => {
+            error.code = ErrorCode::StorageFailure;
+            error.message = "index storage failed".into();
+        }
         IndexError::InvalidVaultRoot(_) => {
             error.code = ErrorCode::StorageFailure;
             error.message = "the vault root became unavailable".into();
