@@ -7,7 +7,12 @@ use vault_core::{
     resolution_diagnostic,
 };
 
+mod delta;
 mod hydrate;
+
+pub use delta::{
+    DeltaPublication, DeltaPublishOutcome, DeltaWriteCounts, NoteReplacement, ResolutionReplacement,
+};
 
 use crate::codec;
 use crate::config::IndexConfig;

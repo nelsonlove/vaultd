@@ -25,7 +25,10 @@ pub use query::{
 };
 pub use reconcile::{IndexService, RefreshReport};
 pub use schema::{SEMANTIC_FORMAT_VERSION, SQL_SCHEMA_VERSION};
-pub use store::IndexStore;
+pub use store::{
+    DeltaPublication, DeltaPublishOutcome, DeltaWriteCounts, IndexStore, NoteReplacement,
+    ResolutionReplacement,
+};
 
 #[doc(hidden)]
 pub fn open_index_for_test(config: &IndexConfig) -> Result<rusqlite::Connection, IndexError> {

@@ -42,7 +42,10 @@ impl FixtureStore {
 pub struct FixtureService {
     pub service: vault_index::IndexService,
     pub scan: ScanReport,
+    pub config: IndexConfig,
     digests_before: std::collections::BTreeMap<String, blake3::Hash>,
+    vault_root: PathBuf,
+    _vault_dir: Option<TempDir>,
     _index_dir: TempDir,
 }
 
@@ -53,14 +56,150 @@ pub fn open_fixture_service() -> FixtureService {
         index_dir.path().join("fixture-index.sqlite3"),
     )
     .expect("fixture config");
-    let service = vault_index::IndexService::open(config).expect("open fixture service");
+    let service = vault_index::IndexService::open(config.clone()).expect("open fixture service");
     let source = FileSystemVaultSource::new(fixture_vault_root()).expect("fixture source");
     let scan = scan_vault(&source).expect("scan fixture vault");
     FixtureService {
         service,
         scan,
+        config,
         digests_before: digest_tree(&fixture_vault_root()),
+        vault_root: fixture_vault_root(),
+        _vault_dir: None,
         _index_dir: index_dir,
+    }
+}
+
+/// A small, privately-owned vault (never the shared checked-in fixture) for
+/// proving delta publication: `Changed.md` starts with no outgoing
+/// references, `Target.md` is its eventual link target, and
+/// `Stable.md -> Other.md` is an unrelated reference whose storage identity
+/// a delta touching only `Changed.md` must never disturb.
+pub fn delta_publication_fixture() -> FixtureService {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index_dir = TempDir::new().expect("index tempdir");
+    std::fs::write(vault.path().join("Changed.md"), "# Changed\n").expect("write Changed");
+    std::fs::write(vault.path().join("Target.md"), "# Target\n").expect("write Target");
+    std::fs::write(vault.path().join("Stable.md"), "[[Other]]\n").expect("write Stable");
+    std::fs::write(vault.path().join("Other.md"), "# Other\n").expect("write Other");
+
+    let config = IndexConfig::explicit(vault.path(), index_dir.path().join("index.sqlite3"))
+        .expect("delta fixture config");
+    let service = vault_index::IndexService::open(config.clone()).expect("delta fixture service");
+    let source = FileSystemVaultSource::new(vault.path()).expect("delta fixture source");
+    let scan = scan_vault(&source).expect("scan delta fixture vault");
+    let vault_root = vault.path().to_path_buf();
+    FixtureService {
+        service,
+        scan,
+        config,
+        digests_before: digest_tree(&vault_root),
+        vault_root,
+        _vault_dir: Some(vault),
+        _index_dir: index_dir,
+    }
+}
+
+impl FixtureService {
+    /// The `note_references.id` for `path`'s `ordinal`-th outgoing reference,
+    /// plus a concatenated snapshot of that reference's stored resolution
+    /// columns (kind, target, subpath). Used to prove an unrelated
+    /// reference's storage identity survives a delta publication untouched.
+    pub fn reference_storage_identity(&self, path: &str, ordinal: u32) -> (i64, String) {
+        let connection = self.service.connection_for_test();
+        let reference_id: i64 = connection
+            .query_row(
+                "SELECT id FROM note_references WHERE note_path = ?1 AND ordinal = ?2",
+                rusqlite::params![path, ordinal],
+                |row| row.get(0),
+            )
+            .expect("reference id");
+        let values: String = connection
+            .query_row(
+                "SELECT kind || '|' || COALESCE(target_path, '') || '|' || \
+                        COALESCE(subpath_kind, '') || '|' || COALESCE(subpath_value, '') \
+                 FROM resolutions WHERE reference_id = ?1",
+                rusqlite::params![reference_id],
+                |row| row.get(0),
+            )
+            .expect("resolution values");
+        (reference_id, values)
+    }
+
+    /// A second `IndexStore` opened against the same on-disk cache file as
+    /// `self.service`'s own store (safe under WAL, mirroring the existing
+    /// `racing_services` pattern of two services sharing one file): the
+    /// fixture's `service` field keeps `IndexStore` crate-private, so tests
+    /// reach `IndexStore::publish_delta` this way instead.
+    pub fn open_delta_store(&self) -> vault_index::IndexStore {
+        vault_index::IndexStore::open_for_test(&self.config).expect("reopen store for delta")
+    }
+
+    /// Write `body` to `path`, resolve its outgoing references against the
+    /// fixture's current resolution catalog, and publish the result as one
+    /// delta — the "targeted read/plan/resolve" steps a real incremental
+    /// caller performs, done by hand here since this task only builds the
+    /// write path itself (wiring it into `IndexService::refresh` is a later
+    /// task).
+    pub fn publish_changed_note(
+        &mut self,
+        path: &str,
+        body: &str,
+    ) -> vault_index::DeltaPublishOutcome {
+        std::fs::write(self.vault_root.join(path), body).expect("write changed note");
+        let source = FileSystemVaultSource::new(&self.vault_root).expect("rescan source");
+        let scan = scan_vault(&source).expect("rescan vault");
+        let vault_path = vault_core::VaultPath::new(path).expect("vault path");
+        let note = scan
+            .graph
+            .note(&vault_path)
+            .expect("changed note present in rescan")
+            .clone();
+        let fingerprint = vault_index::FileFingerprint {
+            size: note.source.text().len() as u64,
+            modified_seconds: 1,
+            modified_nanos: 0,
+        };
+        let resolutions: Vec<vault_index::ResolutionReplacement> = scan
+            .graph
+            .outgoing(&vault_path)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, resolved)| {
+                let target = vault_core::LinkTarget::from(&resolved.reference);
+                vault_index::ResolutionReplacement {
+                    source_path: vault_path.clone(),
+                    ordinal: ordinal as u32,
+                    resolution: resolved.resolution.clone(),
+                    dependencies: vault_core::reference_dependencies(
+                        &vault_path,
+                        &target,
+                        &resolved.resolution,
+                    ),
+                    diagnostic: vault_core::resolution_diagnostic(resolved),
+                }
+            })
+            .collect();
+        let expected = self
+            .service
+            .current_generation()
+            .expect("current generation")
+            .expect("delta publication requires a prior generation");
+        let notes = vec![vault_index::NoteReplacement { note, fingerprint }];
+        let mut store = self.open_delta_store();
+        let outcome = store
+            .publish_delta(vault_index::DeltaPublication {
+                expected,
+                notes: &notes,
+                deleted: &[],
+                fingerprint_updates: &[],
+                resolutions: &resolutions,
+                scan_diagnostics: None,
+            })
+            .expect("publish delta");
+        drop(store);
+        self.scan = scan;
+        outcome
     }
 }
 
