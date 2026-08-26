@@ -33,6 +33,30 @@ fn parse_responses(output: &Output) -> Vec<ResponseEnvelope> {
         .collect()
 }
 
+/// A client that never subscribes must see the version 1 stream it has
+/// always seen: response envelopes only, with exactly the three top-level
+/// keys, and no event envelope anywhere. This is the byte-compatibility
+/// guarantee that makes the event work additive.
+fn assert_unsubscribed_stream_is_byte_compatible(output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("every output line is one JSON object");
+        let object = value.as_object().expect("every output line is an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["id", "outcome", "version"],
+            "an unsubscribed stream carries only response envelopes: {line}"
+        );
+        assert!(
+            !object.contains_key("subscription_id") && !object.contains_key("event"),
+            "no event may reach a client that never subscribed: {line}"
+        );
+    }
+}
+
 #[test]
 fn vaultd_serves_a_health_request_over_stdio() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_vaultd"))
@@ -188,8 +212,11 @@ fn vaultd_with_explicit_vault_serves_note_then_refresh_requests() {
     std::fs::write(vault.path().join("Note.md"), "# Note\n").unwrap();
     let index_path = index.path().join("index.sqlite3");
     let requests = [
-        r#"{"version":1,"id":"n","request":{"method":"get_note","params":{"path":"Note.md"}}}"#,
+        // The startup catch-up runs on the coordinator thread, so the first
+        // request that must observe generation 1 asks for it explicitly
+        // rather than racing the cold build.
         r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{"verify":false}}}"#,
+        r#"{"version":1,"id":"n","request":{"method":"get_note","params":{"path":"Note.md"}}}"#,
     ];
     let output = run_vaultd(
         &[
@@ -210,10 +237,44 @@ fn vaultd_with_explicit_vault_serves_note_then_refresh_requests() {
     assert_eq!(responses.len(), 2);
     assert!(matches!(
         responses[0].outcome,
-        ResponseOutcome::Ok(Response::GetNote(_))
+        ResponseOutcome::Ok(Response::RefreshIndex(_))
     ));
     assert!(matches!(
         responses[1].outcome,
-        ResponseOutcome::Ok(Response::RefreshIndex(_))
+        ResponseOutcome::Ok(Response::GetNote(_))
     ));
+    assert_unsubscribed_stream_is_byte_compatible(&output);
+}
+
+/// The runtime commits generations whether or not anyone is listening. A
+/// client that never subscribed must still see nothing but its own answers.
+#[test]
+fn an_unsubscribed_stream_never_carries_an_event() {
+    let vault = tempfile::tempdir().expect("vault");
+    let index = tempfile::tempdir().expect("index");
+    std::fs::write(vault.path().join("Note.md"), "# Note\n").unwrap();
+    let index_path = index.path().join("index.sqlite3");
+    let requests = [
+        r#"{"version":1,"id":"r1","request":{"method":"refresh_index","params":{"verify":false}}}"#,
+        r#"{"version":1,"id":"r2","request":{"method":"refresh_index","params":{"verify":true}}}"#,
+        r#"{"version":1,"id":"v","request":{"method":"get_vault_info"}}"#,
+    ];
+    let output = run_vaultd(
+        &[
+            "--vault",
+            vault.path().to_str().unwrap(),
+            "--index",
+            index_path.to_str().unwrap(),
+        ],
+        &requests,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = parse_responses(&output);
+    assert_eq!(responses.len(), 3);
+    assert_unsubscribed_stream_is_byte_compatible(&output);
 }

@@ -80,3 +80,42 @@ fn persistent_index_documents_declare_the_executable_contract() {
         ],
     );
 }
+
+#[test]
+fn live_event_documents_declare_the_subscription_contract() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "subscribe_events",
+            "unsubscribe",
+            "generation_committed",
+            "runtime_state_changed",
+            "resync_required",
+            "subscriber_lag",
+            "oversized_change_set",
+            "watcher_overflow",
+            "root_invalidated",
+            "runtime_recovered",
+            "subscription_not_found",
+            "runtime_not_ready",
+            "runtime_overloaded",
+            "index_in_use",
+            "live_state",
+            "--no-watch",
+            "--watch-debounce-ms",
+            "--reconcile-interval-seconds",
+        ],
+    );
+    assert_document_contains(
+        "README.md",
+        &[
+            "post-commit events",
+            "bounded per-subscriber",
+            "resync_required",
+        ],
+    );
+    assert_document_contains(
+        "VAULTD-COMPATIBILITY.md",
+        &["subscribe_events", "post-commit"],
+    );
+}

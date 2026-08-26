@@ -12,7 +12,19 @@ vaultd --vault /path/to/vault --index /path/to.db   # explicit index path
 vaultd                                              # health-only mode
 ```
 
-One process serves at most one explicitly configured vault. Without `--vault`, only `health` succeeds and every indexed operation returns `index_unavailable`. With `--vault`, startup opens or creates the index and attempts one normal reconciliation; a startup refresh failure with an older complete generation serves that generation as `stale`, and a failure with no generation leaves indexed operations `index_unavailable` while `health` keeps working.
+Runtime tuning, valid only with `--vault`:
+
+```text
+--no-watch                          # reconcile on demand and on the tick only
+--watch-debounce-ms <10..=5000>     # event coalescing window, default 100
+--reconcile-interval-seconds <N>    # periodic complete reconciliation, default 60; 0 disables it
+```
+
+One process serves at most one explicitly configured vault. Without `--vault`, only `health` succeeds, every indexed operation returns `index_unavailable`, `subscribe_events` returns `runtime_not_ready`, and no runtime — no watcher, no writer lease, no live graph, no timer — is started at all.
+
+With `--vault`, startup takes the exclusive writer lease, opens or creates the index, and returns as soon as reads can be answered from the last committed generation. The startup catch-up runs behind that on the runtime's coordinator thread, so an early read may answer from an older generation, or return `index_unavailable` when no generation has ever been committed. A refresh failure with an older complete generation serves that generation as `stale`.
+
+Exactly one process may hold a given index. A second `vaultd` over the same index fails to start, and an operation that meets the lease held elsewhere returns `index_in_use`.
 
 ## Envelope rules
 
@@ -40,7 +52,7 @@ Returns the service name and `ok` status. It performs no filesystem access.
 
 ### `get_vault_info`
 
-Returns the canonical vault root, vault identity, index state (`ready`, `stale` with the last refresh error, or `unavailable`), current generation, note count, and the last successful refresh time.
+Returns the canonical vault root, vault identity, index state (`ready`, `stale` with the last refresh error, or `unavailable`), current generation, note count, and the last successful refresh time. With a configured vault it also carries `live_state`, the runtime's observational status: `starting`, `catching_up`, `watching`, `polling_fallback`, or `stopped`. The field is absent in health-only mode, where there is no runtime to describe.
 
 ```json
 {"version":1,"id":"v","request":{"method":"get_vault_info"}}
@@ -134,6 +146,78 @@ Reconciles the vault into a new generation. A normal refresh (`verify: false`, t
 {"version":1,"id":"x","outcome":{"status":"ok","value":{"type":"refresh_index","value":{"previous_generation":3,"generation":4,"added":1,"changed":2,"deleted":0,"unchanged":125,"reparsed":3,"verified":true}}}}
 ```
 
+### `subscribe_events`
+
+Opens a stream of post-commit events and answers with the subscription's opaque identifier, the generation it starts from, and the runtime's `live_state`. The identifier is a process-scoped name, not a security token, and is never reused within a process.
+
+```json
+{"version":1,"id":"s","request":{"method":"subscribe_events","params":{}}}
+```
+
+```json
+{"version":1,"id":"s","outcome":{"status":"ok","value":{"type":"subscribe_events","value":{"subscription_id":"sub-1","generation":3,"live_state":"watching"}}}}
+```
+
+### `unsubscribe`
+
+Ends a subscription. Events already queued for it reach the client *before* this response; nothing bearing that identifier follows it. An identifier this process never issued, or already released, is `subscription_not_found`.
+
+```json
+{"version":1,"id":"u","request":{"method":"unsubscribe","params":{"subscription_id":"sub-1"}}}
+```
+
+```json
+{"version":1,"id":"u","outcome":{"status":"ok","value":{"type":"unsubscribe","value":{"subscription_id":"sub-1"}}}}
+```
+
+## Events
+
+The stdio transport carries a second top-level envelope shape alongside responses: one JSON object per line, with `version`, `subscription_id`, and `event`, and no `id` or `outcome`. Exactly one writer owns the output stream, so an event line can never split a response line, and a client that never subscribed sees byte-identical output to protocol version 1 without events.
+
+Ordering is definite in both directions. A `subscribe_events` response is written before its subscription can receive anything, so no event precedes it. An `unsubscribe` response is written after that subscription's queue is flushed, so no event follows it.
+
+Every event is **post-commit**: the generation it names is already committed to SQLite and installed as live state, so a read issued after the event sees at least that generation.
+
+### `generation_committed`
+
+One committed generation's semantic change. `changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, or `verified`.
+
+```json
+{"version":1,"subscription_id":"sub-1","event":{"type":"generation_committed","value":{"previous_generation":3,"generation":4,"cause":"watcher","changes":{"kind":"detailed","created":[],"modified":["Folder/Note.md"],"deleted":[]},"affected_note_count":1,"affected_reference_count":7}}}
+```
+
+### `runtime_state_changed`
+
+The runtime's observational status moved. `message` carries the reason when there is one; `error_code` is reserved for a future typed code and is always absent today.
+
+```json
+{"version":1,"subscription_id":"sub-1","event":{"type":"runtime_state_changed","value":{"generation":4,"live_state":"polling_fallback","message":"watcher installation was refused"}}}
+```
+
+### `resync_required`
+
+The generation moved in a way no per-path change set describes: an incremental client must re-read current state rather than apply a delta. `current_generation` names the generation to re-read at, and `reason` is one of:
+
+- `runtime_recovered` — the startup catch-up, a periodic tick, a manual refresh, or a watcher-failure recovery.
+- `watcher_overflow` — the watcher lost events (kernel overflow, storming, or a structural change it could not name).
+- `root_invalidated` — the vault root itself was removed or renamed.
+- `subscriber_lag` — this subscription stopped draining, so its queued detail was collapsed onto this one marker.
+- `oversized_change_set` — the preceding generation's change set exceeded the detail limit and was reported as counts.
+
+```json
+{"version":1,"subscription_id":"sub-1","event":{"type":"resync_required","value":{"current_generation":4,"reason":"watcher_overflow"}}}
+```
+
+### Bounds
+
+Every queue is bounded and every overflow degrades into a marker, never into silence.
+
+- **Per subscription: 64 events.** A subscriber that stops reading has its queued generation detail replaced by one `resync_required { subscriber_lag }` naming the newest generation; the newest `runtime_state_changed` survives, because state is a level rather than an edge. Detail resumes once that marker drains.
+- **Per generation: 1024 paths of detail.** Larger change sets are reported as counts plus `resync_required { oversized_change_set }`.
+- **Subscriber independence.** A client that never reads its stdout can neither stall reconciliation nor delay another subscription.
+
+While no generation has ever been committed, `resync_required` is withheld: there would be nothing to re-read at. The first resync that does name a generation — after a cold build, the runtime's own `runtime_recovered` at generation 1 — supersedes every withheld predecessor.
+
 ## Errors
 
 Stable version 1 codes and when each occurs:
@@ -159,6 +243,11 @@ Stable version 1 codes and when each occurs:
 - `incompatible_index` — the index belongs to another vault or an incompatible version that cannot be rebuilt safely.
 - `storage_failure` — an index storage or filesystem failure not representable as a note diagnostic.
 - `internal` — an unexpected server failure.
+- `index_in_use` — another process holds the exclusive writer lease on this index. Nothing is damaged and nothing this process does will release it.
+- `runtime_not_ready` — the operation needs the live runtime and there is none: health-only mode, or a runtime that has stopped.
+- `runtime_overloaded` — the runtime's command mailbox was saturated, so this request was dropped. The change it would have covered is escalated to a complete reconciliation; retry for the report.
+- `subscription_not_found` — an identifier this process never issued, or already released.
+- `watch_unavailable` — reserved for a future operation that requires a filesystem watcher. A runtime that cannot watch reports the reason through `live_state: polling_fallback` and `runtime_state_changed` instead of failing requests.
 
 Errors never contain raw SQL, internal cache paths, or backtraces.
 
@@ -172,7 +261,8 @@ These names document intended boundaries and are not accepted by the version 1 r
 - `begin_transaction`
 - `commit_transaction`
 - `abort_transaction`
-- `subscribe`
+
+The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above.
 
 ## Evolution
 

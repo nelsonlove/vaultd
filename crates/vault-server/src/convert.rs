@@ -5,10 +5,12 @@ use vault_core::{
 use vault_index::{IndexError, IndexState, IndexedNote, NoteSummary, VaultInfo};
 use vault_protocol::{
     AliasDto, BlockDto, DiagnosticDto, ErrorCode, GetVaultInfoResponse, HeadingDto, IndexStateDto,
-    NoteDto, NoteSummaryDto, PropertyDto, PropertyMappingEntryDto, PropertyValueDto, ProtocolError,
-    ReferenceDto, ReferenceKindDto, ReferenceOriginDto, ResolutionDto, SeverityDto, SpanDto,
-    SpannedPropertyValueDto, SubpathDto, TagDto,
+    LiveStateDto, NoteDto, NoteSummaryDto, PropertyDto, PropertyMappingEntryDto, PropertyValueDto,
+    ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto, ResolutionDto, SeverityDto,
+    SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto,
 };
+
+use crate::runtime::RefreshFailure;
 
 pub(crate) fn span(value: SourceSpan) -> SpanDto {
     // usize -> u64 cannot lose range on supported platforms; use try_from to
@@ -240,7 +242,14 @@ fn index_state(value: IndexState) -> IndexStateDto {
     }
 }
 
-pub(crate) fn vault_info(value: VaultInfo) -> GetVaultInfoResponse {
+/// `live_state` is `None` for a server with no runtime — health-only mode —
+/// and is otherwise the runtime's own observational state. It stays optional
+/// on the wire precisely so a transport without a runtime says nothing
+/// rather than guessing.
+pub(crate) fn vault_info(
+    value: VaultInfo,
+    live_state: Option<LiveStateDto>,
+) -> GetVaultInfoResponse {
     GetVaultInfoResponse {
         generation: value.generation.get(),
         canonical_root: value.canonical_root.to_string_lossy().into_owned(),
@@ -248,10 +257,28 @@ pub(crate) fn vault_info(value: VaultInfo) -> GetVaultInfoResponse {
         state: index_state(value.state),
         note_count: value.note_count,
         refreshed_at_unix_ms: value.refreshed_at_unix_ms,
-        // Task 11 adds the field to the wire shape only. Populating it from
-        // the live runtime's actual `LiveState` is Task 12/13's dispatcher
-        // wiring, once `GetVaultInfo` has a path to the runtime coordinator.
-        live_state: None,
+        live_state,
+    }
+}
+
+/// A refresh that produced no report. The three cases are distinct on the
+/// wire because a client can act on the difference: retry soon, never retry,
+/// or treat it as an index failure.
+pub(crate) fn refresh_failure(value: RefreshFailure) -> ProtocolError {
+    match value {
+        RefreshFailure::Overloaded => ProtocolError {
+            code: ErrorCode::RuntimeOverloaded,
+            message: "the runtime is saturated; the vault will be reconciled completely".into(),
+            supported_version: None,
+            current_generation: None,
+        },
+        RefreshFailure::NotReady => ProtocolError {
+            code: ErrorCode::RuntimeNotReady,
+            message: "the runtime is not running".into(),
+            supported_version: None,
+            current_generation: None,
+        },
+        RefreshFailure::Failed(error) => index_error(error),
     }
 }
 
@@ -318,12 +345,13 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::InvalidPath;
             error.message = format!("invalid index path: {message}");
         }
-        // Interim mapping: `IndexInUse` gets its own dedicated protocol code
-        // in Task 11/12. Until then it deliberately shares `StorageFailure`
-        // rather than smuggling a new code into this task.
+        // A different writer holds the exclusive lease on this cache. Not a
+        // storage failure and not retryable by this process: nothing here is
+        // damaged, and nothing this process does will make the lease
+        // available.
         IndexError::IndexInUse => {
-            error.code = ErrorCode::StorageFailure;
-            error.message = "index storage failed".into();
+            error.code = ErrorCode::IndexInUse;
+            error.message = "the index is held by another writer".into();
         }
     }
     error

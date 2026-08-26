@@ -1,14 +1,13 @@
 use std::error::Error;
-use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use clap::Parser;
-use serde::Deserialize;
 use vault_index::IndexConfig;
-use vault_protocol::{
-    ErrorCode, ProtocolError, Request, RequestEnvelope, ResponseEnvelope, validate_version,
-};
 use vault_server::Server;
+use vault_server::runtime::{RuntimeNotice, RuntimeOptions};
+use vault_server::stdio;
 
 #[derive(Debug, Parser)]
 #[command(name = "vaultd", version, about)]
@@ -17,16 +16,45 @@ struct Cli {
     vault: Option<PathBuf>,
     #[arg(long, value_name = "PATH", requires = "vault")]
     index: Option<PathBuf>,
+    /// Reconcile on demand and on the periodic tick only, installing no
+    /// filesystem watcher.
+    #[arg(long, default_value_t = false)]
+    no_watch: bool,
+    /// How long a burst of filesystem events is coalesced before it becomes
+    /// one dirty batch.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(10..=5_000))]
+    watch_debounce_ms: u64,
+    /// How often the vault is reconciled completely regardless of watcher
+    /// activity. `0` disables the periodic tick.
+    #[arg(long, default_value_t = 60)]
+    reconcile_interval_seconds: u64,
 }
 
-/// First parse stage: the envelope with the request left undecoded, so the
-/// version can be validated before the version-specific method enum is applied.
-#[derive(Deserialize)]
-struct RawRequestEnvelope {
-    version: u16,
-    id: String,
-    request: serde_json::Value,
+impl Cli {
+    fn runtime_options(&self) -> RuntimeOptions {
+        let mut watch_config = vault_watch::WatchConfig {
+            debounce: Duration::from_millis(self.watch_debounce_ms),
+            ..vault_watch::WatchConfig::default()
+        };
+        // The hard ceiling keeps its documented relationship to the debounce
+        // window, so tuning one never silently defeats the other.
+        watch_config.max_debounce = watch_config.debounce * 10;
+        RuntimeOptions {
+            watch: !self.no_watch,
+            watch_config,
+            // Zero means "never", not "every instant".
+            reconcile_interval: match self.reconcile_interval_seconds {
+                0 => None,
+                seconds => Some(Duration::from_secs(seconds)),
+            },
+            ..RuntimeOptions::default()
+        }
+    }
 }
+
+/// A server and the notice stream its transport must forward, if it has one.
+/// Health-only mode has no runtime, so there is nothing to forward.
+type ConfiguredServer = (Server, Option<Receiver<RuntimeNotice>>);
 
 fn main() {
     if let Err(error) = run() {
@@ -35,55 +63,21 @@ fn main() {
     }
 }
 
-fn configured_server(cli: &Cli) -> Result<Server, Box<dyn Error>> {
-    match (&cli.vault, &cli.index) {
-        (None, None) => Ok(Server::health_only()),
-        (Some(vault), None) => Server::open(IndexConfig::derived(vault)?).map_err(Into::into),
-        (Some(vault), Some(index)) => {
-            Server::open(IndexConfig::explicit(vault, index)?).map_err(Into::into)
-        }
+/// Health-only mode starts no runtime at all: no watcher, no lease, no
+/// graph, no timer, and no threads beyond the transport's own.
+fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
+    let config = match (&cli.vault, &cli.index) {
+        (None, None) => return Ok((Server::health_only(), None)),
+        (Some(vault), None) => IndexConfig::derived(vault)?,
+        (Some(vault), Some(index)) => IndexConfig::explicit(vault, index)?,
         (None, Some(_)) => unreachable!("clap enforces --index requires --vault"),
-    }
+    };
+    let (server, notices) = Server::start(config, cli.runtime_options())?;
+    Ok((server, Some(notices)))
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let mut server = configured_server(&cli)?;
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let raw: RawRequestEnvelope = serde_json::from_str(&line)?;
-        let response = respond(&mut server, raw);
-        serde_json::to_writer(&mut stdout, &response)?;
-        writeln!(stdout)?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-fn respond(server: &mut Server, raw: RawRequestEnvelope) -> ResponseEnvelope {
-    if let Err(error) = validate_version(raw.version) {
-        return ResponseEnvelope::error(raw.id, error);
-    }
-    match serde_json::from_value::<Request>(raw.request) {
-        Ok(request) => server.handle(RequestEnvelope {
-            version: raw.version,
-            id: raw.id,
-            request,
-        }),
-        Err(error) => ResponseEnvelope::error(
-            raw.id,
-            ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                message: format!("invalid request: {error}"),
-                supported_version: None,
-                current_generation: None,
-            },
-        ),
-    }
+    let (server, notices) = configured_server(&cli)?;
+    stdio::run(server, notices).map_err(Into::into)
 }

@@ -1,39 +1,102 @@
+//! Every request variant, dispatched against a configured server.
+//!
+//! The server owns a `RuntimeHandle` and an `IndexReader`, never an
+//! `IndexService`: reads answer from the published generation on the calling
+//! thread, and the one mutating request is handed to the coordinator.
+
 use std::fs;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
-use vault_index::{IndexConfig, IndexService};
+use vault_index::{IndexConfig, LiveState};
 use vault_protocol::{
-    GetDiagnosticsParams, GetNoteResponse, ListReferencesParams, NotePathParams, PageParams,
-    PathPageParams, ReferenceStatusFilter, Request, RequestEnvelope, ResolveLinkParams, Response,
-    ResponseOutcome, SeverityDto,
+    GetDiagnosticsParams, GetNoteResponse, ListReferencesParams, LiveStateDto, NotePathParams,
+    PageParams, PathPageParams, ReferenceStatusFilter, Request, RequestEnvelope, ResolveLinkParams,
+    Response, ResponseEnvelope, ResponseOutcome, SeverityDto,
 };
 use vault_server::Server;
+use vault_server::runtime::{RuntimeNotice, RuntimeOptions};
+use vault_server::subscriptions::SubscriptionRegistry;
 
-fn configured_server() -> Server {
+/// A runtime that neither watches nor ticks: every generation in these tests
+/// is one the test itself asked for.
+fn quiet_options() -> RuntimeOptions {
+    RuntimeOptions {
+        watch: false,
+        reconcile_interval: None,
+        ..RuntimeOptions::default()
+    }
+}
+
+struct Fixture {
+    server: Server,
+    _notices: Receiver<RuntimeNotice>,
+    subscriptions: SubscriptionRegistry,
+}
+
+impl Fixture {
+    fn handle(&mut self, envelope: RequestEnvelope) -> ResponseEnvelope {
+        self.server.handle(envelope, &mut self.subscriptions)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.server.shutdown();
+    }
+}
+
+/// Start a server over a fresh vault and wait for the cold build, so every
+/// assertion below names a generation that already exists.
+fn start(notes: &[(&str, &str)]) -> Fixture {
     let vault = tempdir().expect("vault");
     let index = tempdir().expect("index");
-    fs::write(vault.path().join("Note.md"), "# Note\n[[Other]]\n").expect("write note");
-    fs::write(vault.path().join("Other.md"), "# Other\n").expect("write other");
+    for (name, body) in notes {
+        fs::write(vault.path().join(name), body).expect("write note");
+    }
     let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).unwrap();
-    let mut service = IndexService::open(config).unwrap();
-    service.refresh(false).unwrap();
-    // The temp dirs must outlive the server: leak them for the test's lifetime.
+    let (server, notices) = Server::start(config, quiet_options()).expect("start server");
+    // The temp dirs must outlive the runtime: leak them for the test's life.
     std::mem::forget(vault);
     std::mem::forget(index);
-    Server::for_index(service)
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = server
+            .reader()
+            .expect("a configured server has a reader")
+            .published_status()
+            .expect("published status");
+        if status.generation.is_some() && status.live_state == LiveState::PollingFallback {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the cold build"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    Fixture {
+        server,
+        _notices: notices,
+        subscriptions: SubscriptionRegistry::new(),
+    }
+}
+
+fn configured_server() -> Fixture {
+    start(&[
+        ("Note.md", "# Note\n[[Other]]\n"),
+        ("Other.md", "# Other\n"),
+    ])
 }
 
 #[test]
 fn configured_server_dispatches_indexed_reads_and_refresh() {
-    let vault = tempdir().expect("vault");
-    let index = tempdir().expect("index");
-    fs::write(vault.path().join("Note.md"), "# Note\n").expect("write note");
-    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).unwrap();
-    let mut service = IndexService::open(config).unwrap();
-    service.refresh(false).unwrap();
-    let mut server = Server::for_index(service);
+    let mut fixture = start(&[("Note.md", "# Note\n")]);
 
-    let response = server.handle(RequestEnvelope::new(
+    let response = fixture.handle(RequestEnvelope::new(
         "note-1",
         Request::GetNote(NotePathParams {
             path: "Note.md".into(),
@@ -51,13 +114,17 @@ fn configured_server_dispatches_indexed_reads_and_refresh() {
 
 #[test]
 fn health_only_server_keeps_health_and_refuses_indexed_reads() {
-    let mut server = Server::health_only();
-    let response = server.handle(RequestEnvelope::new(
-        "note-2",
-        Request::GetNote(NotePathParams {
-            path: "Note.md".into(),
-        }),
-    ));
+    let server = Server::health_only();
+    let mut subscriptions = SubscriptionRegistry::new();
+    let response = server.handle(
+        RequestEnvelope::new(
+            "note-2",
+            Request::GetNote(NotePathParams {
+                path: "Note.md".into(),
+            }),
+        ),
+        &mut subscriptions,
+    );
     assert!(matches!(
         response.outcome,
         ResponseOutcome::Err(ref error)
@@ -67,24 +134,29 @@ fn health_only_server_keeps_health_and_refuses_indexed_reads() {
 
 #[test]
 fn every_remaining_request_variant_dispatches() {
-    let mut server = configured_server();
+    let mut fixture = configured_server();
 
-    let health = server.handle(RequestEnvelope::new("d-health", Request::Health));
+    let health = fixture.handle(RequestEnvelope::new("d-health", Request::Health));
     assert!(matches!(
         health.outcome,
         ResponseOutcome::Ok(Response::Health(_))
     ));
 
-    let info = server.handle(RequestEnvelope::new("d-info", Request::GetVaultInfo));
+    let info = fixture.handle(RequestEnvelope::new("d-info", Request::GetVaultInfo));
     match info.outcome {
         ResponseOutcome::Ok(Response::GetVaultInfo(info)) => {
             assert_eq!(info.generation, 1);
             assert_eq!(info.note_count, 2);
+            assert_eq!(
+                info.live_state,
+                Some(LiveStateDto::PollingFallback),
+                "a configured server reports the runtime's own state"
+            );
         }
         other => panic!("unexpected vault info: {other:?}"),
     }
 
-    let list = server.handle(RequestEnvelope::new(
+    let list = fixture.handle(RequestEnvelope::new(
         "d-list",
         Request::ListNotes(PageParams {
             cursor: None,
@@ -99,7 +171,7 @@ fn every_remaining_request_variant_dispatches() {
         other => panic!("unexpected list: {other:?}"),
     }
 
-    let resolve = server.handle(RequestEnvelope::new(
+    let resolve = fixture.handle(RequestEnvelope::new(
         "d-resolve",
         Request::ResolveLink(ResolveLinkParams {
             source_path: "Note.md".into(),
@@ -117,7 +189,7 @@ fn every_remaining_request_variant_dispatches() {
         other => panic!("unexpected resolve: {other:?}"),
     }
 
-    let backlinks = server.handle(RequestEnvelope::new(
+    let backlinks = fixture.handle(RequestEnvelope::new(
         "d-backlinks",
         Request::GetBacklinks(PathPageParams {
             path: "Other.md".into(),
@@ -133,7 +205,7 @@ fn every_remaining_request_variant_dispatches() {
         other => panic!("unexpected backlinks: {other:?}"),
     }
 
-    let references = server.handle(RequestEnvelope::new(
+    let references = fixture.handle(RequestEnvelope::new(
         "d-references",
         Request::ListReferences(ListReferencesParams {
             source_path: None,
@@ -149,7 +221,7 @@ fn every_remaining_request_variant_dispatches() {
         other => panic!("unexpected references: {other:?}"),
     }
 
-    let diagnostics = server.handle(RequestEnvelope::new(
+    let diagnostics = fixture.handle(RequestEnvelope::new(
         "d-diagnostics",
         Request::GetDiagnostics(GetDiagnosticsParams {
             path: None,
@@ -163,7 +235,7 @@ fn every_remaining_request_variant_dispatches() {
         ResponseOutcome::Ok(Response::GetDiagnostics(_))
     ));
 
-    let refresh = server.handle(RequestEnvelope::new(
+    let refresh = fixture.handle(RequestEnvelope::new(
         "d-refresh",
         Request::RefreshIndex(vault_protocol::RefreshIndexParams { verify: true }),
     ));
@@ -174,13 +246,39 @@ fn every_remaining_request_variant_dispatches() {
         }
         other => panic!("unexpected refresh: {other:?}"),
     }
+
+    let subscribe = fixture.handle(RequestEnvelope::new(
+        "d-subscribe",
+        Request::SubscribeEvents(vault_protocol::SubscribeEventsParams {}),
+    ));
+    let id = match subscribe.outcome {
+        ResponseOutcome::Ok(Response::SubscribeEvents(subscribed)) => {
+            assert_eq!(subscribed.generation, Some(1));
+            assert_eq!(subscribed.live_state, LiveStateDto::PollingFallback);
+            subscribed.subscription_id
+        }
+        other => panic!("unexpected subscribe: {other:?}"),
+    };
+
+    let unsubscribe = fixture.handle(RequestEnvelope::new(
+        "d-unsubscribe",
+        Request::Unsubscribe(vault_protocol::UnsubscribeParams {
+            subscription_id: id.clone(),
+        }),
+    ));
+    match unsubscribe.outcome {
+        ResponseOutcome::Ok(Response::Unsubscribe(released)) => {
+            assert_eq!(released.subscription_id, id);
+        }
+        other => panic!("unexpected unsubscribe: {other:?}"),
+    }
 }
 
 #[test]
 fn invalid_paths_and_missing_notes_map_to_stable_errors() {
-    let mut server = configured_server();
+    let mut fixture = configured_server();
 
-    let invalid = server.handle(RequestEnvelope::new(
+    let invalid = fixture.handle(RequestEnvelope::new(
         "d-invalid",
         Request::GetNote(NotePathParams {
             path: "../escape.md".into(),
@@ -192,7 +290,7 @@ fn invalid_paths_and_missing_notes_map_to_stable_errors() {
             if error.code == vault_protocol::ErrorCode::InvalidPath
     ));
 
-    let missing = server.handle(RequestEnvelope::new(
+    let missing = fixture.handle(RequestEnvelope::new(
         "d-missing",
         Request::GetNote(NotePathParams {
             path: "Nope.md".into(),
@@ -203,4 +301,46 @@ fn invalid_paths_and_missing_notes_map_to_stable_errors() {
         ResponseOutcome::Err(ref error)
             if error.code == vault_protocol::ErrorCode::NoteNotFound
     ));
+}
+
+/// A stopped runtime refuses the requests that need it, with codes that say
+/// which kind of unavailability this is.
+#[test]
+fn a_stopped_runtime_reports_runtime_not_ready() {
+    let mut fixture = configured_server();
+    fixture.server.shutdown();
+
+    let refresh = fixture.handle(RequestEnvelope::new(
+        "d-refresh-stopped",
+        Request::RefreshIndex(vault_protocol::RefreshIndexParams { verify: false }),
+    ));
+    assert!(matches!(
+        refresh.outcome,
+        ResponseOutcome::Err(ref error)
+            if error.code == vault_protocol::ErrorCode::RuntimeNotReady
+    ));
+
+    let subscribe = fixture.handle(RequestEnvelope::new(
+        "d-subscribe-stopped",
+        Request::SubscribeEvents(vault_protocol::SubscribeEventsParams {}),
+    ));
+    assert!(matches!(
+        subscribe.outcome,
+        ResponseOutcome::Err(ref error)
+            if error.code == vault_protocol::ErrorCode::RuntimeNotReady
+    ));
+
+    // Reads keep answering from the last published generation, and the state
+    // they report is the runtime's real one — the barrier's own `Stopped`,
+    // corroborated by the joined handle.
+    let info = fixture.handle(RequestEnvelope::new(
+        "d-info-stopped",
+        Request::GetVaultInfo,
+    ));
+    match info.outcome {
+        ResponseOutcome::Ok(Response::GetVaultInfo(info)) => {
+            assert_eq!(info.live_state, Some(LiveStateDto::Stopped));
+        }
+        other => panic!("unexpected vault info: {other:?}"),
+    }
 }

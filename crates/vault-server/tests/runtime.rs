@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexService, LiveState};
 use vault_server::runtime::{
-    ResyncReason, Runtime, RuntimeCommand, RuntimeHandle, RuntimeNotice, RuntimeOptions,
+    Dispatch, ResyncReason, Runtime, RuntimeCommand, RuntimeHandle, RuntimeNotice, RuntimeOptions,
     RuntimeTestHooks,
 };
 
@@ -193,10 +193,13 @@ fn cached_reads_answer_during_catch_up_and_mutations_never_overlap() {
     // returns once the command is in the mailbox, so this is a rendezvous,
     // not a sleep.
     let (reply, replies) = sync_channel(1);
-    assert!(handle.send_command(RuntimeCommand::Refresh {
-        verify: false,
-        reply
-    }));
+    assert_eq!(
+        handle.send_command(RuntimeCommand::Refresh {
+            verify: false,
+            reply
+        }),
+        Dispatch::Accepted
+    );
 
     gate.wait();
 
@@ -917,8 +920,12 @@ fn a_failed_escalation_is_announced_and_retried() {
     // Announced twice: once by the attempt that failed — the loss is true
     // whether or not it can be repaired — and once by the retry that
     // succeeded. Exactly one would mean the failure was swallowed.
+    // Counted across polls, not within one: `drain` consumes what it sees,
+    // so the two announcements are routinely delivered to different polls
+    // and a per-poll count would never reach two.
+    let mut seen = 0usize;
     let overflows = wait_for("both overflow announcements", || {
-        let seen = drain(&notices)
+        seen += drain(&notices)
             .into_iter()
             .filter(|notice| {
                 matches!(

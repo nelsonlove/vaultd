@@ -497,8 +497,14 @@ fn spawn_timer(
 }
 
 /// What became of one offered command.
+///
+/// Public because the distinction is client-visible: a command the mailbox
+/// refused because it was saturated is a *transient overload* the caller may
+/// retry, while a closed mailbox is a runtime that has stopped for good. The
+/// protocol layer maps them to `runtime_overloaded` and `runtime_not_ready`
+/// respectively, and cannot do that if both arrive as one error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Dispatch {
+pub enum Dispatch {
     Accepted,
     /// The mailbox was full. The command was dropped and the overflow latch
     /// set — the change it described is escalated to a complete
@@ -528,6 +534,35 @@ fn dispatch(
         Err(TrySendError::Disconnected(_)) => Dispatch::MailboxClosed,
     }
 }
+
+/// Why a requested refresh produced no report.
+///
+/// The three cases are deliberately distinct because a client can act on the
+/// difference: an overloaded runtime is worth retrying in a moment, a
+/// stopped one never is, and an index failure is neither.
+#[derive(Debug)]
+pub enum RefreshFailure {
+    /// The command mailbox was saturated. The refresh was dropped and the
+    /// overflow latch set, so the runtime will reconcile completely anyway —
+    /// but no report exists for *this* request.
+    Overloaded,
+    /// The runtime has stopped, or stopped before answering.
+    NotReady,
+    /// The refresh ran and failed.
+    Failed(IndexError),
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overloaded => formatter.write_str("the runtime is overloaded"),
+            Self::NotReady => formatter.write_str("the runtime is not running"),
+            Self::Failed(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for RefreshFailure {}
 
 /// The shared, clonable half of a running runtime.
 struct RuntimeInner {
@@ -609,27 +644,36 @@ impl RuntimeHandle {
         Arc::clone(&self.inner.reader)
     }
 
-    /// Queue one command. `false` means the runtime has stopped; a full
-    /// mailbox instead sets the overflow latch and still returns `true`,
-    /// because the change it describes is not lost — it is escalated to a
-    /// full reconciliation.
-    pub fn send_command(&self, command: RuntimeCommand) -> bool {
-        dispatch(&self.inner.commands, &self.inner.overflow, command) != Dispatch::MailboxClosed
+    /// Queue one command, without ever blocking. A full mailbox sets the
+    /// overflow latch and reports [`Dispatch::Overflowed`]: the change the
+    /// command described is escalated to a complete reconciliation rather
+    /// than lost, but the command itself is gone and will never be answered.
+    pub fn send_command(&self, command: RuntimeCommand) -> Dispatch {
+        dispatch(&self.inner.commands, &self.inner.overflow, command)
     }
 
-    /// Feed one hint in, exactly as the watcher would.
+    /// Feed one hint in, exactly as the watcher would. `false` means the
+    /// runtime has stopped; an overflowed hint still returns `true`, because
+    /// the change it described is escalated rather than lost.
     pub fn hint(&self, hint: ChangeHint) -> bool {
-        self.send_command(RuntimeCommand::Hint(hint))
+        self.send_command(RuntimeCommand::Hint(hint)) != Dispatch::MailboxClosed
     }
 
     /// Ask for a refresh and wait for its report. Hints already in the
     /// mailbox are processed first; hints that arrive later wait.
-    pub fn refresh(&self, verify: bool) -> Result<RefreshReport, IndexError> {
+    pub fn refresh(&self, verify: bool) -> Result<RefreshReport, RefreshFailure> {
         let (reply, replies) = sync_channel(1);
-        if !self.send_command(RuntimeCommand::Refresh { verify, reply }) {
-            return Err(IndexError::IndexUnavailable);
+        match self.send_command(RuntimeCommand::Refresh { verify, reply }) {
+            Dispatch::Accepted => {}
+            Dispatch::Overflowed => return Err(RefreshFailure::Overloaded),
+            Dispatch::MailboxClosed => return Err(RefreshFailure::NotReady),
         }
-        replies.recv().map_err(|_| IndexError::IndexUnavailable)?
+        // The coordinator answers every refresh it takes, so a dropped reply
+        // channel means it stopped without answering this one.
+        match replies.recv() {
+            Ok(result) => result.map_err(RefreshFailure::Failed),
+            Err(_) => Err(RefreshFailure::NotReady),
+        }
     }
 
     /// Stop the runtime and wait for every thread. Idempotent, and implied
