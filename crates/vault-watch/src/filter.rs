@@ -64,6 +64,46 @@ pub fn normalize_included_markdown(
     }
 }
 
+/// Classifies whether an event path is confined entirely under a hidden
+/// directory (e.g. `.obsidian/...`) relative to the vault root — the same
+/// rule [`normalize_included_markdown`] uses to exclude it, but exposed on
+/// its own so a caller can tell "excluded because hidden" apart from
+/// "excluded for some other reason" (wrong extension, outside the root,
+/// unclassifiable).
+///
+/// This matters for structural events (folder create/remove/rename) that
+/// carry no included `.md` path: churn confined to both sides of a hidden
+/// directory can never move content into or out of the indexed view, but
+/// churn touching even one path outside hidden territory might.
+///
+/// Conservatively returns `false` ("not hidden") for anything it can't
+/// positively classify as hidden: paths outside the root, and paths whose
+/// components can't be read as UTF-8. A caller relying on this to skip a
+/// reconcile should treat `false` as "can't rule it out."
+pub(crate) fn is_under_hidden_dir(canonical_root: &Path, event_path: &Path) -> bool {
+    let normalized_root = lexically_normalize(canonical_root);
+    let normalized_event = lexically_normalize(event_path);
+
+    let Ok(relative) = normalized_event.strip_prefix(&normalized_root) else {
+        return false;
+    };
+
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        let Some(text) = part.to_str() else {
+            return false;
+        };
+        let is_last = components.peek().is_none();
+        if !is_last && text.starts_with('.') {
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolve `.` and `..` components lexically, without touching the
 /// filesystem, so it works for paths whose target no longer exists.
 fn lexically_normalize(path: &Path) -> PathBuf {

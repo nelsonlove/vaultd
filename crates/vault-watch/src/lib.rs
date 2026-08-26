@@ -183,15 +183,30 @@ impl WatchStream {
         // `Folder/` to `Renamed/` is a routine Obsidian drag-and-drop; it
         // must never come back as zero hints. Force a reconcile instead of
         // guessing which paths changed.
-        let structural_without_detail = !any_included
-            && matches!(
-                event.kind,
-                EventKind::Create(CreateKind::Folder)
-                    | EventKind::Remove(RemoveKind::Folder)
-                    | EventKind::Modify(ModifyKind::Name(_))
-            );
-        if structural_without_detail {
-            self.debouncer.observe_overflow(now);
+        //
+        // Exception: Obsidian atomic-saves its own config (e.g.
+        // `.obsidian/workspace.json`) via temp-file-then-rename every few
+        // seconds while the user works. When *every* path in the event is
+        // confined to a hidden directory on both sides, content can't have
+        // entered or left the indexed view, so skip the reconcile — a real
+        // vault would otherwise full-reconcile near-constantly. Any path
+        // that isn't confined to hidden territory (including one outside
+        // the vault root entirely) still forces the fallback.
+        let structural = matches!(
+            event.kind,
+            EventKind::Create(CreateKind::Folder)
+                | EventKind::Remove(RemoveKind::Folder)
+                | EventKind::Modify(ModifyKind::Name(_))
+        );
+        if structural && !any_included {
+            let all_hidden = !event.paths.is_empty()
+                && event
+                    .paths
+                    .iter()
+                    .all(|path| filter::is_under_hidden_dir(&self.canonical_root, path));
+            if !all_hidden {
+                self.debouncer.observe_overflow(now);
+            }
         }
     }
 }
@@ -228,6 +243,81 @@ mod tests {
 
         let event =
             notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        stream.handle_event(event, now);
+
+        let hint = stream
+            .debouncer
+            .poll(now + Duration::from_millis(100))
+            .expect("ready");
+        assert_eq!(hint, ChangeHint::Overflow);
+    }
+
+    /// Obsidian atomic-saves `.obsidian/workspace.json` (and similar config)
+    /// via temp-file-then-rename every few seconds while the user works.
+    /// Both sides of that rename are hidden — content can't enter or leave
+    /// the indexed view — so it must never force a reconcile.
+    #[test]
+    fn structural_churn_confined_to_a_hidden_directory_produces_no_hint() {
+        let root = TempDir::new().expect("temp vault");
+        let mut stream =
+            WatchStream::start(root.path(), WatchConfig::default()).expect("start watch");
+        let now = Instant::now();
+
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(root.path().join(".obsidian/workspace.json.tmp"))
+        .add_path(root.path().join(".obsidian/workspace.json"));
+        stream.handle_event(event, now);
+
+        // Drive well past max_debounce to prove nothing was latched at all
+        // — not paths, not overflow, nothing.
+        let far_future = now + WatchConfig::default().max_debounce + Duration::from_millis(500);
+        assert_eq!(stream.debouncer.poll(far_future), None);
+    }
+
+    /// A rename where one side is hidden and the other is visible (e.g.
+    /// `.drafts/` → `drafts/`) can move content into the indexed view, so it
+    /// must still force a reconcile even though it's a "structural, no
+    /// included .md path" event just like the hidden-to-hidden case above.
+    #[test]
+    fn structural_rename_from_hidden_to_visible_directory_still_forces_overflow() {
+        let root = TempDir::new().expect("temp vault");
+        let mut stream =
+            WatchStream::start(root.path(), WatchConfig::default()).expect("start watch");
+        let now = Instant::now();
+
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(root.path().join(".drafts/x"))
+        .add_path(root.path().join("drafts/x"));
+        stream.handle_event(event, now);
+
+        let hint = stream
+            .debouncer
+            .poll(now + Duration::from_millis(100))
+            .expect("ready");
+        assert_eq!(hint, ChangeHint::Overflow);
+    }
+
+    /// A rename that moves a folder out of the vault entirely is not
+    /// "confined to hidden directories" — the destination isn't under the
+    /// root at all — so it must still force a reconcile.
+    #[test]
+    fn structural_rename_moving_a_folder_outside_the_root_still_forces_overflow() {
+        let root = TempDir::new().expect("temp vault");
+        let mut stream =
+            WatchStream::start(root.path(), WatchConfig::default()).expect("start watch");
+        let now = Instant::now();
+
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(root.path().join("Folder"))
+        .add_path(std::path::PathBuf::from(
+            "/definitely-outside-the-vault-root/Folder",
+        ));
         stream.handle_event(event, now);
 
         let hint = stream
