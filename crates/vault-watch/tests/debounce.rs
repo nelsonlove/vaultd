@@ -7,20 +7,24 @@ use std::time::{Duration, Instant};
 use vault_core::VaultPath;
 use vault_watch::{ChangeHint, Debouncer};
 
+/// A max_debounce large enough that it never fires in tests that are only
+/// exercising the per-activity debounce window.
+const NEVER: Duration = Duration::from_secs(3600);
+
 fn path(value: &str) -> VaultPath {
     VaultPath::new(value).expect("valid path")
 }
 
 #[test]
 fn stays_idle_with_no_activity() {
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     assert_eq!(debouncer.poll(Instant::now()), None);
 }
 
 #[test]
 fn does_not_emit_before_the_debounce_window_elapses() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_path(path("A.md"), base);
     assert_eq!(debouncer.poll(base + Duration::from_millis(50)), None);
 }
@@ -28,7 +32,7 @@ fn does_not_emit_before_the_debounce_window_elapses() {
 #[test]
 fn emits_paths_once_no_new_activity_arrives_for_the_debounce_duration() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_path(path("A.md"), base);
     let hint = debouncer
         .poll(base + Duration::from_millis(100))
@@ -44,7 +48,7 @@ fn emits_paths_once_no_new_activity_arrives_for_the_debounce_duration() {
 #[test]
 fn new_activity_pushes_the_debounce_window_back_out() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_path(path("A.md"), base);
     debouncer.observe_path(path("B.md"), base + Duration::from_millis(80));
     // 100ms after the first event but only 20ms after the second: not ready.
@@ -66,7 +70,7 @@ fn new_activity_pushes_the_debounce_window_back_out() {
 #[test]
 fn duplicate_paths_are_inserted_once() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_path(path("A.md"), base);
     debouncer.observe_path(path("A.md"), base + Duration::from_millis(10));
     let hint = debouncer
@@ -83,7 +87,7 @@ fn duplicate_paths_are_inserted_once() {
 #[test]
 fn exceeding_max_dirty_paths_emits_a_single_overflow_hint() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 2);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 2);
     debouncer.observe_path(path("A.md"), base);
     debouncer.observe_path(path("B.md"), base + Duration::from_millis(1));
     debouncer.observe_path(path("C.md"), base + Duration::from_millis(2));
@@ -96,7 +100,7 @@ fn exceeding_max_dirty_paths_emits_a_single_overflow_hint() {
 #[test]
 fn once_overflowed_further_detailed_paths_are_ignored_until_consumed() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 1);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 1);
     debouncer.observe_path(path("A.md"), base);
     debouncer.observe_path(path("B.md"), base + Duration::from_millis(1));
     // Overflowed now. More paths keep arriving but must not be tracked.
@@ -123,7 +127,7 @@ fn once_overflowed_further_detailed_paths_are_ignored_until_consumed() {
 #[test]
 fn root_invalidation_outranks_pending_paths() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_path(path("A.md"), base);
     debouncer.observe_root_invalidated(base + Duration::from_millis(1));
     let hint = debouncer
@@ -135,7 +139,7 @@ fn root_invalidation_outranks_pending_paths() {
 #[test]
 fn watcher_failure_does_not_accumulate_across_multiple_failures() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_watcher_failed("first".to_string(), base);
     debouncer.observe_watcher_failed("second".to_string(), base + Duration::from_millis(1));
     let hint = debouncer
@@ -147,8 +151,54 @@ fn watcher_failure_does_not_accumulate_across_multiple_failures() {
 #[test]
 fn consuming_a_hint_resets_state_for_the_next_window() {
     let base = Instant::now();
-    let mut debouncer = Debouncer::new(Duration::from_millis(100), 10);
+    let mut debouncer = Debouncer::new(Duration::from_millis(100), NEVER, 10);
     debouncer.observe_path(path("A.md"), base);
     debouncer.poll(base + Duration::from_millis(100));
     assert_eq!(debouncer.poll(base + Duration::from_millis(200)), None);
+}
+
+#[test]
+fn sustained_churn_under_the_debounce_window_still_emits_by_max_debounce() {
+    let base = Instant::now();
+    let debounce = Duration::from_millis(100);
+    let max_debounce = Duration::from_millis(250);
+    let mut debouncer = Debouncer::new(debounce, max_debounce, 100);
+
+    // Every touch is well inside the 100ms debounce window relative to the
+    // previous one, so per-activity debounce alone would never fire.
+    for offset_ms in [0, 50, 100, 150, 200, 240] {
+        debouncer.observe_path(path("Churn.md"), base + Duration::from_millis(offset_ms));
+    }
+
+    // 10ms after the last touch: nowhere near the 100ms debounce window, but
+    // 250ms have passed since the first touch at t=0 — max_debounce forces
+    // emission despite the ongoing storm.
+    let hint = debouncer
+        .poll(base + Duration::from_millis(250))
+        .expect("emitted by max_debounce despite continuous sub-debounce churn");
+    assert!(matches!(hint, ChangeHint::Paths(_)));
+}
+
+#[test]
+fn overflow_latched_mid_storm_is_delivered_by_max_debounce_despite_continued_churn() {
+    let base = Instant::now();
+    let debounce = Duration::from_millis(100);
+    let max_debounce = Duration::from_millis(250);
+    let mut debouncer = Debouncer::new(debounce, max_debounce, 1);
+
+    // Two paths exceed max_dirty_paths=1, latching overflow at t=50ms.
+    debouncer.observe_path(path("A.md"), base);
+    debouncer.observe_path(path("B.md"), base + Duration::from_millis(50));
+    // The storm continues after the latch. These calls must neither
+    // un-latch the overflow nor keep resetting the window past max_debounce.
+    for offset_ms in [90, 130, 170, 210, 240] {
+        debouncer.observe_path(path("Storm.md"), base + Duration::from_millis(offset_ms));
+    }
+
+    // 10ms after the last touch — well under the 100ms debounce window —
+    // but 250ms have passed since the storm began at t=0.
+    let hint = debouncer
+        .poll(base + Duration::from_millis(250))
+        .expect("overflow delivered by max_debounce despite ongoing churn");
+    assert_eq!(hint, ChangeHint::Overflow);
 }

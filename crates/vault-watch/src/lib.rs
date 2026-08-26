@@ -36,6 +36,14 @@ pub enum ChangeHint {
 #[derive(Clone, Debug)]
 pub struct WatchConfig {
     pub debounce: Duration,
+    /// Hard ceiling on how long a pending hint may be held back, measured
+    /// from the *first* unconsumed signal rather than the most recent one.
+    /// Sustained churn (writes arriving faster than `debounce`) would
+    /// otherwise reset the debounce window forever and never emit — this
+    /// bound guarantees a hint eventually escapes. Defaults to 10x the
+    /// default `debounce` (1s), a round number well above normal editor
+    /// save latency but short enough that a storm is still noticed quickly.
+    pub max_debounce: Duration,
     pub max_dirty_paths: usize,
     pub callback_queue: usize,
 }
@@ -44,6 +52,7 @@ impl Default for WatchConfig {
     fn default() -> Self {
         Self {
             debounce: Duration::from_millis(100),
+            max_debounce: Duration::from_millis(1_000),
             max_dirty_paths: 8_192,
             callback_queue: 1_024,
         }
@@ -96,7 +105,7 @@ impl WatchStream {
             events: backend.events,
             overflow_latch: backend.overflow_latch,
             canonical_root,
-            debouncer: Debouncer::new(config.debounce, config.max_dirty_paths),
+            debouncer: Debouncer::new(config.debounce, config.max_debounce, config.max_dirty_paths),
         })
     }
 
@@ -132,7 +141,17 @@ impl WatchStream {
 
     fn handle_event(&mut self, event: notify::Event, now: Instant) {
         use notify::EventKind;
-        use notify::event::ModifyKind;
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+
+        // The kernel (or notify itself) is telling us events were dropped
+        // or coalesced and our view of the tree can no longer be trusted
+        // incrementally. This outranks every other kind check below —
+        // notify sets it on `EventKind::Other`, which the access/other
+        // early-return further down would otherwise silently swallow.
+        if event.need_rescan() {
+            self.debouncer.observe_overflow(now);
+            return;
+        }
 
         let root_affected = matches!(
             event.kind,
@@ -147,19 +166,43 @@ impl WatchStream {
             return;
         }
 
+        let mut any_included = false;
         for path in &event.paths {
             if let Ok(Some(vault_path)) =
                 filter::normalize_included_markdown(&self.canonical_root, path)
             {
                 self.debouncer.observe_path(vault_path, now);
+                any_included = true;
             }
+        }
+
+        // A folder create/remove/rename never itself normalizes to an
+        // included `.md` path (directories have no extension), so the loop
+        // above never sees it — yet the descendants that moved with it can
+        // include notes the incremental hint has no way to name. Renaming
+        // `Folder/` to `Renamed/` is a routine Obsidian drag-and-drop; it
+        // must never come back as zero hints. Force a reconcile instead of
+        // guessing which paths changed.
+        let structural_without_detail = !any_included
+            && matches!(
+                event.kind,
+                EventKind::Create(CreateKind::Folder)
+                    | EventKind::Remove(RemoveKind::Folder)
+                    | EventKind::Modify(ModifyKind::Name(_))
+            );
+        if structural_without_detail {
+            self.debouncer.observe_overflow(now);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::WatchStream;
+    use std::time::{Duration, Instant};
+
+    use tempfile::TempDir;
+
+    use super::{ChangeHint, WatchConfig, WatchStream};
 
     /// The consumer runs an `IndexService` (Send but not Sync) on a single
     /// writer thread and needs to move a `WatchStream` there. This is a
@@ -169,5 +212,28 @@ mod tests {
     #[test]
     fn watch_stream_is_send() {
         assert_send::<WatchStream>();
+    }
+
+    /// notify emits `Event::new(EventKind::Other).set_flag(Flag::Rescan)`
+    /// for FSEvents' `kFSEventStreamEventFlagMustScanSubDirs` and inotify's
+    /// `IN_Q_OVERFLOW` — the kernel telling us events were dropped. This
+    /// must never be silently swallowed by the `Access | Other` early
+    /// return; it has to force a full reconcile.
+    #[test]
+    fn kernel_rescan_signal_forces_an_overflow_hint() {
+        let root = TempDir::new().expect("temp vault");
+        let mut stream =
+            WatchStream::start(root.path(), WatchConfig::default()).expect("start watch");
+        let now = Instant::now();
+
+        let event =
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        stream.handle_event(event, now);
+
+        let hint = stream
+            .debouncer
+            .poll(now + Duration::from_millis(100))
+            .expect("ready");
+        assert_eq!(hint, ChangeHint::Overflow);
     }
 }
