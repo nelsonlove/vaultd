@@ -915,7 +915,6 @@ name = "vault-server"
 version = "0.1.0"
 dependencies = [
  "clap",
- "filetime",
  "libc",
  "serde",
  "serde_json",
