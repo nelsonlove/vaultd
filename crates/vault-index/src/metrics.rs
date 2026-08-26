@@ -31,7 +31,18 @@ pub struct WorkCounts {
     /// the complete-resolution path; outgoing plus dependency-selected
     /// incoming references on the live (incremental) path.
     pub affected_references: u64,
+    /// References that came out `Resolved`: every reference in the published
+    /// graph on the complete path, and only the references this cycle actually
+    /// re-resolved on the live (incremental) path — the live path never looks
+    /// at a reference it did not select.
     pub references_resolved: u64,
+    /// Always zero, on both paths. The delta writer scopes every statement by
+    /// an explicit `note_path`/`reference_id` drawn from the caller's own
+    /// change set (see `DeltaWriteCounts::unaffected_references_touched`), and
+    /// the complete path replaces every reference by definition, so no
+    /// reference outside the reported change set is ever touched. Reported
+    /// here so a caller reading `WorkCounts` alone can see the guarantee.
+    pub unaffected_references_touched: u64,
     pub note_rows_written: u64,
     pub reference_rows_written: u64,
     pub resolution_rows_written: u64,
@@ -56,6 +67,7 @@ impl WorkCounts {
         self.resolution_rows_written += delta.resolutions_replaced;
         self.dependency_rows_written += delta.dependencies_replaced;
         self.diagnostic_rows_written += delta.diagnostics_replaced;
+        self.unaffected_references_touched += delta.unaffected_references_touched;
     }
 }
 

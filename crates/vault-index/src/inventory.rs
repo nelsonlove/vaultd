@@ -27,6 +27,16 @@ pub trait ReconcileSource: Send {
     fn canonical_root(&self) -> &Path;
     fn inventory(&self) -> Result<InventorySnapshot, IndexError>;
     fn read_bytes(&self, path: &VaultPath) -> Result<Vec<u8>, ScanError>;
+    /// One path's fingerprint, without enumerating anything. `Ok(None)` means
+    /// the path is absent — and *only* that. Every other metadata failure is
+    /// an error, which the incremental engine turns into the same
+    /// `UnreadableFile` diagnostic the complete path produces, rather than
+    /// silently mistaking an unreadable file for a deleted one.
+    ///
+    /// Deliberately has no default implementation: a source that forgot to
+    /// implement it would answer "absent" for every path, and the incremental
+    /// engine would delete the whole vault from the cache.
+    fn fingerprint(&self, path: &VaultPath) -> Result<Option<FileFingerprint>, IndexError>;
 }
 
 pub struct FileSystemIndexSource {
@@ -96,6 +106,24 @@ impl ReconcileSource for FileSystemIndexSource {
     fn read_bytes(&self, path: &VaultPath) -> Result<Vec<u8>, ScanError> {
         self.source.read_bytes(path)
     }
+
+    fn fingerprint(&self, path: &VaultPath) -> Result<Option<FileFingerprint>, IndexError> {
+        match std::fs::metadata(self.source.root().join(path.as_str())) {
+            Ok(metadata) => {
+                let modified = filetime::FileTime::from_last_modification_time(&metadata);
+                Ok(Some(FileFingerprint {
+                    size: metadata.len(),
+                    modified_seconds: modified.unix_seconds(),
+                    modified_nanos: modified.nanoseconds(),
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(IndexError::Storage(format!(
+                "cannot read metadata for {}: {error}",
+                path.as_str()
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +156,13 @@ mod tests {
         fn read_bytes(&self, _path: &VaultPath) -> Result<Vec<u8>, ScanError> {
             self.body_reads.set(self.body_reads.get() + 1);
             Ok(Vec::new())
+        }
+
+        fn fingerprint(
+            &self,
+            _path: &VaultPath,
+        ) -> Result<Option<crate::model::FileFingerprint>, crate::IndexError> {
+            Ok(None)
         }
     }
 

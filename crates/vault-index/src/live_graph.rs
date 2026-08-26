@@ -104,9 +104,15 @@ fn removed_candidate_keys(path: &VaultPath, record: &NoteRecord) -> BTreeSet<Dep
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImpactPlan {
     pub affected: BTreeSet<ReferenceKey>,
-    /// Reserved for future overflow/uncertainty signaling (bounded dirty
-    /// sets, malformed input, etc.). This task's `plan_impact` always
-    /// answers from exact key lookups, so it is always `false` here.
+    /// Reserved for uncertainty this planner itself detects (bounded dirty
+    /// sets, malformed input, etc.). `plan_impact` always answers from exact
+    /// key lookups, so it never sets this — it stays `false` here.
+    ///
+    /// Overflow is a separate, caller-side decision: `live_reconcile` compares
+    /// the selection against its own
+    /// `complete_resolution_threshold` and falls back to a complete
+    /// re-resolution when the selection stops paying for itself. A caller
+    /// that sees `true` here must fall back regardless of that threshold.
     pub complete_resolution: bool,
 }
 

@@ -599,6 +599,39 @@ impl IndexStore {
         Ok(fingerprints)
     }
 
+    /// One path's stored content revision and observed fingerprint, in a
+    /// single primary-key lookup. The incremental engine's per-path
+    /// replacement for `stored_fingerprints` + `stored_revision`, which
+    /// together would cost a whole-table scan plus a second query per path.
+    pub(crate) fn stored_note_metadata(
+        &self,
+        path: &VaultPath,
+    ) -> Result<Option<(String, FileFingerprint)>, IndexError> {
+        let row: Option<(String, i64, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT content_revision, observed_size, observed_mtime_seconds, \
+                 observed_mtime_nanos FROM notes WHERE path = ?1",
+                params![path.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((revision, size, seconds, nanos)) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            revision,
+            FileFingerprint {
+                size: u64::try_from(size)
+                    .map_err(|_| IndexError::IncompatibleIndex("negative observed size".into()))?,
+                modified_seconds: seconds,
+                modified_nanos: u32::try_from(nanos).map_err(|_| {
+                    IndexError::IncompatibleIndex("mtime nanos out of range".into())
+                })?,
+            },
+        )))
+    }
+
     pub(crate) fn stored_revision(&self, path: &VaultPath) -> Result<Option<String>, IndexError> {
         Ok(self
             .connection

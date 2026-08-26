@@ -294,6 +294,13 @@ impl ReconcileSource for CountingSource {
         self.body_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_bytes(path)
     }
+
+    fn fingerprint(
+        &self,
+        path: &vault_core::VaultPath,
+    ) -> Result<Option<vault_index::FileFingerprint>, vault_index::IndexError> {
+        self.inner.fingerprint(path)
+    }
 }
 
 pub struct CountingService {
@@ -400,6 +407,13 @@ impl ReconcileSource for PhantomOnSecondInventorySource {
     fn read_bytes(&self, path: &vault_core::VaultPath) -> Result<Vec<u8>, vault_core::ScanError> {
         self.inner.read_bytes(path)
     }
+
+    fn fingerprint(
+        &self,
+        path: &vault_core::VaultPath,
+    ) -> Result<Option<vault_index::FileFingerprint>, vault_index::IndexError> {
+        self.inner.fingerprint(path)
+    }
 }
 
 pub struct ChangingService {
@@ -461,6 +475,13 @@ impl ReconcileSource for FailingInventorySource {
     fn read_bytes(&self, path: &vault_core::VaultPath) -> Result<Vec<u8>, vault_core::ScanError> {
         self.inner.read_bytes(path)
     }
+
+    fn fingerprint(
+        &self,
+        path: &vault_core::VaultPath,
+    ) -> Result<Option<vault_index::FileFingerprint>, vault_index::IndexError> {
+        self.inner.fingerprint(path)
+    }
 }
 
 pub struct FailingService {
@@ -508,6 +529,13 @@ impl ReconcileSource for RaceOnInventorySource {
 
     fn read_bytes(&self, path: &vault_core::VaultPath) -> Result<Vec<u8>, vault_core::ScanError> {
         self.inner.read_bytes(path)
+    }
+
+    fn fingerprint(
+        &self,
+        path: &vault_core::VaultPath,
+    ) -> Result<Option<vault_index::FileFingerprint>, vault_index::IndexError> {
+        self.inner.fingerprint(path)
     }
 }
 

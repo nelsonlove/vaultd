@@ -132,6 +132,12 @@ fn a_read_started_during_publication_waits_for_the_whole_publication() {
 /// before it commits. Readers must keep answering throughout that window:
 /// the barrier exists to swap state, not to serialize reads behind a write
 /// transaction.
+///
+/// Driven through `refresh_complete_for_test` rather than `refresh`, because
+/// a warm `refresh` now routes through the incremental engine, whose
+/// publication is delta-bounded and has no row-writing window to keep reads
+/// out of. The path under test here is the cold build's — exercised warm so a
+/// previous generation exists for the reader to keep answering from.
 #[test]
 fn a_read_is_not_blocked_while_a_full_publication_writes_its_rows() {
     let mut fixture = live_fixture();
@@ -149,7 +155,9 @@ fn a_read_is_not_blocked_while_a_full_publication_writes_its_rows() {
 
     let mut service = fixture.take_service();
     let writer = thread::spawn(move || {
-        service.refresh(false).expect("warm publish");
+        service
+            .refresh_complete_for_test(false)
+            .expect("warm complete publish");
         service
     });
 

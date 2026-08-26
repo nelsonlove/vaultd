@@ -191,6 +191,13 @@ impl ReconcileSource for CountingSource {
         self.body_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_bytes(path)
     }
+
+    fn fingerprint(
+        &self,
+        path: &VaultPath,
+    ) -> Result<Option<vault_index::FileFingerprint>, vault_index::IndexError> {
+        self.inner.fingerprint(path)
+    }
 }
 
 fn synthetic_note(index: usize, count: usize) -> String {

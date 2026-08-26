@@ -18,7 +18,10 @@ fn phase_three_one_file_refresh_reports_its_global_work() {
     assert_eq!(fixture.body_reads(), 1);
     assert_eq!(metrics.work.body_reads, 1);
     assert_eq!(metrics.work.notes_reparsed, 1);
-    assert_eq!(metrics.work.complete_inventories, 2);
+    // One inventory, not two: a warm refresh now calculates its dirty set from
+    // a single metadata pass, and confirms the vault did not move under it by
+    // re-fingerprinting only the paths it is about to publish.
+    assert_eq!(metrics.work.complete_inventories, 1);
     assert!(metrics.work.references_resolved >= 1);
     assert!(metrics.work.resolution_rows_written >= 1);
 }

@@ -18,7 +18,7 @@ use crate::model::{
 use crate::reader::{IndexReader, PauseHook, write_published};
 use crate::store::{BeginOutcome, DeltaPublication, DeltaPublishOutcome, IndexStore, Publication};
 
-const MAX_RECONCILE_RETRIES: usize = 3;
+pub(crate) const MAX_RECONCILE_RETRIES: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefreshReport {
@@ -50,7 +50,11 @@ pub struct IndexService {
     /// Test-only pause after a full publication has written every row but
     /// before it takes the barrier, invoked with NO guard held.
     row_write_pause: Option<PauseHook>,
-    last_metrics: Option<ReconcileMetrics>,
+    pub(crate) last_metrics: Option<ReconcileMetrics>,
+    /// Test-only override for `complete_resolution_threshold`, so the
+    /// fallback branch can be exercised without a ten-thousand-reference
+    /// vault.
+    pub(crate) live_threshold_override: Option<usize>,
 }
 
 enum TryOutcome {
@@ -92,6 +96,7 @@ impl IndexService {
             publication_pause: None,
             row_write_pause: None,
             last_metrics: None,
+            live_threshold_override: None,
         })
     }
 
@@ -145,6 +150,16 @@ impl IndexService {
         self.row_write_pause = Some(hook);
     }
 
+    /// Lower the selected-reference count at which incremental reconciliation
+    /// gives up and re-resolves everything the compact graph holds. Test-only:
+    /// the production threshold starts at ten thousand references, so the
+    /// fallback branch would otherwise be unreachable in any fixture small
+    /// enough to assert on.
+    #[doc(hidden)]
+    pub fn set_complete_resolution_threshold_for_test(&mut self, threshold: usize) {
+        self.live_threshold_override = Some(threshold);
+    }
+
     pub fn state(&self) -> Result<IndexState, IndexError> {
         let generation = self.current_generation()?;
         let last_error = self.store.last_refresh_error()?;
@@ -167,8 +182,34 @@ impl IndexService {
     }
 
     pub fn refresh(&mut self, verify: bool) -> Result<RefreshReport, IndexError> {
+        self.refresh_with(verify, Self::try_refresh)
+    }
+
+    /// Run the complete path even when a generation already exists — the same
+    /// whole-vault inventory, read, resolve, and publish the cold build runs.
+    ///
+    /// Test-only. `refresh` routes every warm call through the incremental
+    /// engine, so the complete path's own publication window (rows written and
+    /// its transaction open, with no barrier held) is otherwise reachable only
+    /// on a cold build, where there is no previous generation for a reader to
+    /// keep answering from.
+    #[doc(hidden)]
+    pub fn refresh_complete_for_test(&mut self, verify: bool) -> Result<RefreshReport, IndexError> {
+        self.refresh_with(verify, |service, verify| {
+            let mut metrics = ReconcileMetrics::default();
+            let outcome = service.try_complete_refresh(verify, &mut metrics);
+            service.last_metrics = Some(metrics);
+            outcome
+        })
+    }
+
+    fn refresh_with(
+        &mut self,
+        verify: bool,
+        mut attempt: impl FnMut(&mut Self, bool) -> Result<TryOutcome, IndexError>,
+    ) -> Result<RefreshReport, IndexError> {
         for _ in 0..MAX_RECONCILE_RETRIES {
-            match self.try_refresh(verify)? {
+            match attempt(self, verify)? {
                 TryOutcome::Done(report) => return Ok(report),
                 TryOutcome::Retry => {}
             }
@@ -189,10 +230,38 @@ impl IndexService {
         outcome
     }
 
-    /// Reads only added/changed bodies in normal mode and every body in
-    /// verified mode; parses only new content revisions; publishes one atomic
-    /// compare-and-swap snapshot when anything client-visible changed.
+    /// Route one refresh attempt. Once a generation exists, both normal and
+    /// verified refresh calculate a dirty set and hand it to the same targeted
+    /// engine `refresh_paths` uses, so an ordinary refresh no longer loads,
+    /// parses, or re-resolves anything the change did not select. The cold,
+    /// first-ever build stays on the complete path below — there is nothing to
+    /// be incremental against.
     fn try_refresh_body(
+        &mut self,
+        verify: bool,
+        metrics: &mut ReconcileMetrics,
+    ) -> Result<TryOutcome, IndexError> {
+        if let Some(expected) = self.current_generation()? {
+            let outcome = self.refresh_dirty_paths(expected, verify, metrics)?;
+            return Ok(TryOutcome::Done(RefreshReport {
+                previous_generation: Some(outcome.previous_generation),
+                generation: outcome.generation,
+                added: outcome.changes.created.len() as u64,
+                changed: outcome.changes.modified.len() as u64,
+                deleted: outcome.changes.deleted.len() as u64,
+                unchanged: outcome.unchanged,
+                reparsed: outcome.reparsed,
+                verified: verify,
+            }));
+        }
+        self.try_complete_refresh(verify, metrics)
+    }
+
+    /// The complete path: one whole-vault inventory, every added or changed
+    /// body read (every body in verified mode), and one whole-vault
+    /// resolution. This is the cold build — and the only path that can run
+    /// without a published generation to be incremental against.
+    fn try_complete_refresh(
         &mut self,
         verify: bool,
         metrics: &mut ReconcileMetrics,
@@ -307,6 +376,11 @@ impl IndexService {
         }
 
         metrics.work.changed_notes = added + changed;
+
+        // Canonical order, matching what the delta path stores, so a set that
+        // did not change is never rewritten just because the two paths
+        // assembled it in different orders.
+        crate::live_reconcile::sort_scan_diagnostics(&mut diagnostics);
 
         if !semantic_change && diagnostics != self.store.load_scan_diagnostics()? {
             semantic_change = true;
@@ -618,7 +692,10 @@ impl IndexService {
     /// about to build on. The returned handle is a temporary co-owner: drop
     /// it before publishing, or the install has to copy the graph instead of
     /// mutating it.
-    fn published_graph(&self, expected: Generation) -> Result<Arc<LiveGraph>, IndexError> {
+    pub(crate) fn published_graph(
+        &self,
+        expected: Generation,
+    ) -> Result<Arc<LiveGraph>, IndexError> {
         let published = crate::reader::read_published(&self.published)?;
         let graph = published
             .graph
@@ -656,7 +733,7 @@ impl IndexService {
     /// existing cache, or one whose seeding failed. Ordinarily a no-op: the
     /// hydration below only runs when the published generation is actually
     /// behind, and it runs before the barrier is taken.
-    fn republish_current(&mut self, generation: Generation) -> Result<(), IndexError> {
+    pub(crate) fn republish_current(&mut self, generation: Generation) -> Result<(), IndexError> {
         if crate::reader::read_published(&self.published)?.generation == Some(generation) {
             return Ok(());
         }
