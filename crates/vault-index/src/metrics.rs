@@ -27,6 +27,9 @@ pub struct WorkCounts {
     pub body_reads: u64,
     pub notes_reparsed: u64,
     pub changed_notes: u64,
+    /// References selected for re-resolution this cycle: outgoing-only on
+    /// the complete-resolution path; outgoing plus dependency-selected
+    /// incoming references on the live (incremental) path.
     pub affected_references: u64,
     pub references_resolved: u64,
     pub note_rows_written: u64,

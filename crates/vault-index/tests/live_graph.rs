@@ -279,6 +279,100 @@ fn candidate_notes_appear_on_add_and_disappear_on_removal() {
 }
 
 #[test]
+fn note_path_round_trips_and_forgets_removed_notes() {
+    let mut fixture = common::live_graph_fixture();
+    fixture.service.refresh(false).expect("cold build");
+    let mut graph = fixture.service.hydrate_live_graph().expect("hydrate");
+
+    // Every note registers its own full path under ExactPathWithExtension
+    // (see `added_candidate_keys`), so this is an O(1) way to recover a
+    // path's `NoteId` from existing accessors without a whole-graph scan.
+    let note_id_of = |graph: &vault_index::LiveGraph, path: &VaultPath| -> vault_index::NoteId {
+        let key = DependencyKey::new(DependencyKind::ExactPathWithExtension, path.as_str());
+        *graph
+            .candidate_notes(&key)
+            .iter()
+            .next()
+            .expect("every tracked note registers its own exact-path key")
+    };
+
+    let mut ids_by_path = std::collections::BTreeMap::new();
+    for path in graph.note_paths() {
+        let id = note_id_of(&graph, &path);
+        assert_eq!(
+            graph.note_path(id),
+            Some(&path),
+            "note_path must round-trip for {path:?}"
+        );
+        ids_by_path.insert(path, id);
+    }
+
+    let removed_id = ids_by_path[&vp("Unrelated.md")];
+    let expected_generation = graph.generation();
+    let delta = graph
+        .prepare_delta(expected_generation, &[], &[vp("Unrelated.md")], &[])
+        .expect("prepare delta");
+    graph.install(delta);
+
+    assert_eq!(
+        graph.note_path(removed_id),
+        None,
+        "a removed note's id must no longer resolve to a path"
+    );
+    for (path, id) in &ids_by_path {
+        if path == &vp("Unrelated.md") {
+            continue;
+        }
+        assert_eq!(
+            graph.note_path(*id),
+            Some(path),
+            "unaffected notes must still round-trip after an unrelated removal"
+        );
+    }
+}
+
+#[test]
+fn reference_returns_the_current_record_after_a_per_ordinal_replacement() {
+    let mut fixture = common::live_graph_fixture();
+    fixture.service.refresh(false).expect("cold build");
+    let mut graph = fixture.service.hydrate_live_graph().expect("hydrate");
+    let expected_generation = graph.generation();
+
+    let hub_sub_key = only_reference_targeting(&graph, &vp("Hub.md"), "Sub");
+    let before = graph
+        .reference(hub_sub_key)
+        .expect("reference exists before replacement");
+    assert_eq!(before.target.raw_target, "Sub");
+    assert_eq!(before.source_path, vp("Hub.md"));
+
+    let replacement_reference = HydratedReference {
+        source_path: vp("Hub.md"),
+        ordinal: hub_sub_key.ordinal,
+        target: LinkTarget::parse("Other"),
+        resolution: Resolution::Resolved {
+            target: vp("Other.md"),
+            subpath: None,
+        },
+    };
+    let delta = graph
+        .prepare_delta(expected_generation, &[], &[], &[replacement_reference])
+        .expect("prepare delta");
+    graph.install(delta);
+
+    let after = graph
+        .reference(hub_sub_key)
+        .expect("reference still exists after replacement");
+    assert_eq!(after.target.raw_target, "Other");
+    assert_eq!(
+        after.resolution,
+        Resolution::Resolved {
+            target: vp("Other.md"),
+            subpath: None,
+        }
+    );
+}
+
+#[test]
 fn install_after_prepare_delta_matches_a_fresh_hydration() {
     let mut fixture = common::live_graph_fixture();
     fixture.service.refresh(false).expect("cold build");
@@ -337,22 +431,20 @@ fn only_reference_targeting(
 /// logical content are not guaranteed to assign the same `NoteId` to the
 /// same path — comparing raw `ReferenceKey`/`ImpactPlan` values across them
 /// would be comparing incomparable numberings, not a meaningful equivalence
-/// check. Resolving each key back to `(path, ordinal)` via the existing
-/// `note_paths`/`reference_keys` accessors (no new production API) restores
-/// a comparable, path-addressed shape.
+/// check. Resolving each key back to `(path, ordinal)` via `note_path`
+/// (O(1) per key — no whole-graph scan) restores a comparable,
+/// path-addressed shape.
 fn resolve_keys(
     graph: &vault_index::LiveGraph,
     keys: &BTreeSet<vault_index::ReferenceKey>,
 ) -> BTreeSet<(VaultPath, u32)> {
-    let mut resolved = BTreeSet::new();
-    for path in graph.note_paths() {
-        for key in graph.reference_keys(&path) {
-            if keys.contains(&key) {
-                resolved.insert((path.clone(), key.ordinal));
-            }
-        }
-    }
-    resolved
+    keys.iter()
+        .filter_map(|key| {
+            graph
+                .note_path(key.source)
+                .map(|path| (path.clone(), key.ordinal))
+        })
+        .collect()
 }
 
 fn assert_graphs_equivalent(left: &vault_index::LiveGraph, right: &vault_index::LiveGraph) {

@@ -19,6 +19,13 @@ use crate::model::Generation;
 
 /// A compact, per-graph-instance identity for a note. Never stable across
 /// process restarts and never exposed through protocol DTOs.
+///
+/// Unrelated to `vault_core::NoteId` — both are crate-root re-exports that
+/// happen to share a name across two different crates. A module that glob
+/// imports both preludes (`use vault_core::*;` and `use vault_index::*;`)
+/// will hit a name ambiguity; qualify one or both
+/// (`vault_core::NoteId`/`vault_index::NoteId`) rather than relying on an
+/// unqualified glob.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NoteId(u32);
 
@@ -119,16 +126,17 @@ pub struct PreparedGraphDelta {
     candidate_removals: BTreeMap<NoteId, Vec<DependencyKey>>,
 }
 
-/// The compact live resolution graph: path interning, a forward candidate
-/// index (dependency key -> notes that could satisfy a reference using that
-/// key), per-source references (grouped implicitly by `ReferenceKey`
-/// ordering), and a reverse index from dependency key to the references that
-/// depend on it.
+/// The compact live resolution graph: path interning in both directions
+/// (`paths`/`path_by_id`), a forward candidate index (dependency key ->
+/// notes that could satisfy a reference using that key), per-source
+/// references (grouped implicitly by `ReferenceKey` ordering), and a reverse
+/// index from dependency key to the references that depend on it.
 #[derive(Clone, Debug)]
 pub struct LiveGraph {
     generation: Generation,
     next_note_id: u32,
     paths: BTreeMap<VaultPath, NoteId>,
+    path_by_id: BTreeMap<NoteId, VaultPath>,
     notes: BTreeMap<NoteId, NoteRecord>,
     references: BTreeMap<ReferenceKey, ReferenceRecord>,
     dependents: BTreeMap<DependencyKey, BTreeSet<ReferenceKey>>,
@@ -141,6 +149,7 @@ impl LiveGraph {
             generation,
             next_note_id: 0,
             paths: BTreeMap::new(),
+            path_by_id: BTreeMap::new(),
             notes: BTreeMap::new(),
             references: BTreeMap::new(),
             dependents: BTreeMap::new(),
@@ -174,6 +183,7 @@ impl LiveGraph {
                 graph.candidates.entry(key).or_default().insert(id);
             }
             graph.notes.insert(id, record);
+            graph.path_by_id.insert(id, note.path.clone());
             graph.paths.insert(note.path, id);
         }
         for reference in references {
@@ -222,6 +232,34 @@ impl LiveGraph {
 
     pub fn note_paths(&self) -> BTreeSet<VaultPath> {
         self.paths.keys().cloned().collect()
+    }
+
+    /// `id`'s path, if `id` is currently tracked — the O(1) inverse of
+    /// looking a path up to get its `NoteId`. Intended for consumers that
+    /// hold a `NoteId`/`ReferenceKey` from `candidate_notes`/`dependents`/
+    /// `ImpactPlan::affected` and need to resolve it without a whole-graph
+    /// scan.
+    pub fn note_path(&self, id: NoteId) -> Option<&VaultPath> {
+        self.path_by_id.get(&id)
+    }
+
+    /// The current record for `key`, if it is tracked — the O(1) inverse of
+    /// `reference_keys`/`outgoing`, for a consumer that already holds a
+    /// `ReferenceKey` (e.g. from `ImpactPlan::affected` or `dependents`) and
+    /// needs its content without a whole-graph scan. Returned as an owned
+    /// `HydratedReference` (the graph does not store one keyed by
+    /// `ReferenceKey` directly — only a `target`/`resolution` pair plus its
+    /// dependency keys — so there is nothing to hand back a `&` to; building
+    /// one is still two `BTreeMap` lookups, not an iteration).
+    pub fn reference(&self, key: ReferenceKey) -> Option<HydratedReference> {
+        let record = self.references.get(&key)?;
+        let source_path = self.path_by_id.get(&key.source)?.clone();
+        Some(HydratedReference {
+            source_path,
+            ordinal: key.ordinal,
+            target: record.target.clone(),
+            resolution: record.resolution.clone(),
+        })
     }
 
     /// The resolution-relevant facts the graph retains for `path`, if it is
@@ -432,7 +470,24 @@ impl LiveGraph {
     /// Apply a previously prepared delta: swaps, removals, and inserts only.
     /// Cannot fail — every fallible check already happened in
     /// `prepare_delta`.
+    ///
+    /// Precondition: exactly one prepared delta may be installed per
+    /// generation step. `prepare_delta` validates `expected` against
+    /// `self.generation` at *preparation* time only, so two deltas prepared
+    /// from the same starting generation (e.g. from concurrent callers) can
+    /// both validate successfully; installing both would silently regress
+    /// or duplicate the generation counter. The real guard against that is
+    /// the caller's own barrier (one delta in flight per generation) — the
+    /// debug assertion below is only a local tripwire that fires in this
+    /// crate's own tests and any debug-build caller, never a substitute for
+    /// that barrier.
     pub fn install(&mut self, delta: PreparedGraphDelta) {
+        debug_assert_eq!(
+            delta.generation.get(),
+            self.generation.get() + 1,
+            "stale delta installed: prepared against a generation this graph has moved past"
+        );
+
         for (note_id, keys) in &delta.candidate_removals {
             for key in keys {
                 if let Some(set) = self.candidates.get_mut(key) {
@@ -448,6 +503,7 @@ impl LiveGraph {
             if let Some(note_id) = self.paths.remove(path) {
                 self.clear_outgoing(note_id);
                 self.notes.remove(&note_id);
+                self.path_by_id.remove(&note_id);
             }
         }
 
@@ -458,11 +514,13 @@ impl LiveGraph {
         }
 
         for (path, id) in delta.new_note_ids {
+            self.path_by_id.insert(id, path.clone());
             self.paths.insert(path, id);
         }
         self.next_note_id = delta.next_note_id;
 
         for (path, (note_id, record)) in delta.note_updates {
+            self.path_by_id.insert(note_id, path.clone());
             self.paths.insert(path, note_id);
             self.notes.insert(note_id, record);
         }
