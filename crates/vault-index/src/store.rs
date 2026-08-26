@@ -642,15 +642,14 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Build a compact live resolution graph from narrow SQL: paths,
-    /// headings, block ids, reference target columns, stored resolution
-    /// columns, and ambiguous candidates only. Never touches `source_bytes`,
-    /// `properties`, `aliases`, or `tags`.
-    pub(crate) fn hydrate_live_graph(
-        &self,
-        generation: Generation,
-    ) -> Result<LiveGraph, IndexError> {
-        hydrate::hydrate_live_graph(&self.connection, generation)
+    /// Build a compact live resolution graph from one consistent snapshot:
+    /// narrow SQL for paths, headings, block ids, reference target columns,
+    /// stored resolution columns, and ambiguous candidates only (never
+    /// `source_bytes`, `properties`, `aliases`, or `tags`), including the
+    /// generation itself, all read inside a single deferred transaction so
+    /// a concurrent publish cannot tear the read.
+    pub(crate) fn hydrate_live_graph(&self) -> Result<LiveGraph, IndexError> {
+        hydrate::hydrate_live_graph(&self.connection)
     }
 
     /// Verification facade: rebuild the graph from persisted notes and prove

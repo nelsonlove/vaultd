@@ -187,6 +187,98 @@ fn unrelated_paths_select_no_references() {
 }
 
 #[test]
+fn install_retires_a_stale_dependency_when_a_reference_is_updated_without_a_source_clear() {
+    let mut fixture = common::live_graph_fixture();
+    fixture.service.refresh(false).expect("cold build");
+    let mut graph = fixture.service.hydrate_live_graph().expect("hydrate");
+    let expected_generation = graph.generation();
+
+    let sub_key = DependencyKey::new(DependencyKind::ExactPathWithExtension, "Sub.md");
+    let other_key = DependencyKey::new(DependencyKind::ExactPathWithExtension, "Other.md");
+    let hub_key_before = only_reference_targeting(&graph, &vp("Hub.md"), "Sub");
+    assert!(graph.dependents(&sub_key).contains(&hub_key_before));
+
+    // A targeted, per-ordinal update: Hub.md's [[Sub]] reference (ordinal 0)
+    // now resolves to Other.md instead, supplied WITHOUT listing Hub.md in
+    // `replacement_notes` or `removed_paths` — only in
+    // `replacement_references`, as prepare_delta's docs describe. The old
+    // Sub.md dependency for this exact key must not survive as an orphan.
+    let replacement_reference = HydratedReference {
+        source_path: vp("Hub.md"),
+        ordinal: 0,
+        target: LinkTarget::parse("Other"),
+        resolution: Resolution::Resolved {
+            target: vp("Other.md"),
+            subpath: None,
+        },
+    };
+    let delta = graph
+        .prepare_delta(expected_generation, &[], &[], &[replacement_reference])
+        .expect("prepare delta");
+    graph.install(delta);
+
+    // Ordinal 0's key is stable across the update (same source, same
+    // ordinal); look it up by ordinal rather than by raw target, since the
+    // fixture already has an unrelated `[[Other]]` reference at another
+    // ordinal and this update makes the raw target "Other" non-unique.
+    let hub_key_after = *graph
+        .reference_keys(&vp("Hub.md"))
+        .iter()
+        .find(|key| key.ordinal == hub_key_before.ordinal)
+        .expect("ordinal 0 is still tracked for Hub.md");
+    assert_eq!(
+        hub_key_before, hub_key_after,
+        "the reference key at ordinal 0 for Hub.md is unchanged"
+    );
+    assert!(
+        !graph.dependents(&sub_key).contains(&hub_key_after),
+        "the stale Sub.md dependency must not survive the replacement"
+    );
+    assert!(
+        graph.dependents(&other_key).contains(&hub_key_after),
+        "the new Other.md dependency must be indexed"
+    );
+}
+
+#[test]
+fn candidate_notes_appear_on_add_and_disappear_on_removal() {
+    let mut fixture = common::live_graph_fixture();
+    fixture.service.refresh(false).expect("cold build");
+    let mut graph = fixture.service.hydrate_live_graph().expect("hydrate");
+
+    let filename_key = DependencyKey::new(DependencyKind::ExactPathWithExtension, "Foo.md");
+    let stem_key = DependencyKey::new(DependencyKind::Stem, "foo");
+    assert!(graph.candidate_notes(&filename_key).is_empty());
+    assert!(graph.candidate_notes(&stem_key).is_empty());
+
+    let expected_generation = graph.generation();
+    let new_note = HydratedNote {
+        path: vp("Foo.md"),
+        headings: Vec::new(),
+        blocks: Vec::new(),
+    };
+    let delta = graph
+        .prepare_delta(expected_generation, &[new_note], &[], &[])
+        .expect("prepare delta");
+    graph.install(delta);
+
+    assert_eq!(graph.candidate_notes(&filename_key).len(), 1);
+    assert_eq!(graph.candidate_notes(&stem_key).len(), 1);
+
+    let expected_generation = graph.generation();
+    let delta = graph
+        .prepare_delta(expected_generation, &[], &[vp("Foo.md")], &[])
+        .expect("prepare delta");
+    graph.install(delta);
+
+    assert!(
+        graph.candidate_notes(&filename_key).is_empty(),
+        "removing the note must remove it from the candidate map"
+    );
+    assert!(graph.candidate_notes(&stem_key).is_empty());
+}
+
+#[test]
 fn install_after_prepare_delta_matches_a_fresh_hydration() {
     let mut fixture = common::live_graph_fixture();
     fixture.service.refresh(false).expect("cold build");
@@ -238,6 +330,31 @@ fn only_reference_targeting(
         .expect("a reference key exists for this ordinal")
 }
 
+/// Translate a raw `affected` set into an ID-independent shape. `NoteId` is
+/// assigned by each graph's own build/install history (arrival order for an
+/// incrementally-installed note vs. alphabetical-at-hydration-time for a
+/// freshly rehydrated one), so two independently-built graphs over the same
+/// logical content are not guaranteed to assign the same `NoteId` to the
+/// same path — comparing raw `ReferenceKey`/`ImpactPlan` values across them
+/// would be comparing incomparable numberings, not a meaningful equivalence
+/// check. Resolving each key back to `(path, ordinal)` via the existing
+/// `note_paths`/`reference_keys` accessors (no new production API) restores
+/// a comparable, path-addressed shape.
+fn resolve_keys(
+    graph: &vault_index::LiveGraph,
+    keys: &BTreeSet<vault_index::ReferenceKey>,
+) -> BTreeSet<(VaultPath, u32)> {
+    let mut resolved = BTreeSet::new();
+    for path in graph.note_paths() {
+        for key in graph.reference_keys(&path) {
+            if keys.contains(&key) {
+                resolved.insert((path.clone(), key.ordinal));
+            }
+        }
+    }
+    resolved
+}
+
 fn assert_graphs_equivalent(left: &vault_index::LiveGraph, right: &vault_index::LiveGraph) {
     assert_eq!(left.generation(), right.generation());
     assert_eq!(left.note_paths(), right.note_paths());
@@ -258,5 +375,65 @@ fn assert_graphs_equivalent(left: &vault_index::LiveGraph, right: &vault_index::
             left_outgoing, right_outgoing,
             "outgoing references for {path:?} differ"
         );
+
+        let left_note = left.note(&path).expect("left tracks this note");
+        let right_note = right.note(&path).expect("right tracks this note");
+        assert_eq!(
+            left_note.headings, right_note.headings,
+            "headings for {path:?} differ"
+        );
+        assert_eq!(
+            left_note.blocks, right_note.blocks,
+            "blocks for {path:?} differ"
+        );
+
+        // Compare the reverse index (the only thing `plan_impact` reads) via
+        // both channels, since neither the outgoing-content check above nor
+        // the note-identity check exercises `dependents`/`candidates` at all.
+        let identity = ResolutionIdentityChange {
+            old: None,
+            new: Some(ResolutionNote {
+                path: path.clone(),
+                headings: left_note.headings.clone(),
+                blocks: left_note.blocks.clone(),
+            }),
+        };
+        let left_by_identity = left.plan_impact(&BTreeSet::new(), std::slice::from_ref(&identity));
+        let right_by_identity =
+            right.plan_impact(&BTreeSet::new(), std::slice::from_ref(&identity));
+        assert_eq!(
+            left_by_identity.complete_resolution, right_by_identity.complete_resolution,
+            "identity-channel complete_resolution for {path:?} differs"
+        );
+        assert_eq!(
+            resolve_keys(left, &left_by_identity.affected),
+            resolve_keys(right, &right_by_identity.affected),
+            "identity-channel impact for {path:?} differs"
+        );
+
+        let changed_sources: BTreeSet<VaultPath> = [path.clone()].into_iter().collect();
+        let left_by_source = left.plan_impact(&changed_sources, &[]);
+        let right_by_source = right.plan_impact(&changed_sources, &[]);
+        assert_eq!(
+            left_by_source.complete_resolution, right_by_source.complete_resolution,
+            "changed-source complete_resolution for {path:?} differs"
+        );
+        assert_eq!(
+            resolve_keys(left, &left_by_source.affected),
+            resolve_keys(right, &right_by_source.affected),
+            "changed-source impact for {path:?} differs"
+        );
+
+        // Compare the forward candidate index for every key derivable from
+        // this note's identity, by size only (NoteId numbering across the
+        // two independently-built graphs is not comparable — see
+        // `resolve_keys`).
+        for key in vault_core::changed_candidate_keys(&identity) {
+            assert_eq!(
+                left.candidate_notes(&key).len(),
+                right.candidate_notes(&key).len(),
+                "candidate set size for {key:?} differs"
+            );
+        }
     }
 }

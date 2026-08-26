@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use vault_core::{
-    DependencyKey, LinkTarget, Resolution, ResolutionIdentityChange, VaultPath,
+    DependencyKey, LinkTarget, Resolution, ResolutionIdentityChange, ResolutionNote, VaultPath,
     changed_candidate_keys, reference_dependencies,
 };
 
@@ -63,6 +63,34 @@ struct ReferenceRecord {
     dependency_keys: Vec<DependencyKey>,
 }
 
+fn note_identity(path: &VaultPath, record: &NoteRecord) -> ResolutionNote {
+    ResolutionNote {
+        path: path.clone(),
+        headings: record.headings.clone(),
+        blocks: record.blocks.clone(),
+    }
+}
+
+/// The candidate-map keys a note contributes when it is added, computed the
+/// same way `dependents` keys are: only through `vault_core`'s own
+/// `changed_candidate_keys`, never hand-built. Modeled as an add
+/// (`old: None`) with no prior state.
+fn added_candidate_keys(path: &VaultPath, record: &NoteRecord) -> BTreeSet<DependencyKey> {
+    changed_candidate_keys(&ResolutionIdentityChange {
+        old: None,
+        new: Some(note_identity(path, record)),
+    })
+}
+
+/// The candidate-map keys to retire when a note is removed: the mirror of
+/// `added_candidate_keys`.
+fn removed_candidate_keys(path: &VaultPath, record: &NoteRecord) -> BTreeSet<DependencyKey> {
+    changed_candidate_keys(&ResolutionIdentityChange {
+        old: Some(note_identity(path, record)),
+        new: None,
+    })
+}
+
 /// The bounded work one reconciliation cycle must redo: the references whose
 /// resolution answer could have changed, plus a conservative escape hatch
 /// for callers that must fall back to a complete resolution.
@@ -87,11 +115,15 @@ pub struct PreparedGraphDelta {
     note_updates: BTreeMap<VaultPath, (NoteId, NoteRecord)>,
     reference_updates: BTreeMap<VaultPath, Vec<(u32, ReferenceRecord)>>,
     removed_paths: Vec<VaultPath>,
+    candidate_additions: BTreeMap<NoteId, Vec<DependencyKey>>,
+    candidate_removals: BTreeMap<NoteId, Vec<DependencyKey>>,
 }
 
-/// The compact live resolution graph: path interning, per-source references
-/// (grouped implicitly by `ReferenceKey` ordering), and a reverse index from
-/// dependency key to the references that depend on it.
+/// The compact live resolution graph: path interning, a forward candidate
+/// index (dependency key -> notes that could satisfy a reference using that
+/// key), per-source references (grouped implicitly by `ReferenceKey`
+/// ordering), and a reverse index from dependency key to the references that
+/// depend on it.
 #[derive(Clone, Debug)]
 pub struct LiveGraph {
     generation: Generation,
@@ -100,6 +132,7 @@ pub struct LiveGraph {
     notes: BTreeMap<NoteId, NoteRecord>,
     references: BTreeMap<ReferenceKey, ReferenceRecord>,
     dependents: BTreeMap<DependencyKey, BTreeSet<ReferenceKey>>,
+    candidates: BTreeMap<DependencyKey, BTreeSet<NoteId>>,
 }
 
 impl LiveGraph {
@@ -111,52 +144,64 @@ impl LiveGraph {
             notes: BTreeMap::new(),
             references: BTreeMap::new(),
             dependents: BTreeMap::new(),
+            candidates: BTreeMap::new(),
         }
     }
 
     /// Build a graph from a complete set of hydrated notes and references,
     /// as read by `IndexStore::hydrate_live_graph`. Dependency keys are
     /// computed here, once, from each reference's own target and resolution.
+    ///
+    /// Fails if a reference names a `source_path` outside `notes` — that can
+    /// only mean the caller handed us an inconsistent snapshot (e.g. a torn
+    /// read), and silently dropping the reference would under-select it
+    /// forever (it would never appear in `dependents`), which conservative
+    /// invalidation forbids.
     pub(crate) fn from_hydrated(
         generation: Generation,
         notes: Vec<HydratedNote>,
         references: Vec<HydratedReference>,
-    ) -> Self {
+    ) -> Result<Self, IndexError> {
         let mut graph = Self::empty(generation);
         for note in notes {
             let id = NoteId(graph.next_note_id);
             graph.next_note_id += 1;
-            graph.notes.insert(
-                id,
-                NoteRecord {
-                    headings: note.headings,
-                    blocks: note.blocks,
-                },
-            );
+            let record = NoteRecord {
+                headings: note.headings,
+                blocks: note.blocks,
+            };
+            for key in added_candidate_keys(&note.path, &record) {
+                graph.candidates.entry(key).or_default().insert(id);
+            }
+            graph.notes.insert(id, record);
             graph.paths.insert(note.path, id);
         }
         for reference in references {
-            if let Some(&note_id) = graph.paths.get(&reference.source_path) {
-                let dependency_keys = reference_dependencies(
-                    &reference.source_path,
-                    &reference.target,
-                    &reference.resolution,
-                );
-                let key = ReferenceKey {
-                    source: note_id,
-                    ordinal: reference.ordinal,
-                };
-                graph.insert_reference(
-                    key,
-                    ReferenceRecord {
-                        target: reference.target,
-                        resolution: reference.resolution,
-                        dependency_keys,
-                    },
-                );
-            }
+            let &note_id = graph.paths.get(&reference.source_path).ok_or_else(|| {
+                IndexError::Storage(format!(
+                    "reference for unknown note {}",
+                    reference.source_path.as_str()
+                ))
+            })?;
+            let dependency_keys = reference_dependencies(
+                &reference.source_path,
+                &reference.target,
+                &reference.resolution,
+            );
+            let key = ReferenceKey {
+                source: note_id,
+                ordinal: reference.ordinal,
+            };
+            graph.insert_reference(
+                key,
+                ReferenceRecord {
+                    target: reference.target,
+                    resolution: reference.resolution,
+                    dependency_keys,
+                },
+            );
         }
-        graph
+        Ok(graph)
     }
 
     pub fn generation(&self) -> Generation {
@@ -230,6 +275,16 @@ impl LiveGraph {
         self.dependents.get(key).cloned().unwrap_or_default()
     }
 
+    /// The notes that could satisfy a reference looked up under `key`: the
+    /// forward counterpart to `dependents`, populated from
+    /// `vault_core::changed_candidate_keys` applied to each note's own
+    /// identity (an add with no prior state). This is what a future
+    /// consumer can use to resolve a reference's lookup routes without
+    /// rebuilding the whole-vault `Resolver`.
+    pub fn candidate_notes(&self, key: &DependencyKey) -> BTreeSet<NoteId> {
+        self.candidates.get(key).cloned().unwrap_or_default()
+    }
+
     /// The bounded set of references that could need re-resolution given a
     /// batch of directly-changed source bodies and note-identity changes.
     ///
@@ -272,6 +327,20 @@ impl LiveGraph {
     /// `self`. Fails if `expected` does not match this graph's current
     /// generation (the same compare-and-swap discipline `IndexStore::publish`
     /// uses against the SQLite generation).
+    ///
+    /// Listing a note's path in `replacement_notes` replaces that source's
+    /// *entire* tracked reference set: `install` clears every existing
+    /// reference for that source before applying whatever
+    /// `replacement_references` supplies for it, so a re-parsed note's
+    /// caller must supply its complete new reference list, not a subset.
+    ///
+    /// A source path that appears in `replacement_references` *without*
+    /// also appearing in `replacement_notes` is a targeted, per-ordinal
+    /// update instead (e.g. one existing reference's resolution changed
+    /// without a re-parse of its source): existing ordinals for that source
+    /// that are absent from `replacement_references` are left untouched,
+    /// and ordinals that are present are safely overwritten (their old
+    /// dependency keys are retired, never left dangling).
     pub fn prepare_delta(
         &self,
         expected: Generation,
@@ -290,6 +359,7 @@ impl LiveGraph {
         let mut next_note_id = self.next_note_id;
         let mut new_note_ids: BTreeMap<VaultPath, NoteId> = BTreeMap::new();
         let mut note_updates: BTreeMap<VaultPath, (NoteId, NoteRecord)> = BTreeMap::new();
+        let mut candidate_additions: BTreeMap<NoteId, Vec<DependencyKey>> = BTreeMap::new();
         for note in replacement_notes {
             let note_id = if let Some(&existing) = self.paths.get(&note.path) {
                 existing
@@ -301,16 +371,29 @@ impl LiveGraph {
                 new_note_ids.insert(note.path.clone(), id);
                 id
             };
-            note_updates.insert(
-                note.path.clone(),
-                (
-                    note_id,
-                    NoteRecord {
-                        headings: note.headings.clone(),
-                        blocks: note.blocks.clone(),
-                    },
-                ),
+            let record = NoteRecord {
+                headings: note.headings.clone(),
+                blocks: note.blocks.clone(),
+            };
+            candidate_additions.insert(
+                note_id,
+                added_candidate_keys(&note.path, &record)
+                    .into_iter()
+                    .collect(),
             );
+            note_updates.insert(note.path.clone(), (note_id, record));
+        }
+
+        let mut candidate_removals: BTreeMap<NoteId, Vec<DependencyKey>> = BTreeMap::new();
+        for path in removed_paths {
+            if let Some(&note_id) = self.paths.get(path) {
+                if let Some(record) = self.notes.get(&note_id) {
+                    candidate_removals.insert(
+                        note_id,
+                        removed_candidate_keys(path, record).into_iter().collect(),
+                    );
+                }
+            }
         }
 
         let mut reference_updates: BTreeMap<VaultPath, Vec<(u32, ReferenceRecord)>> =
@@ -341,6 +424,8 @@ impl LiveGraph {
             note_updates,
             reference_updates,
             removed_paths: removed_paths.to_vec(),
+            candidate_additions,
+            candidate_removals,
         })
     }
 
@@ -348,6 +433,17 @@ impl LiveGraph {
     /// Cannot fail — every fallible check already happened in
     /// `prepare_delta`.
     pub fn install(&mut self, delta: PreparedGraphDelta) {
+        for (note_id, keys) in &delta.candidate_removals {
+            for key in keys {
+                if let Some(set) = self.candidates.get_mut(key) {
+                    set.remove(note_id);
+                    if set.is_empty() {
+                        self.candidates.remove(key);
+                    }
+                }
+            }
+        }
+
         for path in &delta.removed_paths {
             if let Some(note_id) = self.paths.remove(path) {
                 self.clear_outgoing(note_id);
@@ -369,6 +465,12 @@ impl LiveGraph {
         for (path, (note_id, record)) in delta.note_updates {
             self.paths.insert(path, note_id);
             self.notes.insert(note_id, record);
+        }
+
+        for (note_id, keys) in delta.candidate_additions {
+            for key in keys {
+                self.candidates.entry(key).or_default().insert(note_id);
+            }
         }
 
         for (path, refs) in delta.reference_updates {
@@ -400,7 +502,12 @@ impl LiveGraph {
         self.references.range(start..=end).map(|(key, _)| *key)
     }
 
+    /// Idempotent: if `key` already holds a record (its resolution or target
+    /// changed without a full source clear), that record's dependency keys
+    /// are retired from `dependents` first, so no stale entry can ever
+    /// outlive the reference it was indexing.
     fn insert_reference(&mut self, key: ReferenceKey, record: ReferenceRecord) {
+        self.remove_reference(key);
         for dependency_key in &record.dependency_keys {
             self.dependents
                 .entry(dependency_key.clone())
@@ -428,5 +535,40 @@ impl LiveGraph {
         for key in keys {
             self.remove_reference(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vp(spelling: &str) -> VaultPath {
+        VaultPath::new(spelling).expect("valid path")
+    }
+
+    /// A torn read (or any other inconsistency between the note set and the
+    /// reference set) must fail loudly, never silently drop the reference:
+    /// a dropped reference is never in `dependents`, so nothing would ever
+    /// select it again — the one forbidden (under-selective) direction for
+    /// conservative invalidation.
+    #[test]
+    fn from_hydrated_rejects_a_reference_for_an_unknown_note() {
+        let notes = vec![HydratedNote {
+            path: vp("Known.md"),
+            headings: Vec::new(),
+            blocks: Vec::new(),
+        }];
+        let references = vec![HydratedReference {
+            source_path: vp("Unknown.md"),
+            ordinal: 0,
+            target: LinkTarget::parse("Known"),
+            resolution: Resolution::Resolved {
+                target: vp("Known.md"),
+                subpath: None,
+            },
+        }];
+
+        let result = LiveGraph::from_hydrated(Generation::new(1), notes, references);
+        assert!(matches!(result, Err(IndexError::Storage(_))));
     }
 }

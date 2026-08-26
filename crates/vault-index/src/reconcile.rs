@@ -402,14 +402,14 @@ impl IndexService {
         self.store.load_graph_for_test()
     }
 
-    /// Hydrate a compact live resolution graph from the current committed
-    /// generation. Fails with `IndexError::IndexUnavailable` before the
-    /// first successful `refresh`.
+    /// Hydrate a compact live resolution graph from one consistent snapshot
+    /// of the current committed generation. Fails with
+    /// `IndexError::IndexUnavailable` before the first successful
+    /// `refresh`. The generation is read inside the same transaction as
+    /// every other row, so a concurrent publish cannot hand back notes and
+    /// references from different generations.
     pub fn hydrate_live_graph(&self) -> Result<LiveGraph, IndexError> {
-        let generation = self
-            .current_generation()?
-            .ok_or(IndexError::IndexUnavailable)?;
-        self.store.hydrate_live_graph(generation)
+        self.store.hydrate_live_graph()
     }
 }
 

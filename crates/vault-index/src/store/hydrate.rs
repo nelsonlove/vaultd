@@ -14,6 +14,8 @@ use crate::live_graph::{HydratedNote, HydratedReference, LiveGraph};
 use crate::model::Generation;
 use crate::store::i64_to_usize;
 
+const GENERATION_SQL: &str = "SELECT generation FROM index_metadata WHERE singleton = 1";
+
 const NOTES_SQL: &str = "SELECT path FROM notes ORDER BY path";
 const HEADINGS_SQL: &str = "SELECT note_path, text FROM headings ORDER BY note_path, ordinal";
 const BLOCKS_SQL: &str = "SELECT note_path, identifier FROM blocks ORDER BY note_path, ordinal";
@@ -24,13 +26,22 @@ const REFERENCES_SQL: &str = "SELECT r.id, r.note_path, r.ordinal, r.raw_target,
 const CANDIDATES_SQL: &str =
     "SELECT candidate_path FROM resolution_candidates WHERE reference_id = ?1 ORDER BY ordinal";
 
-pub(crate) fn hydrate_live_graph(
-    connection: &Connection,
-    generation: Generation,
-) -> Result<LiveGraph, IndexError> {
-    let paths = load_paths(connection)?;
-    let mut headings = load_text_map(connection, HEADINGS_SQL)?;
-    let mut blocks = load_text_map(connection, BLOCKS_SQL)?;
+/// Hydrate a `LiveGraph` from one consistent snapshot: the generation and
+/// every row read here are taken from a single deferred read transaction
+/// (`Connection::unchecked_transaction`, which takes `&self` rather than
+/// `&mut self`, since under WAL a deferred transaction's first read pins a
+/// snapshot for every statement that follows). Without this, a publish
+/// committing between the five separate implicit read transactions the
+/// individual statements would otherwise each open could hand back notes
+/// and references from different generations — exactly the "torn read"
+/// `LiveGraph::from_hydrated` now refuses to accept silently.
+pub(crate) fn hydrate_live_graph(connection: &Connection) -> Result<LiveGraph, IndexError> {
+    let transaction = connection.unchecked_transaction()?;
+
+    let generation = load_generation(&transaction)?.ok_or(IndexError::IndexUnavailable)?;
+    let paths = load_paths(&transaction)?;
+    let mut headings = load_text_map(&transaction, HEADINGS_SQL)?;
+    let mut blocks = load_text_map(&transaction, BLOCKS_SQL)?;
 
     let notes: Vec<HydratedNote> = paths
         .into_iter()
@@ -44,9 +55,16 @@ pub(crate) fn hydrate_live_graph(
         })
         .collect();
 
-    let references = load_references(connection)?;
+    let references = load_references(&transaction)?;
 
-    Ok(LiveGraph::from_hydrated(generation, notes, references))
+    // Read-only: no commit needed, and dropping the transaction here rolls
+    // back (a no-op against an unmodified database) rather than panicking.
+    LiveGraph::from_hydrated(generation, notes, references)
+}
+
+fn load_generation(connection: &Connection) -> Result<Option<Generation>, IndexError> {
+    let value: Option<i64> = connection.query_row(GENERATION_SQL, [], |row| row.get(0))?;
+    value.map(Generation::from_db).transpose()
 }
 
 fn load_paths(connection: &Connection) -> Result<Vec<VaultPath>, IndexError> {
@@ -155,12 +173,15 @@ fn load_candidates(connection: &Connection, reference_id: i64) -> Result<Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCKS_SQL, CANDIDATES_SQL, HEADINGS_SQL, NOTES_SQL, REFERENCES_SQL};
+    use super::{
+        BLOCKS_SQL, CANDIDATES_SQL, GENERATION_SQL, HEADINGS_SQL, NOTES_SQL, REFERENCES_SQL,
+    };
 
     /// Every SQL statement hydration runs, checked directly against its
     /// literal text so a future edit that starts selecting a note-body or
     /// metadata column fails this test immediately.
     const HYDRATION_QUERIES: &[&str] = &[
+        GENERATION_SQL,
         NOTES_SQL,
         HEADINGS_SQL,
         BLOCKS_SQL,
