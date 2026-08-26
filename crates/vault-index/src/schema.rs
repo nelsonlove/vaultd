@@ -71,15 +71,8 @@ pub(crate) fn open_connection(config: &IndexConfig) -> Result<Connection, IndexE
 /// process is retryable storage pressure, never evidence of corruption — a
 /// busy healthy cache must not be deleted and rebuilt.
 fn open_issue_from(error: rusqlite::Error) -> OpenIssue {
-    let lock_contention = matches!(
-        &error,
-        rusqlite::Error::SqliteFailure(failure, _) if matches!(
-            failure.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        )
-    );
-    if lock_contention {
-        return OpenIssue::Fatal(IndexError::Storage(error.to_string()));
+    if crate::error::is_lock_contention(&error) {
+        return OpenIssue::Fatal(IndexError::Busy(error.to_string()));
     }
     OpenIssue::Corrupt(error.to_string())
 }

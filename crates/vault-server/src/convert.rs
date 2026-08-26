@@ -291,7 +291,14 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::IncompatibleIndex;
             error.message = "the index is incompatible with this vault or version".into();
         }
-        IndexError::Storage(_) => {
+        // `Busy` and `LiveStateStale` are distinct *internally* — one is
+        // retryable lock contention, the other is cured by
+        // `resync_published` — but both deliberately keep the existing
+        // `StorageFailure` code and message here. Protocol output must stay
+        // byte-identical to what a single `Storage` variant produced;
+        // dedicated codes are Task 11's job, and adding them here would be a
+        // protocol change smuggled into a refactor.
+        IndexError::Busy(_) | IndexError::LiveStateStale(_) | IndexError::Storage(_) => {
             error.code = ErrorCode::StorageFailure;
             error.message = "index storage failed".into();
         }

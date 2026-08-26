@@ -35,8 +35,8 @@ pub use reader::PauseHook;
 pub use reconcile::{IndexService, RefreshReport};
 pub use schema::{SEMANTIC_FORMAT_VERSION, SQL_SCHEMA_VERSION};
 pub use store::{
-    DeltaPublication, DeltaPublishOutcome, DeltaWriteCounts, IndexStore, NoteReplacement,
-    ResolutionReplacement,
+    DeltaPublication, DeltaPublishOutcome, DeltaPublishTimings, DeltaWriteCounts, IndexStore,
+    NoteReplacement, ResolutionReplacement,
 };
 
 #[doc(hidden)]

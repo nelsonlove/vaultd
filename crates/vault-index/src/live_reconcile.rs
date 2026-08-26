@@ -704,7 +704,6 @@ impl IndexService {
             })
             .collect();
 
-        let install_start = Instant::now();
         let outcome = self.publish_delta(
             DeltaPublication {
                 expected,
@@ -718,11 +717,21 @@ impl IndexService {
             &removed,
             &graph_references,
         )?;
-        metrics.stages.live_install += install_start.elapsed();
 
         match outcome {
-            DeltaPublishOutcome::Committed { generation, counts } => {
+            DeltaPublishOutcome::Committed {
+                generation,
+                counts,
+                timings,
+            } => {
                 metrics.work.merge_delta(&counts);
+                // Stage for stage with the complete path: the SQLite halves
+                // come from inside the delta transaction, `live_install`
+                // covers the graph delta's preparation and installation and
+                // nothing else.
+                metrics.stages.sqlite_write += timings.sqlite_write;
+                metrics.stages.sqlite_commit += timings.sqlite_commit;
+                metrics.stages.live_install += timings.live_install;
                 Ok(Some(BatchOutcome {
                     previous_generation: expected,
                     generation,

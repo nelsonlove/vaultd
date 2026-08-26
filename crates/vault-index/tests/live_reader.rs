@@ -396,6 +396,68 @@ fn a_delta_publication_advances_rows_and_live_graph_together() {
     );
 }
 
+/// The no-whole-graph-clone claim, mechanically enforced rather than merely
+/// documented: `published_state` hands out a co-owning handle, and a handle
+/// still alive when a delta installs turns `Arc::make_mut` into a deep copy of
+/// the entire graph. Nothing in the process would otherwise report that — it
+/// would surface only as unexplained latency — so a debug tripwire fires
+/// instead, and this test is what proves the tripwire is armed.
+///
+/// Debug-assertions only, by construction: the assert compiles out of a
+/// release build, where the copy is silently correct (just slow).
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "whole-graph copy")]
+fn a_held_published_state_handle_trips_the_whole_graph_copy_tripwire() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let reader = fixture.service().reader().expect("reader");
+    let expected = fixture
+        .service()
+        .current_generation()
+        .expect("generation")
+        .expect("cold build published a generation");
+
+    // The leak under test: a second owner of the live graph, still alive when
+    // the delta below installs.
+    let held = reader.published_state().expect("published state");
+
+    let path = VaultPath::new("New.md").expect("valid path");
+    let note = vault_core::parse_note(vault_core::SourceDocument::new(
+        path.clone(),
+        "# New\n".to_string(),
+    ));
+    let notes = vec![vault_index::NoteReplacement {
+        note,
+        fingerprint: vault_index::FileFingerprint {
+            size: 6,
+            modified_seconds: 1,
+            modified_nanos: 0,
+        },
+    }];
+    let graph_notes = vec![vault_index::HydratedNote {
+        path,
+        headings: vec!["New".to_string()],
+        blocks: Vec::new(),
+    }];
+
+    let published = fixture.service().publish_delta(
+        vault_index::DeltaPublication {
+            expected,
+            notes: &notes,
+            deleted: &[],
+            fingerprint_updates: &[],
+            resolutions: &[],
+            scan_diagnostics: None,
+        },
+        &graph_notes,
+        &[],
+        &[],
+    );
+    drop(held);
+    published.expect("publish delta");
+}
+
 #[test]
 fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
     let mut fixture = live_fixture();
@@ -479,7 +541,10 @@ fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
     // process's live graph. This refusal is the only defense against that
     // mixture, so it is asserted before the cure below removes it.
     assert!(
-        matches!(reader.get_note(&source_path()), Err(IndexError::Storage(_))),
+        matches!(
+            reader.get_note(&source_path()),
+            Err(IndexError::LiveStateStale(_))
+        ),
         "a read must refuse while the store is ahead of the published generation"
     );
 

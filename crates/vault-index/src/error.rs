@@ -16,6 +16,19 @@ pub enum IndexError {
     VaultChangedDuringRefresh,
     #[error("incompatible index: {0}")]
     IncompatibleIndex(String),
+    /// Lock contention, not damage: another connection or process holds the
+    /// write lock. Always retryable, and never evidence that the cache is
+    /// corrupt — split out of `Storage` so callers stop having to guess which
+    /// storage failures are worth retrying.
+    #[error("index storage is busy: {0}")]
+    Busy(String),
+    /// This process's published live state does not match what the cache has
+    /// committed, because a writer it does not own moved the cache. Curable
+    /// by `IndexService::resync_published`, and distinct from `Storage` for
+    /// exactly that reason: a reader refusing here is behaving correctly, not
+    /// reporting damage.
+    #[error("published live state is stale: {0}")]
+    LiveStateStale(String),
     #[error("storage failure: {0}")]
     Storage(String),
     #[error("delta publication left {0} with a reference row that has no resolution row")]
@@ -28,8 +41,24 @@ impl From<std::io::Error> for IndexError {
     }
 }
 
+/// Whether a SQLite failure is lock contention rather than damage. The single
+/// place that decision is made, so the recovery policy in `schema.rs` and the
+/// `?` conversion below can never drift apart on it.
+pub(crate) fn is_lock_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _) if matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    )
+}
+
 impl From<rusqlite::Error> for IndexError {
     fn from(error: rusqlite::Error) -> Self {
+        if is_lock_contention(&error) {
+            return Self::Busy(error.to_string());
+        }
         Self::Storage(error.to_string())
     }
 }

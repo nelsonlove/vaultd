@@ -108,6 +108,15 @@ CREATE TABLE resolution_candidates (
     PRIMARY KEY (reference_id, ordinal)
 );
 
+-- Write-only in production today: the live graph recomputes every dependency
+-- key from each reference's own target and resolution at hydration, so no
+-- production read path queries this table. The durable copy is kept
+-- deliberately, for two reasons: it is the write-side equality oracle the
+-- dependency-key tests compare a fresh `vault_core::reference_dependencies`
+-- computation against, and it is what lets a future consumer read a
+-- reference's dependencies without hydrating a whole graph. Its write
+-- amplification (one row per dependency key per re-resolved reference) is
+-- therefore a known, accepted cost, not an oversight.
 CREATE TABLE resolution_dependencies (
     reference_id INTEGER NOT NULL
         REFERENCES note_references(id) ON DELETE CASCADE,

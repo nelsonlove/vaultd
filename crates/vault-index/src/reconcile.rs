@@ -519,7 +519,9 @@ impl IndexService {
         // already fixed by the compare-and-swap above, so the matching graph
         // can be built — and can fail — before the guard is taken.
         let next_generation = pending.generation();
+        let prepare_start = Instant::now();
         let prepared = Arc::new(live_graph_from_semantic(next_generation, &report.graph)?);
+        metrics.stages.live_install += prepare_start.elapsed();
 
         // Only now the barrier, and only for the commit plus the install.
         // The commit is the one place a lock is deliberately held across
@@ -558,8 +560,10 @@ impl IndexService {
         if let Some(hook) = &self.publication_pause {
             hook();
         }
+        let install_start = Instant::now();
         published.generation = Some(generation);
         published.graph = Some(prepared);
+        metrics.stages.live_install += install_start.elapsed();
         drop(published);
 
         metrics.stages.sqlite_write += publish_metrics.sqlite_write;
@@ -647,6 +651,7 @@ impl IndexService {
         // in-process writer can move the published graph in between; a
         // foreign process that moves the *cache* is caught by the
         // compare-and-swap below.
+        let prepare_start = Instant::now();
         let delta = {
             let graph = self.published_graph(expected)?;
             graph.prepare_delta(
@@ -656,11 +661,16 @@ impl IndexService {
                 replacement_references,
             )?
         };
+        let prepare = prepare_start.elapsed();
 
         let mut published = write_published(&self.published)?;
         let outcome = self.store.publish_delta(publication)?;
         match outcome {
-            DeltaPublishOutcome::Committed { generation, counts } => {
+            DeltaPublishOutcome::Committed {
+                generation,
+                counts,
+                mut timings,
+            } => {
                 if let Some(hook) = &self.publication_pause {
                     hook();
                 }
@@ -676,10 +686,26 @@ impl IndexService {
                 // caller that holds one pays a whole-graph copy here. The
                 // copy `make_mut` takes then is a correctness fallback, not
                 // a normal cost.
+                //
+                // The tripwire below is what keeps that a documented claim
+                // rather than a hope: nothing else in the process would ever
+                // report the copy, so a leaked handle would show up only as
+                // unexplained latency.
+                debug_assert_eq!(
+                    Arc::strong_count(graph),
+                    1,
+                    "a held published_state() handle forces a whole-graph copy at install"
+                );
+                let install_start = Instant::now();
                 Arc::make_mut(graph).install(delta);
+                timings.live_install = prepare + install_start.elapsed();
                 published.generation = Some(generation);
                 drop(published);
-                Ok(DeltaPublishOutcome::Committed { generation, counts })
+                Ok(DeltaPublishOutcome::Committed {
+                    generation,
+                    counts,
+                    timings,
+                })
             }
             DeltaPublishOutcome::GenerationChanged => {
                 drop(published);

@@ -149,7 +149,12 @@ impl IndexReader {
         let stored: Option<i64> = transaction.query_row(GENERATION_SQL, [], |row| row.get(0))?;
         let stored = stored.map(Generation::from_db).transpose()?;
         if stored != Some(generation) {
-            return Err(IndexError::Storage(format!(
+            // A writer this process does not own moved the cache. Refusing is
+            // correct — answering would mix a foreign generation's rows with
+            // this process's live graph — and it is curable, by
+            // `IndexService::resync_published`. Typed as such so a caller can
+            // tell "run resync" apart from "storage is damaged".
+            return Err(IndexError::LiveStateStale(format!(
                 "stored generation {} does not match the published generation {}",
                 stored.map_or_else(|| "none".to_string(), |value| value.get().to_string()),
                 generation.get()

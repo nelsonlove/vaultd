@@ -6,6 +6,8 @@
 //! by an explicit `note_path` or `reference_id`, proven by
 //! `publish_delta_never_issues_a_table_wide_resolution_delete` below.
 
+use std::time::{Duration, Instant};
+
 use rusqlite::params;
 use vault_core::{DependencyKey, Diagnostic, ParsedNote, Resolution, VaultPath};
 
@@ -82,11 +84,27 @@ pub struct DeltaWriteCounts {
     pub unaffected_references_touched: u64,
 }
 
+/// Where one delta publication spent its time, in the same stage vocabulary
+/// `StageDurations` uses, so delta and complete publications can be compared
+/// stage for stage rather than as one opaque total.
+///
+/// The store fills `sqlite_write` and `sqlite_commit` and leaves
+/// `live_install` zero: it owns neither the graph delta nor its installation.
+/// `IndexService::publish_delta`, which owns both, fills `live_install` in
+/// before handing the outcome back.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeltaPublishTimings {
+    pub sqlite_write: Duration,
+    pub sqlite_commit: Duration,
+    pub live_install: Duration,
+}
+
 #[derive(Debug)]
 pub enum DeltaPublishOutcome {
     Committed {
         generation: Generation,
         counts: DeltaWriteCounts,
+        timings: DeltaPublishTimings,
     },
     GenerationChanged,
 }
@@ -124,6 +142,7 @@ impl IndexStore {
         }
 
         let mut counts = DeltaWriteCounts::default();
+        let write_start = Instant::now();
 
         for path in deleted {
             transaction.execute("DELETE FROM notes WHERE path = ?1", params![path.as_str()])?;
@@ -290,11 +309,19 @@ impl IndexStore {
             ],
         )?;
 
+        let sqlite_write = write_start.elapsed();
+        let commit_start = Instant::now();
         transaction.commit()?;
+        let sqlite_commit = commit_start.elapsed();
 
         Ok(DeltaPublishOutcome::Committed {
             generation: next,
             counts,
+            timings: DeltaPublishTimings {
+                sqlite_write,
+                sqlite_commit,
+                live_install: Duration::ZERO,
+            },
         })
     }
 }

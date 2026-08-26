@@ -234,7 +234,10 @@ fn publication_failure_before_commit_preserves_all_rows() {
 
     fs::write(vault.path().join("Note.md"), "# Note changed\n").unwrap();
     let error = service.refresh(false).expect_err("blocked publication");
-    assert!(matches!(error, IndexError::Storage(_)));
+    assert!(
+        matches!(error, IndexError::Busy(_)),
+        "lock contention must be typed as retryable, not as damage: {error:?}"
+    );
 
     blocker.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
@@ -309,7 +312,7 @@ fn a_busy_healthy_derived_cache_is_not_deleted_as_corrupt() {
         Err(error) => error,
     };
     assert!(
-        matches!(error, IndexError::Storage(_)),
+        matches!(error, IndexError::Busy(_)),
         "busy must be retryable, not corruption: {error:?}"
     );
 

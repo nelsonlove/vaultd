@@ -11,7 +11,8 @@ mod delta;
 mod hydrate;
 
 pub use delta::{
-    DeltaPublication, DeltaPublishOutcome, DeltaWriteCounts, NoteReplacement, ResolutionReplacement,
+    DeltaPublication, DeltaPublishOutcome, DeltaPublishTimings, DeltaWriteCounts, NoteReplacement,
+    ResolutionReplacement,
 };
 
 use crate::codec;
