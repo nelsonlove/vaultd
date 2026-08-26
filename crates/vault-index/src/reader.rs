@@ -11,12 +11,14 @@
 //! 6. run the complete query and drop the transaction;
 //! 7. release both locks.
 //!
-//! Steps 1 and 5 are what make a read generation-consistent. The barrier
-//! keeps the writer out for the whole read, so the rows cannot move under
-//! it; the equality check catches the one case the barrier cannot cover — a
-//! *different process* publishing into the same cache file — and refuses to
-//! answer rather than mixing a foreign generation's rows with this
-//! process's live graph.
+//! Steps 1 and 5 are what make a read generation-consistent. A writer may
+//! be writing rows the whole time a read runs — those writes are
+//! uncommitted and invisible — but it cannot *commit* them, because a
+//! publication takes the same barrier exclusively to commit and install.
+//! So the rows cannot move under a read. The equality check catches the one
+//! case the barrier cannot cover — a *different process* publishing into
+//! the same cache file — and refuses to answer rather than mixing a foreign
+//! generation's rows with this process's live graph.
 //!
 //! Lock order is always `publication barrier -> reader connection` and
 //! `publication barrier -> resolver cache`. The connection and resolver
@@ -31,7 +33,7 @@ use vault_core::Resolver;
 
 use crate::config::IndexConfig;
 use crate::error::IndexError;
-use crate::model::{Generation, PublicationBarrier, PublishedState};
+use crate::model::{Generation, PublicationBarrier, PublishedState, PublishedStatus};
 
 /// A test-only rendezvous callback. Production code never installs one, so
 /// the only cost on a real read or publication is one `Option` check.
@@ -97,9 +99,21 @@ impl IndexReader {
         &self.config
     }
 
-    /// A copy of the publication state as of this instant: the published
-    /// generation, the live graph installed with it, the runtime's live
-    /// state, and its last runtime error.
+    /// The publication state as of this instant, without the live graph:
+    /// the published generation, the installed graph's generation, the
+    /// runtime's live state, and its last runtime error. The copy-free way
+    /// to observe publication — prefer it to `published_state`.
+    pub fn published_status(&self) -> Result<PublishedStatus, IndexError> {
+        Ok(read_published(&self.published)?.status())
+    }
+
+    /// A full copy of the publication state, live graph handle included.
+    ///
+    /// The returned handle co-owns the graph: while it is alive the writer
+    /// is no longer the graph's sole owner, so the next delta install has to
+    /// copy the whole graph instead of mutating it in place. Use
+    /// `published_status` unless the graph itself is genuinely needed, and
+    /// drop the handle as soon as it is not.
     pub fn published_state(&self) -> Result<PublishedState, IndexError> {
         Ok(read_published(&self.published)?.clone())
     }
@@ -154,12 +168,14 @@ impl IndexReader {
     /// The resolver for the published generation, built from the published
     /// live graph rather than from SQL.
     ///
-    /// The graph `Arc` deliberately never escapes the read guard: the writer
-    /// installs a delta by mutating the published graph in place (which is
-    /// only possible while it is the sole owner), so a reader that kept a
-    /// clone alive would force the writer into a whole-graph copy. Building
-    /// the resolver under the guard costs one pass over the note identities,
-    /// once per generation per reader.
+    /// The graph `Arc` deliberately never escapes the read guard here: the
+    /// writer installs a delta by mutating the published graph in place
+    /// (which is only possible while it is the sole owner), so a handle kept
+    /// alive past the guard would force the writer into a whole-graph copy.
+    /// No reader other than `published_state` lets the `Arc` escape; a
+    /// caller that holds one pays a whole-graph copy on the next install.
+    /// Building the resolver under the guard costs one pass over the note
+    /// identities, once per generation per reader.
     pub(crate) fn resolver(&self) -> Result<(Generation, Arc<Resolver>), IndexError> {
         let published = read_published(&self.published)?;
         let generation = published.generation.ok_or(IndexError::IndexUnavailable)?;

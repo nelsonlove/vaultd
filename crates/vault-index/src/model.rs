@@ -52,10 +52,31 @@ pub enum LiveState {
 /// reader can never see rows from one generation and a live graph from
 /// another. `generation: None` means "nothing published yet" — every read
 /// answers `IndexError::IndexUnavailable` until the first publication.
+///
+/// Cloning this clones the graph handle, making the cloner a co-owner of the
+/// live graph for as long as it lives. That is not free: the writer installs
+/// a delta by mutating the published graph in place, which is only possible
+/// while it is the sole owner, so any outstanding clone costs a whole-graph
+/// copy at the next install. Prefer [`PublishedStatus`] (via
+/// `PublishedState::status` or `IndexReader::published_status`) whenever the
+/// graph itself is not needed.
 #[derive(Clone)]
 pub struct PublishedState {
     pub generation: Option<Generation>,
     pub graph: Option<std::sync::Arc<crate::LiveGraph>>,
+    pub live_state: LiveState,
+    pub runtime_error: Option<String>,
+}
+
+/// The publication state without the graph handle: the same facts, reported
+/// as values, so an observer never becomes a co-owner of the live graph and
+/// never makes the writer copy it. `graph_generation` is the generation of
+/// the installed live graph, which equals `generation` whenever a
+/// publication is installed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedStatus {
+    pub generation: Option<Generation>,
+    pub graph_generation: Option<Generation>,
     pub live_state: LiveState,
     pub runtime_error: Option<String>,
 }
@@ -69,6 +90,16 @@ impl PublishedState {
             graph: None,
             live_state: LiveState::Starting,
             runtime_error: None,
+        }
+    }
+
+    /// A copy-free summary: everything except the graph handle.
+    pub fn status(&self) -> PublishedStatus {
+        PublishedStatus {
+            generation: self.generation,
+            graph_generation: self.graph.as_ref().map(|graph| graph.generation()),
+            live_state: self.live_state,
+            runtime_error: self.runtime_error.clone(),
         }
     }
 }

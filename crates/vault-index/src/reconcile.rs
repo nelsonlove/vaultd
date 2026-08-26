@@ -16,9 +16,7 @@ use crate::model::{
     FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
 };
 use crate::reader::{IndexReader, PauseHook, write_published};
-use crate::store::{
-    DeltaPublication, DeltaPublishOutcome, IndexStore, Publication, PublishOutcome,
-};
+use crate::store::{BeginOutcome, DeltaPublication, DeltaPublishOutcome, IndexStore, Publication};
 
 const MAX_RECONCILE_RETRIES: usize = 3;
 
@@ -49,6 +47,9 @@ pub struct IndexService {
     /// Test-only pause between the SQLite commit and the live-state
     /// installation, invoked while the publication write guard is held.
     publication_pause: Option<PauseHook>,
+    /// Test-only pause after a full publication has written every row but
+    /// before it takes the barrier, invoked with NO guard held.
+    row_write_pause: Option<PauseHook>,
     last_metrics: Option<ReconcileMetrics>,
 }
 
@@ -89,6 +90,7 @@ impl IndexService {
             published,
             reader,
             publication_pause: None,
+            row_write_pause: None,
             last_metrics: None,
         })
     }
@@ -132,6 +134,15 @@ impl IndexService {
     #[doc(hidden)]
     pub fn pause_publication_for_test(&mut self, hook: PauseHook) {
         self.publication_pause = Some(hook);
+    }
+
+    /// Pause a full publication once every row is written and its
+    /// transaction is open, before the barrier is taken. Test-only: it is
+    /// what lets a test prove reads keep answering during the row-writing
+    /// window.
+    #[doc(hidden)]
+    pub fn pause_row_writes_for_test(&mut self, hook: PauseHook) {
+        self.row_write_pause = Some(hook);
     }
 
     pub fn state(&self) -> Result<IndexState, IndexError> {
@@ -409,63 +420,69 @@ impl IndexService {
             return Err(IndexError::VaultChangedDuringRefresh);
         }
 
-        // Everything fallible about the new live state happens here, before
-        // the barrier: the generation a successful publication will claim is
-        // already determined by the compare-and-swap's `expected`, so the
-        // matching graph can be built (and can fail) outside the section
-        // that must stay short.
-        let next_generation = Generation::new(previous.map_or(0, Generation::get) + 1);
-        let prepared = Arc::new(live_graph_from_semantic(next_generation, &report.graph)?);
-
-        // The publication barrier is held across the SQLite commit — the one
-        // place a lock is deliberately held across SQLite I/O. That is the
-        // whole point: rows and live graph become visible together or not at
-        // all, so no reader can catch a generation whose two halves
-        // disagree. Nothing else runs inside the guard: the commit is the
-        // writer's own connection, and the install below is a pointer swap.
-        let mut published = write_published(&self.published)?;
-        let outcome = self.store.publish(Publication {
+        // Write every row of the new snapshot with NO barrier held. The
+        // transaction stays open, so under WAL none of it is visible to any
+        // other connection yet and readers keep answering at the old
+        // generation throughout — a whole-vault rewrite must not freeze
+        // reads.
+        let pending = match self.store.begin_publish(Publication {
             expected: previous,
             notes: &replaced,
             deleted: &removed,
             fingerprint_updates: &fingerprint_updates,
             graph: &report.graph,
             scan_diagnostics: &scan_diagnostics,
-        })?;
-        match outcome {
-            PublishOutcome::Committed(generation, publish_metrics) => {
-                debug_assert_eq!(generation, next_generation);
-                if let Some(hook) = &self.publication_pause {
-                    hook();
-                }
-                published.generation = Some(generation);
-                published.graph = Some(prepared);
-                drop(published);
-
-                metrics.stages.sqlite_write += publish_metrics.sqlite_write;
-                metrics.stages.sqlite_commit += publish_metrics.sqlite_commit;
-                metrics.work.resolution_rows_written +=
-                    publish_metrics.graph_write.resolution_rows_written;
-                metrics.work.dependency_rows_written +=
-                    publish_metrics.graph_write.dependency_rows_written;
-                metrics.work.diagnostic_rows_written +=
-                    publish_metrics.graph_write.diagnostic_rows_written;
-                Ok(TryOutcome::Done(RefreshReport {
-                    previous_generation: previous,
-                    generation,
-                    added: counts.added,
-                    changed: counts.changed,
-                    deleted: counts.deleted,
-                    unchanged: counts.unchanged,
-                    reparsed: counts.reparsed,
-                    verified: counts.verified,
-                }))
-            }
-            PublishOutcome::GenerationChanged => {
-                drop(published);
-                Ok(TryOutcome::Retry)
-            }
+        })? {
+            BeginOutcome::Prepared(pending) => pending,
+            BeginOutcome::GenerationChanged => return Ok(TryOutcome::Retry),
+        };
+        if let Some(hook) = &self.row_write_pause {
+            hook();
         }
+
+        // Also outside the barrier: everything fallible about the new live
+        // state. The generation a successful publication will claim is
+        // already fixed by the compare-and-swap above, so the matching graph
+        // can be built — and can fail — before the guard is taken.
+        let next_generation = pending.generation();
+        let prepared = Arc::new(live_graph_from_semantic(next_generation, &report.graph)?);
+
+        // Only now the barrier, and only for the commit plus the install.
+        // The commit is the one place a lock is deliberately held across
+        // SQLite I/O, because that is the whole point: rows and live graph
+        // become visible together or not at all, so no reader can catch a
+        // generation whose two halves disagree. The install after it is a
+        // pointer swap.
+        //
+        // Lock order here is SQLite write transaction -> publication
+        // barrier, the reverse of a reader's barrier -> SQLite read
+        // snapshot. That cannot deadlock: under WAL a reader never waits on
+        // a writer, so a reader holding the barrier always makes progress
+        // and releases it.
+        let mut published = write_published(&self.published)?;
+        let (generation, publish_metrics) = pending.commit()?;
+        if let Some(hook) = &self.publication_pause {
+            hook();
+        }
+        published.generation = Some(generation);
+        published.graph = Some(prepared);
+        drop(published);
+
+        metrics.stages.sqlite_write += publish_metrics.sqlite_write;
+        metrics.stages.sqlite_commit += publish_metrics.sqlite_commit;
+        metrics.work.resolution_rows_written += publish_metrics.graph_write.resolution_rows_written;
+        metrics.work.dependency_rows_written += publish_metrics.graph_write.dependency_rows_written;
+        metrics.work.diagnostic_rows_written += publish_metrics.graph_write.diagnostic_rows_written;
+        Ok(TryOutcome::Done(RefreshReport {
+            previous_generation: previous,
+            generation,
+            added: counts.added,
+            changed: counts.changed,
+            deleted: counts.deleted,
+            unchanged: counts.unchanged,
+            reparsed: counts.reparsed,
+            verified: counts.verified,
+        }))
     }
 
     /// Apply one delta to both halves of the published state at once: the
@@ -494,6 +511,28 @@ impl IndexService {
         replacement_references: &[HydratedReference],
     ) -> Result<DeltaPublishOutcome, IndexError> {
         let expected = publication.expected;
+        // The two halves must describe the same change. A caller that fills
+        // in one and forgets the other would commit rows and install a graph
+        // that disagree — precisely the state this module exists to make
+        // unreachable — and no later check would notice, because each half
+        // is internally consistent. A debug tripwire, like
+        // `LiveGraph::install`'s own: the real guarantee is that callers
+        // derive both halves from one change set.
+        debug_assert_eq!(
+            publication
+                .notes
+                .iter()
+                .map(|replacement| replacement.note.source.path().clone())
+                .chain(publication.deleted.iter().cloned())
+                .collect::<BTreeSet<VaultPath>>(),
+            replacement_notes
+                .iter()
+                .map(|note| note.path.clone())
+                .chain(removed_paths.iter().cloned())
+                .collect::<BTreeSet<VaultPath>>(),
+            "the row delta and the graph delta must describe the same paths"
+        );
+
         // Prepared outside the barrier. The borrowed handle is released
         // again before the guard is taken, so the writer is once more the
         // graph's only owner when it installs — nothing here forces a copy.
@@ -525,8 +564,11 @@ impl IndexService {
                 // In place whenever the writer is the graph's only owner,
                 // which is the ordinary case: readers resolve under the read
                 // guard and never let the `Arc` escape it, so a delta never
-                // copies the whole graph. The copy `make_mut` would take
-                // otherwise is a correctness fallback, not a normal cost.
+                // copies the whole graph. No reader other than
+                // `IndexReader::published_state` lets the handle escape; a
+                // caller that holds one pays a whole-graph copy here. The
+                // copy `make_mut` takes then is a correctness fallback, not
+                // a normal cost.
                 Arc::make_mut(graph).install(delta);
                 published.generation = Some(generation);
                 drop(published);

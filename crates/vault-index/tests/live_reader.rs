@@ -128,6 +128,64 @@ fn a_read_started_during_publication_waits_for_the_whole_publication() {
     );
 }
 
+/// The full publication path writes every row of a whole-vault snapshot
+/// before it commits. Readers must keep answering throughout that window:
+/// the barrier exists to swap state, not to serialize reads behind a write
+/// transaction.
+#[test]
+fn a_read_is_not_blocked_while_a_full_publication_writes_its_rows() {
+    let mut fixture = live_fixture();
+    fixture.service().refresh(false).expect("cold build");
+    let old_generation = fixture
+        .service()
+        .current_generation()
+        .expect("generation")
+        .expect("cold build published a generation");
+    let reader = Arc::new(fixture.service().reader().expect("reader"));
+
+    fixture.write_note("Source.md", "# Source changed\n[[Target]]\n");
+    let (reached, release, hook) = pause_pair();
+    fixture.service().pause_row_writes_for_test(hook);
+
+    let mut service = fixture.take_service();
+    let writer = thread::spawn(move || {
+        service.refresh(false).expect("warm publish");
+        service
+    });
+
+    // Every row of the new snapshot is written and the transaction is still
+    // open. The barrier is NOT held.
+    reached.wait();
+
+    let (finished, answered) = mpsc::channel();
+    let reading = Arc::clone(&reader);
+    let read = thread::spawn(move || {
+        let answer = reading.get_note(&source_path());
+        finished.send(()).ok();
+        answer
+    });
+    assert!(
+        answered.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "a read must not block behind the writer's row writes"
+    );
+    let during = read
+        .join()
+        .expect("reader thread")
+        .expect("read during row writes");
+    assert_eq!(
+        during.generation.get(),
+        old_generation.get(),
+        "uncommitted rows must be invisible to a reader"
+    );
+
+    release.wait();
+    fixture.service = Some(writer.join().expect("writer thread"));
+    let after = reader
+        .get_note(&source_path())
+        .expect("read after publication");
+    assert_eq!(after.generation.get(), old_generation.get() + 1);
+}
+
 #[test]
 fn a_read_started_before_the_writer_acquires_the_barrier_finishes_at_the_old_generation() {
     let mut fixture = live_fixture();
@@ -396,8 +454,8 @@ fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
     // service published, and the live graph still does not know `New.md`.
     assert_eq!(
         reader
-            .published_state()
-            .expect("published state")
+            .published_status()
+            .expect("published status")
             .generation,
         Some(stale)
     );
@@ -407,6 +465,15 @@ fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
             .expect("resolve after"),
         (_, Resolution::Unresolved)
     ));
+
+    // The store is ahead of what this process published, so every SQL-backed
+    // read refuses rather than mixing a foreign generation's rows with this
+    // process's live graph. This refusal is the only defense against that
+    // mixture, so it is asserted before the cure below removes it.
+    assert!(
+        matches!(reader.get_note(&source_path()), Err(IndexError::Storage(_))),
+        "a read must refuse while the store is ahead of the published generation"
+    );
 
     // And no row was written either — adopting the foreign generation makes
     // the rows readable again, and `New.md` is not among them.
@@ -428,8 +495,8 @@ fn a_reader_sees_the_writers_live_state() {
 
     assert_eq!(
         reader
-            .published_state()
-            .expect("published state")
+            .published_status()
+            .expect("published status")
             .live_state,
         LiveState::Starting
     );
@@ -438,13 +505,16 @@ fn a_reader_sees_the_writers_live_state() {
         .service()
         .set_live_state(LiveState::Watching)
         .expect("set live state");
-    let state = reader.published_state().expect("published state");
-    assert_eq!(state.live_state, LiveState::Watching);
-    assert_eq!(state.runtime_error, None);
+    let status = reader.published_status().expect("published status");
+    assert_eq!(status.live_state, LiveState::Watching);
+    assert_eq!(status.runtime_error, None);
     assert_eq!(
-        state.generation,
+        status.generation,
         fixture.service().current_generation().expect("generation")
     );
+    // Status observation reports the live graph's generation without handing
+    // out the graph itself.
+    assert_eq!(status.graph_generation, status.generation);
 
     fixture
         .service()
@@ -452,8 +522,8 @@ fn a_reader_sees_the_writers_live_state() {
         .expect("set runtime error");
     assert_eq!(
         reader
-            .published_state()
-            .expect("published state")
+            .published_status()
+            .expect("published status")
             .runtime_error
             .as_deref(),
         Some("watcher fell back to polling")

@@ -22,6 +22,7 @@ pub use live_graph::{
 pub use metrics::{ReconcileMetrics, StageDurations, WorkCounts};
 pub use model::{
     FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
+    PublishedStatus,
 };
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus, VaultInfo,

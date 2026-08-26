@@ -22,9 +22,54 @@ use crate::model::{FileFingerprint, Generation};
 use crate::query::diagnostics as diagnostic_union;
 use crate::schema;
 
-pub(crate) enum PublishOutcome {
-    Committed(Generation, PublishMetrics),
+/// What `begin_publish` decided. `Prepared` hands back a transaction that
+/// has written every row but has not committed: under WAL none of it is
+/// visible to any other connection, so readers keep answering at the old
+/// generation for as long as it stays open.
+pub(crate) enum BeginOutcome<'a> {
+    Prepared(PendingPublication<'a>),
     GenerationChanged,
+}
+
+/// A publication with all of its rows written and its transaction still
+/// open. `commit` finishes it; dropping it rolls the whole thing back.
+///
+/// Splitting the write from the commit is what keeps the publication
+/// barrier off the writer's row-writing path: the caller writes rows with no
+/// lock held, takes the barrier only to commit and install, and so freezes
+/// readers for a commit rather than for a whole-vault rewrite.
+pub(crate) struct PendingPublication<'a> {
+    transaction: Transaction<'a>,
+    generation: Generation,
+    graph_write: GraphWriteCounts,
+    sqlite_write: Duration,
+}
+
+impl PendingPublication<'_> {
+    /// The generation this publication will claim when it commits.
+    pub(crate) fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    pub(crate) fn commit(self) -> Result<(Generation, PublishMetrics), IndexError> {
+        let PendingPublication {
+            transaction,
+            generation,
+            graph_write,
+            sqlite_write,
+        } = self;
+        let commit_start = Instant::now();
+        transaction.commit()?;
+        let sqlite_commit = commit_start.elapsed();
+        Ok((
+            generation,
+            PublishMetrics {
+                graph_write,
+                sqlite_write,
+                sqlite_commit,
+            },
+        ))
+    }
 }
 
 /// Structural work and timing produced while writing one publication's graph
@@ -463,10 +508,14 @@ impl IndexStore {
     /// One compare-and-swap publication transaction: verify the expected
     /// generation, replace note and graph rows, advance the generation, and
     /// stamp the refresh time.
-    pub(crate) fn publish(
+    /// Compare-and-swap and write one complete snapshot, leaving the
+    /// transaction open for the caller to commit. Nothing written here is
+    /// visible to another connection until that commit, so this runs with no
+    /// publication barrier held.
+    pub(crate) fn begin_publish(
         &mut self,
         publication: Publication<'_>,
-    ) -> Result<PublishOutcome, IndexError> {
+    ) -> Result<BeginOutcome<'_>, IndexError> {
         let Publication {
             expected,
             notes,
@@ -483,7 +532,8 @@ impl IndexStore {
         )?;
         let current = current.map(Generation::from_db).transpose()?;
         if current != expected {
-            return Ok(PublishOutcome::GenerationChanged);
+            // Dropping `transaction` rolls back; nothing above wrote.
+            return Ok(BeginOutcome::GenerationChanged);
         }
 
         for path in deleted {
@@ -508,17 +558,12 @@ impl IndexStore {
                 schema::now_unix_ms()?
             ],
         )?;
-        let commit_start = Instant::now();
-        transaction.commit()?;
-        let sqlite_commit = commit_start.elapsed();
-        Ok(PublishOutcome::Committed(
-            next,
-            PublishMetrics {
-                graph_write,
-                sqlite_write,
-                sqlite_commit,
-            },
-        ))
+        Ok(BeginOutcome::Prepared(PendingPublication {
+            transaction,
+            generation: next,
+            graph_write,
+            sqlite_write,
+        }))
     }
 
     pub(crate) fn stored_fingerprints(
