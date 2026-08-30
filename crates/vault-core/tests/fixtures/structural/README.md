@@ -16,3 +16,15 @@ Empirical conventions these fixtures pin, which tests must honor:
 Section-type vocabulary observed across the corpus: `yaml`, `heading`, `paragraph`, `code`, `blockquote`, `table`, `thematicBreak`, `list`, `callout`, `html`.
 
 Re-capture procedure: stage these `.md` files into a scratch folder of a live vault, wait for the metadata cache, run `app.metadataCache.getFileCache(file)` per file, save `{obsidianVersion, sections, listItems}`, and update the version above. If a re-capture changes any shape, that is an upstream behavior change and belongs in a commit of its own.
+
+## Second capture (2026-08-30, same Obsidian 1.13.4): cases 17-21, disputed edges
+
+Captured to settle review findings 4-6 and to test a prescribed fix before applying it. Pinned by these fixtures:
+
+- `footnoteDefinition` and `definition` are real Obsidian section types (17) — the vocabulary above is not closed, and `Other(String)` passing mdast names through matches reality for these two.
+- `math` is a real section type (18); `$$` blocks must not degrade to `paragraph`.
+- Obsidian can emit **zero-width phantom sections** (`text` and `element`, both `113..113` in 17) at end-of-file after a footnote reference. Comparisons filter zero-width sections and this clause documents why; vault-core does not reproduce them.
+- A task marker requires whitespace (or line end) after `]` (19): `- [x]nospace` and `- [x](link)` have NO task state; `- [a] text` has state `a`.
+- A callout requires the `[!type]` marker on the quote's FIRST line (20: marker on second line → `blockquote`), and the type may contain spaces (20: `[!my type]` → `callout`); uppercase and fold markers confirmed.
+- A parent list item's span INCLUDES lists nested deeper than direct children (21: item `0..55` contains a blockquote-wrapped list at `15..55`); only DIRECT child lists are excluded from the parent's span (07/14). Items inside the nested quote are emitted as list items of their own inner list (`parent=-1` via the line formula).
+- Clause refinement for case 13: a `^id` on a list item appears as `id` on the *listItem* entry in Obsidian's cache; the pinned storage model deliberately does not persist per-item ids (sections only) — a recorded divergence, not an oversight.

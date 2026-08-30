@@ -1,0 +1,4 @@
+- [x]nospace after bracket
+- [x](https://example.com) link not task
+- [x] real done task
+- [a] custom state

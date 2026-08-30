@@ -1,0 +1,84 @@
+{
+    "obsidianVersion": "1.13.4",
+    "sections": [
+        {
+            "type": "list",
+            "position": {
+                "start": {
+                    "line": 0,
+                    "col": 0,
+                    "offset": 0
+                },
+                "end": {
+                    "line": 3,
+                    "col": 18,
+                    "offset": 107
+                }
+            }
+        }
+    ],
+    "listItems": [
+        {
+            "position": {
+                "start": {
+                    "line": 0,
+                    "col": 0,
+                    "offset": 0
+                },
+                "end": {
+                    "line": 0,
+                    "col": 26,
+                    "offset": 26
+                }
+            },
+            "parent": -1
+        },
+        {
+            "position": {
+                "start": {
+                    "line": 1,
+                    "col": 0,
+                    "offset": 27
+                },
+                "end": {
+                    "line": 1,
+                    "col": 40,
+                    "offset": 67
+                }
+            },
+            "parent": -1
+        },
+        {
+            "position": {
+                "start": {
+                    "line": 2,
+                    "col": 0,
+                    "offset": 68
+                },
+                "end": {
+                    "line": 2,
+                    "col": 20,
+                    "offset": 88
+                }
+            },
+            "parent": -1,
+            "task": "x"
+        },
+        {
+            "position": {
+                "start": {
+                    "line": 3,
+                    "col": 0,
+                    "offset": 89
+                },
+                "end": {
+                    "line": 3,
+                    "col": 18,
+                    "offset": 107
+                }
+            },
+            "parent": -1,
+            "task": "a"
+        }
+    ]
+}
