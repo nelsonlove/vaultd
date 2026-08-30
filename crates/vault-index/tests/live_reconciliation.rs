@@ -225,7 +225,12 @@ fn a_targeted_refresh_replaces_the_notes_structural_rows() {
         "Lonely.md",
         "# Lonely\n\n- [x] done\n    - nested\n- [/] partial\n",
     );
-    fixture.refresh_paths(&["Lonely.md"]);
+    let report = fixture.refresh_paths(&["Lonely.md"]);
+    // The claim is that structural rows ride the INCREMENTAL route — so
+    // prove the incremental route is what ran, or a silent fallback to
+    // complete resolution would leave this test proving the wrong thing.
+    assert!(!report.complete_resolution);
+    assert_eq!(report.metrics.work.complete_inventories, 0);
 
     // Heading plus list; three items, one of them nested.
     assert_eq!(fixture.stored_row_count("sections", "Lonely.md"), 2);
@@ -326,6 +331,15 @@ fn adding_a_note_resolves_the_references_that_were_waiting_for_it() {
 #[test]
 fn deleting_a_note_unresolves_every_reference_that_reached_it() {
     let mut fixture = live_fixture();
+    // Seed the doomed note with a list first, so the delete also proves the
+    // structural-row cascade: orphaned rows would be invisible to the
+    // scan-equivalence oracle (hydration iterates the notes table), so only
+    // a direct row count can catch them.
+    let body = std::fs::read_to_string(fixture.root.join("Sub.md")).expect("read Sub");
+    fixture.write("Sub.md", &format!("{body}\n- [x] doomed item\n"));
+    fixture.refresh_paths(&["Sub.md"]);
+    assert_eq!(fixture.stored_row_count("list_items", "Sub.md"), 1);
+
     fixture.delete("Sub.md");
 
     let report = fixture.refresh_paths(&["Sub.md"]);
@@ -339,6 +353,8 @@ fn deleting_a_note_unresolves_every_reference_that_reached_it() {
         report.metrics.work.body_reads, 0,
         "a deleted path is never read"
     );
+    assert_eq!(fixture.stored_row_count("sections", "Sub.md"), 0);
+    assert_eq!(fixture.stored_row_count("list_items", "Sub.md"), 0);
     fixture.assert_matches_scan();
 }
 

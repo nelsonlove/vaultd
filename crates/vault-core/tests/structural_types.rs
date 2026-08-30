@@ -60,3 +60,46 @@ fn section_and_nested_list_item_round_trip() {
         ListItemParent::Root { list_start_line: 0 }
     );
 }
+
+/// Tripwire for a silent index-corruption hazard: `SectionKind::Other(s)`
+/// persists `s` literally, and the index codec decodes known wire strings to
+/// their named variants first — so if `node_type_name` in `markdown.rs` ever
+/// emitted a string that collides with the known vocabulary, an `Other`
+/// would come back from the store as the WRONG named variant with no error
+/// anywhere. Both lists are duplicated here on purpose; update BOTH this
+/// test and the source when either vocabulary changes, and never let them
+/// intersect.
+#[test]
+fn other_section_names_never_collide_with_the_known_wire_vocabulary() {
+    // The closed output set of `node_type_name` (crates/vault-core/src/markdown.rs).
+    let other_names = [
+        "definition",
+        "footnoteDefinition",
+        "math",
+        "mdxFlowExpression",
+        "mdxJsxFlowElement",
+        "mdxjsEsm",
+        "toml",
+        "unknown",
+    ];
+    // The named-variant wire vocabulary (fixtures README, first capture).
+    let known = [
+        "yaml",
+        "heading",
+        "paragraph",
+        "code",
+        "blockquote",
+        "table",
+        "thematicBreak",
+        "list",
+        "callout",
+        "html",
+    ];
+    for name in other_names {
+        assert!(
+            !known.contains(&name),
+            "node_type_name output {name:?} collides with a known wire string — \
+             an Other({name:?}) row would decode as the named variant"
+        );
+    }
+}
