@@ -35,6 +35,7 @@ pub const CASES: &[&str] = &[
     "19-task-nospace",
     "20-callout-edges",
     "21-list-in-blockquote-in-item",
+    "22-indented-callout-and-math-link",
 ];
 
 pub struct Fixture {

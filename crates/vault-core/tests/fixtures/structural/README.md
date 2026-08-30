@@ -28,3 +28,8 @@ Captured to settle review findings 4-6 and to test a prescribed fix before apply
 - A callout requires the `[!type]` marker on the quote's FIRST line (20: marker on second line → `blockquote`), and the type may contain spaces (20: `[!my type]` → `callout`); uppercase and fold markers confirmed.
 - A parent list item's span INCLUDES lists nested deeper than direct children (21: item `0..55` contains a blockquote-wrapped list at `15..55`); only DIRECT child lists are excluded from the parent's span (07/14). Items inside the nested quote are emitted as list items of their own inner list (`parent=-1` via the line formula).
 - Clause refinement for case 13: a `^id` on a list item appears as `id` on the *listItem* entry in Obsidian's cache; the pinned storage model deliberately does not persist per-item ids (sections only) — a recorded divergence, not an oversight.
+
+## Third capture (2026-08-30, same Obsidian 1.13.4): case 22, re-review edges
+
+- An indented blockquote (up to CommonMark's three leading spaces) carrying a `[!type]` marker IS a callout (`   > [!note]` → `callout`).
+- A wikilink inside a `$$…$$` math block produces NO link in Obsidian's cache (`links: []` captured alongside the sections) — vault-core's reference extraction skipping math blocks matches, and this fixture pins it. The `links` key in this one expected.json exists for that ruling; the structural test loader ignores it.

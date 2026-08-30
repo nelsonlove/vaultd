@@ -119,7 +119,12 @@ fn is_callout(text: &str, span: SourceSpan) -> bool {
         return false;
     };
     let first_line = slice.split('\n').next().unwrap_or(slice);
-    let content = first_line.strip_prefix('>').unwrap_or(first_line);
+    // CommonMark allows up to three spaces of indentation before `>`;
+    // Obsidian still renders such a quote as a callout (fixture 22).
+    let content = first_line
+        .trim_start()
+        .strip_prefix('>')
+        .unwrap_or(first_line);
     let content = content.strip_prefix(' ').unwrap_or(content);
     CALLOUT_MARKER.is_match(content)
 }
