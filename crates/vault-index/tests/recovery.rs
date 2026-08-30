@@ -216,6 +216,71 @@ fn a_genuine_version_one_explicit_cache_with_matching_identity_is_replaced_by_sc
     assert_eq!(report.generation, Generation::new(1));
 }
 
+/// The schema-v3 bump seen from a real v2 cache: authentic v2 DDL, v2 version
+/// stamps, and the matching vault identity, so the open path has to classify
+/// it as `Obsolete` on its versions alone — the one case a bumped
+/// `user_version` cannot prove. It must rebuild, not be refused and not be
+/// read as corrupt, and it must land on the current schema with both
+/// structural tables present.
+#[test]
+fn a_genuine_version_two_cache_is_replaced_by_schema_three() {
+    let vault = tempdir().unwrap();
+    let index_dir = tempdir().unwrap();
+    fs::write(
+        vault.path().join("Note.md"),
+        "# Note\n\n- [x] done\n    - nested\n",
+    )
+    .unwrap();
+    let index_path = index_dir.path().join("derived.sqlite3");
+
+    let mut config = IndexConfig::explicit(vault.path(), &index_path).unwrap();
+    config.location = IndexLocation::Derived;
+    {
+        let connection = rusqlite::Connection::open(&index_path).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema_v2.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_metadata \
+                 (singleton, semantic_format_version, vault_identity, generation, \
+                  created_at_unix_ms) \
+                 VALUES (1, 2, ?1, NULL, 0)",
+                rusqlite::params![config.vault_identity],
+            )
+            .unwrap();
+    }
+
+    let mut service = IndexService::open(config).unwrap();
+    assert_eq!(service.current_generation().unwrap(), None);
+    let report = service.refresh(false).unwrap();
+    assert_eq!(report.generation, Generation::new(1));
+
+    let connection = service.connection_for_test();
+    let user_version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(user_version, SQL_SCHEMA_VERSION);
+    assert_eq!(user_version, 3);
+    for table in ["sections", "list_items"] {
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "missing {table} after the rebuild");
+        let rows: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(rows > 0, "{table} was rebuilt empty");
+    }
+}
+
 #[test]
 fn publication_failure_before_commit_preserves_all_rows() {
     let vault = tempdir().unwrap();

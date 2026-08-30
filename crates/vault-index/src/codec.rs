@@ -1,6 +1,7 @@
 use vault_core::{
-    DependencyKey, DependencyKind, Diagnostic, DiagnosticCode, PropertyValue, Reference,
-    ReferenceKind, ReferenceOrigin, Resolution, Severity, SourceSpan, Spanned, Subpath, VaultPath,
+    DependencyKey, DependencyKind, Diagnostic, DiagnosticCode, ListItemParent, PropertyValue,
+    Reference, ReferenceKind, ReferenceOrigin, Resolution, SectionKind, Severity, SourceSpan,
+    Spanned, Subpath, VaultPath,
 };
 
 use crate::error::IndexError;
@@ -434,6 +435,103 @@ pub(crate) fn decode_dependency_key(
         decode_dependency_kind(kind)?,
         comparison_key.to_string(),
     ))
+}
+
+/// A section kind's wire string. The known variants spell Obsidian's own
+/// `sections[].type` vocabulary; `Other(s)` stores `s` literally, so an
+/// unrecognized kind survives storage instead of being flattened.
+///
+/// The literal encoding is only lossless because no `Other` value can spell a
+/// known variant: `vault_core`'s `node_type_name` produces exactly
+/// `definition`, `footnoteDefinition`, `math`, the three `mdx*` names, `toml`,
+/// and `unknown`, none of which collide with the strings below.
+pub(crate) fn encode_section_kind(kind: &SectionKind) -> &str {
+    match kind {
+        SectionKind::Yaml => "yaml",
+        SectionKind::Heading => "heading",
+        SectionKind::Paragraph => "paragraph",
+        SectionKind::Code => "code",
+        SectionKind::Blockquote => "blockquote",
+        SectionKind::Table => "table",
+        SectionKind::ThematicBreak => "thematicBreak",
+        SectionKind::List => "list",
+        SectionKind::Callout => "callout",
+        SectionKind::Html => "html",
+        SectionKind::Other(value) => value.as_str(),
+    }
+}
+
+/// Total, by construction: an unknown string is an `Other`, never an error,
+/// because that is exactly what `Other` is for.
+pub(crate) fn decode_section_kind(value: &str) -> SectionKind {
+    match value {
+        "yaml" => SectionKind::Yaml,
+        "heading" => SectionKind::Heading,
+        "paragraph" => SectionKind::Paragraph,
+        "code" => SectionKind::Code,
+        "blockquote" => SectionKind::Blockquote,
+        "table" => SectionKind::Table,
+        "thematicBreak" => SectionKind::ThematicBreak,
+        "list" => SectionKind::List,
+        "callout" => SectionKind::Callout,
+        "html" => SectionKind::Html,
+        other => SectionKind::Other(other.to_string()),
+    }
+}
+
+/// `(list_start_line, parent_start_line)` — exactly one is `Some`, which is
+/// also what the table's `CHECK` constraint enforces. Line numbers, never a
+/// negated sentinel: the sign trick lives in Obsidian's wire format, not in
+/// this store.
+pub(crate) fn encode_list_item_parent(parent: ListItemParent) -> (Option<i64>, Option<i64>) {
+    match parent {
+        ListItemParent::Root { list_start_line } => (Some(i64::from(list_start_line)), None),
+        ListItemParent::Item { parent_start_line } => (None, Some(i64::from(parent_start_line))),
+    }
+}
+
+pub(crate) fn decode_list_item_parent(
+    list_start_line: Option<i64>,
+    parent_start_line: Option<i64>,
+) -> Result<ListItemParent, IndexError> {
+    let line = |value: i64| -> Result<u32, IndexError> {
+        u32::try_from(value).map_err(|_| {
+            IndexError::IncompatibleIndex(format!("list item parent line {value} out of range"))
+        })
+    };
+    match (list_start_line, parent_start_line) {
+        (Some(value), None) => Ok(ListItemParent::Root {
+            list_start_line: line(value)?,
+        }),
+        (None, Some(value)) => Ok(ListItemParent::Item {
+            parent_start_line: line(value)?,
+        }),
+        _ => Err(IndexError::IncompatibleIndex(
+            "list item row sets both parent columns or neither".into(),
+        )),
+    }
+}
+
+/// A task marker is one character in the domain and a one-character string on
+/// the wire, so the column stays readable in SQL.
+pub(crate) fn encode_task(task: Option<char>) -> Option<String> {
+    task.map(|task| task.to_string())
+}
+
+pub(crate) fn decode_task(value: Option<String>) -> Result<Option<char>, IndexError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let mut characters = value.chars();
+    let task = characters.next().ok_or_else(|| {
+        IndexError::IncompatibleIndex("list item task marker is an empty string".into())
+    })?;
+    if characters.next().is_some() {
+        return Err(IndexError::IncompatibleIndex(format!(
+            "list item task marker {value:?} is longer than one character"
+        )));
+    }
+    Ok(Some(task))
 }
 
 /// The lowercase filename/stem comparison keys must use the same spelling

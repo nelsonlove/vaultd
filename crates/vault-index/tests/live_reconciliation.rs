@@ -150,6 +150,21 @@ impl LiveFixture {
             common::snapshot_from_scan(&fresh),
         );
     }
+
+    /// How many rows one table holds for one note. The equivalence check above
+    /// already compares hydrated `sections`/`list_items` against a fresh scan;
+    /// this is what keeps that comparison from passing vacuously when a note
+    /// has no structural rows at all.
+    fn stored_row_count(&self, table: &str, name: &str) -> i64 {
+        self.service
+            .connection_for_test()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE note_path = ?1"),
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| panic!("counting {table} rows for {name}: {error}"))
+    }
 }
 
 fn write_file(root: &Path, name: &str, body: &str) {
@@ -194,6 +209,35 @@ fn a_body_only_edit_selects_no_incoming_references() {
     assert_eq!(report.metrics.work.body_reads, 1);
     assert_eq!(report.metrics.work.complete_inventories, 0);
     assert!(!report.complete_resolution);
+    fixture.assert_matches_scan();
+}
+
+/// The structural rows ride the incremental route, not just the full
+/// publication: a targeted single-note refresh must write `sections` and
+/// `list_items` for the edited note, drop the rows its previous body owned,
+/// and still match a clean scan afterwards.
+#[test]
+fn a_targeted_refresh_replaces_the_notes_structural_rows() {
+    let mut fixture = live_fixture();
+    assert_eq!(fixture.stored_row_count("list_items", "Lonely.md"), 0);
+
+    fixture.write(
+        "Lonely.md",
+        "# Lonely\n\n- [x] done\n    - nested\n- [/] partial\n",
+    );
+    fixture.refresh_paths(&["Lonely.md"]);
+
+    // Heading plus list; three items, one of them nested.
+    assert_eq!(fixture.stored_row_count("sections", "Lonely.md"), 2);
+    assert_eq!(fixture.stored_row_count("list_items", "Lonely.md"), 3);
+    fixture.assert_matches_scan();
+
+    // Editing the list away must take its rows with it, or a stale item would
+    // survive under a note that no longer has one.
+    fixture.write("Lonely.md", "# Lonely\n");
+    fixture.refresh_paths(&["Lonely.md"]);
+    assert_eq!(fixture.stored_row_count("sections", "Lonely.md"), 1);
+    assert_eq!(fixture.stored_row_count("list_items", "Lonely.md"), 0);
     fixture.assert_matches_scan();
 }
 

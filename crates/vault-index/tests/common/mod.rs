@@ -336,57 +336,11 @@ pub fn resolver_from_scan(report: &ScanReport) -> vault_core::Resolver {
     )
 }
 
-/// `ParsedNote.sections` / `.list_items` (structural-parse-extension Tasks
-/// 1-3, vault-core only) aren't persisted or hydrated yet — that lands in
-/// Task 4's schema-v3 bump. Until then, a note rebuilt from the index store
-/// legitimately has empty `sections`/`list_items` while the same note fresh
-/// off `scan_vault` does not, so every scan-vs-index oracle comparison in
-/// this crate's tests strips those two fields first rather than asserting a
-/// round-trip storage doesn't do yet.
-pub fn strip_pending_structural_fields(mut note: vault_core::ParsedNote) -> vault_core::ParsedNote {
-    note.sections.clear();
-    note.list_items.clear();
-    note
-}
-
-/// Index-side counterpart of [`strip_pending_structural_fields`], and the
-/// seam's self-retiring tripwire: a note hydrated from the store must have
-/// EMPTY structural fields until Task 4 persists them. The moment Task 4
-/// lands, this assertion fires on every oracle run, forcing the strip to be
-/// deleted and the full comparison restored — a comment alone could survive
-/// Task 4 unnoticed; this cannot.
-pub fn index_note_without_structural_fields(
-    note: vault_core::ParsedNote,
-) -> vault_core::ParsedNote {
-    assert!(
-        note.sections.is_empty() && note.list_items.is_empty(),
-        "Task 4 has landed — delete strip_pending_structural_fields and \
-         index_note_without_structural_fields, and restore the full oracle \
-         comparison of sections and list_items"
-    );
-    note
-}
-
-fn without_pending_structural_fields(
-    note: Option<&vault_core::ParsedNote>,
-) -> Option<vault_core::ParsedNote> {
-    note.cloned().map(strip_pending_structural_fields)
-}
-
-fn index_note_opt_without_structural_fields(
-    note: Option<&vault_core::ParsedNote>,
-) -> Option<vault_core::ParsedNote> {
-    note.cloned().map(index_note_without_structural_fields)
-}
-
 pub fn assert_semantically_equivalent(indexed: &ScanReport, scan: &ScanReport) {
     assert_eq!(indexed.diagnostics, scan.diagnostics);
     assert_eq!(indexed.graph.note_paths(), scan.graph.note_paths());
     for path in scan.graph.note_paths() {
-        assert_eq!(
-            index_note_opt_without_structural_fields(indexed.graph.note(path)),
-            without_pending_structural_fields(scan.graph.note(path))
-        );
+        assert_eq!(indexed.graph.note(path), scan.graph.note(path));
         assert_eq!(indexed.graph.outgoing(path), scan.graph.outgoing(path));
         assert_eq!(indexed.graph.backlinks(path), scan.graph.backlinks(path));
     }
@@ -861,11 +815,7 @@ pub struct SemanticSnapshot {
 pub fn snapshot_from_scan(report: &vault_core::ScanReport) -> SemanticSnapshot {
     let graph = &report.graph;
     SemanticSnapshot {
-        notes: graph
-            .notes()
-            .cloned()
-            .map(strip_pending_structural_fields)
-            .collect(),
+        notes: graph.notes().cloned().collect(),
         outgoing: graph
             .note_paths()
             .into_iter()
@@ -904,7 +854,7 @@ pub fn snapshot_from_index(service: &vault_index::IndexService) -> SemanticSnaps
     let mut backlinks = Vec::new();
     for path in &paths {
         let indexed = service.get_note(path).expect("indexed note");
-        notes.push(index_note_without_structural_fields(indexed.note));
+        notes.push(indexed.note);
         outgoing.push((path.clone(), indexed.outgoing));
 
         let mut incoming = Vec::new();

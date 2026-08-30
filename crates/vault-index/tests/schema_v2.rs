@@ -4,13 +4,12 @@ use std::collections::BTreeSet;
 
 use common::{open_fixture_service, snapshot_from_index, snapshot_from_scan};
 use vault_core::{DiagnosticCode, LinkTarget, VaultPath, reference_dependencies};
-use vault_index::{SEMANTIC_FORMAT_VERSION, SQL_SCHEMA_VERSION};
 
+/// The version constants moved on with the schema-v3 bump and are asserted in
+/// `schema_v3.rs`; what this file still owns is that v3 keeps carrying every
+/// table and behavior v2 introduced.
 #[test]
 fn schema_two_owns_dependencies_and_resolution_diagnostics() {
-    assert_eq!(SQL_SCHEMA_VERSION, 2);
-    assert_eq!(SEMANTIC_FORMAT_VERSION, 2);
-
     let mut fixture = open_fixture_service();
     fixture.service.refresh(false).expect("cold build");
     let connection = fixture.service.connection_for_test();

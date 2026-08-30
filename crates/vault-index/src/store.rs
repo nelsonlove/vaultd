@@ -264,6 +264,44 @@ impl IndexStore {
             )?;
         }
 
+        // Structural rows ride the same funnel as every other per-note row,
+        // so the delta/live route gets them for free: `publish_delta` replaces
+        // a note through this function too.
+        for (ordinal, section) in note.sections.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO sections \
+                 (note_path, ordinal, kind, span_start, span_end, block_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    path,
+                    usize_to_i64(ordinal, "section ordinal")?,
+                    codec::encode_section_kind(&section.kind),
+                    usize_to_i64(section.span.start(), "section span start")?,
+                    usize_to_i64(section.span.end(), "section span end")?,
+                    section.block_id.as_deref(),
+                ],
+            )?;
+        }
+
+        for (ordinal, item) in note.list_items.iter().enumerate() {
+            let (list_start_line, parent_start_line) = codec::encode_list_item_parent(item.parent);
+            transaction.execute(
+                "INSERT INTO list_items \
+                 (note_path, ordinal, span_start, span_end, list_start_line, \
+                  parent_start_line, task) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    path,
+                    usize_to_i64(ordinal, "list item ordinal")?,
+                    usize_to_i64(item.span.start(), "list item span start")?,
+                    usize_to_i64(item.span.end(), "list item span end")?,
+                    list_start_line,
+                    parent_start_line,
+                    codec::encode_task(item.task),
+                ],
+            )?;
+        }
+
         for (ordinal, diagnostic) in note.diagnostics.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO note_diagnostics \
@@ -1152,6 +1190,57 @@ pub(crate) fn load_note_with(
         .collect::<Result<Vec<_>, _>>()?;
     for row in &reference_rows {
         note.references.push(decode_reference(row)?);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT kind, span_start, span_end, block_id FROM sections \
+         WHERE note_path = ?1 ORDER BY ordinal",
+    )?;
+    let section_rows = statement
+        .query_map(params![path.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (kind, start, end, block_id) in section_rows {
+        note.sections.push(vault_core::Section {
+            kind: codec::decode_section_kind(&kind),
+            span: codec::decode_span(
+                i64_to_usize(start, "section span start")?,
+                i64_to_usize(end, "section span end")?,
+            )?,
+            block_id,
+        });
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT span_start, span_end, list_start_line, parent_start_line, task \
+         FROM list_items WHERE note_path = ?1 ORDER BY ordinal",
+    )?;
+    let list_item_rows = statement
+        .query_map(params![path.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (start, end, list_start_line, parent_start_line, task) in list_item_rows {
+        note.list_items.push(vault_core::ListItem {
+            span: codec::decode_span(
+                i64_to_usize(start, "list item span start")?,
+                i64_to_usize(end, "list item span end")?,
+            )?,
+            parent: codec::decode_list_item_parent(list_start_line, parent_start_line)?,
+            task: codec::decode_task(task)?,
+        });
     }
 
     let mut statement = connection.prepare(

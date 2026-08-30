@@ -5,10 +5,14 @@ use rusqlite::Connection;
 use crate::config::{IndexConfig, IndexLocation};
 use crate::error::IndexError;
 
-pub const SQL_SCHEMA_VERSION: u32 = 2;
-pub const SEMANTIC_FORMAT_VERSION: u32 = 2;
+pub const SQL_SCHEMA_VERSION: u32 = 3;
+pub const SEMANTIC_FORMAT_VERSION: u32 = 3;
 
-const SCHEMA_V2: &str = include_str!("schema_v2.sql");
+/// The current schema. `schema_v1.sql` and `schema_v2.sql` stay in the tree
+/// as the authentic older shapes the recovery tests build a genuine obsolete
+/// cache from — never as a migration source: an obsolete cache is rebuilt,
+/// never upgraded in place.
+const SCHEMA_V3: &str = include_str!("schema_v3.sql");
 
 pub(crate) fn now_unix_ms() -> Result<i64, IndexError> {
     let elapsed = SystemTime::now()
@@ -189,7 +193,7 @@ fn has_metadata_table(connection: &Connection) -> Result<bool, rusqlite::Error> 
 }
 
 fn initialize(connection: &Connection, config: &IndexConfig) -> Result<(), IndexError> {
-    connection.execute_batch(SCHEMA_V2)?;
+    connection.execute_batch(SCHEMA_V3)?;
     connection.pragma_update(None, "user_version", SQL_SCHEMA_VERSION)?;
     connection.execute(
         "INSERT INTO index_metadata \
