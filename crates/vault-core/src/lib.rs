@@ -25,7 +25,8 @@ pub use resolver::{
     LinkTarget, Resolution, ResolutionNote, ResolvedReference, Resolver, resolution_diagnostic,
 };
 pub use semantic::{
-    Alias, BlockId, Heading, ParsedNote, Reference, ReferenceKind, ReferenceOrigin, Subpath, Tag,
+    Alias, BlockId, Heading, ListItem, ListItemParent, ParsedNote, Reference, ReferenceKind,
+    ReferenceOrigin, Section, SectionKind, Subpath, Tag,
 };
 pub use source::{SourceDocument, SourceError, Spanned};
 pub use vault_source::{

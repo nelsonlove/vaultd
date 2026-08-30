@@ -58,6 +58,54 @@ pub struct Reference {
     pub target_span: SourceSpan,
 }
 
+/// The vocabulary Obsidian's `CachedMetadata.sections[].type` emits, captured
+/// from a live Obsidian 1.13.4 (see
+/// `tests/fixtures/structural/README.md`), plus `Other` so an unrecognized
+/// kind is preserved rather than dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SectionKind {
+    Yaml,
+    Heading,
+    Paragraph,
+    Code,
+    Blockquote,
+    Table,
+    ThematicBreak,
+    List,
+    Callout,
+    Html,
+    Other(String),
+}
+
+/// One top-level block, in document order. Mirrors an entry of Obsidian's
+/// `CachedMetadata.sections`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Section {
+    pub kind: SectionKind,
+    pub span: SourceSpan,
+    pub block_id: Option<String>,
+}
+
+/// Obsidian's `listItems[].parent` convention, modeled as a type instead of
+/// the sign trick `obsidian.d.ts` uses: a nested item carries its parent
+/// item's own start line (positive); a top-level item carries the negated
+/// start line of its containing list. Both line numbers are 0-based source
+/// lines.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListItemParent {
+    Root { list_start_line: u32 },
+    Item { parent_start_line: u32 },
+}
+
+/// One list item, in document order. Mirrors an entry of Obsidian's
+/// `CachedMetadata.listItems`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListItem {
+    pub span: SourceSpan,
+    pub parent: ListItemParent,
+    pub task: Option<char>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedNote {
     pub source: SourceDocument,
@@ -67,6 +115,8 @@ pub struct ParsedNote {
     pub blocks: Vec<BlockId>,
     pub tags: Vec<Tag>,
     pub references: Vec<Reference>,
+    pub sections: Vec<Section>,
+    pub list_items: Vec<ListItem>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -80,6 +130,8 @@ impl ParsedNote {
             blocks: Vec::new(),
             tags: Vec::new(),
             references: Vec::new(),
+            sections: Vec::new(),
+            list_items: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
