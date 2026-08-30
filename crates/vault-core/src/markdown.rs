@@ -1,16 +1,19 @@
 use markdown::mdast::Node;
 use markdown::{ParseOptions, to_mdast};
 use percent_encoding::percent_decode_str;
+use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::{
-    Diagnostic, DiagnosticCode, Heading, Reference, ReferenceKind, ReferenceOrigin, Severity,
-    SourceDocument, SourceSpan, Subpath,
+    Diagnostic, DiagnosticCode, Heading, Reference, ReferenceKind, ReferenceOrigin, Section,
+    SectionKind, Severity, SourceDocument, SourceSpan, Subpath,
 };
 
 pub(crate) struct MarkdownParse {
     pub headings: Vec<Heading>,
     pub references: Vec<Reference>,
     pub text_ranges: Vec<SourceSpan>,
+    pub sections: Vec<Section>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -19,6 +22,7 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
         headings: Vec::new(),
         references: Vec::new(),
         text_ranges: Vec::new(),
+        sections: Vec::new(),
         diagnostics: Vec::new(),
     };
     let text = document.text();
@@ -44,6 +48,8 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
         }
     };
 
+    parse.sections = extract_sections(&tree, body_start, text);
+
     let mut walker = Walker {
         document,
         body_start,
@@ -60,6 +66,110 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
         .sort_by_key(|reference| (reference.span.start(), reference.span.end()));
     parse.text_ranges.sort_unstable();
     parse
+}
+
+fn span_for(body_start: usize, node: &Node) -> Option<SourceSpan> {
+    let position = node.position()?;
+    SourceSpan::new(
+        body_start + position.start.offset,
+        body_start + position.end.offset,
+    )
+    .ok()
+}
+
+/// A callout is a blockquote whose very first text starts with `[!type]`
+/// (mdast has no callout node of its own — Obsidian recognizes this pattern
+/// on top of a plain blockquote; see `tests/fixtures/structural/README.md`).
+static CALLOUT_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[!\w[\w-]*\]").expect("callout marker pattern compiles"));
+
+fn is_callout(blockquote: &markdown::mdast::Blockquote) -> bool {
+    let Some(first_child) = blockquote.children.first() else {
+        return false;
+    };
+    let mut text = String::new();
+    collect_text(first_child, &mut text);
+    CALLOUT_MARKER.is_match(&text)
+}
+
+fn section_kind(node: &Node) -> SectionKind {
+    match node {
+        Node::Heading(_) => SectionKind::Heading,
+        Node::Paragraph(_) => SectionKind::Paragraph,
+        Node::Code(_) => SectionKind::Code,
+        Node::Blockquote(blockquote) => {
+            if is_callout(blockquote) {
+                SectionKind::Callout
+            } else {
+                SectionKind::Blockquote
+            }
+        }
+        Node::Table(_) => SectionKind::Table,
+        Node::ThematicBreak(_) => SectionKind::ThematicBreak,
+        Node::List(_) => SectionKind::List,
+        Node::Html(_) => SectionKind::Html,
+        other => SectionKind::Other(node_type_name(other).to_string()),
+    }
+}
+
+/// A best-effort label for a top-level mdast node type this parser doesn't
+/// otherwise recognize. Never observed in the Task 0 capture — Obsidian's
+/// own string for these, if any, is unknown, so this exists only so an
+/// unrecognized block is preserved rather than silently dropped.
+fn node_type_name(node: &Node) -> &'static str {
+    match node {
+        Node::Definition(_) => "definition",
+        Node::FootnoteDefinition(_) => "footnoteDefinition",
+        Node::Math(_) => "math",
+        Node::MdxFlowExpression(_) => "mdxFlowExpression",
+        Node::MdxJsxFlowElement(_) => "mdxJsxFlowElement",
+        Node::MdxjsEsm(_) => "mdxjsEsm",
+        Node::Toml(_) => "toml",
+        Node::Yaml(_) => "yaml",
+        _ => "unknown",
+    }
+}
+
+/// mdast reports a `List`'s (and a `ListItem`'s) end position one line past
+/// its own last line — the start of the next line — whenever more content
+/// follows; at end-of-document there is no next line and the position lands
+/// exactly on the container's real last byte instead. Obsidian's captured
+/// `sections`/`listItems` never include that swallowed newline (verified
+/// against `tests/fixtures/structural/13-block-ids` and `14-mixed-deep`),
+/// so trim it back off when present.
+fn trim_list_trailing_newline(text: &str, span: SourceSpan) -> SourceSpan {
+    let bytes = text.as_bytes();
+    let mut end = span.end();
+    if end > span.start() && bytes.get(end.wrapping_sub(1)) == Some(&b'\n') {
+        end -= 1;
+        if end > span.start() && bytes.get(end.wrapping_sub(1)) == Some(&b'\r') {
+            end -= 1;
+        }
+    }
+    SourceSpan::new(span.start(), end).unwrap_or(span)
+}
+
+/// Walk only the root node's direct children — one `Section` per top-level
+/// block, never one nested inside another block. `Section.block_id` is
+/// filled in later by `parse_note`, once `ParsedNote.blocks` exists.
+fn extract_sections(tree: &Node, body_start: usize, text: &str) -> Vec<Section> {
+    let Some(children) = tree.children() else {
+        return Vec::new();
+    };
+    children
+        .iter()
+        .filter_map(|child| {
+            let mut span = span_for(body_start, child)?;
+            if matches!(child, Node::List(_)) {
+                span = trim_list_trailing_newline(text, span);
+            }
+            Some(Section {
+                kind: section_kind(child),
+                span,
+                block_id: None,
+            })
+        })
+        .collect()
 }
 
 struct Walker<'a> {
@@ -131,12 +241,7 @@ impl Walker<'_> {
     }
 
     fn node_span(&self, node: &Node) -> Option<SourceSpan> {
-        let position = node.position()?;
-        SourceSpan::new(
-            self.body_start + position.start.offset,
-            self.body_start + position.end.offset,
-        )
-        .ok()
+        span_for(self.body_start, node)
     }
 
     fn emit_reference(&mut self, node: &Node, kind: ReferenceKind, display: Option<String>) {

@@ -10,6 +10,12 @@ pub(crate) struct FrontmatterParse {
     pub aliases: Vec<Alias>,
     pub tags: Vec<Tag>,
     pub body_start: usize,
+    /// The span of the whole `---`-fenced frontmatter block (opening fence
+    /// through the end of the closing fence line, excluding its trailing
+    /// newline), when the fences are present and closed. This is Obsidian's
+    /// `yaml` section span — set here so `Section` extraction reuses it
+    /// rather than re-deriving it from the fence-finding logic.
+    pub frontmatter_span: Option<SourceSpan>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -20,6 +26,7 @@ impl FrontmatterParse {
             aliases: Vec::new(),
             tags: Vec::new(),
             body_start,
+            frontmatter_span: None,
             diagnostics: Vec::new(),
         }
     }
@@ -308,6 +315,10 @@ pub(crate) fn parse_frontmatter(document: &SourceDocument) -> FrontmatterParse {
     };
 
     let mut parse = FrontmatterParse::empty(fences.body_start);
+    // The closing fence line's own content was checked to equal "---"
+    // (3 bytes) in `find_fences`, so the frontmatter block ends there,
+    // regardless of `\n` vs `\r\n` line endings.
+    parse.frontmatter_span = SourceSpan::new(0, fences.payload_end + 3).ok();
     let payload = &text[fences.payload_start..fences.payload_end];
     if payload.trim().is_empty() {
         return parse;
