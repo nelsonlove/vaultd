@@ -1,0 +1,3 @@
+- item with a [[Target Note]] link
+- item with an embed ![[Some Image.png]]
+- plain item

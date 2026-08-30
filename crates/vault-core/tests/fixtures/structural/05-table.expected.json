@@ -1,0 +1,21 @@
+{
+    "obsidianVersion": "1.13.4",
+    "sections": [
+        {
+            "type": "table",
+            "position": {
+                "start": {
+                    "line": 0,
+                    "col": 0,
+                    "offset": 0
+                },
+                "end": {
+                    "line": 2,
+                    "col": 9,
+                    "offset": 29
+                }
+            }
+        }
+    ],
+    "listItems": null
+}

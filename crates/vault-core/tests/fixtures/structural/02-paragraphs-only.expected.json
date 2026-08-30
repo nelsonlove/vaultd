@@ -1,0 +1,36 @@
+{
+    "obsidianVersion": "1.13.4",
+    "sections": [
+        {
+            "type": "paragraph",
+            "position": {
+                "start": {
+                    "line": 0,
+                    "col": 0,
+                    "offset": 0
+                },
+                "end": {
+                    "line": 1,
+                    "col": 17,
+                    "offset": 42
+                }
+            }
+        },
+        {
+            "type": "paragraph",
+            "position": {
+                "start": {
+                    "line": 3,
+                    "col": 0,
+                    "offset": 44
+                },
+                "end": {
+                    "line": 3,
+                    "col": 17,
+                    "offset": 61
+                }
+            }
+        }
+    ],
+    "listItems": null
+}

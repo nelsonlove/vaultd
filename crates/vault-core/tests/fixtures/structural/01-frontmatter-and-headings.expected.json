@@ -1,0 +1,81 @@
+{
+    "obsidianVersion": "1.13.4",
+    "sections": [
+        {
+            "type": "yaml",
+            "position": {
+                "start": {
+                    "line": 0,
+                    "col": 0,
+                    "offset": 0
+                },
+                "end": {
+                    "line": 3,
+                    "col": 3,
+                    "offset": 43
+                }
+            }
+        },
+        {
+            "type": "heading",
+            "position": {
+                "start": {
+                    "line": 4,
+                    "col": 0,
+                    "offset": 44
+                },
+                "end": {
+                    "line": 4,
+                    "col": 13,
+                    "offset": 57
+                }
+            }
+        },
+        {
+            "type": "paragraph",
+            "position": {
+                "start": {
+                    "line": 6,
+                    "col": 0,
+                    "offset": 59
+                },
+                "end": {
+                    "line": 6,
+                    "col": 34,
+                    "offset": 93
+                }
+            }
+        },
+        {
+            "type": "heading",
+            "position": {
+                "start": {
+                    "line": 8,
+                    "col": 0,
+                    "offset": 95
+                },
+                "end": {
+                    "line": 8,
+                    "col": 17,
+                    "offset": 112
+                }
+            }
+        },
+        {
+            "type": "paragraph",
+            "position": {
+                "start": {
+                    "line": 10,
+                    "col": 0,
+                    "offset": 114
+                },
+                "end": {
+                    "line": 10,
+                    "col": 18,
+                    "offset": 132
+                }
+            }
+        }
+    ],
+    "listItems": null
+}

@@ -1,0 +1,143 @@
+{
+    "obsidianVersion": "1.13.4",
+    "sections": [
+        {
+            "type": "yaml",
+            "position": {
+                "start": {
+                    "line": 0,
+                    "col": 0,
+                    "offset": 0
+                },
+                "end": {
+                    "line": 2,
+                    "col": 3,
+                    "offset": 20
+                }
+            }
+        },
+        {
+            "type": "heading",
+            "position": {
+                "start": {
+                    "line": 3,
+                    "col": 0,
+                    "offset": 21
+                },
+                "end": {
+                    "line": 3,
+                    "col": 7,
+                    "offset": 28
+                }
+            }
+        },
+        {
+            "type": "list",
+            "position": {
+                "start": {
+                    "line": 5,
+                    "col": 0,
+                    "offset": 30
+                },
+                "end": {
+                    "line": 8,
+                    "col": 17,
+                    "offset": 137
+                }
+            }
+        },
+        {
+            "type": "code",
+            "position": {
+                "start": {
+                    "line": 10,
+                    "col": 0,
+                    "offset": 139
+                },
+                "end": {
+                    "line": 12,
+                    "col": 3,
+                    "offset": 158
+                }
+            }
+        },
+        {
+            "type": "blockquote",
+            "position": {
+                "start": {
+                    "line": 14,
+                    "col": 0,
+                    "offset": 160
+                },
+                "end": {
+                    "line": 14,
+                    "col": 18,
+                    "offset": 178
+                }
+            }
+        }
+    ],
+    "listItems": [
+        {
+            "position": {
+                "start": {
+                    "line": 5,
+                    "col": 0,
+                    "offset": 30
+                },
+                "end": {
+                    "line": 5,
+                    "col": 34,
+                    "offset": 64
+                }
+            },
+            "parent": -5,
+            "task": " "
+        },
+        {
+            "position": {
+                "start": {
+                    "line": 6,
+                    "col": 2,
+                    "offset": 67
+                },
+                "end": {
+                    "line": 6,
+                    "col": 33,
+                    "offset": 98
+                }
+            },
+            "parent": 5
+        },
+        {
+            "position": {
+                "start": {
+                    "line": 7,
+                    "col": 2,
+                    "offset": 101
+                },
+                "end": {
+                    "line": 7,
+                    "col": 20,
+                    "offset": 119
+                }
+            },
+            "parent": 5
+        },
+        {
+            "position": {
+                "start": {
+                    "line": 8,
+                    "col": 0,
+                    "offset": 120
+                },
+                "end": {
+                    "line": 8,
+                    "col": 17,
+                    "offset": 137
+                }
+            },
+            "parent": -5
+        }
+    ]
+}
