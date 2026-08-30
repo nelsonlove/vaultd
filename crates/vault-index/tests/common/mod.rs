@@ -349,10 +349,34 @@ pub fn strip_pending_structural_fields(mut note: vault_core::ParsedNote) -> vaul
     note
 }
 
+/// Index-side counterpart of [`strip_pending_structural_fields`], and the
+/// seam's self-retiring tripwire: a note hydrated from the store must have
+/// EMPTY structural fields until Task 4 persists them. The moment Task 4
+/// lands, this assertion fires on every oracle run, forcing the strip to be
+/// deleted and the full comparison restored — a comment alone could survive
+/// Task 4 unnoticed; this cannot.
+pub fn index_note_without_structural_fields(
+    note: vault_core::ParsedNote,
+) -> vault_core::ParsedNote {
+    assert!(
+        note.sections.is_empty() && note.list_items.is_empty(),
+        "Task 4 has landed — delete strip_pending_structural_fields and \
+         index_note_without_structural_fields, and restore the full oracle \
+         comparison of sections and list_items"
+    );
+    note
+}
+
 fn without_pending_structural_fields(
     note: Option<&vault_core::ParsedNote>,
 ) -> Option<vault_core::ParsedNote> {
     note.cloned().map(strip_pending_structural_fields)
+}
+
+fn index_note_opt_without_structural_fields(
+    note: Option<&vault_core::ParsedNote>,
+) -> Option<vault_core::ParsedNote> {
+    note.cloned().map(index_note_without_structural_fields)
 }
 
 pub fn assert_semantically_equivalent(indexed: &ScanReport, scan: &ScanReport) {
@@ -360,7 +384,7 @@ pub fn assert_semantically_equivalent(indexed: &ScanReport, scan: &ScanReport) {
     assert_eq!(indexed.graph.note_paths(), scan.graph.note_paths());
     for path in scan.graph.note_paths() {
         assert_eq!(
-            without_pending_structural_fields(indexed.graph.note(path)),
+            index_note_opt_without_structural_fields(indexed.graph.note(path)),
             without_pending_structural_fields(scan.graph.note(path))
         );
         assert_eq!(indexed.graph.outgoing(path), scan.graph.outgoing(path));
@@ -880,7 +904,7 @@ pub fn snapshot_from_index(service: &vault_index::IndexService) -> SemanticSnaps
     let mut backlinks = Vec::new();
     for path in &paths {
         let indexed = service.get_note(path).expect("indexed note");
-        notes.push(strip_pending_structural_fields(indexed.note));
+        notes.push(index_note_without_structural_fields(indexed.note));
         outgoing.push((path.clone(), indexed.outgoing));
 
         let mut incoming = Vec::new();

@@ -1,5 +1,5 @@
 use markdown::mdast::Node;
-use markdown::{ParseOptions, to_mdast};
+use markdown::{Constructs, ParseOptions, to_mdast};
 use percent_encoding::percent_decode_str;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -33,7 +33,7 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
         return parse;
     }
 
-    let tree = match to_mdast(body, &ParseOptions::gfm()) {
+    let tree = match to_mdast(body, &parse_options()) {
         Ok(tree) => tree,
         Err(error) => {
             let span = SourceSpan::new(body_start, text.len()).expect("body span is ordered");
@@ -71,6 +71,23 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
     parse
 }
 
+/// GFM plus math (block `$$...$$`): Obsidian renders `$$` blocks as their own
+/// `math` section (`tests/fixtures/structural/18-math-block`), which mdast
+/// only emits when `math_flow` is explicitly enabled — off in
+/// `Constructs::gfm()` since it isn't part of the GFM spec. Footnotes and
+/// link-reference definitions need no extra opt-in: `Constructs::gfm()`
+/// already turns on `gfm_footnote_definition`, and plain `[label]: url`
+/// definitions are a core CommonMark construct.
+fn parse_options() -> ParseOptions {
+    ParseOptions {
+        constructs: Constructs {
+            math_flow: true,
+            ..Constructs::gfm()
+        },
+        ..ParseOptions::gfm()
+    }
+}
+
 fn span_for(body_start: usize, node: &Node) -> Option<SourceSpan> {
     let position = node.position()?;
     SourceSpan::new(
@@ -80,28 +97,40 @@ fn span_for(body_start: usize, node: &Node) -> Option<SourceSpan> {
     .ok()
 }
 
-/// A callout is a blockquote whose very first text starts with `[!type]`
-/// (mdast has no callout node of its own — Obsidian recognizes this pattern
-/// on top of a plain blockquote; see `tests/fixtures/structural/README.md`).
+/// A callout marker: `[!type]`, optionally with spaces in `type`
+/// (`tests/fixtures/structural/20-callout-edges`: `[!my type]`) and an
+/// optional trailing fold indicator (`[!NOTE]-`, `[!NOTE]+`) which this
+/// pattern doesn't need to care about since it only anchors the opening
+/// bracket run.
 static CALLOUT_MARKER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\[!\w[\w-]*\]").expect("callout marker pattern compiles"));
+    LazyLock::new(|| Regex::new(r"^\[!\w[\w -]*\]").expect("callout marker pattern compiles"));
 
-fn is_callout(blockquote: &markdown::mdast::Blockquote) -> bool {
-    let Some(first_child) = blockquote.children.first() else {
+/// A callout is a blockquote whose FIRST source line (after stripping the
+/// `>` marker and at most one following space) starts with a `[!type]`
+/// marker. This reads the raw source at the quote's own start rather than
+/// mdast's merged multi-line paragraph text: the merged text would still
+/// start with the marker even when it actually sits on the blockquote's
+/// *second* quoted line preceded by a blank first line (`20-callout-edges`,
+/// `> ` then `> [!note] marker on second line` — Obsidian classifies that as
+/// a plain `blockquote`, not a `callout`), so only the true first line can
+/// be trusted.
+fn is_callout(text: &str, span: SourceSpan) -> bool {
+    let Some(slice) = text.get(span.start()..span.end()) else {
         return false;
     };
-    let mut text = String::new();
-    collect_text(first_child, &mut text);
-    CALLOUT_MARKER.is_match(&text)
+    let first_line = slice.split('\n').next().unwrap_or(slice);
+    let content = first_line.strip_prefix('>').unwrap_or(first_line);
+    let content = content.strip_prefix(' ').unwrap_or(content);
+    CALLOUT_MARKER.is_match(content)
 }
 
-fn section_kind(node: &Node) -> SectionKind {
+fn section_kind(node: &Node, text: &str, span: SourceSpan) -> SectionKind {
     match node {
         Node::Heading(_) => SectionKind::Heading,
         Node::Paragraph(_) => SectionKind::Paragraph,
         Node::Code(_) => SectionKind::Code,
-        Node::Blockquote(blockquote) => {
-            if is_callout(blockquote) {
+        Node::Blockquote(_) => {
+            if is_callout(text, span) {
                 SectionKind::Callout
             } else {
                 SectionKind::Blockquote
@@ -116,9 +145,13 @@ fn section_kind(node: &Node) -> SectionKind {
 }
 
 /// A best-effort label for a top-level mdast node type this parser doesn't
-/// otherwise recognize. Never observed in the Task 0 capture — Obsidian's
-/// own string for these, if any, is unknown, so this exists only so an
-/// unrecognized block is preserved rather than silently dropped.
+/// otherwise map to a known `SectionKind`. `definition`, `footnoteDefinition`,
+/// and `math` are confirmed real Obsidian section-type strings (second
+/// capture, fixtures 17-18) — everything else here is an unmapped mdast node
+/// type never observed in either capture, preserved rather than dropped.
+/// `Node::Yaml` never reaches this function: `parse_markdown` only ever runs
+/// on the post-frontmatter body, and frontmatter's own `---` fences are
+/// consumed by `frontmatter.rs` before mdast ever sees the text.
 fn node_type_name(node: &Node) -> &'static str {
     match node {
         Node::Definition(_) => "definition",
@@ -128,19 +161,23 @@ fn node_type_name(node: &Node) -> &'static str {
         Node::MdxJsxFlowElement(_) => "mdxJsxFlowElement",
         Node::MdxjsEsm(_) => "mdxjsEsm",
         Node::Toml(_) => "toml",
-        Node::Yaml(_) => "yaml",
         _ => "unknown",
     }
 }
 
-/// mdast reports a `List`'s (and a `ListItem`'s) end position one line past
-/// its own last line — the start of the next line — whenever more content
-/// follows; at end-of-document there is no next line and the position lands
-/// exactly on the container's real last byte instead. Obsidian's captured
-/// `sections`/`listItems` never include that swallowed newline (verified
-/// against `tests/fixtures/structural/13-block-ids` and `14-mixed-deep`),
-/// so trim it back off when present.
-fn trim_list_trailing_newline(text: &str, span: SourceSpan) -> SourceSpan {
+/// mdast reports certain multi-line block containers' end positions one
+/// line past their own last line — the start of the next line — whenever
+/// more content follows; at end-of-document there is no next line and the
+/// position lands exactly on the container's real last byte instead.
+/// Confirmed on `List`/`ListItem` (`tests/fixtures/structural/13-block-ids`,
+/// `14-mixed-deep`) and on `FootnoteDefinition`
+/// (`17-definitions-and-footnotes`); NOT reproduced on `Blockquote`
+/// (`04-blockquote`, `11-callout` both matched without this trim) or any
+/// single-line construct (`Definition`, `Heading`, `Paragraph`, ...).
+/// Obsidian's captured `sections`/`listItems` never include the swallowed
+/// newline, so trim it back off when present — a no-op for any span whose
+/// real last byte isn't itself `\n`.
+fn trim_swallowed_trailing_newline(text: &str, span: SourceSpan) -> SourceSpan {
     let bytes = text.as_bytes();
     let mut end = span.end();
     if end > span.start() && bytes.get(end.wrapping_sub(1)) == Some(&b'\n') {
@@ -163,11 +200,11 @@ fn extract_sections(tree: &Node, body_start: usize, text: &str) -> Vec<Section> 
         .iter()
         .filter_map(|child| {
             let mut span = span_for(body_start, child)?;
-            if matches!(child, Node::List(_)) {
-                span = trim_list_trailing_newline(text, span);
+            if matches!(child, Node::List(_) | Node::FootnoteDefinition(_)) {
+                span = trim_swallowed_trailing_newline(text, span);
             }
             Some(Section {
-                kind: section_kind(child),
+                kind: section_kind(child, text, span),
                 span,
                 block_id: None,
             })
@@ -185,18 +222,27 @@ fn line_of(text: &str, byte_offset: usize) -> u32 {
 }
 
 /// A task-list marker: a list/ordered marker immediately followed by a
-/// single bracketed character, e.g. `- [ ]`, `1. [x]`, `- [/]`. Matched
-/// against the raw source (never mdast's `checked` field) because mdast only
-/// recognizes `[ ]`/`[x]`/`[X]` as GFM checkboxes — a non-standard state like
-/// `[/]` parses as plain paragraph text, with `checked: None`, yet Obsidian
-/// still reports its raw bracket character (`tests/fixtures/structural/09-task-list`).
+/// single bracketed character, e.g. `- [ ]`, `1. [x]`, `- [/]`, then either
+/// whitespace or end-of-line. Matched against the raw source (never mdast's
+/// `checked` field) because mdast only recognizes `[ ]`/`[x]`/`[X]` as GFM
+/// checkboxes — a non-standard state like `[/]` parses as plain paragraph
+/// text, with `checked: None`, yet Obsidian still reports its raw bracket
+/// character (`tests/fixtures/structural/09-task-list`). The trailing
+/// `(?:[ \t]|$)` requires whitespace or line-end right after `]` — without
+/// it, `- [x]nospace` and `- [x](link)` would misdetect a task state that
+/// Obsidian does not report (`19-task-nospace`).
 static TASK_MARKER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[(.)\]").expect("task marker pattern compiles")
+    Regex::new(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[(.)\](?:[ \t]|$)")
+        .expect("task marker pattern compiles")
 });
 
+/// Only the item's own first source line is a candidate for the marker —
+/// `$` in `TASK_MARKER` must mean "end of that line", not "end of the
+/// item's entire (possibly multi-line) span".
 fn detect_task_char(text: &str, span: SourceSpan) -> Option<char> {
     let slice = text.get(span.start()..span.end())?;
-    let capture = TASK_MARKER.captures(slice)?;
+    let first_line = slice.split('\n').next().unwrap_or(slice);
+    let capture = TASK_MARKER.captures(first_line)?;
     capture.get(1)?.as_str().chars().next()
 }
 
@@ -233,7 +279,7 @@ fn item_span(body_start: usize, text: &str, item_node: &Node) -> Option<SourceSp
         }
     }
     let span = SourceSpan::new(whole.start(), end.unwrap_or(whole.end())).ok()?;
-    Some(trim_list_trailing_newline(text, span))
+    Some(trim_swallowed_trailing_newline(text, span))
 }
 
 fn walk_for_list_items(
@@ -244,14 +290,22 @@ fn walk_for_list_items(
     items: &mut Vec<ListItem>,
 ) {
     if let Node::List(list) = node {
-        let list_start_line = span_for(body_start, node)
-            .map(|span| line_of(text, span.start()))
-            .unwrap_or(0);
+        let list_position = span_for(body_start, node);
+        debug_assert!(
+            list_position.is_some(),
+            "a List node produced by to_mdast from real source text always has a position"
+        );
+        let list_start_line = list_position.map_or(0, |span| line_of(text, span.start()));
         for child in &list.children {
             if !matches!(child, Node::ListItem(_)) {
                 continue;
             }
-            let Some(span) = item_span(body_start, text, child) else {
+            let item_position = item_span(body_start, text, child);
+            debug_assert!(
+                item_position.is_some(),
+                "a ListItem node produced by to_mdast from real source text always has a position"
+            );
+            let Some(span) = item_position else {
                 continue;
             };
             let item_line = line_of(text, span.start());
@@ -262,11 +316,26 @@ fn walk_for_list_items(
                 },
             };
             let task = detect_task_char(text, span);
+            debug_assert!(
+                items
+                    .last()
+                    .is_none_or(|previous: &ListItem| previous.span.start() <= span.start()),
+                "list items must be pushed in ascending document order"
+            );
             items.push(ListItem { span, parent, task });
 
+            // Only a DIRECT nested `List` child continues under this item
+            // (`ListItemParent::Item`); anything reached through some other
+            // wrapper (e.g. a blockquote) is structurally independent and
+            // gets its own `Root` treatment, per
+            // `tests/fixtures/structural/21-list-in-blockquote-in-item`:
+            // items inside a quoted list nested inside an item are emitted
+            // as root items of that inner list, not as children of the
+            // outer item.
             if let Some(grandchildren) = child.children() {
                 for grandchild in grandchildren {
-                    walk_for_list_items(grandchild, body_start, text, Some(item_line), items);
+                    let next_parent_line = matches!(grandchild, Node::List(_)).then_some(item_line);
+                    walk_for_list_items(grandchild, body_start, text, next_parent_line, items);
                 }
             }
         }

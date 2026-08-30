@@ -1,6 +1,7 @@
 //! Shared harness for the `tests/fixtures/structural/` corpus (see
-//! `crates/vault-core/tests/fixtures/structural/README.md`). Sixteen cases
-//! captured from a live Obsidian 1.13.4; each `<case>.md` is fed through
+//! `crates/vault-core/tests/fixtures/structural/README.md`). Twenty-one
+//! cases captured from a live Obsidian 1.13.4 (16 original + 5 from the
+//! second capture settling disputed edges); each `<case>.md` is fed through
 //! `vault_core::parse_note` and compared against Obsidian's captured
 //! `<case>.expected.json`.
 
@@ -29,6 +30,11 @@ pub const CASES: &[&str] = &[
     "14-mixed-deep",
     "15-wide-offsets",
     "16-setext-and-html",
+    "17-definitions-and-footnotes",
+    "18-math-block",
+    "19-task-nospace",
+    "20-callout-edges",
+    "21-list-in-blockquote-in-item",
 ];
 
 pub struct Fixture {

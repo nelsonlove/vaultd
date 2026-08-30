@@ -66,7 +66,7 @@ fn get_note_returns_exact_source_semantics_diagnostics_and_resolutions() {
     // structural-parse-extension (schema v3); strip them from both sides so
     // this stays an oracle check on what the index store round-trips today.
     assert_eq!(
-        common::strip_pending_structural_fields(indexed.note.clone()),
+        common::index_note_without_structural_fields(indexed.note.clone()),
         common::strip_pending_structural_fields(oracle.clone())
     );
     assert_eq!(indexed.outgoing, fixture.scan.graph.outgoing(&path));

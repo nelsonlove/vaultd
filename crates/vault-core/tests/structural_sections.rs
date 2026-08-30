@@ -31,7 +31,17 @@ fn every_fixture_sections_match_obsidian_exactly() {
         let fixture = load(name);
         let expected_sections = match &fixture.expected["sections"] {
             Value::Null => Vec::new(),
-            Value::Array(items) => items.clone(),
+            Value::Array(items) => items
+                .iter()
+                // Obsidian can emit zero-width phantom sections (`text`,
+                // `element`) at end-of-file after a footnote reference; the
+                // fixtures README's second-capture section records why. They
+                // carry no content and vault-core does not reproduce them.
+                .filter(|item| {
+                    item["position"]["start"]["offset"] != item["position"]["end"]["offset"]
+                })
+                .cloned()
+                .collect(),
             other => panic!("{name}: sections is neither null nor an array: {other:?}"),
         };
 
@@ -140,6 +150,16 @@ proptest! {
         );
         let parsed = parse_note(document);
 
+        // Non-vacuity guard: any input with a non-blank line must yield at
+        // least one section, so this test cannot silently go vacuous if the
+        // generator or the extractor changes.
+        if text.lines().any(|line| !line.trim().is_empty()) {
+            prop_assert!(
+                !parsed.sections.is_empty(),
+                "non-blank input produced zero sections"
+            );
+        }
+
         let mut previous_end: Option<usize> = None;
         for section in &parsed.sections {
             prop_assert!(section.span.start() <= section.span.end());
@@ -151,6 +171,22 @@ proptest! {
                 prop_assert!(section.span.start() >= previous_end);
             }
             previous_end = Some(section.span.end());
+        }
+
+        // List items: spans slice cleanly and starts ascend in document
+        // order (containment is legal — a parent item's span includes its
+        // descendants — so only starts are monotonic, not ranges).
+        let mut previous_start: Option<usize> = None;
+        for item in &parsed.list_items {
+            prop_assert!(item.span.start() <= item.span.end());
+            prop_assert!(item.span.end() <= text.len());
+            prop_assert!(text.is_char_boundary(item.span.start()));
+            prop_assert!(text.is_char_boundary(item.span.end()));
+            prop_assert!(parsed.source.slice(item.span).is_some());
+            if let Some(previous_start) = previous_start {
+                prop_assert!(item.span.start() >= previous_start);
+            }
+            previous_start = Some(item.span.start());
         }
     }
 }
