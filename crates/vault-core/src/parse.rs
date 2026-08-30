@@ -34,6 +34,8 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     note.sections.extend(markdown.sections);
     attach_section_block_ids(&mut note.sections, &note.blocks);
 
+    note.list_items = markdown.list_items;
+
     note.diagnostics = frontmatter.diagnostics;
     note.diagnostics.extend(markdown.diagnostics);
     note.diagnostics.extend(body.diagnostics);

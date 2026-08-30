@@ -5,8 +5,8 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 use crate::{
-    Diagnostic, DiagnosticCode, Heading, Reference, ReferenceKind, ReferenceOrigin, Section,
-    SectionKind, Severity, SourceDocument, SourceSpan, Subpath,
+    Diagnostic, DiagnosticCode, Heading, ListItem, ListItemParent, Reference, ReferenceKind,
+    ReferenceOrigin, Section, SectionKind, Severity, SourceDocument, SourceSpan, Subpath,
 };
 
 pub(crate) struct MarkdownParse {
@@ -14,6 +14,7 @@ pub(crate) struct MarkdownParse {
     pub references: Vec<Reference>,
     pub text_ranges: Vec<SourceSpan>,
     pub sections: Vec<Section>,
+    pub list_items: Vec<ListItem>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -23,6 +24,7 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
         references: Vec::new(),
         text_ranges: Vec::new(),
         sections: Vec::new(),
+        list_items: Vec::new(),
         diagnostics: Vec::new(),
     };
     let text = document.text();
@@ -49,6 +51,7 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
     };
 
     parse.sections = extract_sections(&tree, body_start, text);
+    parse.list_items = extract_list_items(&tree, body_start, text);
 
     let mut walker = Walker {
         document,
@@ -170,6 +173,110 @@ fn extract_sections(tree: &Node, body_start: usize, text: &str) -> Vec<Section> 
             })
         })
         .collect()
+}
+
+/// 0-based source line number for an absolute byte offset. mdast's own
+/// `position.start.line` is relative to whatever `&str` it parsed (the body,
+/// not the whole document), so it undercounts by the frontmatter's line
+/// count whenever frontmatter is present. Counting newlines in the full
+/// document text up to the absolute offset sidesteps that mismatch entirely.
+fn line_of(text: &str, byte_offset: usize) -> u32 {
+    text[..byte_offset].matches('\n').count() as u32
+}
+
+/// A task-list marker: a list/ordered marker immediately followed by a
+/// single bracketed character, e.g. `- [ ]`, `1. [x]`, `- [/]`. Matched
+/// against the raw source (never mdast's `checked` field) because mdast only
+/// recognizes `[ ]`/`[x]`/`[X]` as GFM checkboxes — a non-standard state like
+/// `[/]` parses as plain paragraph text, with `checked: None`, yet Obsidian
+/// still reports its raw bracket character (`tests/fixtures/structural/09-task-list`).
+static TASK_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[(.)\]").expect("task marker pattern compiles")
+});
+
+fn detect_task_char(text: &str, span: SourceSpan) -> Option<char> {
+    let slice = text.get(span.start()..span.end())?;
+    let capture = TASK_MARKER.captures(slice)?;
+    capture.get(1)?.as_str().chars().next()
+}
+
+/// Descend every list, in document order, tracking the enclosing item's own
+/// start line so `ListItemParent` can be built per the pinned correction: a
+/// nested item carries its parent item's start line, a root item carries the
+/// negated start line of its containing list (see
+/// `crates/vault-core/src/semantic.rs::ListItemParent`).
+fn extract_list_items(tree: &Node, body_start: usize, text: &str) -> Vec<ListItem> {
+    let mut items = Vec::new();
+    walk_for_list_items(tree, body_start, text, None, &mut items);
+    items
+}
+
+/// A `ListItem`'s own span, per Obsidian's convention: the item's marker
+/// through the end of its own direct (non-`List`) content, excluding any
+/// nested sublist. mdast's own `ListItem.position` covers the item *and*
+/// every nested sublist beneath it — Obsidian's `listItems[].position` does
+/// not (verified against `07-unordered-nested` and `14-mixed-deep`, where a
+/// naive `item.position` swallows the nested list that gets its own entries).
+fn item_span(body_start: usize, text: &str, item_node: &Node) -> Option<SourceSpan> {
+    let whole = span_for(body_start, item_node)?;
+    let mut end = None;
+    if let Some(children) = item_node.children() {
+        for child in children {
+            if matches!(child, Node::List(_)) {
+                continue;
+            }
+            if let Some(child_span) = span_for(body_start, child) {
+                end = Some(end.map_or(child_span.end(), |current: usize| {
+                    current.max(child_span.end())
+                }));
+            }
+        }
+    }
+    let span = SourceSpan::new(whole.start(), end.unwrap_or(whole.end())).ok()?;
+    Some(trim_list_trailing_newline(text, span))
+}
+
+fn walk_for_list_items(
+    node: &Node,
+    body_start: usize,
+    text: &str,
+    parent_item_line: Option<u32>,
+    items: &mut Vec<ListItem>,
+) {
+    if let Node::List(list) = node {
+        let list_start_line = span_for(body_start, node)
+            .map(|span| line_of(text, span.start()))
+            .unwrap_or(0);
+        for child in &list.children {
+            if !matches!(child, Node::ListItem(_)) {
+                continue;
+            }
+            let Some(span) = item_span(body_start, text, child) else {
+                continue;
+            };
+            let item_line = line_of(text, span.start());
+            let parent = match parent_item_line {
+                None => ListItemParent::Root { list_start_line },
+                Some(parent_line) => ListItemParent::Item {
+                    parent_start_line: parent_line,
+                },
+            };
+            let task = detect_task_char(text, span);
+            items.push(ListItem { span, parent, task });
+
+            if let Some(grandchildren) = child.children() {
+                for grandchild in grandchildren {
+                    walk_for_list_items(grandchild, body_start, text, Some(item_line), items);
+                }
+            }
+        }
+        return;
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            walk_for_list_items(child, body_start, text, parent_item_line, items);
+        }
+    }
 }
 
 struct Walker<'a> {
