@@ -13,9 +13,17 @@
 //! 3. **Generation exactness** — the generation advances by exactly one when
 //!    client-visible state changed, and by exactly zero when it did not. Not
 //!    "at least": a metadata-only touch that manufactures a generation is as
-//!    much a bug as a content change that fails to.
+//!    much a bug as a content change that fails to. *Client-visible state* is
+//!    both axes the cache indexes: the semantic snapshot **and** the file
+//!    tree — a batch that leaves the notes exactly as they were but leaves a
+//!    new folder behind did change what a client can see, and must publish.
 //! 4. **Vault integrity** — the vault's own bytes change only by the
 //!    operation the test performed. The index never writes into the vault.
+//! 5. **Tree equivalence** — the stored file tree equals what a fresh walk
+//!    would have written: same paths, same kinds, same sizes. The targeted
+//!    route stats only the paths a hint named (plus the folders above them),
+//!    so this is where "it converges on what a complete walk would write"
+//!    stops being an assumption.
 //!
 //! The operation alphabet deliberately includes the changes that are
 //! invisible to the cheap signals: `Touch` moves metadata without content,
@@ -29,8 +37,41 @@ use std::path::{Path, PathBuf};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use tempfile::TempDir;
-use vault_core::{FileSystemVaultSource, LinkTarget, ScanReport, VaultPath, scan_vault};
+use vault_core::{
+    FileSystemVaultSource, LinkTarget, ScanReport, TreeEntryKind, VaultPath, scan_vault,
+};
 use vault_index::{ChangeCause, IndexConfig, IndexService};
+
+/// The file tree as three comparable facts per entry: path, kind, and size.
+///
+/// Timestamps are deliberately left out. A folder's timestamps move whenever
+/// anything inside it is created or removed, and nothing reads them (a folder
+/// carries no `stat` in the object model), so they are not client-visible
+/// state and must not make this snapshot "changed" — `TreeDelta` draws the
+/// same line. A note's timestamps are the fingerprint's business, and the
+/// file-tree tests cover the timestamp columns directly.
+type TreeSnapshot = Vec<(String, TreeEntryKind, Option<u64>)>;
+
+/// What a fresh walk says the tree is.
+fn scanned_tree(root: &Path) -> TreeSnapshot {
+    let source = FileSystemVaultSource::new(root).expect("tree scan source");
+    source
+        .scan()
+        .expect("scan vault tree")
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.as_str().to_string(), entry.kind, entry.size))
+        .collect()
+}
+
+/// What the cache stored.
+fn stored_tree(service: &IndexService) -> TreeSnapshot {
+    let (_, entries) = service.tree_entries().expect("stored tree");
+    entries
+        .into_iter()
+        .map(|entry| (entry.path.as_str().to_string(), entry.kind, entry.size))
+        .collect()
+}
 
 /// Several spellings per stem across three nesting levels, so relative links,
 /// duplicate stems, and ambiguity transitions are all reachable from one
@@ -203,6 +244,8 @@ struct Oracle {
     /// The scan-derived truth as of the last verified batch, for the
     /// "advanced exactly once iff something changed" comparison.
     expected: common::SemanticSnapshot,
+    /// The other half of that truth: the file tree the same walk saw.
+    expected_tree: TreeSnapshot,
     generation: u64,
     /// How many batches actually took the complete-resolution fallback. The
     /// witness that forcing the threshold to zero did what it claims: without
@@ -251,11 +294,13 @@ impl Oracle {
             .expect("cold build published")
             .get();
         let expected = common::snapshot_from_scan(&scan(&root));
+        let expected_tree = scanned_tree(&root);
 
         Self {
             service,
             root,
             expected,
+            expected_tree,
             generation,
             complete_resolutions: 0,
             _vault: vault,
@@ -274,7 +319,8 @@ impl Oracle {
 
         let truth = scan(&self.root);
         let expected = common::snapshot_from_scan(&truth);
-        let changed = expected != self.expected;
+        let expected_tree = scanned_tree(&self.root);
+        let changed = expected != self.expected || expected_tree != self.expected_tree;
 
         let report = self
             .service
@@ -307,6 +353,16 @@ impl Oracle {
         // (2) Resolution equivalence, route by route.
         self.assert_resolution_matches(&truth, batch)?;
 
+        // (5) Tree equivalence: the targeted route stated only the paths the
+        // batch named and the folders above them, and still landed exactly
+        // where a complete walk would have.
+        prop_assert_eq!(
+            stored_tree(&self.service),
+            expected_tree.clone(),
+            "the stored file tree diverged from a clean walk after {:?}",
+            batch
+        );
+
         // (4) The vault changed only by the operation itself.
         prop_assert_eq!(
             common::digest_tree(&self.root),
@@ -319,6 +375,7 @@ impl Oracle {
             self.complete_resolutions += 1;
         }
         self.expected = expected;
+        self.expected_tree = expected_tree;
         self.generation = report.generation.get();
         Ok(())
     }

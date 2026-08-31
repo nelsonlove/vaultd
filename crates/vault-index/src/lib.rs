@@ -39,7 +39,7 @@ pub use reconcile::{IndexService, RefreshReport};
 pub use schema::{SEMANTIC_FORMAT_VERSION, SQL_SCHEMA_VERSION};
 pub use store::{
     DeltaPublication, DeltaPublishOutcome, DeltaPublishTimings, DeltaWriteCounts, IndexStore,
-    NoteReplacement, ResolutionReplacement,
+    NoteReplacement, ResolutionReplacement, StoredTreeEntry, TreeDelta,
 };
 #[doc(hidden)]
 pub use test_hook::{HookPoint, TestHook};

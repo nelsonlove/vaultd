@@ -9,11 +9,13 @@ use vault_core::{
 
 mod delta;
 mod hydrate;
+pub(crate) mod tree;
 
 pub use delta::{
     DeltaPublication, DeltaPublishOutcome, DeltaPublishTimings, DeltaWriteCounts, NoteReplacement,
     ResolutionReplacement,
 };
+pub use tree::{StoredTreeEntry, TreeDelta};
 
 use crate::codec;
 use crate::config::IndexConfig;
@@ -98,6 +100,9 @@ pub(crate) struct Publication<'a> {
     pub fingerprint_updates: &'a [(VaultPath, FileFingerprint)],
     pub graph: &'a SemanticGraph,
     pub scan_diagnostics: &'a [Diagnostic],
+    /// What the same walk observed about the file tree. Empty when the tree
+    /// did not move, and always empty for a source that observes no tree.
+    pub tree: &'a TreeDelta,
 }
 
 pub(crate) fn usize_to_i64(value: usize, field: &str) -> Result<i64, IndexError> {
@@ -607,6 +612,7 @@ impl IndexStore {
             fingerprint_updates,
             graph,
             scan_diagnostics,
+            tree,
         } = publication;
         let transaction = self.connection.transaction()?;
         let current: Option<i64> = transaction.query_row(
@@ -631,6 +637,7 @@ impl IndexStore {
         }
         let write_start = Instant::now();
         let graph_write = Self::replace_graph_rows(&transaction, graph, scan_diagnostics)?;
+        tree::apply(&transaction, tree)?;
         let sqlite_write = write_start.elapsed();
 
         let next = Generation::new(expected.map_or(0, Generation::get) + 1);
@@ -717,6 +724,23 @@ impl IndexStore {
         )))
     }
 
+    /// Every stored tree row, keyed by path, for diffing against a whole-vault
+    /// walk.
+    pub(crate) fn stored_tree_map(
+        &self,
+    ) -> Result<std::collections::BTreeMap<VaultPath, StoredTreeEntry>, IndexError> {
+        tree::load_map(&self.connection)
+    }
+
+    /// One path's stored tree row, for the targeted path that never
+    /// enumerates anything.
+    pub(crate) fn stored_tree_entry(
+        &self,
+        path: &VaultPath,
+    ) -> Result<Option<StoredTreeEntry>, IndexError> {
+        tree::load_one(&self.connection, path)
+    }
+
     pub(crate) fn stored_revision(&self, path: &VaultPath) -> Result<Option<String>, IndexError> {
         Ok(self
             .connection
@@ -728,16 +752,23 @@ impl IndexStore {
             .optional()?)
     }
 
-    /// Operational update after an unchanged refresh: refresh fingerprints and
-    /// the refresh timestamp without touching the semantic generation.
+    /// Operational update after an unchanged refresh: refresh fingerprints,
+    /// the projected tree rows of the notes those fingerprints belong to, and
+    /// the refresh timestamp — without touching the semantic generation.
+    ///
+    /// `tree` here only ever carries note rows whose metadata moved while
+    /// their content did not (`TreeDelta::is_generational` decides), which is
+    /// the same non-event `notes.observed_*` already absorbs silently.
     pub(crate) fn touch(
         &mut self,
         fingerprint_updates: &[(VaultPath, FileFingerprint)],
+        tree: &TreeDelta,
     ) -> Result<(), IndexError> {
         let transaction = self.connection.transaction()?;
         for (path, fingerprint) in fingerprint_updates {
             update_fingerprint(&transaction, path, *fingerprint)?;
         }
+        tree::apply(&transaction, tree)?;
         transaction.execute(
             "UPDATE index_metadata SET refreshed_at_unix_ms = ?1, last_refresh_error = NULL \
              WHERE singleton = 1",

@@ -1,7 +1,7 @@
 use vault_core::{
     DependencyKey, DependencyKind, Diagnostic, DiagnosticCode, ListItemParent, PropertyValue,
     Reference, ReferenceKind, ReferenceOrigin, Resolution, SectionKind, Severity, SourceSpan,
-    Spanned, Subpath, VaultPath,
+    Spanned, Subpath, TreeEntryKind, VaultPath,
 };
 
 use crate::error::IndexError;
@@ -435,6 +435,25 @@ pub(crate) fn decode_dependency_key(
         decode_dependency_kind(kind)?,
         comparison_key.to_string(),
     ))
+}
+
+/// A tree entry's `kind` column. Total in both directions: the three
+/// spellings are the ones the schema's own `CHECK` constraint admits, so an
+/// unknown string can only come from a foreign writer and is an incompatible
+/// index rather than a value to guess at.
+pub(crate) fn encode_tree_entry_kind(kind: TreeEntryKind) -> &'static str {
+    kind.as_str()
+}
+
+pub(crate) fn decode_tree_entry_kind(value: &str) -> Result<TreeEntryKind, IndexError> {
+    match value {
+        "folder" => Ok(TreeEntryKind::Folder),
+        "note" => Ok(TreeEntryKind::Note),
+        "file" => Ok(TreeEntryKind::File),
+        other => Err(IndexError::IncompatibleIndex(format!(
+            "unknown tree entry kind {other:?}"
+        ))),
+    }
 }
 
 /// A section kind's wire string. The known variants spell Obsidian's own

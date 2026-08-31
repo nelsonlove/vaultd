@@ -84,7 +84,12 @@ pub enum ResyncReasonDto {
     RootInvalidated,
 }
 
-/// One committed generation's semantic change, addressed to a subscription.
+/// One committed generation's change, addressed to a subscription.
+///
+/// `changes` spans both axes the cache indexes: a note whose semantic rows
+/// moved, and a file or folder whose file-tree row moved. A path here is
+/// therefore not necessarily a note, while `affected_note_count` counts notes
+/// alone.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenerationCommittedEventDto {
     pub previous_generation: Option<u64>,

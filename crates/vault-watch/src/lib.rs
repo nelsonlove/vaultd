@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub use debounce::Debouncer;
-pub use filter::normalize_included_markdown;
+pub use filter::{normalize_included_markdown, normalize_included_path};
 
 /// A single, normalized signal about vault content that may have changed.
 ///
@@ -166,13 +166,22 @@ impl WatchStream {
             return;
         }
 
+        // Every included path is hinted, whatever its kind: the cache indexes
+        // a file tree as well as note content, and an attachment or a folder
+        // that no hint names is a tree row that only a complete reconciliation
+        // can repair. `any_included` stays Markdown-only on purpose — it is
+        // what decides the structural fallback below, and a folder event that
+        // now normalizes to a path must not be mistaken for "the change is
+        // fully named".
         let mut any_included = false;
         for path in &event.paths {
             if let Ok(Some(vault_path)) =
-                filter::normalize_included_markdown(&self.canonical_root, path)
+                filter::normalize_included_path(&self.canonical_root, path)
             {
+                if vault_path.is_markdown() {
+                    any_included = true;
+                }
                 self.debouncer.observe_path(vault_path, now);
-                any_included = true;
             }
         }
 

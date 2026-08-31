@@ -276,6 +276,10 @@ impl FixtureService {
                 fingerprint_updates: &[],
                 resolutions: &resolutions,
                 scan_diagnostics: None,
+                // This fixture publishes one note's rows out of band; it
+                // observes no filesystem, so it has nothing to say about the
+                // tree and leaves those rows exactly as they are.
+                tree: &vault_index::TreeDelta::default(),
             })
             .expect("publish delta");
         drop(store);

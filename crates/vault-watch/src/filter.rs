@@ -1,9 +1,17 @@
 //! Pure, filesystem-free path normalization and inclusion filtering.
 //!
 //! Mirrors `vault_core::FileSystemVaultSource`'s inclusion rules (skip
-//! `.obsidian` and other hidden directories, only `.md` files) but works
-//! lexically on event paths that may no longer exist on disk (the file may
-//! already have been deleted by the time the hint is processed).
+//! `.obsidian` and other hidden directories) but works lexically on event
+//! paths that may no longer exist on disk (the file may already have been
+//! deleted by the time the hint is processed).
+//!
+//! Two views of one rule, exactly as the scan has two views of one walk:
+//! [`normalize_included_path`] admits every included entry — folders,
+//! attachments, notes — because the file tree indexes all of them, and
+//! [`normalize_included_markdown`] is that same answer filtered to `.md`,
+//! because the semantic index indexes only those. The hidden-directory,
+//! outside-the-root, and `..` rules are shared by construction: the Markdown
+//! view is a filter over the general one, not a second copy of it.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -17,6 +25,25 @@ use crate::WatchError;
 /// Operates purely on the two paths given — no filesystem access, no
 /// `canonicalize`, so it works for paths that have already been deleted.
 pub fn normalize_included_markdown(
+    canonical_root: &Path,
+    event_path: &Path,
+) -> Result<Option<VaultPath>, WatchError> {
+    match normalize_included_path(canonical_root, event_path)? {
+        Some(vault_path) if vault_path.is_markdown() => Ok(Some(vault_path)),
+        _ => Ok(None),
+    }
+}
+
+/// Normalize a raw watcher event path into an included [`VaultPath`] of any
+/// kind — a folder, an attachment, or a note — or `Ok(None)` if the path is
+/// outside the vault or under a hidden directory.
+///
+/// The tree counterpart of [`normalize_included_markdown`]: same root, hidden,
+/// and `..` rules, no extension filter. A directory and a file are
+/// indistinguishable here by design — the path may already be gone from disk,
+/// so nothing may be asked of the filesystem — and the consumer that stats it
+/// is what learns which it was.
+pub fn normalize_included_path(
     canonical_root: &Path,
     event_path: &Path,
 ) -> Result<Option<VaultPath>, WatchError> {
@@ -46,16 +73,6 @@ pub fn normalize_included_markdown(
             return Ok(None);
         }
         parts.push(text.to_string());
-    }
-
-    let Some(file_name) = parts.last() else {
-        return Ok(None);
-    };
-    let has_md_extension = Path::new(file_name)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
-    if !has_md_extension {
-        return Ok(None);
     }
 
     match VaultPath::new(parts.join("/")) {

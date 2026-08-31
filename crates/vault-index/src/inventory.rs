@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use vault_core::{
-    Diagnostic, DiagnosticCode, FileSystemVaultSource, ScanError, Severity, VaultPath,
+    Diagnostic, DiagnosticCode, FileSystemVaultSource, ScanError, Severity, TreeEntry, VaultPath,
     VaultSource as _,
 };
 
@@ -37,6 +37,33 @@ pub trait ReconcileSource: Send {
     /// implement it would answer "absent" for every path, and the incremental
     /// engine would delete the whole vault from the cache.
     fn fingerprint(&self, path: &VaultPath) -> Result<Option<FileFingerprint>, IndexError>;
+
+    /// Whether this source observes the vault's file tree at all.
+    ///
+    /// Defaults to `false`, and every tree write is gated on it, so a source
+    /// that models only note content (the test doubles) leaves `tree_entries`
+    /// exactly as it found it rather than reporting an empty vault and having
+    /// the tree deleted underneath it.
+    fn observes_tree(&self) -> bool {
+        false
+    }
+
+    /// One walk producing both products: the note inventory and the file tree
+    /// the same walk saw. The default runs the inventory alone and reports no
+    /// tree, which is what `observes_tree` already says about such a source.
+    ///
+    /// A single method rather than two because they are one walk: taking the
+    /// tree separately would double a cold build's directory traversal.
+    fn inventory_and_tree(&self) -> Result<(InventorySnapshot, Vec<TreeEntry>), IndexError> {
+        Ok((self.inventory()?, Vec::new()))
+    }
+
+    /// One path's tree entry as it stands right now, without enumerating
+    /// anything. `Ok(None)` means absent or excluded; a source that observes
+    /// no tree always answers `None` and is never asked.
+    fn tree_entry(&self, _path: &VaultPath) -> Result<Option<TreeEntry>, IndexError> {
+        Ok(None)
+    }
 }
 
 pub struct FileSystemIndexSource {
@@ -62,16 +89,76 @@ impl ReconcileSource for FileSystemIndexSource {
 
     /// List Markdown paths through the core source (so the hidden-directory
     /// and symlink policy stays single-sourced) and record only lightweight
-    /// path/size/mtime fingerprints. Never reads a note body.
+    /// path/size/mtime fingerprints. Never reads a note body, and never
+    /// collects tree metadata — see `inventory_and_tree` for the walk that
+    /// does both.
     fn inventory(&self) -> Result<InventorySnapshot, IndexError> {
         let listing = self.source.markdown_paths().map_err(|error| match error {
             ScanError::InaccessibleRoot { message } => IndexError::InvalidVaultRoot(message),
             other => IndexError::Storage(other.to_string()),
         })?;
+        self.fingerprint_listing(listing.paths, listing.diagnostics)
+    }
 
+    fn observes_tree(&self) -> bool {
+        true
+    }
+
+    fn inventory_and_tree(&self) -> Result<(InventorySnapshot, Vec<TreeEntry>), IndexError> {
+        let scan = self.source.scan().map_err(|error| match error {
+            ScanError::InaccessibleRoot { message } => IndexError::InvalidVaultRoot(message),
+            other => IndexError::Storage(other.to_string()),
+        })?;
+        let snapshot = self.fingerprint_listing(scan.paths, scan.diagnostics)?;
+        Ok((snapshot, scan.entries))
+    }
+
+    fn tree_entry(&self, path: &VaultPath) -> Result<Option<TreeEntry>, IndexError> {
+        self.source.tree_entry(path).map_err(|error| match error {
+            ScanError::InaccessibleRoot { message } => IndexError::InvalidVaultRoot(message),
+            ScanError::UnreadableFile { path, message } => IndexError::Storage(format!(
+                "cannot read metadata for {}: {message}",
+                path.as_str()
+            )),
+        })
+    }
+
+    fn read_bytes(&self, path: &VaultPath) -> Result<Vec<u8>, ScanError> {
+        self.source.read_bytes(path)
+    }
+
+    fn fingerprint(&self, path: &VaultPath) -> Result<Option<FileFingerprint>, IndexError> {
+        match std::fs::metadata(self.source.root().join(path.as_str())) {
+            Ok(metadata) => {
+                let modified = filetime::FileTime::from_last_modification_time(&metadata);
+                Ok(Some(FileFingerprint {
+                    size: metadata.len(),
+                    modified_seconds: modified.unix_seconds(),
+                    modified_nanos: modified.nanoseconds(),
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(IndexError::Storage(format!(
+                "cannot read metadata for {}: {error}",
+                path.as_str()
+            ))),
+        }
+    }
+}
+
+impl FileSystemIndexSource {
+    /// Fingerprint exactly the Markdown paths a walk reported. Its own
+    /// `metadata` call per note, deliberately separate from the tree's: the
+    /// fingerprint is the semantic pipeline's change detector and keeps the
+    /// exact shape and failure diagnostics it always had.
+    fn fingerprint_listing(
+        &self,
+        paths: Vec<VaultPath>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Result<InventorySnapshot, IndexError> {
         let mut entries = BTreeMap::new();
-        let mut diagnostics = listing.diagnostics;
-        for path in listing.paths {
+        let mut diagnostics = diagnostics;
+        for path in paths {
             match std::fs::metadata(self.source.root().join(path.as_str())) {
                 Ok(metadata) => {
                     let modified = filetime::FileTime::from_last_modification_time(&metadata);
@@ -101,28 +188,6 @@ impl ReconcileSource for FileSystemIndexSource {
             entries,
             diagnostics,
         })
-    }
-
-    fn read_bytes(&self, path: &VaultPath) -> Result<Vec<u8>, ScanError> {
-        self.source.read_bytes(path)
-    }
-
-    fn fingerprint(&self, path: &VaultPath) -> Result<Option<FileFingerprint>, IndexError> {
-        match std::fs::metadata(self.source.root().join(path.as_str())) {
-            Ok(metadata) => {
-                let modified = filetime::FileTime::from_last_modification_time(&metadata);
-                Ok(Some(FileFingerprint {
-                    size: metadata.len(),
-                    modified_seconds: modified.unix_seconds(),
-                    modified_nanos: modified.nanoseconds(),
-                }))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(IndexError::Storage(format!(
-                "cannot read metadata for {}: {error}",
-                path.as_str()
-            ))),
-        }
     }
 }
 

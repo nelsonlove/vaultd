@@ -188,6 +188,22 @@ CREATE TABLE list_items (
     CHECK ((list_start_line IS NULL) <> (parent_start_line IS NULL))
 );
 
+-- tree_entries: the vault file tree — every non-hidden folder, note, and
+-- other file the scan sees. Not keyed to `notes`: a folder and an attachment
+-- have no note row, and a note's tree row is a projection of the same
+-- observation `notes.observed_*` records. `content_revision` is reserved for
+-- a non-note file whose bytes a future consumer hashes; nothing computes one
+-- today, so it is written NULL for every kind (a note's revision lives on
+-- `notes`, a folder has none).
+CREATE TABLE tree_entries (
+    path             TEXT PRIMARY KEY,
+    kind             TEXT    NOT NULL CHECK (kind IN ('note','file','folder')),
+    size             INTEGER,              -- NULL for folders
+    ctime_unix_ms    INTEGER NOT NULL,     -- birthtime; mtime fallback where unavailable
+    mtime_unix_ms    INTEGER NOT NULL,
+    content_revision TEXT                  -- NULL for folders and notes (notes carry theirs on `notes`)
+);
+
 CREATE INDEX headings_lookup ON headings(note_path, comparison_key);
 CREATE INDEX blocks_lookup ON blocks(note_path, identifier);
 CREATE INDEX tags_lookup ON tags(comparison_key, note_path, ordinal);

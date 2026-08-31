@@ -17,7 +17,9 @@ use crate::model::{
     FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
 };
 use crate::reader::{IndexReader, PauseHook, write_published};
-use crate::store::{BeginOutcome, DeltaPublication, DeltaPublishOutcome, IndexStore, Publication};
+use crate::store::{
+    BeginOutcome, DeltaPublication, DeltaPublishOutcome, IndexStore, Publication, TreeDelta, tree,
+};
 
 pub(crate) const MAX_RECONCILE_RETRIES: usize = 3;
 
@@ -323,10 +325,17 @@ impl IndexService {
     ) -> Result<TryOutcome, IndexError> {
         let previous = self.current_generation()?;
         let inventory_start = Instant::now();
-        let first = self.source.inventory()?;
+        // One walk, both products: the note inventory and the file tree the
+        // same walk saw.
+        let (first, observed_tree) = self.source.inventory_and_tree()?;
         metrics.stages.inventory += inventory_start.elapsed();
         metrics.work.complete_inventories += 1;
         let stored = self.store.stored_fingerprints()?;
+        let tree_delta = if self.source.observes_tree() {
+            tree::diff_scan(&self.store.stored_tree_map()?, &observed_tree)
+        } else {
+            TreeDelta::default()
+        };
 
         let mut unchanged_paths = Vec::new();
         let mut to_read: Vec<VaultPath> = Vec::new();
@@ -440,6 +449,12 @@ impl IndexService {
         if !semantic_change && diagnostics != self.store.load_scan_diagnostics()? {
             semantic_change = true;
         }
+        // A file appearing, disappearing, or restating itself is a change a
+        // tree client can only learn from a new generation, even when no note
+        // moved at all.
+        if tree_delta.is_generational() {
+            semantic_change = true;
+        }
 
         let Some(previous_generation) = previous else {
             return self.publish_snapshot(
@@ -449,6 +464,7 @@ impl IndexService {
                 removed,
                 fingerprint_updates,
                 diagnostics,
+                tree_delta,
                 RefreshCounts {
                     added,
                     changed,
@@ -462,7 +478,10 @@ impl IndexService {
         };
 
         if !semantic_change {
-            self.store.touch(&fingerprint_updates)?;
+            // The tree delta here can only be the non-generational kind — a
+            // note's or a folder's own metadata — which rides the same
+            // non-publishing refresh the note fingerprints do.
+            self.store.touch(&fingerprint_updates, &tree_delta)?;
             self.republish_current(previous_generation)?;
             return Ok(TryOutcome::Done(RefreshReport {
                 previous_generation: Some(previous_generation),
@@ -483,6 +502,7 @@ impl IndexService {
             removed,
             fingerprint_updates,
             diagnostics,
+            tree_delta,
             RefreshCounts {
                 added,
                 changed,
@@ -504,6 +524,7 @@ impl IndexService {
         removed: Vec<VaultPath>,
         fingerprint_updates: Vec<(VaultPath, FileFingerprint)>,
         scan_diagnostics: Vec<Diagnostic>,
+        tree_delta: TreeDelta,
         counts: RefreshCounts,
         metrics: &mut ReconcileMetrics,
     ) -> Result<TryOutcome, IndexError> {
@@ -561,6 +582,7 @@ impl IndexService {
             fingerprint_updates: &fingerprint_updates,
             graph: &report.graph,
             scan_diagnostics: &scan_diagnostics,
+            tree: &tree_delta,
         })? {
             BeginOutcome::Prepared(pending) => pending,
             BeginOutcome::GenerationChanged => return Ok(TryOutcome::Retry),

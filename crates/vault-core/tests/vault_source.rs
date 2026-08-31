@@ -1,7 +1,7 @@
 use std::fs;
 
 use tempfile::TempDir;
-use vault_core::{FileSystemVaultSource, VaultSource, read_documents};
+use vault_core::{FileSystemVaultSource, TreeEntryKind, VaultPath, VaultSource, read_documents};
 
 #[test]
 fn lists_markdown_in_vault_path_order_and_excludes_internal_directories() {
@@ -21,6 +21,75 @@ fn lists_markdown_in_vault_path_order_and_excludes_internal_directories() {
 
     assert_eq!(paths, ["A.md", "Zed/B.md"]);
     assert!(listing.diagnostics.is_empty());
+}
+
+#[test]
+fn the_markdown_listing_is_a_filtered_view_of_the_same_walk() {
+    let root = TempDir::new().expect("temp vault");
+    fs::create_dir_all(root.path().join("Zed")).expect("create Zed");
+    fs::create_dir_all(root.path().join("Empty")).expect("create empty folder");
+    fs::create_dir_all(root.path().join(".obsidian")).expect("create internal dir");
+    fs::write(root.path().join("Zed/B.md"), "B").expect("write B");
+    fs::write(root.path().join("A.md"), "A").expect("write A");
+    fs::write(root.path().join("ignored.txt"), "text").expect("write text");
+    fs::write(root.path().join(".obsidian/config.md"), "config").expect("write config");
+
+    let source = FileSystemVaultSource::new(root.path()).expect("valid vault root");
+    let scan = source.scan().expect("scan vault");
+    let listing = source.markdown_paths().expect("list vault");
+
+    // The Markdown half is identical either way — that is what makes the tree
+    // an addition rather than a change to the semantic pipeline.
+    assert_eq!(scan.paths, listing.paths);
+    assert_eq!(scan.diagnostics, listing.diagnostics);
+
+    let entries = scan
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        [
+            ("A.md", TreeEntryKind::Note),
+            ("Empty", TreeEntryKind::Folder),
+            ("Zed", TreeEntryKind::Folder),
+            ("Zed/B.md", TreeEntryKind::Note),
+            ("ignored.txt", TreeEntryKind::File),
+        ]
+    );
+}
+
+#[test]
+fn one_paths_tree_entry_matches_what_the_walk_reported() {
+    let root = TempDir::new().expect("temp vault");
+    fs::create_dir_all(root.path().join(".obsidian")).expect("create internal dir");
+    fs::write(root.path().join(".obsidian/config.md"), "config").expect("write config");
+    fs::write(root.path().join("A.md"), "A").expect("write A");
+
+    let source = FileSystemVaultSource::new(root.path()).expect("valid vault root");
+    let scan = source.scan().expect("scan vault");
+
+    for entry in &scan.entries {
+        assert_eq!(
+            source.tree_entry(&entry.path).expect("stat one path"),
+            Some(entry.clone()),
+            "the per-path stat and the walk must agree about {}",
+            entry.path.as_str()
+        );
+    }
+
+    for hidden in [".obsidian", ".obsidian/config.md"] {
+        let path = VaultPath::new(hidden).expect("valid vault path");
+        assert_eq!(
+            source.tree_entry(&path).expect("stat hidden path"),
+            None,
+            "hidden territory is excluded by the index's own rule, not only the watcher's"
+        );
+    }
+
+    let absent = VaultPath::new("Gone.md").expect("valid vault path");
+    assert_eq!(source.tree_entry(&absent).expect("stat absent path"), None);
 }
 
 #[test]

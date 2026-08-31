@@ -21,6 +21,43 @@ impl VaultPath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether the vault scan excludes this path for being hidden: any
+    /// component *but the last* starting with a dot.
+    ///
+    /// The last component is deliberately not tested here, because the answer
+    /// depends on what it is: a hidden *directory* is excluded, a hidden
+    /// *file* (`.hidden-note.md`) is not, and nothing lexical can tell them
+    /// apart. A caller that has stat-ed the path applies the directory half
+    /// itself.
+    pub fn is_hidden(&self) -> bool {
+        let mut components = self.0.split('/').peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                return false;
+            }
+            if component.starts_with('.') {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The last component of this path — its file or folder name.
+    pub fn name(&self) -> &str {
+        self.0.rsplit('/').next().unwrap_or(&self.0)
+    }
+
+    /// Whether this path names a Markdown note.
+    ///
+    /// The single spelling of the `.md` test the vault scan, the watcher
+    /// filter, and the file-tree kind classification all share, so none of
+    /// them can drift from the others.
+    pub fn is_markdown(&self) -> bool {
+        std::path::Path::new(self.name())
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

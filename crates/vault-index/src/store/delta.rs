@@ -15,7 +15,7 @@ use crate::codec;
 use crate::error::IndexError;
 use crate::model::{FileFingerprint, Generation};
 use crate::schema;
-use crate::store::IndexStore;
+use crate::store::{IndexStore, TreeDelta};
 
 /// One note whose parsed content replaces its previous stored row (and, via
 /// `ON DELETE CASCADE`, its previous source-local reference rows — the
@@ -60,6 +60,11 @@ pub struct DeltaPublication<'a> {
     /// commits with the read-only comparison as its only statement against
     /// the table.
     pub scan_diagnostics: Option<&'a [Diagnostic]>,
+    /// Exactly the file-tree rows this cycle observed moving. Empty for a
+    /// cycle that changed no tree row, and for any source that observes no
+    /// tree at all; every statement it produces is scoped by an explicit
+    /// `path` or that path's own subtree range, never table-wide.
+    pub tree: &'a TreeDelta,
 }
 
 /// Structural work one delta publication did, in the same shape as
@@ -125,6 +130,7 @@ impl IndexStore {
             fingerprint_updates,
             resolutions,
             scan_diagnostics,
+            tree,
         } = publication;
 
         let transaction = self.connection.transaction()?;
@@ -299,6 +305,8 @@ impl IndexStore {
             }
         }
 
+        super::tree::apply(&transaction, tree)?;
+
         let next = Generation::new(expected.get() + 1);
         transaction.execute(
             "UPDATE index_metadata SET generation = ?1, refreshed_at_unix_ms = ?2, \
@@ -335,7 +343,9 @@ mod tests {
         resolution_diagnostic,
     };
 
-    use super::{DeltaPublication, DeltaPublishOutcome, NoteReplacement, ResolutionReplacement};
+    use super::{
+        DeltaPublication, DeltaPublishOutcome, NoteReplacement, ResolutionReplacement, TreeDelta,
+    };
     use crate::config::IndexConfig;
     use crate::model::FileFingerprint;
     use crate::reconcile::IndexService;
@@ -430,6 +440,7 @@ mod tests {
                 fingerprint_updates: &[],
                 resolutions: &resolutions,
                 scan_diagnostics: None,
+                tree: &TreeDelta::default(),
             })
             .expect("publish delta");
         service.store.connection.trace(None);
@@ -521,6 +532,7 @@ mod tests {
                 fingerprint_updates: &[],
                 resolutions: &[],
                 scan_diagnostics: Some(&diagnostics),
+                tree: &TreeDelta::default(),
             })
             .expect("first scan-diagnostics publish");
         let second_expected = match first_outcome {
@@ -543,6 +555,7 @@ mod tests {
                 fingerprint_updates: &[],
                 resolutions: &[],
                 scan_diagnostics: Some(&diagnostics),
+                tree: &TreeDelta::default(),
             })
             .expect("second, identical scan-diagnostics publish");
         service.store.connection.trace(None);

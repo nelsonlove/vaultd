@@ -13,7 +13,9 @@ use crate::error::IndexError;
 use crate::model::{Generation, IndexState};
 use crate::reader::IndexReader;
 use crate::reconcile::IndexService;
-use crate::store::{load_note_with, load_outgoing_with, resolved_reference_from_row_with};
+use crate::store::{
+    StoredTreeEntry, load_note_with, load_outgoing_with, resolved_reference_from_row_with, tree,
+};
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 1_000;
@@ -68,6 +70,18 @@ fn effective_limit(limit: Option<u32>) -> Result<u32, IndexError> {
 }
 
 impl IndexReader {
+    /// The whole file tree, in path order, pinned to one published
+    /// generation — the accessor a snapshot session reads its tree from.
+    ///
+    /// Unpaginated on purpose: a tree is read as one consistent whole (a
+    /// half-tree is not a tree), and every row is a path plus five scalars.
+    /// A vault large enough for that to hurt is the same vault that would
+    /// need a paginated variant, which can be added beside this without
+    /// changing what it means.
+    pub fn tree_entries(&self) -> Result<(Generation, Vec<StoredTreeEntry>), IndexError> {
+        self.read(|transaction, generation| Ok((generation, tree::load_all(transaction)?)))
+    }
+
     pub fn vault_info(&self) -> Result<VaultInfo, IndexError> {
         let config = self.config();
         self.read(|transaction, generation| {
@@ -445,6 +459,11 @@ fn reference_page_in(
 impl IndexService {
     pub fn vault_info(&self) -> Result<VaultInfo, IndexError> {
         self.reader_handle().vault_info()
+    }
+
+    /// The vault's file tree at the published generation.
+    pub fn tree_entries(&self) -> Result<(Generation, Vec<StoredTreeEntry>), IndexError> {
+        self.reader_handle().tree_entries()
     }
 
     pub fn list_notes(

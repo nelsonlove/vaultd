@@ -12,3 +12,12 @@
 # appearing where an existing reference was waiting for it. Keeping it means
 # every run re-checks that case before generating anything novel.
 cc 58ec420fb18125371dd229fcc711f082ffb9d8dc7d841c2053008b4143775c62 # shrinks to batches = [[Write { path: "Gamma.md", body: "# Heading\n\ntext ^block\n" }]]
+#
+# The two seeds below were drawn when the file tree joined the cache: each
+# creates a note in a folder that did not exist and deletes the note again in
+# the same batch, so the semantic snapshot is unmoved while the vault has
+# genuinely gained an empty folder. They pin the rule that a tree-only change
+# is still a generation, and that the oracle's own notion of "client-visible
+# state" spans both axes.
+cc 38ba089826bdf6a2499d57f53ed9448a2afd1522acd93ad9ec175fd8f0a00858 # shrinks to batches = [[Write { path: "Nested/Deep/Gamma.md", body: "# Heading\n\ntext ^block\n" }, Delete { path: "Nested/Deep/Gamma.md" }]]
+cc 378c70f5b8c7a060f28b0a47dcc168e87d91af380a6a84b503b1fa151cd14521 # shrinks to batches = [[Write { path: "Other/Alpha.md", body: "# Heading\n\ntext ^block\n" }, Delete { path: "Other/Alpha.md" }]]

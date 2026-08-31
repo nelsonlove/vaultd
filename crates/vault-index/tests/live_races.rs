@@ -529,6 +529,9 @@ fn publish_out_of_band(config: &IndexConfig, root: &Path, name: &str, expected: 
             fingerprint_updates: &[],
             resolutions: &resolutions,
             scan_diagnostics: None,
+            // A foreign writer publishing one note's rows: it took no walk,
+            // so it says nothing about the tree and leaves those rows alone.
+            tree: &vault_index::TreeDelta::default(),
         })
         .expect("out-of-band delta");
     match outcome {

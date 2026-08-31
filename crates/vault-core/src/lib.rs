@@ -30,5 +30,6 @@ pub use semantic::{
 };
 pub use source::{SourceDocument, SourceError, Spanned};
 pub use vault_source::{
-    FileSystemVaultSource, ScanError, VaultDocuments, VaultListing, VaultSource, read_documents,
+    FileSystemVaultSource, ScanError, TreeEntry, TreeEntryKind, VaultDocuments, VaultListing,
+    VaultScan, VaultSource, read_documents,
 };

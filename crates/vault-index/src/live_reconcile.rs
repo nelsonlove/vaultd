@@ -32,7 +32,9 @@ use crate::live_graph::{HydratedNote, HydratedReference, LiveGraph, ReferenceKey
 use crate::metrics::ReconcileMetrics;
 use crate::model::{FileFingerprint, Generation};
 use crate::reconcile::{IndexService, MAX_RECONCILE_RETRIES};
-use crate::store::{DeltaPublication, DeltaPublishOutcome, NoteReplacement, ResolutionReplacement};
+use crate::store::{
+    DeltaPublication, DeltaPublishOutcome, NoteReplacement, ResolutionReplacement, TreeDelta, tree,
+};
 
 /// Why a reconciliation cycle ran. Observational: nothing in this module
 /// branches on it, and it is reported back so a runtime can attribute work.
@@ -45,10 +47,17 @@ pub enum ChangeCause {
     Verified,
 }
 
-/// The *semantic* change one cycle published, by path. A path only appears
-/// here when the cache's own view of it moved: a metadata-only touch (same
-/// content revision) leaves every vector empty, because nothing a client can
-/// observe changed. Every vector is sorted and deduplicated.
+/// The change one cycle published, by path. A path only appears here when the
+/// cache's own view of it moved: a metadata-only touch (same content
+/// revision) leaves every vector empty, because nothing a client can observe
+/// changed. Every vector is sorted and deduplicated.
+///
+/// Both axes the cache indexes are reported here, in one set: a note whose
+/// semantic rows moved, and a file or folder whose `tree_entries` row moved.
+/// A path that is not a note therefore can appear — a client that only cares
+/// about notes filters by extension, exactly as it must already do for the
+/// vault itself — because a tree change has no other event to ride, and
+/// phase 5's snapshot sessions pin the tree at a generation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PathChanges {
     pub created: Vec<VaultPath>,
@@ -117,6 +126,9 @@ enum ScanDiagnostics {
 struct DirtyBatch {
     states: BTreeMap<VaultPath, PathState>,
     scan_diagnostics: ScanDiagnostics,
+    /// What the same observation said about the file tree. Read once, with
+    /// the bodies, so a re-planned attempt re-stats nothing.
+    tree: TreeDelta,
 }
 
 /// The shape both `LiveRefreshReport` and the compatibility `RefreshReport`
@@ -334,6 +346,19 @@ impl IndexService {
         let mut states = BTreeMap::new();
         let mut diagnostics = Vec::new();
         for path in paths {
+            // The semantic index is Markdown-only; the file tree is not. A
+            // widened watcher hint names attachments and folders too, and
+            // reading one of those as a note would either index a `.txt` as a
+            // note or manufacture an `InvalidUtf8` diagnostic for a `.png`.
+            //
+            // Hidden territory is refused here as well, not only in the
+            // watcher's filter: a caller naming `.trash/Gone.md` directly must
+            // not be able to put a note in the cache that the scan does not
+            // list — the next complete reconciliation would delete it again,
+            // and the two routes would disagree in the meantime.
+            if !path.is_markdown() || path.is_hidden() {
+                continue;
+            }
             let state = self.read_stable_path(path, None, metrics)?;
             if let PathState::Unusable { diagnostic, .. } = &state {
                 diagnostics.push(diagnostic.clone());
@@ -344,6 +369,7 @@ impl IndexService {
         let batch = DirtyBatch {
             states,
             scan_diagnostics: ScanDiagnostics::Patch(diagnostics),
+            tree: self.observe_tree_paths(paths)?,
         };
         self.reconcile_batch(&batch, metrics)
     }
@@ -362,10 +388,16 @@ impl IndexService {
         self.republish_current(expected)?;
 
         let inventory_start = Instant::now();
-        let inventory = self.source.inventory()?;
+        // One walk, both products, exactly as the complete path takes them.
+        let (inventory, observed_tree) = self.source.inventory_and_tree()?;
         metrics.stages.inventory += inventory_start.elapsed();
         metrics.work.complete_inventories += 1;
         let stored = self.store.stored_fingerprints()?;
+        let tree = if self.source.observes_tree() {
+            tree::diff_scan(&self.store.stored_tree_map()?, &observed_tree)
+        } else {
+            TreeDelta::default()
+        };
 
         // The `bool` is what the inventory just claimed about the path.
         // `read_stable_path` requires the point fingerprint to agree, which is
@@ -401,10 +433,48 @@ impl IndexService {
         let batch = DirtyBatch {
             states,
             scan_diagnostics: ScanDiagnostics::Complete(diagnostics),
+            tree,
         };
         let mut outcome = self.reconcile_batch(&batch, metrics)?;
         outcome.unchanged += unchanged;
         Ok(outcome)
+    }
+
+    /// What the file tree says about exactly these paths, plus the folders
+    /// above them.
+    ///
+    /// The ancestors matter: creating `Sub/Note.md` moves `Sub`'s own
+    /// metadata and may create `Sub` outright, and no watcher hint names it
+    /// separately. Stat-ing them here — a handful of `stat` calls bounded by
+    /// path depth, never a walk — is what keeps this path's stored tree equal
+    /// to what a whole-vault walk would have written.
+    ///
+    /// A path whose metadata cannot be read at all is left exactly as it is
+    /// stored rather than failing the batch or guessing it away: the tree is
+    /// not a resolution input, and the next complete reconciliation repairs
+    /// it.
+    fn observe_tree_paths(&self, paths: &BTreeSet<VaultPath>) -> Result<TreeDelta, IndexError> {
+        let mut delta = TreeDelta::default();
+        if !self.source.observes_tree() {
+            return Ok(delta);
+        }
+        let mut targets: BTreeSet<VaultPath> = BTreeSet::new();
+        for path in paths {
+            if path.is_hidden() {
+                continue;
+            }
+            targets.extend(ancestor_folders(path));
+            targets.insert(path.clone());
+        }
+        for path in &targets {
+            let observed = match self.source.tree_entry(path) {
+                Ok(observed) => observed,
+                Err(_) => continue,
+            };
+            let stored = self.store.stored_tree_entry(path)?;
+            tree::diff_one(stored.as_ref(), observed, &mut delta);
+        }
+        Ok(delta)
     }
 
     /// Read one path so that what is parsed provably belongs to one coherent
@@ -561,14 +631,24 @@ impl IndexService {
             }
         }
 
+        // Counted before the tree's own paths join the change set: this is
+        // the *note* count, and a folder or an attachment is neither.
         metrics.work.changed_notes = changes.created.len() as u64 + changes.modified.len() as u64;
+        merge_tree_changes(&mut changes, &batch.tree);
 
         let stored_scan_diagnostics = self.store.load_scan_diagnostics()?;
         let scan_diagnostics = merge_scan_diagnostics(batch, &stored_scan_diagnostics);
         let scan_diagnostics_changed = scan_diagnostics != stored_scan_diagnostics;
 
-        if replaced.is_empty() && removed.is_empty() && !scan_diagnostics_changed {
-            self.store.touch(&fingerprint_updates)?;
+        if replaced.is_empty()
+            && removed.is_empty()
+            && !scan_diagnostics_changed
+            && !batch.tree.is_generational()
+        {
+            // Whatever tree rows moved here are the non-generational kind — a
+            // note's or a folder's own metadata — so they ride the same
+            // non-publishing refresh the note fingerprints do.
+            self.store.touch(&fingerprint_updates, &batch.tree)?;
             self.republish_current(expected)?;
             return Ok(Some(BatchOutcome {
                 previous_generation: expected,
@@ -718,6 +798,7 @@ impl IndexService {
                 fingerprint_updates: &fingerprint_updates,
                 resolutions: &resolutions,
                 scan_diagnostics: scan_diagnostics_changed.then_some(scan_diagnostics.as_slice()),
+                tree: &batch.tree,
             },
             &hydrated_notes,
             &removed,
@@ -886,6 +967,38 @@ impl IndexService {
         }
         Ok(())
     }
+}
+
+/// Every folder above `path`, outermost first: `a/b/c.md` yields `a`, `a/b`.
+fn ancestor_folders(path: &VaultPath) -> Vec<VaultPath> {
+    let text = path.as_str();
+    let mut folders = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = text[start..].find('/') {
+        let end = start + offset;
+        if let Ok(folder) = VaultPath::new(&text[..end]) {
+            folders.push(folder);
+        }
+        start = end + 1;
+    }
+    folders
+}
+
+/// Fold the tree's own moved paths into the published change set, keeping
+/// every vector sorted and deduplicated: a note that moved on both axes is
+/// one path, reported once.
+fn merge_tree_changes(changes: &mut PathChanges, tree: &TreeDelta) {
+    fn merge(target: &mut Vec<VaultPath>, extra: &[VaultPath]) {
+        if extra.is_empty() {
+            return;
+        }
+        target.extend(extra.iter().cloned());
+        target.sort();
+        target.dedup();
+    }
+    merge(&mut changes.created, tree.created());
+    merge(&mut changes.modified, tree.modified());
+    merge(&mut changes.deleted, tree.removed());
 }
 
 /// The scan-diagnostic set this cycle should store.
