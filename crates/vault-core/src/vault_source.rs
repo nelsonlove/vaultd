@@ -334,7 +334,7 @@ impl FileSystemVaultSource {
         if metadata.is_dir() && path.name().starts_with('.') {
             return Ok(None);
         }
-        Ok(tree_entry_from_metadata(path.clone(), &metadata))
+        Ok(Some(tree_entry_from_metadata(path.clone(), &metadata)))
     }
 }
 
@@ -345,13 +345,18 @@ fn push_tree_entry(entries: &mut Vec<TreeEntry>, path: VaultPath, absolute: &Pat
     let Ok(metadata) = std::fs::metadata(absolute) else {
         return;
     };
-    if let Some(entry) = tree_entry_from_metadata(path, &metadata) {
-        entries.push(entry);
-    }
+    entries.push(tree_entry_from_metadata(path, &metadata));
 }
 
-fn tree_entry_from_metadata(path: VaultPath, metadata: &std::fs::Metadata) -> Option<TreeEntry> {
-    let mtime_unix_ms = metadata.modified().ok().map(unix_millis)?;
+/// Total: an entry that exists always produces a row.
+///
+/// A platform that cannot represent a modification time at all — the same
+/// class of failure [`unix_millis`] saturates for rather than refuses — yields
+/// the epoch, not nothing. "No timestamp" is not "absent", and absent is
+/// exactly what a `None` here would come to mean one caller downstream, where
+/// it would take the entry *and its whole subtree* out of the tree.
+fn tree_entry_from_metadata(path: VaultPath, metadata: &std::fs::Metadata) -> TreeEntry {
+    let mtime_unix_ms = metadata.modified().ok().map_or(0, unix_millis);
     // Birthtime where the platform has one, mtime where it does not.
     let ctime_unix_ms = metadata.created().ok().map_or(mtime_unix_ms, unix_millis);
     let is_dir = metadata.is_dir();
@@ -362,13 +367,13 @@ fn tree_entry_from_metadata(path: VaultPath, metadata: &std::fs::Metadata) -> Op
     } else {
         TreeEntryKind::File
     };
-    Some(TreeEntry {
+    TreeEntry {
         path,
         kind,
         size: if is_dir { None } else { Some(metadata.len()) },
         ctime_unix_ms,
         mtime_unix_ms,
-    })
+    }
 }
 
 /// Unix milliseconds, saturating rather than failing: a timestamp outside

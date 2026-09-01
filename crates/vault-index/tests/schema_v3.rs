@@ -95,7 +95,7 @@ fn a_fresh_index_carries_the_structural_tables() {
         .expect("user_version");
     assert_eq!(user_version, 3);
 
-    for table in ["sections", "list_items"] {
+    for table in ["sections", "list_items", "tree_entries"] {
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

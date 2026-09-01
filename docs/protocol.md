@@ -184,7 +184,11 @@ The converse also holds, and matters for a client tracking continuity. Publicati
 
 ### `generation_committed`
 
-One committed generation's change, across both axes the cache indexes: a note whose semantic rows moved, and a file or folder whose file-tree row moved. A path in `changes` is therefore not necessarily a note — a client that only wants notes filters by extension, exactly as it must already do for the vault itself — while `affected_note_count` counts notes alone. `changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, or `verified`.
+One committed generation's change, across both axes the cache indexes: a note whose semantic rows moved, and a file or folder whose file-tree row moved. A path in `changes` is therefore not necessarily a note — a client that only wants notes filters by extension, exactly as it must already do for the vault itself — while `affected_note_count` counts notes alone, so a generation that only moved the file tree reports zero affected notes with its paths still spelled out.
+
+**A deleted folder implies its subtree.** A folder in `deleted` means the folder and everything that was under it is gone; the descendants are not spelled out individually, because the event that named the folder never named them. This matches Obsidian's own vault-event semantics, where deleting a folder raises one `delete` for the folder. It also means the two reconciliation routes report the same physical event at different resolutions: a watcher-driven delete names the folder alone, while a complete reconciliation — which enumerated the vault and so knows each path — names the folder and its descendants. Both are correct, and a client that applies the subtree rule gets the same state from either.
+
+`changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, or `verified`.
 
 ```json
 {"version":1,"subscription_id":"sub-1","event":{"type":"generation_committed","value":{"previous_generation":3,"generation":4,"cause":"watcher","changes":{"kind":"detailed","created":[],"modified":["Folder/Note.md"],"deleted":[]},"affected_note_count":1,"affected_reference_count":7}}}

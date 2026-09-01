@@ -89,7 +89,11 @@ pub enum ResyncReasonDto {
 /// `changes` spans both axes the cache indexes: a note whose semantic rows
 /// moved, and a file or folder whose file-tree row moved. A path here is
 /// therefore not necessarily a note, while `affected_note_count` counts notes
-/// alone.
+/// alone — a generation that moved only the file tree reports zero.
+///
+/// A folder in `changes.deleted` implies its whole subtree; see
+/// `docs/protocol.md` for the rule and for why the two reconciliation routes
+/// spell the same deletion at different resolutions.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenerationCommittedEventDto {
     pub previous_generation: Option<u64>,

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use vault_core::VaultPath;
 use vault_index::{
-    ChangeCause, Generation, IndexConfig, IndexService, LiveRefreshReport, LiveState, PathChanges,
-    PublishedStatus, ReconcileMetrics,
+    ChangeCause, Generation, IndexConfig, IndexService, LiveRefreshReport, LiveState,
+    NoteChangeCounts, PathChanges, PublishedStatus, ReconcileMetrics,
 };
 use vault_protocol::{
     ChangeSetDto, ErrorCode, EventEnvelope, GenerationCauseDto, LiveStateDto, PROTOCOL_VERSION,
@@ -43,6 +43,7 @@ fn paths(prefix: &str, count: usize) -> Vec<VaultPath> {
 }
 
 fn generation_notice(generation: u64, modified: Vec<VaultPath>) -> RuntimeNotice {
+    let note_count = modified.len() as u64;
     RuntimeNotice::Generation(Box::new(LiveRefreshReport {
         previous_generation: generation.checked_sub(1).map(Generation::new),
         generation: Generation::new(generation),
@@ -51,6 +52,14 @@ fn generation_notice(generation: u64, modified: Vec<VaultPath>) -> RuntimeNotice
             created: Vec::new(),
             modified,
             deleted: Vec::new(),
+        },
+        // Every path this helper synthesises is a note, so the note count and
+        // the change set's size agree — which is exactly the case that hid
+        // the two being different things.
+        note_changes: NoteChangeCounts {
+            created: 0,
+            modified: note_count,
+            deleted: 0,
         },
         affected_reference_count: 7,
         complete_resolution: false,
@@ -830,6 +839,70 @@ fn a_subscriber_that_never_drains_is_bounded_against_a_live_runtime() {
             );
         }
         other => panic!("expected a subscriber_lag marker last, got {other:?}"),
+    }
+
+    handle.shutdown();
+}
+
+/// A generation that moved only the file tree names its paths and reports
+/// **no affected notes**, over a real vault and a real runtime.
+///
+/// `affected_note_count` and the change set are two different questions with
+/// two different answers, and only a non-note change can tell them apart: for
+/// a note edit both are one, which is why deriving the count from the change
+/// set's size went unnoticed for as long as nothing but notes could appear in
+/// it. Here an attachment lands in a folder that did not exist, so the
+/// generation carries two paths and zero notes.
+#[test]
+fn a_tree_only_generation_reports_its_paths_and_no_affected_notes() {
+    let fixture = live_fixture();
+    let (sink, notices) = sync_channel(64);
+    let handle = Runtime::start_with_hooks(
+        fixture.config.clone(),
+        quiet_options(),
+        sink,
+        RuntimeTestHooks::default(),
+    )
+    .expect("start runtime");
+    let server = Server::for_runtime(handle.clone());
+    let mut registry = SubscriptionRegistry::new();
+
+    wait_for_settled(&handle);
+    subscribe_through_dispatcher(&server, &mut registry);
+
+    fs::create_dir_all(fixture.path("Art")).expect("create attachment folder");
+    fs::write(fixture.path("Art/Image.png"), [0x89, b'P', b'N', b'G']).expect("write attachment");
+    assert!(handle.hint(paths_hint(&["Art/Image.png"])));
+
+    let committed = wait_for("the tree-only generation", || {
+        pump(&mut registry, &notices)
+            .into_iter()
+            .find_map(|envelope| match envelope.event {
+                RuntimeEventDto::GenerationCommitted(committed) => Some(committed),
+                _ => None,
+            })
+    });
+
+    assert_eq!(
+        committed.affected_note_count, 0,
+        "no note moved: an attachment and the folder it arrived in are not notes"
+    );
+    match &committed.changes {
+        ChangeSetDto::Detailed {
+            created,
+            modified,
+            deleted,
+        } => {
+            assert_eq!(
+                created,
+                &["Art".to_string(), "Art/Image.png".to_string()],
+                "the paths that moved are still spelled out — the folder the \
+                 hint never named included"
+            );
+            assert!(modified.is_empty());
+            assert!(deleted.is_empty());
+        }
+        other => panic!("expected a detailed change set, got {other:?}"),
     }
 
     handle.shutdown();

@@ -508,6 +508,13 @@ fn synthetic_generation_notice(generation: u64, previous: Option<u64>) -> Runtim
             modified: vec![VaultPath::new("Bench-Subscriber.md").expect("valid vault path")],
             deleted: Vec::new(),
         },
+        // One note, matching the one path above: this notice stands in for an
+        // ordinary single-note generation.
+        note_changes: vault_index::NoteChangeCounts {
+            created: 0,
+            modified: 1,
+            deleted: 0,
+        },
         affected_reference_count: 1,
         complete_resolution: false,
         metrics: ReconcileMetrics::default(),

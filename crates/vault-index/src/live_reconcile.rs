@@ -65,6 +65,28 @@ pub struct PathChanges {
     pub deleted: Vec<VaultPath>,
 }
 
+/// How many **notes** one cycle created, changed, and deleted, counted before
+/// the file tree's own paths join the published change set.
+///
+/// The two axes have to stay separately countable. `PathChanges` is the union
+/// — a client applying a delta needs every path that moved, whatever it is —
+/// but "how many notes did this generation affect" is a different question
+/// with a different answer, and answering it from the union would report two
+/// affected notes for a folder that appeared with nothing in it. Every count
+/// here is of paths the semantic pipeline itself moved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoteChangeCounts {
+    pub created: u64,
+    pub modified: u64,
+    pub deleted: u64,
+}
+
+impl NoteChangeCounts {
+    pub fn total(self) -> u64 {
+        self.created + self.modified + self.deleted
+    }
+}
+
 /// What one targeted reconciliation cycle did.
 #[derive(Clone, Debug)]
 pub struct LiveRefreshReport {
@@ -72,6 +94,9 @@ pub struct LiveRefreshReport {
     pub generation: Generation,
     pub cause: ChangeCause,
     pub changes: PathChanges,
+    /// The note-only half of `changes`, counted before the tree's paths were
+    /// merged in. This is what `affected_note_count` on the wire means.
+    pub note_changes: NoteChangeCounts,
     /// References selected for re-resolution: the changed sources' own
     /// outgoing references plus the dependency-selected incoming ones.
     pub affected_reference_count: u64,
@@ -137,6 +162,9 @@ pub(crate) struct BatchOutcome {
     pub(crate) previous_generation: Generation,
     pub(crate) generation: Generation,
     pub(crate) changes: PathChanges,
+    /// The note-only half of `changes`, counted before the tree's paths were
+    /// merged in — what every note-shaped count downstream is built from.
+    pub(crate) note_changes: NoteChangeCounts,
     pub(crate) unchanged: u64,
     pub(crate) reparsed: u64,
     pub(crate) affected_reference_count: u64,
@@ -328,6 +356,7 @@ impl IndexService {
             generation: batch.generation,
             cause,
             changes: batch.changes,
+            note_changes: batch.note_changes,
             affected_reference_count: batch.affected_reference_count,
             complete_resolution: batch.complete_resolution,
             metrics,
@@ -452,7 +481,31 @@ impl IndexService {
     /// A path whose metadata cannot be read at all is left exactly as it is
     /// stored rather than failing the batch or guessing it away: the tree is
     /// not a resolution input, and the next complete reconciliation repairs
-    /// it.
+    /// it. An inaccessible *vault root* is not that case and is not tolerated
+    /// — it is the failure every other read path already refuses on.
+    ///
+    /// # What this route does not do, and what covers it
+    ///
+    /// Only the named paths and their ancestors are stat-ed, so a folder that
+    /// appears **with contents already inside it** — `mv` of a populated
+    /// directory, an unarchive, a `git checkout` — leaves this route with the
+    /// folder's own row and none of its descendants'. Nothing here can fix
+    /// that: no hint names those descendants, and enumerating the folder would
+    /// make this a walk.
+    ///
+    /// What covers it lives in another crate. `vault_watch`'s `handle_event`
+    /// treats a folder create, remove, or rename that names no included
+    /// Markdown path as a structural event and forces `ChangeHint::Overflow`,
+    /// which the runtime turns into a complete reconciliation — and that walks
+    /// the vault and finds the descendants. So the guarantee is a two-step
+    /// one: this route converges on everything a hint can name, and the
+    /// watcher's structural fallback is what converges the rest.
+    ///
+    /// That makes the correctness of this route conditional on a rule in
+    /// `vault-watch`, which is why it is stated here rather than assumed:
+    /// widening that filter so a folder event counts as "fully named" would
+    /// silently strand every descendant. `file_tree.rs` pins both halves —
+    /// that the gap is real, and that a complete refresh closes it.
     fn observe_tree_paths(&self, paths: &BTreeSet<VaultPath>) -> Result<TreeDelta, IndexError> {
         let mut delta = TreeDelta::default();
         if !self.source.observes_tree() {
@@ -469,7 +522,12 @@ impl IndexService {
         for path in &targets {
             let observed = match self.source.tree_entry(path) {
                 Ok(observed) => observed,
-                Err(_) => continue,
+                // One unreadable path is tolerated; a vault root that cannot
+                // be read is not something to carry on past, and every other
+                // error is unclassified enough that swallowing it would hide
+                // a real fault behind a stale tree row.
+                Err(IndexError::Storage(_)) => continue,
+                Err(error) => return Err(error),
             };
             let stored = self.store.stored_tree_entry(path)?;
             tree::diff_one(stored.as_ref(), observed, &mut delta);
@@ -631,9 +689,17 @@ impl IndexService {
             }
         }
 
-        // Counted before the tree's own paths join the change set: this is
-        // the *note* count, and a folder or an attachment is neither.
-        metrics.work.changed_notes = changes.created.len() as u64 + changes.modified.len() as u64;
+        // Counted before the tree's own paths join the change set: these are
+        // the *note* counts, and a folder or an attachment is neither. Every
+        // note-shaped number a client is given — `affected_note_count` on the
+        // wire, `added`/`changed`/`deleted` from `refresh_index` — is built
+        // from these, never from the merged union below.
+        let note_changes = NoteChangeCounts {
+            created: changes.created.len() as u64,
+            modified: changes.modified.len() as u64,
+            deleted: changes.deleted.len() as u64,
+        };
+        metrics.work.changed_notes = note_changes.created + note_changes.modified;
         merge_tree_changes(&mut changes, &batch.tree);
 
         let stored_scan_diagnostics = self.store.load_scan_diagnostics()?;
@@ -654,6 +720,7 @@ impl IndexService {
                 previous_generation: expected,
                 generation: expected,
                 changes: PathChanges::default(),
+                note_changes: NoteChangeCounts::default(),
                 unchanged,
                 reparsed: 0,
                 affected_reference_count: 0,
@@ -823,6 +890,7 @@ impl IndexService {
                     previous_generation: expected,
                     generation,
                     changes,
+                    note_changes,
                     unchanged,
                     reparsed,
                     affected_reference_count,

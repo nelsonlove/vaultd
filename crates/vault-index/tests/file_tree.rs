@@ -82,6 +82,30 @@ impl Fixture {
             .collect()
     }
 
+    /// The stored tree as the facts a fresh walk can also state: path, kind,
+    /// size. Timestamps are left out on purpose — a folder's move with any
+    /// entry inside it, and comparing them would test the clock rather than
+    /// the convergence.
+    fn tree_facts(&self) -> Vec<(String, TreeEntryKind, Option<u64>)> {
+        self.tree()
+            .into_values()
+            .map(|entry| (entry.path.as_str().to_string(), entry.kind, entry.size))
+            .collect()
+    }
+
+    /// The same facts, from a walk of the vault right now.
+    fn scanned_facts(&self) -> Vec<(String, TreeEntryKind, Option<u64>)> {
+        let source =
+            vault_core::FileSystemVaultSource::new(self.root()).expect("scan the fixture vault");
+        source
+            .scan()
+            .expect("scan")
+            .entries
+            .into_iter()
+            .map(|entry| (entry.path.as_str().to_string(), entry.kind, entry.size))
+            .collect()
+    }
+
     fn kinds(&self) -> BTreeMap<String, TreeEntryKind> {
         self.tree()
             .into_iter()
@@ -378,6 +402,19 @@ fn deleting_a_folder_removes_its_whole_subtree() {
     let kinds = fixture.kinds();
     assert!(!kinds.contains_key("Attachments"));
     assert!(!kinds.contains_key("Attachments/Image.png"));
+
+    // The change set names the folder and stops there. The watcher event that
+    // named it never named its contents, so neither does this: a client
+    // applies the documented rule — a deleted folder implies its subtree —
+    // rather than being handed a list the observation could not produce. The
+    // complete route, which enumerated the vault and therefore does know each
+    // path, spells them all out; `store/tree.rs` pins both shapes at the layer
+    // that decides them.
+    assert_eq!(
+        report.changes.deleted,
+        vec![VaultPath::new("Attachments").expect("path")],
+        "a watcher-driven folder deletion names the folder alone"
+    );
 }
 
 #[test]
@@ -451,6 +488,198 @@ fn a_complete_reconciliation_converges_on_the_same_tree_a_targeted_one_wrote() {
     let report = fixture.service.refresh(false).expect("complete refresh");
     assert_eq!(report.generation.get(), generation);
     assert_eq!(fixture.tree(), targeted);
+}
+
+/// Editing an attachment moves nothing but its stat — and that is exactly
+/// what a host serves as `TFile.stat`, so it publishes.
+///
+/// This is the clause that makes the "not every tree row move is
+/// generational" rule non-trivial: a note's metadata and a folder's
+/// timestamps are exempt, a file's are not.
+#[test]
+fn modifying_an_attachment_publishes_its_new_stat() {
+    let mut fixture = fixture();
+    let before_generation = fixture.generation();
+    let before_semantic = fixture.semantic_digest();
+    let before = fixture
+        .tree()
+        .remove("Attachments/Image.png")
+        .expect("the attachment");
+
+    fixture.write(
+        "Attachments/Image.png",
+        &[0x89, b'P', b'N', b'G', 0, 1, 2, 3],
+    );
+    let report = fixture.refresh_paths(&["Attachments/Image.png"]);
+
+    assert_eq!(
+        report.generation.get(),
+        before_generation + 1,
+        "a file's stat is client-visible state"
+    );
+    assert_eq!(
+        report.changes.modified,
+        vec![VaultPath::new("Attachments/Image.png").expect("path")]
+    );
+    let after = fixture
+        .tree()
+        .remove("Attachments/Image.png")
+        .expect("the attachment");
+    assert_eq!(after.size, Some(8));
+    assert!(after.size != before.size);
+    assert_eq!(fixture.semantic_digest(), before_semantic);
+}
+
+/// A folder's own timestamps move whenever anything inside it is created or
+/// removed, and nothing reads them — a folder carries no `stat` in the object
+/// model. Publishing for that would put a second, contentless generation
+/// behind every file written into a folder.
+#[test]
+fn a_folders_timestamps_moving_on_their_own_do_not_publish() {
+    let mut fixture = fixture();
+    let before_generation = fixture.generation();
+    let before = fixture.tree().remove("Empty").expect("the empty folder");
+
+    let path = fixture.root().join("Empty");
+    let metadata = std::fs::metadata(&path).expect("folder metadata");
+    let modified = filetime::FileTime::from_last_modification_time(&metadata);
+    let bumped =
+        filetime::FileTime::from_unix_time(modified.unix_seconds() + 5, modified.nanoseconds());
+    filetime::set_file_mtime(&path, bumped).expect("bump folder mtime");
+
+    let report = fixture.refresh_paths(&["Empty"]);
+
+    assert_eq!(
+        report.generation.get(),
+        before_generation,
+        "a folder's timestamps are not state any client can observe"
+    );
+    assert_eq!(report.changes, vault_index::PathChanges::default());
+    let after = fixture.tree().remove("Empty").expect("the empty folder");
+    assert!(
+        after.mtime_unix_ms > before.mtime_unix_ms,
+        "the row is still refreshed — it just does not publish"
+    );
+}
+
+/// A folder replaced by a file of the same name is not one row changing kind:
+/// the folder ceased to exist, and everything stored beneath it ceased to
+/// exist with it. A bare upsert would leave those descendant rows behind,
+/// served as a subtree that is not there.
+#[test]
+fn a_folder_replaced_by_a_file_takes_its_subtree_with_it() {
+    let mut fixture = fixture();
+    let before_generation = fixture.generation();
+
+    fixture.remove_folder("Attachments");
+    fixture.write("Attachments", b"a file now");
+    let report = fixture.refresh_paths(&["Attachments"]);
+
+    assert_eq!(
+        report.generation.get(),
+        before_generation + 1,
+        "a kind change is client-visible"
+    );
+    let tree = fixture.tree();
+    assert_eq!(
+        tree.get("Attachments").map(|entry| entry.kind),
+        Some(TreeEntryKind::File)
+    );
+    assert!(
+        !tree.contains_key("Attachments/Image.png"),
+        "the folder's descendants must not outlive the folder"
+    );
+    let path = VaultPath::new("Attachments").expect("path");
+    assert!(
+        report.changes.deleted.contains(&path) && report.changes.created.contains(&path),
+        "both things happened, in that order: the folder went, the file arrived"
+    );
+
+    // And a complete walk agrees there is nothing left to fix.
+    let complete = fixture.service.refresh(false).expect("complete refresh");
+    assert_eq!(complete.generation.get(), report.generation.get());
+    assert_eq!(fixture.tree(), tree);
+}
+
+/// The mirror case: a file replaced by a folder. Nothing can be orphaned —
+/// a file has no subtree — but the kind still moved, so it still publishes.
+#[test]
+fn a_file_replaced_by_a_folder_publishes_the_kind_change() {
+    let mut fixture = fixture();
+    let before_generation = fixture.generation();
+
+    fixture.remove_file("Board.canvas");
+    fixture.create_folder("Board.canvas");
+    let report = fixture.refresh_paths(&["Board.canvas"]);
+
+    assert_eq!(report.generation.get(), before_generation + 1);
+    assert_eq!(
+        report.changes.modified,
+        vec![VaultPath::new("Board.canvas").expect("path")]
+    );
+    let entry = fixture.tree().remove("Board.canvas").expect("the row");
+    assert_eq!(entry.kind, TreeEntryKind::Folder);
+    assert_eq!(entry.size, None);
+}
+
+/// A folder that appears **with contents already inside it** — `mv` of a
+/// populated directory, an unarchive, a `git checkout` — is the one case the
+/// targeted route cannot finish on its own, and this test tells the whole
+/// two-step story rather than claiming it converges.
+///
+/// Step one: a hint that names only the folder leaves its descendants absent.
+/// Nothing in this crate can do better — no hint names them, and enumerating
+/// the folder would make the targeted route a walk.
+///
+/// Step two: the recovery is cross-crate. `vault_watch` classifies a folder
+/// create/remove/rename that names no included Markdown path as structural
+/// and forces `ChangeHint::Overflow`, which the runtime turns into the
+/// complete reconciliation performed here — and that walks the vault and
+/// finds the descendants. The dependency is stated in `observe_tree_paths`'
+/// own doc comment; this is its executable half.
+#[test]
+fn a_populated_folder_appearing_converges_only_on_the_complete_route() {
+    let mut fixture = fixture();
+
+    // The shape a `mv` leaves behind: the folder and its contents are both
+    // already there when the first hint arrives.
+    fixture.create_folder("Bundle/Inner");
+    fixture.write("Bundle/Inner/Deep.png", &[1, 2, 3]);
+    fixture.write("Bundle/Note.md", b"# Bundled\n");
+
+    let report = fixture.refresh_paths(&["Bundle"]);
+
+    let kinds = fixture.kinds();
+    assert_eq!(
+        kinds.get("Bundle"),
+        Some(&TreeEntryKind::Folder),
+        "the path the hint named is indexed"
+    );
+    assert!(
+        !kinds.contains_key("Bundle/Inner")
+            && !kinds.contains_key("Bundle/Inner/Deep.png")
+            && !kinds.contains_key("Bundle/Note.md"),
+        "the gap is real: nothing named the descendants, so nothing indexed them"
+    );
+    assert_eq!(
+        report.changes.created,
+        vec![VaultPath::new("Bundle").expect("path")]
+    );
+
+    // Step two: the complete route the watcher's structural fallback triggers.
+    fixture.service.refresh(false).expect("complete refresh");
+    assert_eq!(
+        fixture.tree_facts(),
+        fixture.scanned_facts(),
+        "the complete route converges the stored tree on a fresh walk"
+    );
+    let kinds = fixture.kinds();
+    assert_eq!(kinds.get("Bundle/Inner"), Some(&TreeEntryKind::Folder));
+    assert_eq!(
+        kinds.get("Bundle/Inner/Deep.png"),
+        Some(&TreeEntryKind::File)
+    );
+    assert_eq!(kinds.get("Bundle/Note.md"), Some(&TreeEntryKind::Note));
 }
 
 #[test]

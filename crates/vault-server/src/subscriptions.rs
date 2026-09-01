@@ -106,8 +106,14 @@ fn change_set_total(changes: &PathChanges) -> usize {
 }
 
 /// One committed generation as a client sees it, plus the marker its size
-/// obliges. `affected_note_count` is the semantic change set's own size, so
-/// it agrees with the counts-only summary whichever form the detail takes.
+/// obliges.
+///
+/// Two different counts, deliberately: `changes` (and the detail limit that
+/// governs its form) covers **every** path the generation moved, notes and
+/// file-tree entries alike, because a client applying a delta needs all of
+/// them. `affected_note_count` is the *note* half alone, carried from the
+/// engine's own pre-merge count — a folder that appeared with nothing in it
+/// affects no notes, and reporting the union here would say it affected two.
 fn generation_events(report: &LiveRefreshReport) -> Vec<RuntimeEventDto> {
     let total = change_set_total(&report.changes);
     let oversized = total > DETAILED_PATH_LIMIT;
@@ -130,7 +136,7 @@ fn generation_events(report: &LiveRefreshReport) -> Vec<RuntimeEventDto> {
             generation: report.generation.get(),
             cause: generation_cause(report.cause),
             changes,
-            affected_note_count: total as u64,
+            affected_note_count: report.note_changes.total(),
             affected_reference_count: report.affected_reference_count,
         },
     )];

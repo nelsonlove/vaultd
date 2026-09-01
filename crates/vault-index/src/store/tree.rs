@@ -11,7 +11,7 @@
 //! write costs what the change costs — the same discipline the resolution
 //! delta holds to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use vault_core::{TreeEntry, TreeEntryKind, VaultPath};
@@ -114,6 +114,20 @@ impl TreeDelta {
                 if row.agrees_with(&entry) {
                     return;
                 }
+                // A folder that became a file or a note is not one row
+                // changing kind: the folder ceased to exist, and everything
+                // stored beneath it ceased to exist with it. A bare upsert
+                // would replace the folder's own row and orphan every
+                // descendant — rows a complete walk would have removed, left
+                // behind to be served as a subtree that is not there. Recorded
+                // as a removal followed by a creation, which is both what the
+                // filesystem did and the order `apply` writes.
+                if row.kind == TreeEntryKind::Folder && entry.kind != TreeEntryKind::Folder {
+                    self.record_removal(entry.path.clone());
+                    self.created.push(entry.path.clone());
+                    self.upserts.push(entry);
+                    return;
+                }
                 if row.kind != entry.kind || entry.kind == TreeEntryKind::File {
                     self.generational = true;
                     self.modified.push(entry.path.clone());
@@ -141,17 +155,26 @@ pub(crate) fn diff_scan(
     observed: &[TreeEntry],
 ) -> TreeDelta {
     let mut delta = TreeDelta::default();
-    let mut seen: BTreeMap<&VaultPath, &TreeEntry> = BTreeMap::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for entry in observed {
-        seen.insert(&entry.path, entry);
+        seen.insert(entry.path.as_str());
         delta.record_upsert(stored.get(&entry.path), entry.clone());
     }
     for path in stored.keys() {
-        if seen.contains_key(path) {
+        if seen.contains(path.as_str()) {
             continue;
         }
+        // "Did the walk report anything beneath this path?" — answered by the
+        // first observed path at or after `<path>/`, not by scanning every
+        // observed path once per removal. The two are equivalent because the
+        // set is ordered: every descendant sorts into the `<path>/…` range, so
+        // the first candidate in it settles the question.
         let prefix = format!("{}/", path.as_str());
-        if seen.keys().any(|seen| seen.as_str().starts_with(&prefix)) {
+        let has_descendant = seen
+            .range(prefix.as_str()..)
+            .next()
+            .is_some_and(|seen| seen.starts_with(&prefix));
+        if has_descendant {
             continue;
         }
         delta.record_removal(path.clone());

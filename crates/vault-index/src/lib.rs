@@ -23,7 +23,7 @@ pub use live_graph::{
     HydratedNote, HydratedReference, ImpactPlan, LiveGraph, NoteId, PreparedGraphDelta,
     ReferenceKey,
 };
-pub use live_reconcile::{ChangeCause, LiveRefreshReport, PathChanges};
+pub use live_reconcile::{ChangeCause, LiveRefreshReport, NoteChangeCounts, PathChanges};
 pub use metrics::{ReconcileMetrics, StageDurations, WorkCounts};
 pub use model::{
     FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,

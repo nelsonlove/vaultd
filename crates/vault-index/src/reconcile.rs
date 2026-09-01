@@ -303,9 +303,12 @@ impl IndexService {
             return Ok(TryOutcome::Done(RefreshReport {
                 previous_generation: Some(outcome.previous_generation),
                 generation: outcome.generation,
-                added: outcome.changes.created.len() as u64,
-                changed: outcome.changes.modified.len() as u64,
-                deleted: outcome.changes.deleted.len() as u64,
+                // Note counts, not the merged change set: `refresh_index`
+                // has always answered "how many notes moved", and a folder
+                // appearing must not be reported as a note added.
+                added: outcome.note_changes.created,
+                changed: outcome.note_changes.modified,
+                deleted: outcome.note_changes.deleted,
                 unchanged: outcome.unchanged,
                 reparsed: outcome.reparsed,
                 verified: verify,
