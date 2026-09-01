@@ -2,6 +2,8 @@
 
 Synthetic baselines for the persistent-index milestone. Absolute timings are observational and machine-bound; the structural warm-path counters (`warm_startup_body_reads = 0`, `warm_startup_reparsed = 0`) are the contractual part and are enforced by tests.
 
+The numbers below were taken at schema v1, before the live-incremental runtime and before schema v3. They are kept as the milestone's own record; for what schema v3's structural rows and file tree cost against the code without them, see `structural-parse-baseline.md`, which measures that delta directly rather than across milestones.
+
 ## Environment
 
 - Date: 2026-08-25

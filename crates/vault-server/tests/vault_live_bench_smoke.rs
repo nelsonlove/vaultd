@@ -52,6 +52,8 @@ fn every_named_runtime_case_is_present_with_the_documented_shape() {
         "startup_catch_up",
         "subscriber_delivery",
         "lag_recovery",
+        "attachment_burst_500",
+        "attachment_burst_500_new_folder",
     ];
     let cases = report["cases"].as_array().expect("cases array");
     assert_eq!(
@@ -99,6 +101,35 @@ fn subscriber_delivery_produces_exactly_one_event_per_notice() {
     // yields exactly one `generation_committed` event.
     assert_eq!(entry["notes"], 2);
     assert_eq!(entry["affected_references"], 2);
+}
+
+/// A folder that appears is a structural watcher event, so an import into a
+/// *new* folder is answered by a whole-vault reconciliation on every repeat —
+/// the claim `docs/performance/structural-parse-baseline.md` rests on, and the
+/// reason the two burst cases exist separately. The case repurposes
+/// `work.queue_len_before_drain` as "repeats answered by an overflow", exactly
+/// as `lag_recovery` repurposes it for queue depth.
+///
+/// The mirror claim for `attachment_burst_500` (an import into an *existing*
+/// folder stays a targeted refresh) is deliberately not asserted here: it is a
+/// racing negative — a late resync from the folder's own creation could
+/// legitimately answer the burst — and a benchmark smoke test is the wrong
+/// place to make timing a pass/fail.
+#[test]
+fn a_new_folder_import_is_answered_by_a_whole_vault_reconciliation() {
+    let report = run_live_bench(25, 2);
+    let entry = case(&report, "attachment_burst_500_new_folder");
+    let samples = entry["timings_ms"]["samples"]
+        .as_array()
+        .expect("samples array")
+        .len() as u64;
+    assert_eq!(
+        entry["work"]["queue_len_before_drain"]
+            .as_u64()
+            .expect("queue_len_before_drain is a number"),
+        samples,
+        "every new-folder import repeat must take the overflow route"
+    );
 }
 
 #[test]

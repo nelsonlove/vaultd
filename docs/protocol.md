@@ -188,6 +188,8 @@ One committed generation's change, across both axes the cache indexes: a note wh
 
 **A deleted folder implies its subtree.** A folder in `deleted` means the folder and everything that was under it is gone; the descendants are not spelled out individually, because the event that named the folder never named them. This matches Obsidian's own vault-event semantics, where deleting a folder raises one `delete` for the folder. It also means the two reconciliation routes report the same physical event at different resolutions: a watcher-driven delete names the folder alone, while a complete reconciliation — which enumerated the vault and so knows each path — names the folder and its descendants. Both are correct, and a client that applies the subtree rule gets the same state from either.
 
+**Apply `deleted` before `created`.** One path may appear in both lists in the same generation, and that pairing has exactly one meaning: the thing at that path was removed and a different thing was created there — a folder replaced by a file of the same name is the case that produces it. Applying `deleted` first gets that right, and takes the removed folder's subtree with it; applying `created` first drops the new entry again.
+
 `changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, or `verified`.
 
 ```json

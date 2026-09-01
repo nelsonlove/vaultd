@@ -5,6 +5,8 @@ Synthetic baselines for the live-incremental-runtime milestone (Tasks 1–13). A
 Two binaries produce the numbers below:
 
 - `vault-bench --live` extends the persistent-index milestone's benchmark (`docs/performance/persistent-index-baseline.md`) with the internal, `IndexService`-level live-incremental cases: body-only edits, an outgoing-reference edit, heading fan-out at four scales, filename-resolution transitions and their reversals, a rename, a 100-note burst, the internal complete-resolution fallback, and compact-graph hydration.
+Both binaries have since gained cases that are not reported here: `vault-live-bench`'s two bulk-attachment-import cases arrived with schema v3 and are measured in `structural-parse-baseline.md`, which also records what the structural rows and the file tree cost against the code without them. The tables below are this milestone's own record and were taken before those rows existed.
+
 - `vault-live-bench` is new for this milestone: it starts a real `vault_server::Server` runtime — real filesystem watcher, real coordinator thread, real notice channel — against a temporary synthetic vault and cache, and measures actual watcher hint-to-event latency, post-edit cached-read latency, startup cached-read availability against an already-warm cache, cold startup catch-up, in-process subscriber delivery, and subscriber lag recovery, parsing the real `vault_protocol` wire types throughout.
 
 ## Environment

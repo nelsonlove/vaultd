@@ -443,6 +443,50 @@ fn a_note_still_reaches_both_axes_on_the_same_watcher_path() {
     assert_eq!(indexed.note.source.text(), "# Deep\n\nlonger body\n");
 }
 
+/// One debounced batch carrying both axes at once — a note edit and an
+/// attachment appearing — is what a real editor session produces, and it is
+/// where the two counts must not be confused. `changes` is the union, so it
+/// names both paths; `note_changes` counts notes alone, so it counts one.
+#[test]
+fn a_mixed_note_and_tree_batch_counts_the_note_alone() {
+    let mut fixture = fixture();
+    let before_generation = fixture.generation();
+
+    fixture.write("Note.md", b"# Note\n[[Nested/Deep/Deep]]\n\nedited\n");
+    fixture.write("Attachments/Pasted.png", &[0x89, b'P', b'N', b'G', 0x0d]);
+    let report = fixture.refresh_paths(&["Note.md", "Attachments/Pasted.png"]);
+
+    assert_eq!(report.generation.get(), before_generation + 1);
+    assert_eq!(
+        report.note_changes,
+        vault_index::NoteChangeCounts {
+            created: 0,
+            modified: 1,
+            deleted: 0,
+        },
+        "the attachment is not a note and must not be counted as one"
+    );
+    assert_eq!(
+        report.changes.created,
+        vec![VaultPath::new("Attachments/Pasted.png").expect("path")],
+        "the union still names the attachment"
+    );
+    assert_eq!(
+        report.changes.modified,
+        vec![VaultPath::new("Note.md").expect("path")],
+        "and the note it was pasted into"
+    );
+    assert!(report.changes.deleted.is_empty());
+    assert_eq!(
+        fixture
+            .tree()
+            .remove("Attachments/Pasted.png")
+            .expect("the attachment's tree row")
+            .kind,
+        TreeEntryKind::File
+    );
+}
+
 #[test]
 fn a_metadata_only_touch_refreshes_the_note_row_without_advancing_anything() {
     let mut fixture = fixture();

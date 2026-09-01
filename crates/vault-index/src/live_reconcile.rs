@@ -481,8 +481,14 @@ impl IndexService {
     /// A path whose metadata cannot be read at all is left exactly as it is
     /// stored rather than failing the batch or guessing it away: the tree is
     /// not a resolution input, and the next complete reconciliation repairs
-    /// it. An inaccessible *vault root* is not that case and is not tolerated
-    /// — it is the failure every other read path already refuses on.
+    /// it. Through `FileSystemIndexSource` that is every failure this route
+    /// can actually see — `vault_core`'s `tree_entry` reports an unreadable
+    /// path as `ScanError::UnreadableFile`, which becomes
+    /// `IndexError::Storage`, and it never reports an inaccessible root from
+    /// a per-path stat. The `Err` arm below that propagates anything else is
+    /// therefore defense for other `ReconcileSource` implementations, not a
+    /// reachable case for the filesystem one: an unclassified error from some
+    /// other source is not something to swallow behind a stale tree row.
     ///
     /// # What this route does not do, and what covers it
     ///
@@ -522,10 +528,11 @@ impl IndexService {
         for path in &targets {
             let observed = match self.source.tree_entry(path) {
                 Ok(observed) => observed,
-                // One unreadable path is tolerated; a vault root that cannot
-                // be read is not something to carry on past, and every other
-                // error is unclassified enough that swallowing it would hide
-                // a real fault behind a stale tree row.
+                // One unreadable path is tolerated. Every other error is
+                // unclassified enough that swallowing it would hide a real
+                // fault behind a stale tree row — unreachable through
+                // `FileSystemIndexSource` (see this method's doc comment),
+                // held for the sources that are not it.
                 Err(IndexError::Storage(_)) => continue,
                 Err(error) => return Err(error),
             };

@@ -52,6 +52,7 @@ See `docs/protocol.md` and `docs/design/live-incremental-runtime.md`.
 `vaultd` now persists the semantic graph in a normalized persistent SQLite cache and serves read operations over protocol version 1:
 
 - normalized SQLite storage outside the vault (XDG cache by default, `--index` to override), with exact source bytes, spans, resolutions, backlinks, and diagnostics as rows;
+- the vault file tree indexed alongside the semantic rows: every non-hidden folder and file with its kind, size, and creation/modification timestamps, kept current on the same watcher path as the notes;
 - atomic, monotonically numbered generations published by compare-and-swap; readers never observe partial state;
 - normal reconciliation that trusts path/size/mtime fingerprints and reads no unchanged bodies, plus verified reconciliation that hashes every file but reparses only changed revisions;
 - change detection through startup and manual reconciliation (`refresh_index`); a filesystem watcher and live events arrived with the milestone above;
@@ -71,6 +72,7 @@ The foundation implements semantic identity primitives, protocol versioning, and
 - exact source preservation (`SourceDocument` keeps every UTF-8 byte) and content-derived revisions;
 - read-only deterministic enumeration (`FileSystemVaultSource` sorts vault paths, skips `.obsidian` and hidden directories, and bounds symlinks to the vault root);
 - semantic parsing with exact byte spans for properties, aliases, headings, blocks, tags, links, embeds, and wikilinks, plus explicit structured diagnostics for malformed content;
+- structural parsing with exact byte spans for **sections** (one per top-level block, with its kind and owning block identifier) and **list items** (with the line-number parent convention and raw task state), whose shapes are pinned against observed Obsidian 1.13.4 behavior through committed runtime captures — never derived from Obsidian's source (`crates/vault-core/tests/fixtures/structural/`);
 - in-memory resolution with outgoing, backlink, unresolved, and ambiguous indexes (`scan_vault` → `SemanticGraph`);
 - a committed compatibility fixture corpus at `fixtures/semantic-read-path/` with golden public snapshots;
 - deliberately no protocol or daemon exposure, no persistence, no filesystem watching, and no mutation — the graph is a library boundary only.

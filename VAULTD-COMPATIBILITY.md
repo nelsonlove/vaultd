@@ -19,7 +19,13 @@ The foundation defines this contract but performs no vault writes.
 - Markdown links and embeds with percent-decoded targets and exact destination spans;
 - wikilinks and wiki embeds with display text and heading/block subpaths;
 - deterministic read-only scans, backlinks, unresolved references, and ambiguous candidates;
-- structured diagnostics for malformed frontmatter, wikilinks, tags, and block identifiers.
+- structured diagnostics for malformed frontmatter, wikilinks, tags, and block identifiers;
+- structural **sections** — one per top-level block, in document order, with its kind, its exact span, and the block identifier that owns it — and **list items** with exact spans, the line-number parent convention, and raw task state;
+- the **vault file tree**: every non-hidden folder and file, with its kind (`note`, `file`, `folder`), byte size for files, and creation and modification timestamps in Unix milliseconds.
+
+**How the structural shapes are pinned.** Sections and list items are pinned against *observed* Obsidian behavior at version **1.13.4**, captured at runtime through the public plugin API (`app.metadataCache.getFileCache`) against a live stock Obsidian and committed verbatim as 22 fixtures in `crates/vault-core/tests/fixtures/structural/`. Nothing is derived from Obsidian's source or `app.asar`, and nothing is inferred from the published typings alone: where the typings and the capture disagreed, the capture won. The fixtures' own README records the conventions the capture settled — that Obsidian's offsets are UTF-16 code units while `vaultd`'s spans are bytes (converted for comparison, never the reverse), the negated-start-line parent convention for top-level items with its line-0 edge case, task state as the raw bracket character, and an empty note reporting absent rather than empty collections.
+
+Three divergences are recorded rather than claimed away: `vaultd` does not persist a block identifier on an individual list item (sections carry theirs), it does not reproduce the zero-width phantom `text`/`element` sections Obsidian can emit at end of file, and it computes no content revision for a non-Markdown file. Section kinds outside the observed vocabulary pass through literally rather than being normalized, so an unknown kind survives a storage round trip.
 
 Resolution follows the documented forms; undocumented Obsidian resolution behavior is returned as an explicit ambiguous or unresolved result rather than guessed, and no full compatibility claim is made for it.
 

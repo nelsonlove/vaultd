@@ -9,6 +9,7 @@
 //! `vault_protocol` event types the stdio transport would ship. Emits
 //! exactly one JSON report on stdout; progress goes to stderr.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -35,6 +36,20 @@ const HINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// benchmark gives up. Scaled well above the `vault-bench` cold-build
 /// baseline (tens of seconds) plus runtime startup overhead.
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long a bulk attachment import may take to become visible in the
+/// stored file tree. Sized for the new-folder variant at 100,000 notes, whose
+/// answer is a whole-vault reconciliation rather than a targeted refresh.
+const BURST_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// A minimal PNG signature plus a per-file tail, so every attachment in a
+/// burst is a distinct, non-Markdown file the semantic pipeline must ignore
+/// and the file tree must record.
+fn attachment_bytes(index: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(format!("bench attachment {index:05}\n").as_bytes());
+    bytes
+}
 
 #[derive(clap::Parser)]
 struct Args {
@@ -498,6 +513,172 @@ fn measure_catch_up(vault_root: &Path, notes: usize, repeats: usize) -> CaseRepo
     }
 }
 
+/// Whether every expected path already has a stored `tree_entries` row.
+/// Used only off the timed path, to confirm an overflow-driven whole-vault
+/// reconciliation actually landed the burst (that route emits a
+/// `resync_required` marker and no per-path report, so its notice alone
+/// cannot prove the rows are there).
+fn tree_contains_all(reader: &IndexReader, expected: &BTreeSet<VaultPath>) -> bool {
+    let (_, entries) = reader.tree_entries().expect("read stored tree entries");
+    let present: BTreeSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    expected.iter().all(|path| present.contains(path.as_str()))
+}
+
+/// Consume notices until none arrives for `quiet`: how a repeat's setup
+/// separates itself from the burst it is about to time.
+fn drain_until_quiet(notices: &Receiver<RuntimeNotice>, quiet: Duration) {
+    while notices.recv_timeout(quiet).is_ok() {}
+}
+
+/// A bulk attachment import on the real watcher path: `attachments`
+/// non-Markdown files appearing between refreshes.
+///
+/// This case exists because widening the watcher's hint filter to
+/// non-Markdown paths created a cost that did not exist before: an import of
+/// attachments used to produce **zero** hints and therefore zero work, and
+/// now fills the debounce set and writes one `tree_entries` row per file.
+///
+/// `into_existing_folder` selects which of the two real answers is measured,
+/// and the difference is not a tuning knob — it is `vault_watch`'s own rule.
+/// A folder that is *created* names no included Markdown path, so the watcher
+/// classifies it as structural and forces `ChangeHint::Overflow`, whose
+/// answer is a whole-vault reconciliation however few files follow it. Files
+/// arriving in a folder that already exists raise no structural event, so
+/// they stay a targeted refresh of exactly the named paths. A real import
+/// does the first (an unarchive, a `git checkout`, a plugin's attachment
+/// folder appearing); a paste-into-an-existing-attachments-folder session
+/// does the second.
+///
+/// Every repeat imports into its own folder, so each one is a genuine
+/// creation rather than a rewrite; the imported files stay, so a later
+/// repeat's vault is slightly larger than an earlier one's (stated in the
+/// baseline note rather than hidden by cleanup, which would itself be a
+/// second burst of deletions).
+fn measure_attachment_burst(
+    vault_root: &Path,
+    index_path: &Path,
+    notes: usize,
+    repeats: usize,
+    case: &str,
+    attachments: usize,
+    into_existing_folder: bool,
+) -> CaseReport {
+    let config = IndexConfig::explicit(vault_root, index_path).expect("bench config");
+    let (server, notices) = Server::start(config, runtime_options()).expect("start runtime");
+    assert!(
+        wait_for_state(&notices, LiveState::Watching, CATCH_UP_TIMEOUT),
+        "the runtime never reached Watching before the attachment burst"
+    );
+    let reader = server
+        .reader()
+        .expect("a running runtime always has a reader");
+
+    let mut samples = Vec::with_capacity(repeats);
+    let mut metrics = Vec::new();
+    let mut note_changes_seen = 0u64;
+    let mut overflowed_repeats = 0u64;
+    for repeat in 0..repeats {
+        let folder = format!("Bench-Attachments-{case}-{repeat}");
+        let expected: BTreeSet<VaultPath> = (0..attachments)
+            .map(|index| {
+                VaultPath::new(format!("{folder}/attachment-{index:05}.png"))
+                    .expect("valid vault path")
+            })
+            .collect();
+        let directory = vault_root.join(&folder);
+
+        if into_existing_folder {
+            // Create the folder, let its own structural overflow run to
+            // completion, and only then start timing — otherwise this case
+            // would measure the very reconciliation it exists to avoid.
+            std::fs::create_dir_all(&directory).expect("create attachment folder");
+            let settle_deadline = Instant::now() + BURST_TIMEOUT;
+            let folder_only =
+                BTreeSet::from([VaultPath::new(folder.clone()).expect("valid vault path")]);
+            while !tree_contains_all(&reader, &folder_only) {
+                assert!(
+                    Instant::now() < settle_deadline,
+                    "the pre-created attachment folder never reached the stored tree"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drain_until_quiet(&notices, Duration::from_millis(750));
+        }
+
+        let start = Instant::now();
+        if !into_existing_folder {
+            std::fs::create_dir_all(&directory).expect("create attachment folder");
+        }
+        for index in 0..attachments {
+            std::fs::write(
+                directory.join(format!("attachment-{index:05}.png")),
+                attachment_bytes(index),
+            )
+            .expect("write bench attachment");
+        }
+
+        let deadline = start + BURST_TIMEOUT;
+        let mut seen: BTreeSet<VaultPath> = BTreeSet::new();
+        let elapsed_ms = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "an attachment burst of {attachments} never landed within {BURST_TIMEOUT:?}"
+                );
+            }
+            match notices.recv_timeout(remaining) {
+                Ok(RuntimeNotice::Generation(report)) => {
+                    let candidate_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                    seen.extend(report.changes.created.iter().cloned());
+                    seen.extend(report.changes.modified.iter().cloned());
+                    note_changes_seen += report.note_changes.total();
+                    metrics.push(report.metrics.clone());
+                    if expected.iter().all(|path| seen.contains(path)) {
+                        break candidate_ms;
+                    }
+                }
+                // The overflow route: path detail was discarded upstream, so
+                // the marker is the only signal, and the stored tree is the
+                // only proof.
+                Ok(RuntimeNotice::ResyncRequired { .. }) => {
+                    let candidate_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                    if tree_contains_all(&reader, &expected) {
+                        overflowed_repeats += 1;
+                        break candidate_ms;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the notice channel closed during the attachment burst"),
+            }
+        };
+        samples.push(elapsed_ms);
+    }
+    server.shutdown();
+
+    assert_eq!(
+        note_changes_seen, 0,
+        "an attachment burst must move no note rows at all"
+    );
+    let mut work = work_from_metrics(&metrics);
+    // Repurposed, as `lag_recovery` repurposes it: how many of this case's
+    // repeats were answered by an overflow-driven whole-vault reconciliation
+    // rather than a targeted refresh.
+    work.queue_len_before_drain = overflowed_repeats;
+    CaseReport {
+        case: case.to_string(),
+        notes,
+        affected_references: 0,
+        timings_ms: distribution(samples),
+        stages_ms: if metrics.is_empty() {
+            empty_stage_distributions()
+        } else {
+            stage_distributions(&metrics)
+        },
+        work,
+        peak_rss_bytes: peak_rss_bytes(),
+    }
+}
+
 fn synthetic_generation_notice(generation: u64, previous: Option<u64>) -> RuntimeNotice {
     RuntimeNotice::Generation(Box::new(LiveRefreshReport {
         previous_generation: previous.map(Generation::new),
@@ -686,6 +867,34 @@ fn main() {
     eprintln!("measuring startup catch-up...");
     let catch_up = measure_catch_up(&vault_root, args.notes, args.repeats);
 
+    // Last, deliberately: every burst leaves its imported attachments in the
+    // vault, so running these earlier would enlarge the vault every other
+    // case measures.
+    eprintln!("measuring a bulk attachment import into an existing folder...");
+    let attachment_burst = measure_attachment_burst(
+        &vault_root,
+        &index_path,
+        args.notes,
+        args.repeats,
+        "attachment_burst_500",
+        500,
+        true,
+    );
+    eprintln!("measuring the same import as a new folder appearing...");
+    let attachment_burst_new_folder = measure_attachment_burst(
+        &vault_root,
+        &index_path,
+        args.notes,
+        // Each repeat is a whole-vault reconciliation — the same work
+        // `startup_catch_up` and `vault-bench`'s `cold_index` already measure
+        // in isolation; three samples show the shape without doubling this
+        // binary's wall-clock cost at 100,000 notes.
+        args.repeats.min(3),
+        "attachment_burst_500_new_folder",
+        500,
+        false,
+    );
+
     let report = LiveBenchReport {
         schema: 1,
         notes: args.notes,
@@ -697,6 +906,8 @@ fn main() {
             catch_up,
             subscriber_delivery,
             lag_recovery,
+            attachment_burst,
+            attachment_burst_new_folder,
         ],
     };
     println!(
