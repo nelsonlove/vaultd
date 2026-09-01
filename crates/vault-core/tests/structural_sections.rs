@@ -152,8 +152,11 @@ proptest! {
 
         // Non-vacuity guard: any input with a non-blank line must yield at
         // least one section, so this test cannot silently go vacuous if the
-        // generator or the extractor changes.
-        if text.lines().any(|line| !line.trim().is_empty()) {
+        // generator or the extractor changes. Blankness is judged after
+        // stripping a leading U+FEFF: micromark skips a byte-order mark, so
+        // a BOM-only input is semantically empty (committed seed).
+        let content = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        if content.lines().any(|line| !line.trim().is_empty()) {
             prop_assert!(
                 !parsed.sections.is_empty(),
                 "non-blank input produced zero sections"
@@ -189,4 +192,69 @@ proptest! {
             previous_start = Some(item.span.start());
         }
     }
+}
+
+/// Enabling math parsing is this branch's one deliberate change to
+/// pre-existing reference extraction: a wikilink inside a `$$…$$` block no
+/// longer produces a reference, exactly as fixture 22's captured `links: []`
+/// records. The fixture loaders ignore captured links, so this test is the
+/// executable pin — a Walker that re-descends math nodes fails here.
+#[test]
+fn a_wikilink_inside_a_math_block_produces_no_reference() {
+    let fixture = load("22-indented-callout-and-math-link");
+    assert!(
+        fixture.source.contains("[[Math Link Target]]"),
+        "fixture 22 must keep its math-body wikilink for this pin to bite"
+    );
+    assert_eq!(
+        fixture.expected["links"],
+        serde_json::json!([]),
+        "the capture must still record zero links for the math wikilink"
+    );
+    assert!(
+        fixture
+            .parsed
+            .references
+            .iter()
+            .all(|reference| reference.raw_target != "Math Link Target"),
+        "a math-block wikilink leaked into reference extraction"
+    );
+
+    let math_only = load("18-math-block");
+    assert!(
+        math_only.parsed.references.is_empty(),
+        "a pure math note must extract no references"
+    );
+    assert!(
+        math_only.parsed.tags.is_empty(),
+        "a pure math note must extract no tags"
+    );
+}
+
+/// micromark skips a leading U+FEFF byte-order mark, so a BOM-only note is
+/// semantically empty — zero sections — while a BOM followed by content
+/// still yields its sections. Surfaced by the property above (the committed
+/// seed re-runs the BOM-only case first on every run); pinned here
+/// deterministically. This states micromark's behavior, not a captured
+/// Obsidian parity claim.
+#[test]
+fn a_leading_byte_order_mark_is_not_content() {
+    let bom_only = parse_note(SourceDocument::new(
+        VaultPath::new("Bom.md").expect("valid path"),
+        "\u{feff}".to_string(),
+    ));
+    assert!(
+        bom_only.sections.is_empty(),
+        "a BOM-only note must yield zero sections"
+    );
+
+    let bom_then_text = parse_note(SourceDocument::new(
+        VaultPath::new("Bom.md").expect("valid path"),
+        "\u{feff}hello".to_string(),
+    ));
+    assert_eq!(
+        bom_then_text.sections.len(),
+        1,
+        "a BOM followed by content must still yield its section"
+    );
 }

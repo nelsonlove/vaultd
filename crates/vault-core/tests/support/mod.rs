@@ -1,7 +1,8 @@
 //! Shared harness for the `tests/fixtures/structural/` corpus (see
-//! `crates/vault-core/tests/fixtures/structural/README.md`). Twenty-one
+//! `crates/vault-core/tests/fixtures/structural/README.md`). Twenty-two
 //! cases captured from a live Obsidian 1.13.4 (16 original + 5 from the
-//! second capture settling disputed edges); each `<case>.md` is fed through
+//! second capture settling disputed edges + 1 from the third); each
+//! `<case>.md` is fed through
 //! `vault_core::parse_note` and compared against Obsidian's captured
 //! `<case>.expected.json`.
 

@@ -1,6 +1,6 @@
 # Structural metadata fixtures
 
-Sixteen markdown cases with `CachedMetadata.sections` and `.listItems` captured from a live, stock Obsidian — **version 1.13.4** (installer: Electron; macOS) — via the `obsidian` CLI's `eval` against `app.metadataCache.getFileCache(...)` on 2026-08-30. Captured by observing runtime behavior through the public plugin API; nothing was derived from Obsidian's source or `app.asar`.
+Twenty-two markdown cases (16 from the first capture session, 5 from the second, 1 from the third — the later sections below record each) with `CachedMetadata.sections` and `.listItems` captured from a live, stock Obsidian — **version 1.13.4** (installer: Electron; macOS) — via the `obsidian` CLI's `eval` against `app.metadataCache.getFileCache(...)` on 2026-08-30. Captured by observing runtime behavior through the public plugin API; nothing was derived from Obsidian's source or `app.asar`.
 
 Each `<case>.md` is the exact input; each `<case>.expected.json` is `{ obsidianVersion, sections, listItems }` verbatim as Obsidian returned it (pretty-printed only).
 
