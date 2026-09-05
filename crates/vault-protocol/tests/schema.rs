@@ -76,5 +76,10 @@ fn existing_error_code_spellings_are_unchanged() {
     ];
     for (code, expected) in cases {
         assert_eq!(serde_json::to_string(&code).unwrap(), expected);
+        // Round-trip through the hand-written tolerant deserializer too: a
+        // typo there would otherwise degrade a real code to Unknown with
+        // the suite green.
+        let decoded: ErrorCode = serde_json::from_str(expected).unwrap();
+        assert_eq!(decoded, code);
     }
 }
