@@ -45,6 +45,11 @@ pub enum IndexError {
     /// construction.
     #[error("index storage is already in use by another writer")]
     IndexInUse,
+    /// A mutation was refused by its own preconditions, by path validation,
+    /// or by a zone rule. Never damage, and never retryable by this process:
+    /// the caller's model of the vault was wrong and should hear so.
+    #[error("mutation refused: {0}")]
+    Mutation(#[from] crate::mutate::MutationError),
 }
 
 impl From<std::io::Error> for IndexError {

@@ -8,6 +8,7 @@ mod live_graph;
 mod live_reconcile;
 mod metrics;
 mod model;
+mod mutate;
 mod query;
 mod reader;
 mod reconcile;
@@ -28,6 +29,10 @@ pub use metrics::{ReconcileMetrics, StageDurations, WorkCounts};
 pub use model::{
     FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
     PublishedStatus,
+};
+pub use mutate::{
+    CONFIG_ZONE, DEFAULT_MAX_FILE_BYTES, LOCAL_TRASH, MutationEngine, MutationError, Precondition,
+    revision_of,
 };
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus, VaultInfo,

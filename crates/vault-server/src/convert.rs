@@ -358,6 +358,47 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::IndexInUse;
             error.message = "the index is held by another writer".into();
         }
+        // Nothing constructs this variant yet: the mutation engine's refusals
+        // get a home in `IndexError` here, and the coordinator that produces
+        // them arrives with the mutation dispatch layer — which replaces this
+        // arm with a shared `mutation_error` helper the dispatch path also
+        // calls directly. The arm is written out rather than folded into
+        // `Internal` so no refusal can reach a client as an unexplained
+        // internal error in the meantime, and so it stays exhaustive: a new
+        // `MutationError` variant fails to compile here until it is mapped.
+        IndexError::Mutation(refusal) => {
+            use vault_index::MutationError;
+
+            error.message = match &refusal {
+                // Never leak a filesystem path or an OS error string.
+                MutationError::Io { .. } => "the vault filesystem write failed".into(),
+                other => other.to_string(),
+            };
+            match refusal {
+                MutationError::RevisionConflict { current, .. } => {
+                    error.code = ErrorCode::RevisionConflict;
+                    error.current_revision = current;
+                }
+                MutationError::NotFound { .. } => error.code = ErrorCode::NotFound,
+                MutationError::ParentNotFound { .. } => error.code = ErrorCode::ParentNotFound,
+                MutationError::TargetExists { .. } | MutationError::FolderNotEmpty { .. } => {
+                    error.code = ErrorCode::TargetExists;
+                }
+                MutationError::CaseCollision { .. } => error.code = ErrorCode::CaseCollision,
+                MutationError::ZoneViolation { .. } => error.code = ErrorCode::ZoneViolation,
+                MutationError::TooLarge { .. } => error.code = ErrorCode::PayloadTooLarge,
+                MutationError::ReadOnly => error.code = ErrorCode::ReadOnly,
+                // Malformed requests rather than state conflicts: no retry
+                // helps, and the caller has to change what it asked for.
+                MutationError::NotANote { .. }
+                | MutationError::IsANote { .. }
+                | MutationError::InvalidPrecondition { .. }
+                | MutationError::UnaddressablePatch { .. }
+                | MutationError::MalformedFrontmatter { .. }
+                | MutationError::OverlappingPatch => error.code = ErrorCode::InvalidRequest,
+                MutationError::Io { .. } => error.code = ErrorCode::StorageFailure,
+            }
+        }
     }
     error
 }
