@@ -24,10 +24,7 @@ impl RequestEnvelope {
     }
 }
 
-// `Eq` is not derivable: `ResponseOutcome` carries `Response`, which is only
-// `PartialEq` (see its definition — `SnapshotNotes` carries facet DTOs that
-// deliberately derive only `PartialEq`).
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResponseEnvelope {
     pub version: u16,
     pub id: String,
@@ -52,7 +49,7 @@ impl ResponseEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum ResponseOutcome {
     Ok(Response),

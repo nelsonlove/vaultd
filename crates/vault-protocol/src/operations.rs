@@ -122,11 +122,7 @@ pub struct UnsubscribeParams {
     pub subscription_id: String,
 }
 
-// `Eq` is not derivable here: `SnapshotNotes` carries `SnapshotNotesResponse`,
-// whose `SnapshotNoteDto`/`NoteMetadataDto` deliberately derive only
-// `PartialEq` (see `snapshots.rs`). `PartialEq` is enough — nothing hashes or
-// sorts a `Response`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Response {
     Health(HealthResponse),

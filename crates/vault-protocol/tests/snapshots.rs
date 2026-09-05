@@ -87,7 +87,7 @@ fn a_tree_page_carries_folders_notes_and_plain_files_with_their_stat() {
 
 #[test]
 fn a_notes_page_request_names_the_facets_it_wants() {
-    let line = r#"{"version":1,"id":"s2","request":{"method":"snapshot_notes","params":{"snapshot_id":"snap-1","include":["metadata","references","sections","list_items"]}}}"#;
+    let line = r#"{"version":1,"id":"s2","request":{"method":"snapshot_notes","params":{"snapshot_id":"snap-1","include":["metadata","references","resolutions","backlinks","sections","list_items"]}}}"#;
     let envelope: RequestEnvelope = serde_json::from_str(line).expect("decode snapshot_notes");
     match &envelope.request {
         Request::SnapshotNotes(params) => {
@@ -97,6 +97,8 @@ fn a_notes_page_request_names_the_facets_it_wants() {
                 vec![
                     NoteFacetDto::Metadata,
                     NoteFacetDto::References,
+                    NoteFacetDto::Resolutions,
+                    NoteFacetDto::Backlinks,
                     NoteFacetDto::Sections,
                     NoteFacetDto::ListItems,
                 ]
@@ -106,6 +108,138 @@ fn a_notes_page_request_names_the_facets_it_wants() {
         }
         other => panic!("expected snapshot_notes, got {other:?}"),
     }
+    // Byte-exact in the encode direction too: a same-struct round trip alone
+    // would not catch a renamed `snapshot_id` or a reordered `include`.
+    assert_eq!(serde_json::to_string(&envelope).expect("re-encode"), line);
+}
+
+#[test]
+fn snapshot_tree_and_close_snapshot_round_trip_their_exact_wire_shapes() {
+    // `snapshot_tree`'s method tag and `SnapshotTreeParams`'s three field
+    // names/order, pinned byte-exact both ways.
+    let tree_line = r#"{"version":1,"id":"s3","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1","cursor":"opaque","limit":50}}}"#;
+    let envelope: RequestEnvelope = serde_json::from_str(tree_line).expect("decode snapshot_tree");
+    match &envelope.request {
+        Request::SnapshotTree(params) => {
+            assert_eq!(params.snapshot_id, "snap-1");
+            assert_eq!(params.cursor.as_deref(), Some("opaque"));
+            assert_eq!(params.limit, Some(50));
+        }
+        other => panic!("expected snapshot_tree, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_string(&envelope).expect("re-encode"),
+        tree_line
+    );
+
+    // `close_snapshot`'s method tag and `CloseSnapshotParams.snapshot_id`,
+    // pinned byte-exact both ways.
+    let close_line = r#"{"version":1,"id":"s4","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}"#;
+    let envelope: RequestEnvelope =
+        serde_json::from_str(close_line).expect("decode close_snapshot");
+    match &envelope.request {
+        Request::CloseSnapshot(params) => assert_eq!(params.snapshot_id, "snap-1"),
+        other => panic!("expected close_snapshot, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_string(&envelope).expect("re-encode"),
+        close_line
+    );
+}
+
+#[test]
+fn every_snapshot_response_carries_its_documented_type_tag() {
+    // Each of the four `Response` "type" tags, pinned byte-exact in both
+    // directions: `open_snapshot`'s payload fields were previously only
+    // `contains`-checked, and `snapshot_tree`/`snapshot_notes`/
+    // `close_snapshot` were never wrapped in a `Response`/`ResponseEnvelope`
+    // at all, so a renamed tag would have passed the whole suite.
+    let cases: Vec<(Response, &str)> = vec![
+        (
+            Response::OpenSnapshot(OpenSnapshotResponse {
+                snapshot_id: "snap-1".into(),
+                generation: 1,
+                note_count: 0,
+                entry_count: 0,
+            }),
+            r#"{"version":1,"id":"r1","outcome":{"status":"ok","value":{"type":"open_snapshot","value":{"snapshot_id":"snap-1","generation":1,"note_count":0,"entry_count":0}}}}"#,
+        ),
+        (
+            Response::SnapshotTree(SnapshotTreeResponse {
+                snapshot_id: "snap-1".into(),
+                generation: 1,
+                entries: Vec::new(),
+                next_cursor: None,
+            }),
+            r#"{"version":1,"id":"r1","outcome":{"status":"ok","value":{"type":"snapshot_tree","value":{"snapshot_id":"snap-1","generation":1,"entries":[],"next_cursor":null}}}}"#,
+        ),
+        (
+            Response::SnapshotNotes(SnapshotNotesResponse {
+                snapshot_id: "snap-1".into(),
+                generation: 1,
+                notes: Vec::new(),
+                next_cursor: None,
+            }),
+            r#"{"version":1,"id":"r1","outcome":{"status":"ok","value":{"type":"snapshot_notes","value":{"snapshot_id":"snap-1","generation":1,"notes":[],"next_cursor":null}}}}"#,
+        ),
+        (
+            Response::CloseSnapshot(CloseSnapshotResponse {
+                snapshot_id: "snap-1".into(),
+            }),
+            r#"{"version":1,"id":"r1","outcome":{"status":"ok","value":{"type":"close_snapshot","value":{"snapshot_id":"snap-1"}}}}"#,
+        ),
+    ];
+    for (response, expected) in cases {
+        let envelope = ResponseEnvelope::success("r1", response);
+        assert_eq!(serde_json::to_string(&envelope).expect("encode"), expected);
+        let decoded: ResponseEnvelope = serde_json::from_str(expected).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+}
+
+#[test]
+fn a_populated_tree_entry_pins_every_field_name() {
+    let entry = TreeEntryDto {
+        path: "Folder/One.md".into(),
+        kind: TreeEntryKindDto::Note,
+        size: Some(7),
+        ctime_unix_ms: 1_700_000_001_000,
+        mtime_unix_ms: 1_700_000_002_000,
+        revision: Some("blake3:abc".into()),
+    };
+    let expected = r#"{"path":"Folder/One.md","kind":"note","size":7,"ctime_unix_ms":1700000001000,"mtime_unix_ms":1700000002000,"revision":"blake3:abc"}"#;
+    assert_eq!(serde_json::to_string(&entry).expect("encode"), expected);
+    let decoded: TreeEntryDto = serde_json::from_str(expected).expect("decode");
+    assert_eq!(decoded, entry);
+}
+
+#[test]
+fn a_fully_populated_note_pins_every_field_name() {
+    // Every facet `Some` (unlike `an_unrequested_facet_is_absent_rather_than_empty`,
+    // which pins the *absence* of `references`), so this pins every
+    // remaining `SnapshotNoteDto` and `NoteMetadataDto` field name and order
+    // in one shot.
+    let note = SnapshotNoteDto {
+        path: "One.md".into(),
+        revision: "blake3:abc".into(),
+        metadata: Some(NoteMetadataDto {
+            properties: Vec::new(),
+            aliases: Vec::new(),
+            headings: Vec::new(),
+            blocks: Vec::new(),
+            tags: Vec::new(),
+            diagnostics: Vec::new(),
+        }),
+        references: Some(Vec::new()),
+        resolutions: Some(Vec::new()),
+        backlinks: Some(Vec::new()),
+        sections: Some(Vec::new()),
+        list_items: Some(Vec::new()),
+    };
+    let expected = r#"{"path":"One.md","revision":"blake3:abc","metadata":{"properties":[],"aliases":[],"headings":[],"blocks":[],"tags":[],"diagnostics":[]},"references":[],"resolutions":[],"backlinks":[],"sections":[],"list_items":[]}"#;
+    assert_eq!(serde_json::to_string(&note).expect("encode"), expected);
+    let decoded: SnapshotNoteDto = serde_json::from_str(expected).expect("decode");
+    assert_eq!(decoded, note);
 }
 
 #[test]
@@ -215,6 +349,11 @@ fn the_snapshot_error_codes_have_their_documented_spellings() {
     let decoded: ErrorCode =
         serde_json::from_str(r#""snapshot_not_found""#).expect("decode snapshot_not_found");
     assert_eq!(decoded, ErrorCode::SnapshotNotFound);
+    // The decode direction is a hand-written match arm, the exact path where
+    // a typo can diverge from the derived `Serialize` spelling — pin it too.
+    let decoded: ErrorCode =
+        serde_json::from_str(r#""too_many_snapshots""#).expect("decode too_many_snapshots");
+    assert_eq!(decoded, ErrorCode::TooManySnapshots);
 }
 
 #[test]

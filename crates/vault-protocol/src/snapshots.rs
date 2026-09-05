@@ -36,12 +36,35 @@ pub struct SnapshotTreeParams {
 
 /// What one tree entry is. `Note` is an indexed Markdown file; `File` is any
 /// other vault file (attachments), which carries bytes but no semantics.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// Open-ended for the same reason `LiveStateDto` is: this flows
+/// server-to-client on a `snapshot_tree` page and is plausibly extensible (a
+/// future `canvas` or `base` kind), so a kind this build has not heard of
+/// must degrade to [`TreeEntryKindDto::Unknown`] rather than fail the whole
+/// page. `Deserialize` is hand-written because `#[serde(other)]` is rejected
+/// on an externally tagged enum, which is what a plain unit-variant enum is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreeEntryKindDto {
     Folder,
     Note,
     File,
+    /// A kind this build does not know. Never produced by this server.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for TreeEntryKindDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "folder" => Self::Folder,
+            "note" => Self::Note,
+            "file" => Self::File,
+            _ => Self::Unknown,
+        })
+    }
 }
 
 /// One entry of the vault tree, read from the pre-task's `tree_entries` table
@@ -95,7 +118,7 @@ pub enum NoteFacetDto {
     ListItems,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotNotesParams {
     pub snapshot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,7 +129,7 @@ pub struct SnapshotNotesParams {
     pub include: Vec<NoteFacetDto>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NoteMetadataDto {
     pub properties: Vec<PropertyDto>,
     pub aliases: Vec<AliasDto>,
@@ -139,8 +162,8 @@ pub struct SectionDto {
 /// trick.
 ///
 /// `task` is the raw character inside the brackets when the item is a task
-/// and absent otherwise: `Option<char>` in the domain, a one-character string
-/// on the wire.
+/// and absent otherwise: `Option<String>` in the domain, a one-character
+/// string on the wire.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ListItemDto {
     pub span: SpanDto,
@@ -153,7 +176,7 @@ pub struct ListItemDto {
 }
 
 /// One note's requested facets. Bodies stay per-note through `get_note`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotNoteDto {
     pub path: String,
     pub revision: String,
@@ -171,7 +194,7 @@ pub struct SnapshotNoteDto {
     pub list_items: Option<Vec<ListItemDto>>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotNotesResponse {
     pub snapshot_id: String,
     pub generation: u64,

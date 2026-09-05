@@ -4,7 +4,7 @@
 
 use vault_protocol::{
     ErrorCode, EventEnvelope, GenerationCauseDto, LiveStateDto, ResponseEnvelope, ResponseOutcome,
-    ResyncReasonDto, RuntimeEventDto,
+    ResyncReasonDto, RuntimeEventDto, TreeEntryDto, TreeEntryKindDto,
 };
 
 /// Captured from the shipped live-runtime transport: one line per event
@@ -154,4 +154,21 @@ fn unknown_serializes_to_a_reserved_spelling_this_server_never_emits() {
         serde_json::to_string(&ErrorCode::Unknown).expect("serialize"),
         r#""unknown""#
     );
+    assert_eq!(
+        serde_json::to_string(&TreeEntryKindDto::Unknown).expect("serialize"),
+        r#""unknown""#
+    );
+}
+
+#[test]
+fn an_unknown_tree_entry_kind_degrades_to_unknown() {
+    // `TreeEntryKindDto` flows server-to-client on `snapshot_tree` pages and
+    // is plausibly extensible (a future `canvas` or `base` kind), so it
+    // follows the same tolerance rule as the event and error-code enums
+    // above rather than failing the whole page.
+    let line = r#"{"path":"Folder","kind":"from_the_future","ctime_unix_ms":1,"mtime_unix_ms":2}"#;
+    let entry: TreeEntryDto =
+        serde_json::from_str(line).expect("an unknown tree entry kind must still parse");
+    assert_eq!(entry.kind, TreeEntryKindDto::Unknown);
+    assert_eq!(entry.path, "Folder", "the rest of the entry must survive");
 }
