@@ -177,11 +177,79 @@ impl<'de> Deserialize<'de> for PatchValueDto {
 }
 
 /// One addressed key and what becomes of it. `key_path` is a dot-path
-/// (`a.b.c`) addressing nested keys; `value: null` deletes.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// (`a.b.c`) addressing nested keys; an explicit JSON `value: null` deletes.
+///
+/// `Deserialize` is hand-written rather than derived: the brief's own spec
+/// text only ever describes an *explicit* JSON `null` as the deletion
+/// spelling ("`value: null` deletes"), never "an absent `value` deletes".
+/// Serde's derive makes `Option<T>` struct fields implicitly optional —
+/// `{"key_path":"tags"}` would silently decode to `value: None`, the same
+/// bit pattern as an explicit null, turning "forgot to set a value" into
+/// "delete this key". The hand-written visitor requires the `value` key to
+/// be present (null or not) and rejects anything else as `deny_unknown_fields`
+/// would, so a misspelled key at this nesting level is also a typed error
+/// rather than a silently-ignored field.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FrontmatterEditDto {
     pub key_path: String,
     pub value: Option<PatchValueDto>,
+}
+
+impl<'de> Deserialize<'de> for FrontmatterEditDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            KeyPath,
+            Value,
+        }
+
+        struct FrontmatterEditVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FrontmatterEditVisitor {
+            type Value = FrontmatterEditDto;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a frontmatter edit with `key_path` and `value`")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut key_path: Option<String> = None;
+                // The outer `Option` records whether the `value` key was
+                // seen at all; the inner one is the deletion sentinel an
+                // explicit JSON `null` produces.
+                let mut value: Option<Option<PatchValueDto>> = None;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::KeyPath => {
+                            if key_path.is_some() {
+                                return Err(serde::de::Error::duplicate_field("key_path"));
+                            }
+                            key_path = Some(map.next_value()?);
+                        }
+                        Field::Value => {
+                            if value.is_some() {
+                                return Err(serde::de::Error::duplicate_field("value"));
+                            }
+                            value = Some(map.next_value::<Option<PatchValueDto>>()?);
+                        }
+                    }
+                }
+                let key_path =
+                    key_path.ok_or_else(|| serde::de::Error::missing_field("key_path"))?;
+                let value = value.ok_or_else(|| serde::de::Error::missing_field("value"))?;
+                Ok(FrontmatterEditDto { key_path, value })
+            }
+        }
+
+        deserializer.deserialize_map(FrontmatterEditVisitor)
+    }
 }
 
 /// One referencing note a rename could not rewrite, and why.
@@ -191,7 +259,14 @@ pub struct LinkRewriteFailureDto {
     pub reason: String,
 }
 
+// `deny_unknown_fields` on every params struct below: mutations are the one
+// request family where a lost precondition is a lost update, not a forward-
+// compatibility nicety, so a misspelled field (`"expect"` for `"expected"`)
+// must be a typed decode error rather than a silently-accepted no-op that
+// downgrades a conditional write to an unconditional one.
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteNoteParams {
     pub path: String,
     pub content: String,
@@ -200,6 +275,7 @@ pub struct WriteNoteParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FolderParams {
     pub path: String,
 }
@@ -209,6 +285,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenameNoteParams {
     pub from: String,
     pub to: String,
@@ -219,6 +296,7 @@ pub struct RenameNoteParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenameFolderParams {
     pub from: String,
     pub to: String,
@@ -227,6 +305,7 @@ pub struct RenameFolderParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CopyFileParams {
     pub from: String,
     pub to: String,
@@ -237,6 +316,7 @@ pub struct CopyFileParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNoteParams {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +326,7 @@ pub struct DeleteNoteParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteFolderParams {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +336,7 @@ pub struct DeleteFolderParams {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchFrontmatterParams {
     pub path: String,
     pub patch: Vec<FrontmatterEditDto>,
@@ -263,6 +345,7 @@ pub struct PatchFrontmatterParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteFileParams {
     pub path: String,
     pub content_base64: String,
@@ -271,6 +354,7 @@ pub struct WriteFileParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadFileParams {
     pub path: String,
 }

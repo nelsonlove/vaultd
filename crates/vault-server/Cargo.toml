@@ -16,7 +16,12 @@ path = "src/bin/vault-live-bench.rs"
 clap.workspace = true
 libc.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value` only: the request payload is decoded straight from its input
+# bytes so a nested JSON object's key order survives (see
+# `stdio::RawRequestEnvelope`). This is unrelated to `preserve_order` — it
+# does not change how `serde_json::Value`/`Map` order keys anywhere else in
+# the workspace.
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile.workspace = true
 thiserror.workspace = true
 vault-core = { path = "../vault-core" }

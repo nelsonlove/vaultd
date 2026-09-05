@@ -55,11 +55,19 @@ const OUTPUT_CAPACITY: usize = 256;
 /// First parse stage: the envelope with the request left undecoded, so the
 /// version can be validated before the version-specific method enum is
 /// applied.
+///
+/// `request` is the raw, unparsed JSON text for the `request` field rather
+/// than a `serde_json::Value`: `serde_json::Map` is a `BTreeMap` in this
+/// build, so routing through `Value` would alphabetize every nested JSON
+/// object before the method-specific params ever see it — silently
+/// reordering, for example, a frontmatter patch's `Mapping` keys. Decoding
+/// straight from `request.get()`'s bytes (see [`respond`]) preserves
+/// document order end to end.
 #[derive(Debug, Deserialize)]
 pub struct RawRequestEnvelope {
     pub version: u16,
     pub id: String,
-    pub request: serde_json::Value,
+    pub request: Box<serde_json::value::RawValue>,
 }
 
 /// Everything the dispatcher can be handed, from either producer.
@@ -92,7 +100,7 @@ fn respond(
     if let Err(error) = validate_version(raw.version) {
         return ResponseEnvelope::error(raw.id, error);
     }
-    match serde_json::from_value::<Request>(raw.request) {
+    match serde_json::from_str::<Request>(raw.request.get()) {
         Ok(request) => server.handle(
             RequestEnvelope {
                 version: raw.version,

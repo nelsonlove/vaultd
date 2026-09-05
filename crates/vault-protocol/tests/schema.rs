@@ -55,6 +55,31 @@ fn task_11_error_codes_are_stable_snake_case_values() {
 }
 
 #[test]
+fn task_2_error_codes_are_stable_snake_case_values() {
+    // `ErrorCode::Serialize` is derived from `rename_all = "snake_case"`
+    // while `Deserialize` is a hand-written string match, so the two
+    // spellings are maintained independently — a typo in one arm makes a
+    // code the server emits decode back as `Unknown`, silently, with no
+    // other test to notice.
+    let cases = [
+        (ErrorCode::RevisionConflict, "\"revision_conflict\""),
+        (ErrorCode::NotFound, "\"not_found\""),
+        (ErrorCode::ParentNotFound, "\"parent_not_found\""),
+        (ErrorCode::TargetExists, "\"target_exists\""),
+        (ErrorCode::CaseCollision, "\"case_collision\""),
+        (ErrorCode::ZoneViolation, "\"zone_violation\""),
+        (ErrorCode::PayloadTooLarge, "\"payload_too_large\""),
+        (ErrorCode::ReadOnly, "\"read_only\""),
+    ];
+    for (code, expected) in cases {
+        let json = serde_json::to_string(&code).expect("serialize error code");
+        assert_eq!(json, expected);
+        let decoded: ErrorCode = serde_json::from_str(&json).expect("deserialize error code");
+        assert_eq!(decoded, code);
+    }
+}
+
+#[test]
 fn existing_error_code_spellings_are_unchanged() {
     // Guards against accidental reordering/renaming of pre-Task-11 codes
     // when the enum was extended.
