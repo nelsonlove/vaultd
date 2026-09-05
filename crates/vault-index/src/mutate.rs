@@ -432,12 +432,7 @@ impl MutationEngine {
 
     /// [`MutationEngine::case_collision`] against an already-resolved target.
     fn case_collision_at(&self, resolved: &Path) -> Result<Option<String>, MutationError> {
-        let scan = self.case_scan(resolved)?;
-        if scan.exact {
-            Ok(None)
-        } else {
-            Ok(scan.variant)
-        }
+        Ok(collision(self.case_scan(resolved)?))
     }
 
     /// Read the target's parent directory once and classify its stored names
@@ -477,6 +472,15 @@ struct CaseScan {
 /// case-insensitive filesystem cannot physically produce — an exact name and a
 /// case variant side by side is exactly the state the qualifier exists for,
 /// and it cannot be created on the machine this is developed on.
+/// The refusal decision itself, separated from the `read_dir` that feeds it so
+/// both arms can be asserted: the exact-match arm cannot be reached through
+/// the filesystem on a case-insensitive machine, because the listing it needs
+/// — a name and its case variant, both stored — is one such a filesystem
+/// cannot hold.
+fn collision(scan: CaseScan) -> Option<String> {
+    if scan.exact { None } else { scan.variant }
+}
+
 fn classify_names(names: impl IntoIterator<Item = String>, name: &str) -> CaseScan {
     let wanted = name.to_lowercase();
     let mut scan = CaseScan::default();
@@ -733,6 +737,35 @@ impl MutationEngine {
         VaultPath::new(spelling).map_err(|_| MutationError::ZoneViolation { path: path.clone() })
     }
 
+    /// The vault-relative path a completed write actually landed on, for the
+    /// outcome to report.
+    ///
+    /// Taken after the write, from a full `canonicalize` of the target rather
+    /// than from `resolve`'s parent-only one. `resolve` leaves the final
+    /// component exactly as the caller spelled it, and one class of mismatch
+    /// there survives every check before the write: a Unicode normalization
+    /// difference. `Cafe\u{301}.md` (NFD) and `Café.md` (NFC) are the same file
+    /// on APFS and are *deliberately* allowed to fold — they are visually one
+    /// name and refusing would hurt real callers — but they are two different
+    /// strings, so the collision scan reports neither an exact match nor a
+    /// variant, and the caller's spelling reaches the outcome. That is the
+    /// phantom-row hazard again: a hint keyed to a name the scanner never
+    /// emits. `canonicalize` resolves normalization as well as case and
+    /// symlinks, so one call after the write settles every spelling question
+    /// at once.
+    ///
+    /// `fallback` is the pre-write spelling, used when the canonicalize cannot
+    /// answer — the file was removed or replaced by another writer in the
+    /// instant after ours landed. A write that succeeded must never be
+    /// reported as a failure, and the two spellings differ only in
+    /// normalization anyway.
+    fn written_path(&self, path: &VaultPath, resolved: &Path, fallback: VaultPath) -> VaultPath {
+        std::fs::canonicalize(resolved)
+            .ok()
+            .and_then(|written| self.stored_path(path, &written).ok())
+            .unwrap_or(fallback)
+    }
+
     fn write_note(
         &self,
         path: &VaultPath,
@@ -783,7 +816,7 @@ impl MutationEngine {
         self.check_resolved(path, &resolved, expected)?;
         write_atomically(&resolved, bytes)?;
         Ok(MutationOutcome {
-            changed_paths: BTreeSet::from([stored]),
+            changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
             revision: Some(revision_of(bytes)),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -816,6 +849,47 @@ mod tests {
         let scan = classify_names(names(&["One.md", "one.md"]), "one.md");
         assert!(scan.exact);
         assert_eq!(scan.variant.as_deref(), Some("One.md"));
+    }
+
+    /// The classification tests above pin what the listing *says*; these pin
+    /// what the engine *decides* from it. The exact-match arm is the whole of
+    /// finding I1 — without it, a case-sensitive volume holding both spellings
+    /// locks each of them out of vaultd permanently — and no test on a
+    /// case-insensitive machine can reach it through the filesystem.
+    #[test]
+    fn a_variant_with_no_exact_match_is_the_collision() {
+        assert_eq!(
+            collision(CaseScan {
+                exact: false,
+                variant: Some("One.md".to_string()),
+            })
+            .as_deref(),
+            Some("One.md")
+        );
+    }
+
+    #[test]
+    fn a_variant_beside_the_callers_own_stored_name_is_not_a_collision() {
+        assert_eq!(
+            collision(CaseScan {
+                exact: true,
+                variant: Some("One.md".to_string()),
+            }),
+            None,
+            "the caller's spelling names its own file; nothing folds"
+        );
+    }
+
+    #[test]
+    fn no_variant_is_never_a_collision() {
+        assert_eq!(
+            collision(CaseScan {
+                exact: true,
+                variant: None,
+            }),
+            None
+        );
+        assert_eq!(collision(CaseScan::default()), None);
     }
 
     #[test]

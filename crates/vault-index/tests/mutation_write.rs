@@ -349,6 +349,85 @@ fn the_outcome_names_the_on_disk_spelling_of_the_folder() {
     }
 }
 
+/// The same phantom-row hazard as the folded-folder case, reached through the
+/// *file name* rather than the folder: `resolve` canonicalizes the parent
+/// only, so the final component still carries the caller's spelling. A case
+/// mismatch there is refused by the collision check, but a normalization
+/// mismatch is deliberately allowed to fold (it addresses the same file), and
+/// then the caller's spelling is not the stored one.
+#[test]
+fn the_outcome_names_the_on_disk_normalization_of_the_file_name() {
+    const COMPOSED: &str = "Caf\u{e9}.md"; // NFC: é as one codepoint
+    const DECOMPOSED: &str = "Cafe\u{301}.md"; // NFD: e + combining acute
+
+    let fixture = fixture();
+    std::fs::write(fixture.root.join(COMPOSED), "# cafe\n").expect("write the composed name");
+
+    let outcome = fixture.engine.apply(&Mutation::WriteNote {
+        path: path(DECOMPOSED),
+        content: "# changed\n".into(),
+        expected: Precondition::Revision(revision_of(b"# cafe\n")),
+    });
+
+    if names_in(&fixture.root).contains(COMPOSED) && fixture.root.join(DECOMPOSED).exists() {
+        // A normalization-folding filesystem: the two spellings are one file.
+        let outcome = outcome.expect("the decomposed spelling addresses the stored file");
+        assert_eq!(
+            outcome.changed_paths,
+            BTreeSet::from([path(COMPOSED)]),
+            "the outcome must name the stored normalization, not the caller's"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join(COMPOSED)).expect("read back"),
+            b"# changed\n"
+        );
+        assert!(
+            !names_in(&fixture.root).contains(DECOMPOSED),
+            "no second file may appear under the caller's spelling"
+        );
+    } else {
+        // A filesystem that stores the two names apart: the decomposed name is
+        // simply a different, absent file, and a revision precondition on it
+        // is a plain not_found.
+        let error = outcome.expect_err("the decomposed name is a different file here");
+        assert!(
+            matches!(error, MutationError::NotFound { .. }),
+            "expected not_found, got {error:?}"
+        );
+    }
+}
+
+/// The witness for the *second* zone check — the one that runs on the resolved
+/// path. Every dot-spelled path is already refused before `resolve` is called,
+/// so a symlink whose resolved parent is hidden is the only input that reaches
+/// it. Delete the post-resolve check and this test is what goes red.
+#[cfg(unix)]
+#[test]
+fn a_symlink_into_a_hidden_folder_is_refused_after_resolution() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".secret")).expect("create the hidden folder");
+    std::os::unix::fs::symlink(fixture.root.join(".secret"), fixture.root.join("Alias"))
+        .expect("link an innocuous name at a hidden folder");
+
+    let error = fixture
+        .engine
+        .apply(&Mutation::WriteNote {
+            path: path("Alias/x.md"),
+            content: "# hidden by another name\n".into(),
+            expected: Precondition::Absent,
+        })
+        .expect_err("the link resolves into a folder the scan never lists");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {error:?}"
+    );
+    assert_eq!(
+        names_in(&fixture.root.join(".secret")),
+        BTreeSet::new(),
+        "nothing may land in a hidden folder under any name"
+    );
+}
+
 /// The only failure that can happen *after* every check has passed. It must
 /// be typed as a filesystem failure, leave the original bytes, and leave no
 /// temporary file — the one test that would catch a plain `fs::write`
