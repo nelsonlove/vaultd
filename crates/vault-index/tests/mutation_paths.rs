@@ -211,6 +211,140 @@ fn a_case_variant_of_an_absent_target_is_detected() {
     );
 }
 
+// A dangling link is the case `Err(_) => Ok(resolved)` used to swallow: the
+// name *is* occupied, `canonicalize` fails anyway, and a caller that opened
+// the resolved path with `O_CREAT` instead of renaming over it would have
+// created a file outside the vault. Gated with the other symlink tests, and
+// for the same reason.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_that_escapes_the_vault_is_refused() {
+    let fixture = fixture();
+    std::os::unix::fs::symlink(
+        fixture.outside.join("Absent.md"),
+        fixture.root.join("Dangling.md"),
+    )
+    .expect("plant a dangling escaping symlink");
+    let error = fixture
+        .engine
+        .resolve(&path("Dangling.md"))
+        .expect_err("a write through a dangling escaping symlink must be refused");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {error:?}"
+    );
+    assert!(
+        !fixture.outside.join("Absent.md").exists(),
+        "refusing must not create the link's target"
+    );
+    // The refusal must be about the entry that is there, not about absence:
+    // an ordinary path with nothing at it is exactly what every create
+    // resolves, and it still has to succeed.
+    assert_eq!(
+        fixture
+            .engine
+            .resolve(&path("Absent.md"))
+            .expect("a genuinely absent target still resolves"),
+        fixture.root.join("Absent.md")
+    );
+}
+
+#[test]
+fn a_directory_where_a_file_should_be_is_a_typed_refusal() {
+    let fixture = fixture();
+    for expected in [Precondition::Any, Precondition::Absent] {
+        let error = fixture
+            .engine
+            .check(&path("Folder"), &expected)
+            .expect_err("a directory is not a file to compare against");
+        assert!(
+            matches!(error, MutationError::TargetExists { .. }),
+            "expected target_exists for {expected:?}, got {error:?}"
+        );
+    }
+    let error = fixture
+        .engine
+        .current_revision(&path("Folder"))
+        .expect_err("a directory has no content revision");
+    assert!(
+        matches!(error, MutationError::TargetExists { .. }),
+        "expected target_exists, got {error:?}"
+    );
+}
+
+#[test]
+fn a_nul_byte_is_refused_the_same_way_wherever_it_sits() {
+    let fixture = fixture();
+    // `VaultPath::new` is string-level and accepts both of these; the
+    // filesystem then fails on a different syscall depending on which
+    // component holds the NUL, so classifying by the io error would answer
+    // two ways for one malformed input.
+    for spelling in ["ev\0il.md", "a\0/b.md"] {
+        let error = fixture
+            .engine
+            .resolve(&path(spelling))
+            .expect_err("a path carrying a NUL byte must be refused");
+        assert!(
+            matches!(error, MutationError::ZoneViolation { .. }),
+            "expected a zone violation for {spelling:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_current_revision_reads_the_bytes_on_disk_or_reports_absence() {
+    let fixture = fixture();
+    assert_eq!(
+        fixture
+            .engine
+            .current_revision(&path("One.md"))
+            .expect("an existing note has a revision"),
+        Some(revision_of(b"# One\n"))
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .current_revision(&path("Gone.md"))
+            .expect("an absent path has no revision"),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_current_revision_through_an_escaping_symlink_is_refused() {
+    let fixture = fixture();
+    std::os::unix::fs::symlink(
+        fixture.outside.join("Secret.md"),
+        fixture.root.join("Linked.md"),
+    )
+    .expect("plant an escaping file symlink");
+    let error = fixture
+        .engine
+        .current_revision(&path("Linked.md"))
+        .expect_err("reading out of the vault must be refused");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {error:?}"
+    );
+}
+
+#[test]
+fn an_invalid_precondition_never_shows_a_client_rust_debug_syntax() {
+    let message = MutationError::InvalidPrecondition {
+        expected: Precondition::Revision("blake3:abc".into()),
+    }
+    .to_string();
+    assert_eq!(
+        message,
+        "a revision precondition is not valid for this operation"
+    );
+    assert!(
+        !message.contains('"') && !message.contains("Revision("),
+        "a client must not be shown Rust enum syntax: {message}"
+    );
+}
+
 #[test]
 fn a_revision_is_the_same_blake3_spelling_the_index_stores() {
     assert_eq!(

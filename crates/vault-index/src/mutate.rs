@@ -60,6 +60,21 @@ pub enum Precondition {
     Any,
 }
 
+impl Precondition {
+    /// How this precondition is named to a client.
+    ///
+    /// A refusal's message reaches a client verbatim through `to_string`, and
+    /// a Rust `Debug` form (`Revision("blake3:…")`) is both Rust syntax and a
+    /// needless echo of the caller's own revision string.
+    fn label(&self) -> &'static str {
+        match self {
+            Precondition::Revision(_) => "a revision precondition",
+            Precondition::Absent => "an absent precondition",
+            Precondition::Any => "an unconditional precondition",
+        }
+    }
+}
+
 /// Why a mutation was refused. Every variant means *nothing changed*.
 ///
 /// The messages spell a `VaultPath` through `as_str`, not through `{path}`:
@@ -107,7 +122,7 @@ pub enum MutationError {
     IsANote { path: VaultPath },
     #[error("{} is not empty; pass recursive to delete it anyway", path.as_str())]
     FolderNotEmpty { path: VaultPath },
-    #[error("{expected:?} is not a valid precondition for this operation")]
+    #[error("{} is not valid for this operation", expected.label())]
     InvalidPrecondition { expected: Precondition },
     #[error(
         "{actual} bytes exceeds the {limit}-byte cap; chunked transfer for larger files is not implemented"
@@ -204,8 +219,22 @@ impl MutationEngine {
     /// appended unresolved, because a mutation target need not exist yet.
     /// When the final component *does* exist and is itself a symlink, its own
     /// canonical target is checked too — a link planted at the target name
-    /// must not become an out-of-vault write.
+    /// must not become an out-of-vault write. A link that cannot be resolved
+    /// at all, because it dangles or loops, is refused rather than treated as
+    /// an absent target: the name is occupied by something this check cannot
+    /// vouch for.
     pub fn resolve(&self, path: &VaultPath) -> Result<PathBuf, MutationError> {
+        // A NUL byte never reaches the filesystem — std refuses the C-string
+        // conversion — and *which* component holds it decides which syscall
+        // fails first, so classifying by the resulting `io::Error` answers
+        // two different ways for one malformed input (and `Ok` for one of
+        // them, since the final `canonicalize` failing is indistinguishable
+        // from an absent target). Refused once, here, for every spelling.
+        // `VaultPath::new` is string-level and does not reject it; tightening
+        // that constructor is a `vault-core` change this task does not own.
+        if path.as_str().contains('\0') {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
         let absolute = self.canonical_root.join(path.as_str());
         let parent = absolute
             .parent()
@@ -232,21 +261,65 @@ impl MutationEngine {
                     Err(MutationError::ZoneViolation { path: path.clone() })
                 }
             }
-            // The target does not exist yet, or is a link whose own target
-            // does not exist. Either way the parent check above is what
-            // bounds it, and nothing has been written.
-            Err(_) => Ok(resolved),
+            Err(_) => {
+                // Two very different situations reach here. Either nothing is
+                // at the name — the ordinary create case, bounded by the
+                // parent check above, with nothing written — or something *is*
+                // at the name and still cannot be resolved: a symlink that
+                // dangles or loops. The second is not absence. Its target is
+                // outside anything this check can vouch for, and a caller that
+                // opened the returned path with `O_CREAT` rather than renaming
+                // over it would create a file wherever the link points, which
+                // is how a dangling link becomes an out-of-vault write.
+                // `symlink_metadata` does not follow the link, so it is the
+                // one call that can tell the two apart.
+                if std::fs::symlink_metadata(&resolved).is_ok() {
+                    return Err(MutationError::ZoneViolation { path: path.clone() });
+                }
+                Ok(resolved)
+            }
+        }
+    }
+
+    /// Read `resolved`'s bytes when a regular file is there, reporting an
+    /// absent target as `None`.
+    ///
+    /// Anything that is not a regular file — a directory, a fifo, a socket,
+    /// a device — is refused as [`MutationError::TargetExists`], the
+    /// taxonomy's "something else already occupies this name", which is
+    /// exactly the situation. Reading first would answer `EISDIR` instead,
+    /// and that reaches a client as `storage_failure`: a claim the daemon is
+    /// broken, and an invitation to retry a request that can never succeed.
+    /// Refusing before the read also means a fifo at a target name can never
+    /// block the daemon on an open that waits for a writer.
+    fn read_regular_file(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+    ) -> Result<Option<Vec<u8>>, MutationError> {
+        match std::fs::metadata(resolved) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(MutationError::TargetExists { path: path.clone() });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io(error)),
+        }
+        match std::fs::read(resolved) {
+            Ok(bytes) => Ok(Some(bytes)),
+            // Removed between the stat and the read: still absence, and the
+            // caller's precondition is what decides whether that is allowed.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io(error)),
         }
     }
 
     /// `path`'s current on-disk revision, or `None` when it does not exist.
     pub fn current_revision(&self, path: &VaultPath) -> Result<Option<String>, MutationError> {
         let resolved = self.resolve(path)?;
-        match std::fs::read(&resolved) {
-            Ok(bytes) => Ok(Some(revision_of(&bytes))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io(error)),
-        }
+        Ok(self
+            .read_regular_file(path, &resolved)?
+            .map(|bytes| revision_of(&bytes)))
     }
 
     /// Evaluate `expected` against what is on disk right now, handing back
@@ -260,11 +333,7 @@ impl MutationEngine {
         expected: &Precondition,
     ) -> Result<Option<Vec<u8>>, MutationError> {
         let resolved = self.resolve(path)?;
-        let current = match std::fs::read(&resolved) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(io(error)),
-        };
+        let current = self.read_regular_file(path, &resolved)?;
         match (expected, &current) {
             (Precondition::Any, _) => Ok(current),
             (Precondition::Absent, None) => Ok(None),
@@ -301,6 +370,23 @@ impl MutationEngine {
     /// against `One.md` and the collision becomes invisible. A caller runs
     /// this check before any existence or compare-and-swap check for the same
     /// reason.
+    ///
+    /// Applied unconditionally, including on a case-sensitive filesystem
+    /// where both spellings could legally coexist. That refuses a create
+    /// which would have worked there, and deliberately: a vault relying on it
+    /// would lose a file the moment it was opened or synced onto a default
+    /// macOS filesystem.
+    ///
+    /// **Unicode normalization variants are not collisions here.** `Café.md`
+    /// (NFC) and `Café.md` (NFD) address the same file on APFS, and this
+    /// comparison — codepoint lowercasing of the stored bytes — does not see
+    /// that equivalence, so it reports `None`. The reason to leave it there
+    /// rather than normalize is that folding is the platform's own write
+    /// semantics: the caller's spelling reaches the same file, the bytes are
+    /// preserved, and a precondition still guards it (`check` against an NFD
+    /// spelling reads the NFC file's bytes and refuses on `Absent`). Only a
+    /// variant that `read_dir` reveals as a *distinct stored name* is a
+    /// collision, which is what this returns.
     pub fn case_variant(&self, path: &VaultPath) -> Result<Option<String>, MutationError> {
         let resolved = self.resolve(path)?;
         let Some(parent) = resolved.parent() else {
