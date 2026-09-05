@@ -444,6 +444,7 @@ impl SubscriptionRegistry {
                 message: format!("no such subscription: {id}"),
                 supported_version: None,
                 current_generation: None,
+                current_revision: None,
             }),
         }
     }

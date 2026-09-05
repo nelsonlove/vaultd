@@ -5,7 +5,9 @@ use crate::operations::{Request, Response};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// `Eq` is not derivable: `Request` is only `PartialEq` (see its definition —
+// `PatchFrontmatter` carries an `f64`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RequestEnvelope {
     pub version: u16,
     pub id: String,
@@ -63,5 +65,6 @@ pub fn validate_version(version: u16) -> Result<(), ProtocolError> {
         message: format!("unsupported protocol version {version}"),
         supported_version: Some(PROTOCOL_VERSION),
         current_generation: None,
+        current_revision: None,
     })
 }

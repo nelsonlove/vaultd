@@ -1,11 +1,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::events::LiveStateDto;
+use crate::mutations::{
+    CopyFileParams, DeleteFolderParams, DeleteNoteParams, FolderParams, GenerationResponse,
+    MutationResponse, PatchFrontmatterParams, ReadFileParams, ReadFileResponse, RenameFolderParams,
+    RenameNoteParams, RenameResponse, WriteFileParams, WriteFileResponse, WriteNoteParams,
+};
 use crate::semantic::{
     DiagnosticDto, IndexStateDto, NoteDto, NoteSummaryDto, ReferenceDto, ResolutionDto, SeverityDto,
 };
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// `Eq` is not derivable here: `PatchFrontmatter` carries `PatchValueDto`,
+// which holds an `f64` for the JSON-number-with-a-fraction case, and `f64`
+// has no total order. `PartialEq` is enough — nothing hashes or sorts a
+// `Request`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
     Health,
@@ -19,6 +28,16 @@ pub enum Request {
     RefreshIndex(RefreshIndexParams),
     SubscribeEvents(SubscribeEventsParams),
     Unsubscribe(UnsubscribeParams),
+    WriteNote(WriteNoteParams),
+    CreateFolder(FolderParams),
+    RenameNote(RenameNoteParams),
+    RenameFolder(RenameFolderParams),
+    CopyFile(CopyFileParams),
+    DeleteNote(DeleteNoteParams),
+    DeleteFolder(DeleteFolderParams),
+    PatchFrontmatter(PatchFrontmatterParams),
+    WriteFile(WriteFileParams),
+    ReadFile(ReadFileParams),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,6 +128,16 @@ pub enum Response {
     RefreshIndex(RefreshIndexResponse),
     SubscribeEvents(SubscribeEventsResponse),
     Unsubscribe(UnsubscribeResponse),
+    WriteNote(MutationResponse),
+    CreateFolder(GenerationResponse),
+    RenameNote(RenameResponse),
+    RenameFolder(RenameResponse),
+    CopyFile(MutationResponse),
+    DeleteNote(GenerationResponse),
+    DeleteFolder(GenerationResponse),
+    PatchFrontmatter(MutationResponse),
+    WriteFile(WriteFileResponse),
+    ReadFile(ReadFileResponse),
 }
 
 impl Response {

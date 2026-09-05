@@ -54,6 +54,7 @@ fn index_unavailable() -> ProtocolError {
         message: "no vault is configured".into(),
         supported_version: None,
         current_generation: None,
+        current_revision: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn runtime_not_ready(message: &str) -> ProtocolError {
         message: message.into(),
         supported_version: None,
         current_generation: None,
+        current_revision: None,
     }
 }
 
@@ -74,6 +76,7 @@ fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
         message: format!("invalid vault path: {value:?}"),
         supported_version: None,
         current_generation: None,
+        current_revision: None,
     })
 }
 
@@ -361,6 +364,20 @@ impl Server {
                     Ok(response) => ResponseEnvelope::success(id, Response::Unsubscribe(response)),
                     Err(error) => ResponseEnvelope::error(id, error),
                 }
+            }
+            // Wired in Task 9; the DTOs land first so the protocol stays
+            // additive and each layer is reviewable on its own.
+            Request::WriteNote(_)
+            | Request::CreateFolder(_)
+            | Request::RenameNote(_)
+            | Request::RenameFolder(_)
+            | Request::CopyFile(_)
+            | Request::DeleteNote(_)
+            | Request::DeleteFolder(_)
+            | Request::PatchFrontmatter(_)
+            | Request::WriteFile(_)
+            | Request::ReadFile(_) => {
+                ResponseEnvelope::error(id, runtime_not_ready("mutations are not wired yet"))
             }
         }
     }

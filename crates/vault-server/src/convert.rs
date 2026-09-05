@@ -271,12 +271,14 @@ pub(crate) fn refresh_failure(value: RefreshFailure) -> ProtocolError {
             message: "the runtime is saturated; the vault will be reconciled completely".into(),
             supported_version: None,
             current_generation: None,
+            current_revision: None,
         },
         RefreshFailure::NotReady => ProtocolError {
             code: ErrorCode::RuntimeNotReady,
             message: "the runtime is not running".into(),
             supported_version: None,
             current_generation: None,
+            current_revision: None,
         },
         RefreshFailure::Failed(error) => index_error(error),
     }
@@ -290,6 +292,7 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
         message: String::new(),
         supported_version: None,
         current_generation: None,
+        current_revision: None,
     };
     match value {
         IndexError::InvalidPath(message) => {

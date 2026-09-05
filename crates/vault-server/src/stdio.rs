@@ -108,6 +108,7 @@ fn respond(
                 message: format!("invalid request: {error}"),
                 supported_version: None,
                 current_generation: None,
+                current_revision: None,
             },
         ),
     }

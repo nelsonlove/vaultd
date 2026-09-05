@@ -8,6 +8,11 @@ pub struct ProtocolError {
     pub supported_version: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_generation: Option<u64>,
+    /// The revision the target actually holds, on a `revision_conflict`. The
+    /// caller's retry loop needs it, and re-reading the note to discover it
+    /// would race the next writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -29,6 +34,14 @@ pub enum ErrorCode {
     SubscriptionNotFound,
     RuntimeNotReady,
     RuntimeOverloaded,
+    RevisionConflict,
+    NotFound,
+    ParentNotFound,
+    TargetExists,
+    CaseCollision,
+    ZoneViolation,
+    PayloadTooLarge,
+    ReadOnly,
     /// A code this build does not know. Never produced by this server.
     Unknown,
 }
@@ -55,6 +68,14 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "subscription_not_found" => Self::SubscriptionNotFound,
             "runtime_not_ready" => Self::RuntimeNotReady,
             "runtime_overloaded" => Self::RuntimeOverloaded,
+            "revision_conflict" => Self::RevisionConflict,
+            "not_found" => Self::NotFound,
+            "parent_not_found" => Self::ParentNotFound,
+            "target_exists" => Self::TargetExists,
+            "case_collision" => Self::CaseCollision,
+            "zone_violation" => Self::ZoneViolation,
+            "payload_too_large" => Self::PayloadTooLarge,
+            "read_only" => Self::ReadOnly,
             _ => Self::Unknown,
         })
     }
