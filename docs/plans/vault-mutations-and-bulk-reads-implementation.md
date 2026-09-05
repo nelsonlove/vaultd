@@ -6285,7 +6285,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
 ```rust
             Request::WriteNote(params) => match parse_path(&params.path) {
                 Err(error) => ResponseEnvelope::error(id, error),
-                Ok(path) => match convert::precondition(&params.expected) {
+                Ok(path) => match convert::precondition(params.expected.as_ref()) {
                     Err(error) => ResponseEnvelope::error(id, error),
                     Ok(expected) => match self.mutate(vault_index::Mutation::WriteNote {
                         path,
@@ -6322,7 +6322,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
             Request::RenameNote(params) => {
                 match (parse_path(&params.from), parse_path(&params.to)) {
                     (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
-                    (Ok(from), Ok(to)) => match convert::precondition(&params.expected) {
+                    (Ok(from), Ok(to)) => match convert::precondition(params.expected.as_ref()) {
                         Err(error) => ResponseEnvelope::error(id, error),
                         Ok(expected) => match self.mutate(vault_index::Mutation::RenameNote {
                             from,
@@ -6377,7 +6377,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
             }
             Request::CopyFile(params) => match (parse_path(&params.from), parse_path(&params.to)) {
                 (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
-                (Ok(from), Ok(to)) => match convert::precondition(&params.expected_source) {
+                (Ok(from), Ok(to)) => match convert::precondition(params.expected_source.as_ref()) {
                     Err(error) => ResponseEnvelope::error(id, error),
                     Ok(expected_source) => match self.mutate(vault_index::Mutation::CopyFile {
                         from,
@@ -6401,7 +6401,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
             },
             Request::DeleteNote(params) => match parse_path(&params.path) {
                 Err(error) => ResponseEnvelope::error(id, error),
-                Ok(path) => match convert::precondition(&params.expected) {
+                Ok(path) => match convert::precondition(params.expected.as_ref()) {
                     Err(error) => ResponseEnvelope::error(id, error),
                     Ok(expected) => match self.mutate(vault_index::Mutation::DeleteNote {
                         path,
@@ -6439,7 +6439,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
             Request::PatchFrontmatter(params) => match parse_path(&params.path) {
                 Err(error) => ResponseEnvelope::error(id, error),
                 Ok(path) => match (
-                    convert::precondition(&params.expected),
+                    convert::precondition(params.expected.as_ref()),
                     convert::frontmatter_edits(&params.patch),
                 ) {
                     (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
@@ -10929,7 +10929,7 @@ In `crates/vault-server/src/lib.rs`:
             Request::WriteFile(params) => match parse_path(&params.path) {
                 Err(error) => ResponseEnvelope::error(id, error),
                 Ok(path) => match (
-                    convert::precondition(&params.expected),
+                    convert::precondition(params.expected.as_ref()),
                     convert::decode_base64(&params.content_base64),
                 ) {
                     (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
