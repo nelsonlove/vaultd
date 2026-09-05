@@ -18,6 +18,8 @@
 //!
 //! Nothing here knows about protocol types, the coordinator, or generations.
 
+use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use vault_core::VaultPath;
@@ -404,5 +406,221 @@ impl MutationEngine {
             }
         }
         Ok(None)
+    }
+}
+
+/// One mutation, as the coordinator receives it. Later variants are added by
+/// their own tasks; every variant is a single-file operation except the
+/// folder ones and rename-with-repair, which are still one coordinator
+/// command and one generation.
+#[derive(Clone, Debug)]
+pub enum Mutation {
+    WriteNote {
+        path: VaultPath,
+        content: String,
+        expected: Precondition,
+    },
+}
+
+/// One referencing note a rename could not rewrite, and why. Populated only
+/// by rename link repair; every other mutation leaves it empty.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkRewriteFailure {
+    pub path: VaultPath,
+    pub reason: String,
+}
+
+/// What one applied mutation did on disk.
+#[derive(Clone, Debug, Default)]
+pub struct MutationOutcome {
+    /// **Every** filesystem path whose state moved — notes, attachments, and
+    /// folders alike, not only the Markdown ones.
+    ///
+    /// This is what the coordinator hands to `refresh_paths`, and since the
+    /// tree pre-task the index tracks folders and non-Markdown files too: a
+    /// path appearing, disappearing, or changing stat is generational whatever
+    /// its extension. A folder or attachment left unnamed here is a tree row
+    /// that is never written, so `snapshot_tree` would serve a tree missing the
+    /// daemon's own writes. Over-naming is free — conservative invalidation
+    /// re-observes a path and finds nothing changed — while under-naming is a
+    /// missing generation.
+    pub changed_paths: BTreeSet<VaultPath>,
+    /// The revision written, for the operations that write content. `None`
+    /// for folder operations and deletes: a deleted file has no revision.
+    pub revision: Option<String>,
+    pub links_rewritten: u64,
+    pub link_rewrite_failures: Vec<LinkRewriteFailure>,
+    /// Whether this mutation **changed anything the semantic layer indexes**,
+    /// which is to say the Markdown half of the index: notes, their
+    /// frontmatter, their links.
+    ///
+    /// An independent fact each constructor states deliberately, *not* one
+    /// derived from `changed_paths`. The two answer different questions and
+    /// come apart in both directions: `delete_note` of an attachment names the
+    /// deleted path (the tree moved) while nothing semantic did, and a
+    /// byte-identical `patch_frontmatter` names no path at all while still
+    /// being a semantic operation that succeeded. Read off per operation:
+    ///
+    /// | operation | `semantic` |
+    /// | --- | --- |
+    /// | `write_note` | `true` — the target is a note by construction |
+    /// | `create_folder` | `false` — a folder holds no indexed semantics |
+    /// | `delete_note` of a note | `true` |
+    /// | `delete_note` of an attachment | `false` |
+    /// | `delete_folder` | `true` iff it removed at least one note |
+    /// | `copy_file` | `true` iff the **destination** is Markdown |
+    /// | `rename_note` / `rename_folder` | `true` iff any Markdown path moved |
+    /// | `patch_frontmatter` | `true` |
+    /// | `write_file` | **always `false`** — the zone is not indexed, an
+    ///   attachment is not indexed, and a `.md` path is refused with
+    ///   [`MutationError::IsANote`] rather than written raw |
+    ///
+    /// It is deliberately **not** the same question as "does this write live
+    /// inside the indexed vault", which is what the wire's
+    /// `WriteFileResponse::semantic` answers. That one is `!in_config_zone`,
+    /// the server computes it from the path, and conflating the two is what
+    /// made an attachment write claim to be semantic in the first draft.
+    pub semantic: bool,
+}
+
+/// Whether `path` is inside the configuration zone, which every semantic
+/// operation refuses and only the raw pair may touch.
+pub fn in_config_zone(path: &VaultPath) -> bool {
+    let text = path.as_str();
+    text == CONFIG_ZONE
+        || text
+            .strip_prefix(CONFIG_ZONE)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn is_markdown(path: &VaultPath) -> bool {
+    Path::new(path.as_str())
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+/// Carry a replaced file's permission bits onto its replacement.
+///
+/// A replace is a rename over the target, so the surviving inode is the
+/// temporary file's, created `0600` by `tempfile` — every note the daemon
+/// touched would quietly lose whatever mode it had. Copying the old mode over
+/// keeps a write a *content* change and nothing else. A create has no old mode
+/// to copy and keeps the private one: widening it would need the process
+/// umask, which cannot be read without setting it, and a note the caller can
+/// still read and write is the safe end of that trade.
+#[cfg(unix)]
+fn adopt_permissions(target: &Path, replacement: &std::fs::File) -> Result<(), MutationError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = match std::fs::metadata(target) {
+        Ok(metadata) => metadata.permissions().mode(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io(error)),
+    };
+    replacement
+        .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(io)
+}
+
+#[cfg(not(unix))]
+fn adopt_permissions(_target: &Path, _replacement: &std::fs::File) -> Result<(), MutationError> {
+    Ok(())
+}
+
+/// Write `bytes` to `target` atomically: a temporary file in the target's own
+/// directory (so the rename is same-filesystem and therefore atomic),
+/// flushed to disk, then renamed over the target.
+///
+/// A crash leaves the old bytes or the new bytes, never a mixture, and never a
+/// half-written file under the target's name. Whether the *rename itself*
+/// survives a power loss is the filesystem's own ordering guarantee — this
+/// does not fsync the directory, because the invariant clients depend on is
+/// that a note is never torn, not that an acknowledged write outlives an
+/// unclean shutdown.
+///
+/// The temporary name is `.vaultd-*` with **no** extension, deliberately:
+/// `FileSystemVaultSource::markdown_paths` only enumerates `*.md`, so the
+/// temporary is never mistaken for a note even in the microseconds it exists,
+/// and never produces a spurious create-then-delete generation pair.
+pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), MutationError> {
+    let directory = target.parent().ok_or_else(|| MutationError::Io {
+        message: format!("{} has no parent directory", target.display()),
+    })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".vaultd-")
+        .tempfile_in(directory)
+        .map_err(io)?;
+    temporary.write_all(bytes).map_err(io)?;
+    adopt_permissions(target, temporary.as_file())?;
+    temporary.as_file().sync_all().map_err(io)?;
+    temporary
+        .persist(target)
+        .map_err(|error| MutationError::Io {
+            message: error.error.to_string(),
+        })?;
+    Ok(())
+}
+
+impl MutationEngine {
+    /// Apply one mutation. Every refusal happens before anything is written,
+    /// so an `Err` means the vault is byte-identical to what it was.
+    pub fn apply(&self, mutation: &Mutation) -> Result<MutationOutcome, MutationError> {
+        if self.read_only {
+            return Err(MutationError::ReadOnly);
+        }
+        match mutation {
+            Mutation::WriteNote {
+                path,
+                content,
+                expected,
+            } => self.write_note(path, content, expected),
+        }
+    }
+
+    fn write_note(
+        &self,
+        path: &VaultPath,
+        content: &str,
+        expected: &Precondition,
+    ) -> Result<MutationOutcome, MutationError> {
+        if in_config_zone(path) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        if !is_markdown(path) {
+            return Err(MutationError::NotANote { path: path.clone() });
+        }
+        let bytes = content.as_bytes();
+        // Invalid UTF-8 is structurally impossible here: `content` arrived as
+        // a JSON string and is a `&str`. Asserted by the type, not validated.
+        let actual = bytes.len() as u64;
+        if actual > self.max_file_bytes {
+            return Err(MutationError::TooLarge {
+                limit: self.max_file_bytes,
+                actual,
+            });
+        }
+        let resolved = self.resolve(path)?;
+        // The case check comes before the precondition, and unconditionally.
+        // On a case-insensitive filesystem `check` folds the spelling: asked
+        // about `one.md` it reads `One.md`'s bytes, so an `absent`
+        // precondition reports a revision conflict for a name that has no
+        // file, and a `revision` precondition naming those bytes *passes* and
+        // lets the write land on a file the caller never addressed. Neither
+        // answer is true of the path as spelled; the collision is.
+        if let Some(existing) = self.case_variant(path)? {
+            return Err(MutationError::CaseCollision {
+                path: path.clone(),
+                existing,
+            });
+        }
+        self.check(path, expected)?;
+        write_atomically(&resolved, bytes)?;
+        Ok(MutationOutcome {
+            changed_paths: BTreeSet::from([path.clone()]),
+            revision: Some(revision_of(bytes)),
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            semantic: true,
+        })
     }
 }
