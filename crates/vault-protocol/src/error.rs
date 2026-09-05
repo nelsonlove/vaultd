@@ -42,6 +42,8 @@ pub enum ErrorCode {
     ZoneViolation,
     PayloadTooLarge,
     ReadOnly,
+    SnapshotNotFound,
+    TooManySnapshots,
     /// A code this build does not know. Never produced by this server.
     Unknown,
 }
@@ -76,6 +78,8 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "zone_violation" => Self::ZoneViolation,
             "payload_too_large" => Self::PayloadTooLarge,
             "read_only" => Self::ReadOnly,
+            "snapshot_not_found" => Self::SnapshotNotFound,
+            "too_many_snapshots" => Self::TooManySnapshots,
             _ => Self::Unknown,
         })
     }

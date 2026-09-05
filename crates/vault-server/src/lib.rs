@@ -365,8 +365,7 @@ impl Server {
                     Err(error) => ResponseEnvelope::error(id, error),
                 }
             }
-            // Wired in Task 9; the DTOs land first so the protocol stays
-            // additive and each layer is reviewable on its own.
+            // Wired in Task 9 (mutations) and Tasks 13-15 (snapshots).
             Request::WriteNote(_)
             | Request::CreateFolder(_)
             | Request::RenameNote(_)
@@ -376,7 +375,11 @@ impl Server {
             | Request::DeleteFolder(_)
             | Request::PatchFrontmatter(_)
             | Request::WriteFile(_)
-            | Request::ReadFile(_) => {
+            | Request::ReadFile(_)
+            | Request::OpenSnapshot(_)
+            | Request::SnapshotTree(_)
+            | Request::SnapshotNotes(_)
+            | Request::CloseSnapshot(_) => {
                 ResponseEnvelope::error(id, runtime_not_ready("mutations are not wired yet"))
             }
         }

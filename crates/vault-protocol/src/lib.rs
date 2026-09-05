@@ -4,6 +4,7 @@ mod events;
 mod mutations;
 mod operations;
 mod semantic;
+mod snapshots;
 
 pub use envelope::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, ResponseOutcome, validate_version,
@@ -32,4 +33,10 @@ pub use semantic::{
     PropertyDto, PropertyMappingEntryDto, PropertyValueDto, ReferenceDto, ReferenceKindDto,
     ReferenceOriginDto, ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, SubpathDto,
     TagDto,
+};
+pub use snapshots::{
+    CloseSnapshotParams, CloseSnapshotResponse, ListItemDto, NoteFacetDto, NoteMetadataDto,
+    OpenSnapshotParams, OpenSnapshotResponse, SectionDto, SnapshotNoteDto, SnapshotNotesParams,
+    SnapshotNotesResponse, SnapshotTreeParams, SnapshotTreeResponse, TreeEntryDto,
+    TreeEntryKindDto,
 };

@@ -9,6 +9,10 @@ use crate::mutations::{
 use crate::semantic::{
     DiagnosticDto, IndexStateDto, NoteDto, NoteSummaryDto, ReferenceDto, ResolutionDto, SeverityDto,
 };
+use crate::snapshots::{
+    CloseSnapshotParams, CloseSnapshotResponse, OpenSnapshotParams, OpenSnapshotResponse,
+    SnapshotNotesParams, SnapshotNotesResponse, SnapshotTreeParams, SnapshotTreeResponse,
+};
 
 // `Eq` is not derivable here: `PatchFrontmatter` carries `PatchValueDto`,
 // which holds an `f64` for the JSON-number-with-a-fraction case, and `f64`
@@ -38,6 +42,10 @@ pub enum Request {
     PatchFrontmatter(PatchFrontmatterParams),
     WriteFile(WriteFileParams),
     ReadFile(ReadFileParams),
+    OpenSnapshot(OpenSnapshotParams),
+    SnapshotTree(SnapshotTreeParams),
+    SnapshotNotes(SnapshotNotesParams),
+    CloseSnapshot(CloseSnapshotParams),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,7 +122,11 @@ pub struct UnsubscribeParams {
     pub subscription_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// `Eq` is not derivable here: `SnapshotNotes` carries `SnapshotNotesResponse`,
+// whose `SnapshotNoteDto`/`NoteMetadataDto` deliberately derive only
+// `PartialEq` (see `snapshots.rs`). `PartialEq` is enough — nothing hashes or
+// sorts a `Response`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Response {
     Health(HealthResponse),
@@ -138,6 +150,10 @@ pub enum Response {
     PatchFrontmatter(MutationResponse),
     WriteFile(WriteFileResponse),
     ReadFile(ReadFileResponse),
+    OpenSnapshot(OpenSnapshotResponse),
+    SnapshotTree(SnapshotTreeResponse),
+    SnapshotNotes(SnapshotNotesResponse),
+    CloseSnapshot(CloseSnapshotResponse),
 }
 
 impl Response {
