@@ -243,6 +243,185 @@ fn the_configuration_zone_refuses_every_semantic_operation() {
     );
 }
 
+/// The zone check reads the path the write would actually reach, not the
+/// spelling the caller sent. On a case-insensitive filesystem `.OBSIDIAN`
+/// *is* `.obsidian`, so a spelling-only comparison lets a semantic write land
+/// in the one place the spec says nothing semantic may go.
+#[test]
+fn a_case_variant_spelling_of_the_zone_is_still_the_zone() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".obsidian/plugins")).expect("create the zone");
+    let error = fixture
+        .engine
+        .apply(&Mutation::WriteNote {
+            path: path(".OBSIDIAN/plugins/x.md"),
+            content: "# nope\n".into(),
+            expected: Precondition::Absent,
+        })
+        .expect_err("a folded spelling reaches the same zone");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {error:?}"
+    );
+    assert_eq!(
+        names_in(&fixture.root.join(".obsidian/plugins")),
+        BTreeSet::new(),
+        "nothing may land in the zone"
+    );
+}
+
+/// A note under any hidden folder is skipped by `refresh_paths`, so a write
+/// there would report a revision at a generation the client can never read
+/// back — the same read-your-writes break that makes a non-`.md` path a typed
+/// refusal rather than a raw write.
+#[test]
+fn a_note_under_a_hidden_folder_is_refused() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".trash")).expect("create the local trash");
+    let error = fixture
+        .engine
+        .apply(&Mutation::WriteNote {
+            path: path(".trash/Gone.md"),
+            content: "# gone\n".into(),
+            expected: Precondition::Absent,
+        })
+        .expect_err("the scan never lists a hidden folder");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {error:?}"
+    );
+    assert_eq!(names_in(&fixture.root.join(".trash")), BTreeSet::new());
+}
+
+#[test]
+fn a_note_under_a_nested_hidden_folder_is_refused() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join("a/.b")).expect("create the nested hidden folder");
+    let error = fixture
+        .engine
+        .apply(&Mutation::WriteNote {
+            path: path("a/.b/c.md"),
+            content: "# hidden\n".into(),
+            expected: Precondition::Absent,
+        })
+        .expect_err("hidden is hidden at any depth");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {error:?}"
+    );
+    assert_eq!(names_in(&fixture.root.join("a/.b")), BTreeSet::new());
+}
+
+/// What the outcome names is what the coordinator hands to `refresh_paths`,
+/// and the index must be keyed by the spelling the scanner emits — the one
+/// stored on disk. On a case-insensitive filesystem the caller's spelling can
+/// differ from it while addressing the same file, and reporting the caller's
+/// would key a row the scanner never produces.
+#[test]
+fn the_outcome_names_the_on_disk_spelling_of_the_folder() {
+    let fixture = fixture();
+    let outcome = fixture.engine.apply(&Mutation::WriteNote {
+        path: path("folder/New.md"),
+        content: "# New\n".into(),
+        expected: Precondition::Absent,
+    });
+
+    if fixture.root.join("folder").exists() {
+        // A case-insensitive filesystem: `folder/` resolved to the stored
+        // `Folder/`, and the write landed there under the stored spelling.
+        let outcome = outcome.expect("the folded parent resolves to the stored folder");
+        assert_eq!(
+            outcome.changed_paths,
+            BTreeSet::from([path("Folder/New.md")]),
+            "the outcome must name the stored spelling, not the caller's"
+        );
+        assert_eq!(
+            names_in(&fixture.root.join("Folder")),
+            BTreeSet::from(["New.md".to_string()])
+        );
+    } else {
+        // A case-sensitive filesystem: `folder/` is simply not there.
+        let error = outcome.expect_err("no folder by that name exists");
+        assert!(
+            matches!(error, MutationError::ParentNotFound { .. }),
+            "expected parent_not_found, got {error:?}"
+        );
+    }
+}
+
+/// The only failure that can happen *after* every check has passed. It must
+/// be typed as a filesystem failure, leave the original bytes, and leave no
+/// temporary file — the one test that would catch a plain `fs::write`
+/// creeping back into the write path.
+#[cfg(unix)]
+#[test]
+fn a_filesystem_failure_is_typed_and_leaves_the_note_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = fixture();
+    let folder = fixture.root.join("Folder");
+    std::fs::write(folder.join("A.md"), "# a\n").expect("write A");
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500))
+        .expect("make the folder unwritable");
+
+    let outcome = fixture.engine.apply(&Mutation::WriteNote {
+        path: path("Folder/A.md"),
+        content: "# clobbered\n".into(),
+        expected: Precondition::Any,
+    });
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+        .expect("restore the folder so the tempdir can be cleaned up");
+
+    let error = outcome.expect_err("a temp file cannot be created in an unwritable folder");
+    assert!(
+        matches!(error, MutationError::Io { .. }),
+        "expected a typed filesystem failure, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(folder.join("A.md")).expect("read back"),
+        b"# a\n"
+    );
+    assert_eq!(
+        names_in(&folder),
+        BTreeSet::from(["A.md".to_string()]),
+        "a failed write leaves no temporary file"
+    );
+}
+
+/// A created note has no old mode to keep, so it takes the one the folder
+/// implies — the same `0644` inside a `0755` folder that every other tool
+/// writing into the vault produces.
+#[cfg(unix)]
+#[test]
+fn a_created_note_takes_its_mode_from_the_folder_it_lands_in() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = fixture();
+    let folder = fixture.root.join("Folder");
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+        .expect("a world-readable folder");
+
+    fixture
+        .engine
+        .apply(&Mutation::WriteNote {
+            path: path("Folder/New.md"),
+            content: "# New\n".into(),
+            expected: Precondition::Absent,
+        })
+        .expect("create a new note");
+
+    let mode = std::fs::metadata(folder.join("New.md"))
+        .expect("stat the new note")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "a 0755 folder implies 0644 notes, not tempfile's 0600"
+    );
+}
+
 #[test]
 fn a_write_leaves_no_temporary_file_behind() {
     let fixture = fixture();

@@ -335,7 +335,20 @@ impl MutationEngine {
         expected: &Precondition,
     ) -> Result<Option<Vec<u8>>, MutationError> {
         let resolved = self.resolve(path)?;
-        let current = self.read_regular_file(path, &resolved)?;
+        self.check_resolved(path, &resolved, expected)
+    }
+
+    /// [`MutationEngine::check`] against an already-resolved target, for a
+    /// caller that resolved once and is threading the answer through its own
+    /// checks. Resolving again would be three canonicalize chains for one
+    /// write, and three chances for them to disagree under a racing rename.
+    fn check_resolved(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+        expected: &Precondition,
+    ) -> Result<Option<Vec<u8>>, MutationError> {
+        let current = self.read_regular_file(path, resolved)?;
         match (expected, &current) {
             (Precondition::Any, _) => Ok(current),
             (Precondition::Absent, None) => Ok(None),
@@ -391,22 +404,90 @@ impl MutationEngine {
     /// collision, which is what this returns.
     pub fn case_variant(&self, path: &VaultPath) -> Result<Option<String>, MutationError> {
         let resolved = self.resolve(path)?;
-        let Some(parent) = resolved.parent() else {
-            return Ok(None);
-        };
-        let Some(name) = resolved.file_name().and_then(|name| name.to_str()) else {
-            return Ok(None);
-        };
-        let wanted = name.to_lowercase();
-        for entry in std::fs::read_dir(parent).map_err(io)? {
-            let entry = entry.map_err(io)?;
-            let existing = entry.file_name().to_string_lossy().into_owned();
-            if existing != name && existing.to_lowercase() == wanted {
-                return Ok(Some(existing));
-            }
-        }
-        Ok(None)
+        Ok(self.case_scan(&resolved)?.variant)
     }
+
+    /// The case collision a mutation refuses: a differently-cased stored name
+    /// **and no file stored under the caller's own spelling**.
+    ///
+    /// The qualifier is what separates the hazard from a legal state. On a
+    /// case-insensitive filesystem the two can never both be stored, so
+    /// `one.md` beside a stored `One.md` is always the hazard and is always
+    /// refused. On a case-sensitive one they can, and then the caller's
+    /// spelling names its own file unambiguously: the write goes exactly where
+    /// it says, nothing folds, and refusing would lock every such file out of
+    /// vaultd permanently rather than protecting anything. Both the spec's
+    /// Ruling 4 ("`create` with `expected.absent` where a case-variant
+    /// exists") and the controller's ordering ruling ("a case-insensitive
+    /// match … *with no exact match*") carry it.
+    ///
+    /// A *create* on a case-sensitive filesystem still refuses, which is
+    /// Ruling 4's deliberate strictness: the new file would coexist locally
+    /// and destroy its twin the moment the vault reached a default macOS
+    /// volume.
+    pub fn case_collision(&self, path: &VaultPath) -> Result<Option<String>, MutationError> {
+        let resolved = self.resolve(path)?;
+        self.case_collision_at(&resolved)
+    }
+
+    /// [`MutationEngine::case_collision`] against an already-resolved target.
+    fn case_collision_at(&self, resolved: &Path) -> Result<Option<String>, MutationError> {
+        let scan = self.case_scan(resolved)?;
+        if scan.exact {
+            Ok(None)
+        } else {
+            Ok(scan.variant)
+        }
+    }
+
+    /// Read the target's parent directory once and classify its stored names
+    /// against the target's own.
+    fn case_scan(&self, resolved: &Path) -> Result<CaseScan, MutationError> {
+        let (Some(parent), Some(name)) = (
+            resolved.parent(),
+            resolved.file_name().and_then(|name| name.to_str()),
+        ) else {
+            return Ok(CaseScan::default());
+        };
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(parent).map_err(io)? {
+            names.push(
+                entry
+                    .map_err(io)?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        Ok(classify_names(names, name))
+    }
+}
+
+/// What a parent directory's stored names say about one target name.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct CaseScan {
+    /// The target's own spelling is one of the stored names.
+    exact: bool,
+    /// A stored name that folds to the target's but is spelled differently.
+    /// The first such name in directory order when there is more than one.
+    variant: Option<String>,
+}
+
+/// Split out from the `read_dir` so the rule can be tested against listings a
+/// case-insensitive filesystem cannot physically produce — an exact name and a
+/// case variant side by side is exactly the state the qualifier exists for,
+/// and it cannot be created on the machine this is developed on.
+fn classify_names(names: impl IntoIterator<Item = String>, name: &str) -> CaseScan {
+    let wanted = name.to_lowercase();
+    let mut scan = CaseScan::default();
+    for existing in names {
+        if existing == name {
+            scan.exact = true;
+        } else if scan.variant.is_none() && existing.to_lowercase() == wanted {
+            scan.variant = Some(existing);
+        }
+    }
+    scan
 }
 
 /// One mutation, as the coordinator receives it. Later variants are added by
@@ -434,7 +515,15 @@ pub struct LinkRewriteFailure {
 #[derive(Clone, Debug, Default)]
 pub struct MutationOutcome {
     /// **Every** filesystem path whose state moved — notes, attachments, and
-    /// folders alike, not only the Markdown ones.
+    /// folders alike, not only the Markdown ones — each spelled the way the
+    /// filesystem stores it, never the way the caller spelled it.
+    ///
+    /// The stored spelling is what the scanner emits and therefore what the
+    /// index is keyed by. On a case-insensitive filesystem a caller naming
+    /// `folder/New.md` writes into a stored `Folder/`, and reporting its
+    /// spelling would key a row no complete reconciliation can ever match: the
+    /// client would miss its own write at the generation it was handed, and
+    /// the row would survive until the next full scan deleted it.
     ///
     /// This is what the coordinator hands to `refresh_paths`, and since the
     /// tree pre-task the index tracks folders and non-Markdown files too: a
@@ -485,6 +574,13 @@ pub struct MutationOutcome {
 
 /// Whether `path` is inside the configuration zone, which every semantic
 /// operation refuses and only the raw pair may touch.
+///
+/// The comparison is exact-case, so it answers about a *stored* spelling.
+/// Callers pass the path as the filesystem holds it — a caller's `.OBSIDIAN`
+/// reaches the real zone on a case-insensitive filesystem and names a
+/// different, ordinary folder on a case-sensitive one, and only the resolved
+/// path tells the two apart. Case-insensitive matching here would get the
+/// second case wrong for every vault.
 pub fn in_config_zone(path: &VaultPath) -> bool {
     let text = path.as_str();
     text == CONFIG_ZONE
@@ -493,32 +589,55 @@ pub fn in_config_zone(path: &VaultPath) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn is_markdown(path: &VaultPath) -> bool {
-    Path::new(path.as_str())
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+/// Whether the semantic layer would ever read a note at `path` — the union of
+/// the configuration zone and every hidden folder.
+///
+/// One predicate rather than two checks because the two refusals have one
+/// reason: `refresh_paths` skips `is_hidden` paths and the scan never lists
+/// them, so a semantic write into either would report a revision at a
+/// generation that will never contain it. That is the same read-your-writes
+/// break that makes a non-`.md` path a typed refusal instead of a raw write.
+/// [`VaultPath::is_hidden`] is the index's own predicate, used here so the two
+/// cannot drift; it subsumes `.trash`, `.git`, and every nested spelling of
+/// the zone, and `in_config_zone` catches the zone folder named by itself.
+fn is_unindexable(path: &VaultPath) -> bool {
+    in_config_zone(path) || path.is_hidden()
 }
 
-/// Carry a replaced file's permission bits onto its replacement.
+/// Give the replacement file the mode the result should have: the replaced
+/// file's own, or — when there is nothing to replace — the one the containing
+/// folder implies.
 ///
-/// A replace is a rename over the target, so the surviving inode is the
-/// temporary file's, created `0600` by `tempfile` — every note the daemon
-/// touched would quietly lose whatever mode it had. Copying the old mode over
-/// keeps a write a *content* change and nothing else. A create has no old mode
-/// to copy and keeps the private one: widening it would need the process
-/// umask, which cannot be read without setting it, and a note the caller can
-/// still read and write is the safe end of that trade.
+/// A write is a rename over the target, so the surviving inode is the
+/// temporary file's, created `0600` by `tempfile`. Left alone, that makes
+/// every note the daemon touched drop to owner-only while every note Obsidian
+/// writes stays `0644`, and a vault worked on by both grows two classes of
+/// note permission — one of which a publisher, backup, or container mount
+/// running as another user silently cannot read.
+///
+/// A replace takes the old file's mode, so a write changes *content* and
+/// nothing else. A create takes `folder_mode & 0o666`: a `0755` folder implies
+/// `0644` files, which is where every other tool writing into the vault lands,
+/// and the `& 0o666` drops the folder's execute and any setuid/setgid/sticky
+/// bits. The alternative — reading the process umask — is not portable to do
+/// without also setting it, and this answer needs no syscall that is not made
+/// anyway.
 #[cfg(unix)]
 fn adopt_permissions(target: &Path, replacement: &std::fs::File) -> Result<(), MutationError> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let mode = match std::fs::metadata(target) {
-        Ok(metadata) => metadata.permissions().mode(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) => metadata.permissions().mode() & 0o7777,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let folder = target.parent().ok_or_else(|| MutationError::Io {
+                message: format!("{} has no parent directory", target.display()),
+            })?;
+            std::fs::metadata(folder).map_err(io)?.permissions().mode() & 0o666
+        }
         Err(error) => return Err(io(error)),
     };
     replacement
-        .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+        .set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(io)
 }
 
@@ -537,6 +656,13 @@ fn adopt_permissions(_target: &Path, _replacement: &std::fs::File) -> Result<(),
 /// does not fsync the directory, because the invariant clients depend on is
 /// that a note is never torn, not that an acknowledged write outlives an
 /// unclean shutdown.
+///
+/// The rename replaces the *name*, never what a link under that name points
+/// at: a target that was a symlink into the vault becomes a regular file
+/// holding the new bytes, and the link's old target keeps the bytes it had.
+/// That is what every temp-and-rename writer does, and it is the safe end of
+/// the trade — writing through the link would put note bytes at a path the
+/// caller never named.
 ///
 /// The temporary name is `.vaultd-*` with **no** extension, deliberately:
 /// `FileSystemVaultSource::markdown_paths` only enumerates `*.md`, so the
@@ -577,16 +703,49 @@ impl MutationEngine {
         }
     }
 
+    /// The vault-relative path a resolved target is stored under: the parent's
+    /// spelling as the filesystem holds it, plus the name the write will
+    /// create.
+    ///
+    /// This, not the caller's spelling, is what an outcome reports. `resolve`
+    /// canonicalizes the parent, so on a case-insensitive filesystem a caller
+    /// naming `folder/New.md` writes into a stored `Folder/`; reporting the
+    /// caller's spelling would key an index row under a name the scanner never
+    /// emits, and the client would then miss its own write at the generation
+    /// it was handed.
+    fn stored_path(&self, path: &VaultPath, resolved: &Path) -> Result<VaultPath, MutationError> {
+        let relative = resolved
+            .strip_prefix(&self.canonical_root)
+            .map_err(|_| MutationError::ZoneViolation { path: path.clone() })?;
+        let mut spelling = String::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(MutationError::ZoneViolation { path: path.clone() });
+            };
+            let part = part
+                .to_str()
+                .ok_or_else(|| MutationError::ZoneViolation { path: path.clone() })?;
+            if !spelling.is_empty() {
+                spelling.push('/');
+            }
+            spelling.push_str(part);
+        }
+        VaultPath::new(spelling).map_err(|_| MutationError::ZoneViolation { path: path.clone() })
+    }
+
     fn write_note(
         &self,
         path: &VaultPath,
         content: &str,
         expected: &Precondition,
     ) -> Result<MutationOutcome, MutationError> {
-        if in_config_zone(path) {
+        // Once on the caller's spelling, so a path this obviously refuses is
+        // refused even when its parent does not exist and `resolve` would
+        // answer `parent_not_found` instead.
+        if is_unindexable(path) {
             return Err(MutationError::ZoneViolation { path: path.clone() });
         }
-        if !is_markdown(path) {
+        if !path.is_markdown() {
             return Err(MutationError::NotANote { path: path.clone() });
         }
         let bytes = content.as_bytes();
@@ -600,27 +759,103 @@ impl MutationEngine {
             });
         }
         let resolved = self.resolve(path)?;
-        // The case check comes before the precondition, and unconditionally.
-        // On a case-insensitive filesystem `check` folds the spelling: asked
-        // about `one.md` it reads `One.md`'s bytes, so an `absent`
-        // precondition reports a revision conflict for a name that has no
-        // file, and a `revision` precondition naming those bytes *passes* and
-        // lets the write land on a file the caller never addressed. Neither
-        // answer is true of the path as spelled; the collision is.
-        if let Some(existing) = self.case_variant(path)? {
+        // And again on the path the write would actually reach. A
+        // case-insensitive filesystem folds `.OBSIDIAN` onto the real zone,
+        // and a symlink whose own name is innocuous can have a hidden parent
+        // once resolved; neither is visible in the spelling the caller sent.
+        let stored = self.stored_path(path, &resolved)?;
+        if is_unindexable(&stored) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        // The case check comes before the precondition. On a case-insensitive
+        // filesystem `check` folds the spelling: asked about `one.md` it reads
+        // `One.md`'s bytes, so an `absent` precondition reports a revision
+        // conflict for a name that has no file, and a `revision` precondition
+        // naming those bytes *passes* and lets the write land on a file the
+        // caller never addressed. Neither answer is true of the path as
+        // spelled; the collision is.
+        if let Some(existing) = self.case_collision_at(&resolved)? {
             return Err(MutationError::CaseCollision {
                 path: path.clone(),
                 existing,
             });
         }
-        self.check(path, expected)?;
+        self.check_resolved(path, &resolved, expected)?;
         write_atomically(&resolved, bytes)?;
         Ok(MutationOutcome {
-            changed_paths: BTreeSet::from([path.clone()]),
+            changed_paths: BTreeSet::from([stored]),
             revision: Some(revision_of(bytes)),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
             semantic: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(listing: &[&str]) -> Vec<String> {
+        listing.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn a_differently_cased_stored_name_is_a_variant() {
+        let scan = classify_names(names(&["One.md", "Two.md"]), "one.md");
+        assert!(!scan.exact);
+        assert_eq!(scan.variant.as_deref(), Some("One.md"));
+    }
+
+    /// The state only a case-sensitive filesystem can hold, and the reason
+    /// `case_collision` carries the qualifier: the caller's spelling names its
+    /// own stored file, so nothing folds and nothing is at risk. Refusing here
+    /// would lock both files out of vaultd permanently.
+    #[test]
+    fn an_exact_stored_name_beside_a_variant_is_not_a_collision() {
+        let scan = classify_names(names(&["One.md", "one.md"]), "one.md");
+        assert!(scan.exact);
+        assert_eq!(scan.variant.as_deref(), Some("One.md"));
+    }
+
+    #[test]
+    fn unrelated_names_are_neither() {
+        assert_eq!(
+            classify_names(names(&["Two.md", "Three.md"]), "one.md"),
+            CaseScan::default()
+        );
+    }
+
+    /// Documented Task 4 semantics, restated as a test now that two callers
+    /// read the same scan: normalization variants are the same file on APFS,
+    /// so they are deliberately not reported as distinct stored names.
+    #[test]
+    fn a_normalization_variant_is_not_a_case_variant() {
+        let scan = classify_names(names(&["Cafe\u{301}.md"]), "Caf\u{e9}.md");
+        assert_eq!(scan, CaseScan::default());
+    }
+
+    #[test]
+    fn the_configuration_zone_is_unindexable_and_so_is_every_hidden_folder() {
+        let unindexable = [
+            ".obsidian",
+            ".obsidian/app.json",
+            ".trash/Gone.md",
+            "a/.b/c.md",
+            // Not the zone — `in_config_zone` requires the whole first
+            // segment — but hidden, which the scan excludes just the same.
+            ".obsidianish/Note.md",
+        ];
+        for spelling in unindexable {
+            let path = VaultPath::new(spelling).expect("valid vault path");
+            assert!(is_unindexable(&path), "{spelling} must be refused");
+        }
+        // A hidden *file* name is not excluded: only directories are, which is
+        // why `VaultPath::is_hidden` deliberately ignores the last component.
+        let indexable = ["obsidian/Note.md", "Folder/.hidden.md", "One.md"];
+        for spelling in indexable {
+            let path = VaultPath::new(spelling).expect("valid vault path");
+            assert!(!is_unindexable(&path), "{spelling} is indexed by the scan");
+        }
     }
 }
