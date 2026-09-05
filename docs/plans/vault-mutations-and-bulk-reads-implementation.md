@@ -5921,7 +5921,13 @@ Also add the DTO conversions:
 /// Exactly one precondition field may be set. A two-field precondition has no
 /// meaning, and silently preferring one would turn a client's typo into an
 /// unconditional overwrite.
-pub(crate) fn precondition(value: &ExpectedDto) -> Result<Precondition, ProtocolError> {
+pub(crate) fn precondition(value: Option<&ExpectedDto>) -> Result<Precondition, ProtocolError> {
+    // Omitting `expected` entirely means unconditional. An expected object
+    // that is PRESENT but names no field is a typo-shaped client bug and is
+    // refused (checkpoint-1 ruling I1).
+    let Some(value) = value else {
+        return Ok(Precondition::Any);
+    };
     let invalid = |message: &str| ProtocolError {
         code: ErrorCode::InvalidRequest,
         message: message.into(),
@@ -5933,7 +5939,9 @@ pub(crate) fn precondition(value: &ExpectedDto) -> Result<Precondition, Protocol
         (Some(revision), None, None) => Ok(Precondition::Revision(revision.clone())),
         (None, Some(true), None) => Ok(Precondition::Absent),
         (None, None, Some(true)) => Ok(Precondition::Any),
-        (None, None, None) => Ok(Precondition::Any),
+        (None, None, None) => {
+            Err(invalid("expected must name exactly one of revision, absent, or any"))
+        }
         (None, Some(false), None) | (None, None, Some(false)) => {
             Err(invalid("expected.absent and expected.any must be true when present"))
         }
@@ -6329,7 +6337,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
                                     id,
                                     Response::RenameNote(RenameResponse {
                                         generation,
-                                        revision: report.revision.clone().unwrap_or_default(),
+                                        revision: report.revision.clone(),
                                         links_rewritten: report.links_rewritten,
                                         link_rewrite_failures: convert::link_rewrite_failures(
                                             report.link_rewrite_failures,
@@ -6356,7 +6364,7 @@ then replace Task 2 Step 7's single `|`-joined placeholder arm with these ten re
                                 id,
                                 Response::RenameFolder(RenameResponse {
                                     generation,
-                                    revision: report.revision.clone().unwrap_or_default(),
+                                    revision: report.revision.clone(),
                                     links_rewritten: report.links_rewritten,
                                     link_rewrite_failures: convert::link_rewrite_failures(
                                         report.link_rewrite_failures,

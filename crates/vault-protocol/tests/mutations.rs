@@ -16,9 +16,10 @@ fn a_write_note_request_round_trips_through_its_documented_json() {
         Request::WriteNote(params) => {
             assert_eq!(params.path, "One.md");
             assert_eq!(params.content, "# One\n");
-            assert_eq!(params.expected.revision.as_deref(), Some("blake3:abc"));
-            assert_eq!(params.expected.absent, None);
-            assert_eq!(params.expected.any, None);
+            let expected = params.expected.as_ref().expect("precondition present");
+            assert_eq!(expected.revision.as_deref(), Some("blake3:abc"));
+            assert_eq!(expected.absent, None);
+            assert_eq!(expected.any, None);
         }
         other => panic!("expected write_note, got {other:?}"),
     }
@@ -54,13 +55,24 @@ fn the_three_expected_shapes_each_decode_to_exactly_one_field() {
 
 #[test]
 fn a_write_note_request_omits_an_absent_precondition_entirely() {
+    // Omission means unconditional and the key disappears from the wire; an
+    // explicit empty object is a distinct (and refusable) shape, so the two
+    // must not serialize alike.
     let params = WriteNoteParams {
         path: "One.md".into(),
         content: "# One\n".into(),
-        expected: ExpectedDto::default(),
+        expected: None,
     };
     assert_eq!(
         serde_json::to_string(&params).expect("encode"),
+        r##"{"path":"One.md","content":"# One\n"}"##
+    );
+    let explicit_empty = WriteNoteParams {
+        expected: Some(ExpectedDto::default()),
+        ..params
+    };
+    assert_eq!(
+        serde_json::to_string(&explicit_empty).expect("encode"),
         r##"{"path":"One.md","content":"# One\n","expected":{}}"##
     );
 }
@@ -157,7 +169,7 @@ fn a_rename_response_reports_rewrites_and_the_files_it_skipped() {
         "r1",
         Response::RenameNote(RenameResponse {
             generation: 5,
-            revision: "blake3:def".into(),
+            revision: Some("blake3:def".into()),
             links_rewritten: 3,
             link_rewrite_failures: vec![LinkRewriteFailureDto {
                 path: "Busy.md".into(),
@@ -184,15 +196,15 @@ fn a_rename_response_reports_rewrites_and_the_files_it_skipped() {
 #[test]
 fn every_new_method_name_and_field_spelling_round_trips_through_its_exact_json() {
     let lines = [
-        r##"{"version":1,"id":"1","request":{"method":"write_note","params":{"path":"a.md","content":"c","expected":{}}}}"##,
+        r##"{"version":1,"id":"1","request":{"method":"write_note","params":{"path":"a.md","content":"c","expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"2","request":{"method":"create_folder","params":{"path":"a"}}}"##,
-        r##"{"version":1,"id":"3","request":{"method":"rename_note","params":{"from":"a.md","to":"b.md","expected":{},"rewrite_links":true}}}"##,
+        r##"{"version":1,"id":"3","request":{"method":"rename_note","params":{"from":"a.md","to":"b.md","expected":{"any":true},"rewrite_links":true}}}"##,
         r##"{"version":1,"id":"4","request":{"method":"rename_folder","params":{"from":"a","to":"b","rewrite_links":true}}}"##,
-        r##"{"version":1,"id":"5","request":{"method":"copy_file","params":{"from":"a.md","to":"b.md","expected_source":{},"if_exists":"error"}}}"##,
-        r##"{"version":1,"id":"6","request":{"method":"delete_note","params":{"path":"a.md","expected":{}}}}"##,
+        r##"{"version":1,"id":"5","request":{"method":"copy_file","params":{"from":"a.md","to":"b.md","expected_source":{"any":true},"if_exists":"error"}}}"##,
+        r##"{"version":1,"id":"6","request":{"method":"delete_note","params":{"path":"a.md","expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"7","request":{"method":"delete_folder","params":{"path":"a","mode":"trash_local","recursive":true}}}"##,
-        r##"{"version":1,"id":"8","request":{"method":"patch_frontmatter","params":{"path":"a.md","patch":[],"expected":{}}}}"##,
-        r##"{"version":1,"id":"9","request":{"method":"write_file","params":{"path":"a.png","content_base64":"Zm9v","expected":{}}}}"##,
+        r##"{"version":1,"id":"8","request":{"method":"patch_frontmatter","params":{"path":"a.md","patch":[],"expected":{"any":true}}}}"##,
+        r##"{"version":1,"id":"9","request":{"method":"write_file","params":{"path":"a.png","content_base64":"Zm9v","expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"10","request":{"method":"read_file","params":{"path":"a.png"}}}"##,
     ];
     for line in lines {
@@ -226,7 +238,7 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
         (
             Response::RenameNote(RenameResponse {
                 generation: 3,
-                revision: "r".into(),
+                revision: Some("r".into()),
                 links_rewritten: 0,
                 link_rewrite_failures: vec![],
             }),
@@ -235,11 +247,11 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
         (
             Response::RenameFolder(RenameResponse {
                 generation: 4,
-                revision: "r".into(),
+                revision: None,
                 links_rewritten: 1,
                 link_rewrite_failures: vec![],
             }),
-            r#"{"type":"rename_folder","value":{"generation":4,"revision":"r","links_rewritten":1,"link_rewrite_failures":[]}}"#,
+            r#"{"type":"rename_folder","value":{"generation":4,"links_rewritten":1,"link_rewrite_failures":[]}}"#,
         ),
         (
             Response::CopyFile(MutationResponse {

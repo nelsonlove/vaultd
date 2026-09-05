@@ -70,7 +70,10 @@ impl<'de> Deserialize<'de> for TreeEntryKindDto {
 /// One entry of the vault tree, read from the pre-task's `tree_entries` table
 /// inside the session's pinned transaction.
 ///
-/// `size` and `revision` are absent for a folder, which has neither. The two
+/// `size` and `revision` are absent for a folder, which has neither, and
+/// `revision` is also absent for a non-note file: the index stores no
+/// content revision for attachments (a recorded pre-task divergence), so
+/// only `note` entries carry one. The two
 /// timestamps are never absent: they are **the source a host serves
 /// `TFile.stat = { ctime, mtime, size }` from**, which is why they are stored
 /// per entry rather than restated from the filesystem at read time. Both are

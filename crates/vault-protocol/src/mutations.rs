@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 /// is the wire shape the design specifies (`{"revision": …}`,
 /// `{"absent": true}`, `{"any": true}`), and because `deny_unknown_fields`
 /// then rejects a misspelled precondition loudly instead of silently
-/// downgrading it to "unconditional". Exactly one field must be set; the
-/// server validates that and answers `invalid_request` otherwise, because a
-/// two-field precondition has no meaning.
+/// downgrading it to "unconditional". Omitting `expected` altogether means
+/// unconditional; an expected object that is *present* must name exactly one
+/// field — the server answers `invalid_request` for an empty object (a
+/// typo-shaped client bug) and for a two-field precondition (which has no
+/// meaning).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedDto {
@@ -270,8 +272,8 @@ pub struct LinkRewriteFailureDto {
 pub struct WriteNoteParams {
     pub path: String,
     pub content: String,
-    #[serde(default)]
-    pub expected: ExpectedDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -289,8 +291,8 @@ fn default_true() -> bool {
 pub struct RenameNoteParams {
     pub from: String,
     pub to: String,
-    #[serde(default)]
-    pub expected: ExpectedDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedDto>,
     #[serde(default = "default_true")]
     pub rewrite_links: bool,
 }
@@ -309,8 +311,8 @@ pub struct RenameFolderParams {
 pub struct CopyFileParams {
     pub from: String,
     pub to: String,
-    #[serde(default)]
-    pub expected_source: ExpectedDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_source: Option<ExpectedDto>,
     #[serde(default)]
     pub if_exists: CopyConflictDto,
 }
@@ -321,8 +323,8 @@ pub struct DeleteNoteParams {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<DeleteModeDto>,
-    #[serde(default)]
-    pub expected: ExpectedDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -340,8 +342,8 @@ pub struct DeleteFolderParams {
 pub struct PatchFrontmatterParams {
     pub path: String,
     pub patch: Vec<FrontmatterEditDto>,
-    #[serde(default)]
-    pub expected: ExpectedDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -349,8 +351,8 @@ pub struct PatchFrontmatterParams {
 pub struct WriteFileParams {
     pub path: String,
     pub content_base64: String,
-    #[serde(default)]
-    pub expected: ExpectedDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -377,7 +379,11 @@ pub struct GenerationResponse {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RenameResponse {
     pub generation: u64,
-    pub revision: String,
+    /// The renamed file's content revision. Absent for `rename_folder`: a
+    /// folder has no bytes to hash, and a thing with no revision reports no
+    /// `revision` key at all rather than an empty string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub links_rewritten: u64,
     pub link_rewrite_failures: Vec<LinkRewriteFailureDto>,
 }
