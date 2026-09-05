@@ -149,3 +149,15 @@ fn bounds_documentation_describes_the_shipped_transport() {
         &["reconciliation is never stalled by a client"],
     );
 }
+
+#[test]
+fn the_protocol_documents_its_unknown_variant_tolerance() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "Unknown variants are tolerated, not fatal",
+            "MUST treat an unrecognized value",
+            "`Unknown` catch-all",
+        ],
+    );
+}
