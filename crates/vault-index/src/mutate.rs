@@ -19,7 +19,7 @@
 //! Nothing here knows about protocol types, the coordinator, or generations.
 
 use std::collections::BTreeSet;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use vault_core::VaultPath;
@@ -676,6 +676,33 @@ fn is_unindexable(path: &VaultPath) -> bool {
     in_config_zone(path) || path.is_hidden()
 }
 
+/// [`is_unindexable`] for a path a **folder** operation addresses, which adds
+/// the half [`VaultPath::is_hidden`] deliberately leaves to its caller.
+///
+/// `is_hidden` never judges the last component, because nothing lexical can
+/// tell a hidden *file* (`.hidden-note.md`, which the scan does index) from a
+/// hidden *directory* (which it does not). A folder operation is exactly the
+/// caller that doc means: it knows its target is a directory, so it applies
+/// the directory half itself and refuses a final component that starts with a
+/// dot.
+///
+/// Without it, `delete_folder { ".trash", recursive: true }` empties the
+/// recovery surface `trash_local` exists to provide, and
+/// `delete_folder { ".git" }` destroys a repository the daemon does not own
+/// and cannot restore. Both are one call, both are irreversible under
+/// `permanent`, and neither path is one the daemon can even read back.
+///
+/// Applied to the caller's spelling *and* to the stored one, for the reason
+/// Task 5's Ruling B1 gives: `in_config_zone` is exact-case on purpose, so a
+/// caller's `.OBSIDIAN` is not the zone as a string while resolving to it as a
+/// path on any case-folding filesystem. The pre-resolve check is not redundant
+/// with the post-resolve one — a target that does not exist has no stored
+/// spelling to check, and `.git/hooks` must be refused as a zone violation
+/// rather than reported as merely absent.
+fn is_unindexable_folder(path: &VaultPath) -> bool {
+    is_unindexable(path) || path.name().starts_with('.')
+}
+
 /// Give the replacement file the mode the result should have: the replaced
 /// file's own, or — when there is nothing to replace — the one the containing
 /// folder implies.
@@ -957,21 +984,21 @@ impl MutationEngine {
     /// caller wants is "a folder is there", and Obsidian's own
     /// `createFolder` is the only thing that would tell them otherwise.
     ///
-    /// The outcome names **no** changed path, and that is deliberate rather
-    /// than an omission of the folders it created. `changed_paths` is what
-    /// the coordinator turns into a generation, and an empty folder holds
-    /// nothing any client can read back — so publishing a generation for it
-    /// would hand every subscriber a barrier that carries no content. The
-    /// watcher observes the new directory on its own and the tree row lands
-    /// with it, one debounce later, which is the only route that needs to
-    /// exist for something no read-your-writes claim depends on.
+    /// The outcome names **every folder segment this call actually created**,
+    /// and nothing else. Per `MutationOutcome::changed_paths`: since the tree
+    /// pre-task the index holds a row per folder, so a created directory the
+    /// outcome does not name is a `tree_entries` row that never lands, and
+    /// `snapshot_tree` at the generation this call published would serve a
+    /// tree missing the daemon's own write. A segment that was already there
+    /// is named by no one, because nothing about it moved.
     fn create_folder(&self, path: &VaultPath) -> Result<MutationOutcome, MutationError> {
-        if in_config_zone(path) {
+        if is_unindexable_folder(path) {
             return Err(MutationError::ZoneViolation { path: path.clone() });
         }
         // `resolve` requires an existing parent, which a folder chain need
         // not have. Walk the segments instead, checking containment at every
         // level that already exists, and creating the rest.
+        let mut created = BTreeSet::new();
         let mut current = self.canonical_root.clone();
         for segment in path.as_str().split('/') {
             current = current.join(segment);
@@ -983,15 +1010,37 @@ impl MutationEngine {
                     if canonical.is_file() {
                         return Err(MutationError::TargetExists { path: path.clone() });
                     }
+                    // The stored half of the guard, and the only one that can
+                    // see a segment which *resolves* somewhere the caller's
+                    // spelling never mentions: a symlink named `Link` pointing
+                    // at `.obsidian` carries no dot and names no zone.
+                    let stored = self.stored_path(path, &canonical)?;
+                    if is_unindexable_folder(&stored) {
+                        return Err(MutationError::ZoneViolation { path: path.clone() });
+                    }
                     current = canonical;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     std::fs::create_dir(&current).map_err(io)?;
+                    // Canonicalized after creating it, so the segment is named
+                    // the way the filesystem stores it — the same phantom-key
+                    // reasoning as every other reported path.
+                    let canonical = current.canonicalize().map_err(io)?;
+                    created.insert(self.stored_path(path, &canonical)?);
+                    current = canonical;
                 }
                 Err(error) => return Err(io(error)),
             }
         }
-        Ok(MutationOutcome::default())
+        Ok(MutationOutcome {
+            changed_paths: created,
+            revision: None,
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            // A folder holds no frontmatter, no links, and no text: nothing
+            // the semantic half of the index reads.
+            semantic: false,
+        })
     }
 
     /// Delete one file — a note or an attachment — under a precondition.
@@ -1029,15 +1078,38 @@ impl MutationEngine {
         if is_unindexable(&stored) {
             return Err(MutationError::ZoneViolation { path: path.clone() });
         }
+        // The same guard `write_note` carries, in the same position: before
+        // the precondition, because on a case-folding filesystem the
+        // precondition itself folds and answers about a file the caller did
+        // not name. The destructive verb must not be the permissive one — a
+        // folded `one.md` beside a stored `One.md` is a name this vault does
+        // not hold, which is the caller's model being wrong in exactly the way
+        // the `not_found` refusal below exists to report. The refusal names
+        // the stored spelling, so the caller's remedy is immediate.
+        if let Some(existing) = self.case_collision_at(&resolved)? {
+            return Err(MutationError::CaseCollision {
+                path: path.clone(),
+                existing,
+            });
+        }
         // Deletion is never idempotent-silent: a caller deleting something
         // that is already gone had a wrong model of the vault and should
         // hear so.
         let present = match expected {
-            // The bytes are read only because hashing them is the precondition
-            // itself. `check_resolved` answers `not_found` for an absent target
-            // under a revision, so the `is_some` here is the non-regular case
-            // it already refused above turning into a plain absence.
-            Precondition::Revision(_) => self.check_resolved(path, &resolved, expected)?.is_some(),
+            // Hashed in bounded chunks rather than read whole: the revision is
+            // the only thing this branch wants, and a delete that materialised
+            // a multi-gigabyte attachment to compare one string would spend
+            // the memory the M3 decision refuses to cap.
+            Precondition::Revision(wanted) => match self.streamed_revision(path, &resolved)? {
+                None => return Err(MutationError::NotFound { path: path.clone() }),
+                Some(actual) if &actual == wanted => true,
+                Some(actual) => {
+                    return Err(MutationError::RevisionConflict {
+                        path: path.clone(),
+                        current: Some(actual),
+                    });
+                }
+            },
             // Existence is the whole question, so it is answered with a stat
             // and not with a read of a file the daemon has no use for: see
             // [`DEFAULT_MAX_FILE_BYTES`].
@@ -1070,47 +1142,129 @@ impl MutationEngine {
         })
     }
 
+    /// Remove a folder, and — with `recursive` — everything under it.
+    ///
+    /// The most destructive verb the daemon has, and guarded like it: the
+    /// unindexable refusal runs on the caller's spelling and again on the
+    /// stored one, a symlink is never treated as the folder it points at, and
+    /// a folded spelling is refused rather than served.
     fn delete_folder(
         &self,
         path: &VaultPath,
         mode: Option<DeleteMode>,
         recursive: bool,
     ) -> Result<MutationOutcome, MutationError> {
-        if in_config_zone(path) {
+        if is_unindexable_folder(path) {
             return Err(MutationError::ZoneViolation { path: path.clone() });
         }
         let resolved = self.resolve(path)?;
-        if !resolved.is_dir() {
-            return Err(MutationError::NotFound { path: path.clone() });
-        }
-        let empty = std::fs::read_dir(&resolved).map_err(io)?.next().is_none();
-        if !empty && !recursive {
-            return Err(MutationError::FolderNotEmpty { path: path.clone() });
+        // `symlink_metadata` rather than `is_dir`, because the two disagree on
+        // exactly the case that matters. A symlink to a directory *is* a
+        // directory to `is_dir`, but `remove_dir_all` removes the link and not
+        // its contents while `WalkDir` walks the contents — so the outcome
+        // would name the target's notes as deleted while they are all still
+        // there. Refusing keeps the two from ever disagreeing, and it is the
+        // honest answer besides: the caller addressed a folder, and a link is
+        // not one.
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(MutationError::TargetExists { path: path.clone() });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(MutationError::NotFound { path: path.clone() });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(MutationError::NotFound { path: path.clone() });
+            }
+            Err(error) => return Err(io(error)),
         }
         // The folder's own stored spelling, captured while it still exists, so
         // the enumeration below walks the vault as the filesystem spells it
         // rather than as the caller did — every path it yields is then a key
         // the scanner would emit.
         let stored = self.captured_path(path, &resolved)?;
-        // Enumerated *before* the delete: every note that disappears has to
+        if is_unindexable_folder(&stored) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        // Before the emptiness question, because it is the prior one: a folded
+        // spelling names a folder this vault does not store, and answering
+        // "not empty" about a different folder than the one addressed would be
+        // the wrong refusal even though it refuses.
+        if let Some(existing) = self.case_collision_at(&resolved)? {
+            return Err(MutationError::CaseCollision {
+                path: path.clone(),
+                existing,
+            });
+        }
+        let empty = std::fs::read_dir(&resolved).map_err(io)?.next().is_none();
+        if !empty && !recursive {
+            return Err(MutationError::FolderNotEmpty { path: path.clone() });
+        }
+        // Enumerated *before* the delete: every path that disappears has to
         // reach reconciliation, or its rows outlive the file.
-        let removed = markdown_paths_under(&self.canonical_root, &stored)?;
+        let removed = paths_under(&self.canonical_root, &stored)?;
         self.dispose(
             &resolved,
             mode.unwrap_or_else(|| self.configured_delete_mode()),
         )?;
-        let changed_paths: BTreeSet<VaultPath> = removed.into_iter().collect();
+        // Read off the Markdown subset, not off `changed_paths`, per the
+        // `MutationOutcome::semantic` table: a folder of attachments moves
+        // every tree row under it and no semantic row at all.
+        let semantic = removed.iter().any(VaultPath::is_markdown);
+        let mut changed_paths: BTreeSet<VaultPath> = removed.into_iter().collect();
+        // The folder itself is a tree row too, and an empty folder's delete
+        // moves nothing else.
+        changed_paths.insert(stored);
         Ok(MutationOutcome {
-            // `semantic == !changed_paths.is_empty()`, per the invariant on
-            // `MutationOutcome`: a folder of attachments removes no indexed
-            // row, and claiming otherwise would make an empty reconciliation
-            // batch look like a missing generation.
-            semantic: !changed_paths.is_empty(),
+            semantic,
             changed_paths,
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
         })
+    }
+
+    /// The on-disk revision of a regular file at `resolved`, hashed in bounded
+    /// chunks, or `None` when nothing is there.
+    ///
+    /// [`MutationEngine::check_resolved`] hands back the bytes it read because
+    /// `patch_frontmatter` and `copy_file` need them; a delete never does, and
+    /// reading a 4 GB attachment into the daemon's address space to compare one
+    /// revision string would turn the M3 decision — "the payload cap does not
+    /// govern a delete" — into "a delete is unbounded in memory". Streaming
+    /// keeps both halves: nothing is refused for its size, and nothing larger
+    /// than the buffer is held.
+    ///
+    /// The refusals are the same ones the reading path makes: a non-regular
+    /// occupant is [`MutationError::TargetExists`], and a file that vanishes
+    /// between the stat and the open is an absence the caller's precondition
+    /// judges.
+    fn streamed_revision(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+    ) -> Result<Option<String>, MutationError> {
+        if !self.regular_file_exists(path, resolved)? {
+            return Ok(None);
+        }
+        let mut file = match std::fs::File::open(resolved) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io(error)),
+        };
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(io)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        // The same spelling `revision_of` produces, so a streamed revision and
+        // a buffered one are comparable strings.
+        Ok(Some(format!("blake3:{}", hasher.finalize())))
     }
 
     /// Dispose of one already-resolved path. `TrashLocal` moves it into the
@@ -1154,15 +1308,26 @@ impl MutationEngine {
     }
 }
 
-/// Every Markdown path under `folder`, vault-relative. Mirrors the scanner's
-/// hidden-directory rule so a folder delete names exactly the notes the index
-/// knows about.
+/// Every path under `folder`, of every kind — notes, attachments, and the
+/// subfolders holding them — vault-relative, not including `folder` itself.
+///
+/// The extension is not filtered, per Ruling B4: the index has held a row per
+/// tree entry since the tree pre-task, so an attachment or a subfolder a
+/// folder delete removes without naming is a row that outlives the file it
+/// describes. A caller that wants only the notes filters on
+/// [`VaultPath::is_markdown`] — which is what `delete_folder` does to decide
+/// whether the delete was semantic.
+///
+/// The scanner's hidden-directory rule is mirrored, so a `.trash` or `.git`
+/// nested inside a deleted folder contributes no paths: the scan never emitted
+/// rows for them, and `refresh_paths` skips them, so naming them would be
+/// noise rather than a hint.
 ///
 /// `folder` must be the spelling the filesystem stores, not the one a caller
 /// sent: the walk starts at `root.join(folder)` and every path it yields keeps
 /// that prefix verbatim, so a caller's `folder/` against a stored `Folder/`
-/// would key every removed note under a name no scan emits.
-pub(crate) fn markdown_paths_under(
+/// would key every removed path under a name no scan emits.
+pub(crate) fn paths_under(
     root: &Path,
     folder: &VaultPath,
 ) -> Result<Vec<VaultPath>, MutationError> {
@@ -1181,14 +1346,8 @@ pub(crate) fn markdown_paths_under(
         let entry = entry.map_err(|error| MutationError::Io {
             message: error.to_string(),
         })?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let is_markdown_file = entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
-        if !is_markdown_file {
+        // Depth 0 is `folder` itself, which its caller names.
+        if entry.depth() == 0 {
             continue;
         }
         let Ok(relative) = entry.path().strip_prefix(root) else {
@@ -1198,8 +1357,18 @@ pub(crate) fn markdown_paths_under(
         for component in relative.components() {
             match component.as_os_str().to_str() {
                 Some(text) => parts.push(text.to_string()),
-                None => break,
+                // A component this platform lets exist and `VaultPath` cannot
+                // spell. The whole entry is skipped, not truncated to the
+                // prefix collected so far: reporting `Folder` for a file at
+                // `Folder/<non-utf8>` would name a path that was not removed.
+                None => {
+                    parts.clear();
+                    break;
+                }
             }
+        }
+        if parts.is_empty() {
+            continue;
         }
         if let Ok(path) = VaultPath::new(parts.join("/")) {
             found.push(path);
