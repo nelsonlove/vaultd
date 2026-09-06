@@ -32,4 +32,5 @@ proptest = "1.9"
 regex = "1.12"
 saphyr = { version = "0.0.12", default-features = false }
 tempfile = "3.23"
+trash = "5.2"
 walkdir = "2.5"

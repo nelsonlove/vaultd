@@ -20,7 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+trash.workspace = true
 vault-core = { path = "../vault-core" }
+walkdir.workspace = true
 xdg.workspace = true
 
 [dev-dependencies]

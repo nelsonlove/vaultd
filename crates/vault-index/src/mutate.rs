@@ -31,6 +31,17 @@ use vault_core::VaultPath;
 /// line, which strains a line-delimited reader for no measured benefit. This
 /// covers every attachment class in the reference vault. Chunked transfer for
 /// larger files is deferred follow-on, and the refusal names it.
+///
+/// **The cap governs payloads a client hands the daemon, never bytes the
+/// engine reads to verify a precondition.** A delete carries no payload, so
+/// capping the compare-and-swap read would make a 400 MB attachment
+/// permanently undeletable through vaultd — a refusal with no remedy, since
+/// the caller cannot make the file smaller through an interface that will not
+/// touch it. So a delete under a `revision` precondition reads and hashes the
+/// target whatever its size, and a delete under `any` reads nothing at all:
+/// it stats the target instead, because existence is the only fact that
+/// precondition asks for. That keeps the ordinary large-attachment delete at
+/// one `stat` rather than one full read into memory.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The configuration zone. Raw reads and writes are allowed here; every
@@ -283,8 +294,7 @@ impl MutationEngine {
         }
     }
 
-    /// Read `resolved`'s bytes when a regular file is there, reporting an
-    /// absent target as `None`.
+    /// Whether a regular file is at `resolved` right now.
     ///
     /// Anything that is not a regular file — a directory, a fifo, a socket,
     /// a device — is refused as [`MutationError::TargetExists`], the
@@ -294,18 +304,36 @@ impl MutationEngine {
     /// broken, and an invitation to retry a request that can never succeed.
     /// Refusing before the read also means a fifo at a target name can never
     /// block the daemon on an open that waits for a writer.
+    ///
+    /// Split out from [`MutationEngine::read_regular_file`] because a delete
+    /// under an unconditional precondition needs exactly this fact and none of
+    /// the bytes: see [`DEFAULT_MAX_FILE_BYTES`] on why a delete never reads a
+    /// payload it has no use for.
+    fn regular_file_exists(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+    ) -> Result<bool, MutationError> {
+        match std::fs::metadata(resolved) {
+            Ok(metadata) if !metadata.is_file() => {
+                Err(MutationError::TargetExists { path: path.clone() })
+            }
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io(error)),
+        }
+    }
+
+    /// Read `resolved`'s bytes when a regular file is there, reporting an
+    /// absent target as `None`. Non-regular occupants are refused by
+    /// [`MutationEngine::regular_file_exists`] before anything is read.
     fn read_regular_file(
         &self,
         path: &VaultPath,
         resolved: &Path,
     ) -> Result<Option<Vec<u8>>, MutationError> {
-        match std::fs::metadata(resolved) {
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(MutationError::TargetExists { path: path.clone() });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(io(error)),
+        if !self.regular_file_exists(path, resolved)? {
+            return Ok(None);
         }
         match std::fs::read(resolved) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -505,6 +533,46 @@ pub enum Mutation {
         content: String,
         expected: Precondition,
     },
+    CreateFolder {
+        path: VaultPath,
+    },
+    DeleteNote {
+        path: VaultPath,
+        /// `None` takes the vault's own `trashOption` default. A plugin shim
+        /// always passes the plugin's explicit choice; only a direct client
+        /// leaves this open.
+        mode: Option<DeleteMode>,
+        expected: Precondition,
+    },
+    DeleteFolder {
+        path: VaultPath,
+        mode: Option<DeleteMode>,
+        recursive: bool,
+    },
+}
+
+/// How a delete disposes of its target.
+///
+/// Obsidian's API is `vault.trash(file, system: boolean)` and the plugin
+/// chooses per call; `trashOption` governs Obsidian's own UI deletions only.
+/// So a shim maps `trash(f, true)` to `TrashSystem`, `trash(f, false)` to
+/// `TrashLocal`, and `delete(f)` to `Permanent`, consulting no config at all.
+/// The `trashOption` default below applies only when a client deletes with no
+/// plugin involved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteMode {
+    TrashSystem,
+    TrashLocal,
+    Permanent,
+}
+
+/// The slice of `.obsidian/app.json` a delete consults. Every other key in
+/// that file is Obsidian's business, so the struct names one and ignores the
+/// rest rather than modelling a settings file the daemon does not own.
+#[derive(serde::Deserialize)]
+struct AppJson {
+    #[serde(rename = "trashOption")]
+    trash_option: Option<String>,
 }
 
 /// One referencing note a rename could not rewrite, and why. Populated only
@@ -704,6 +772,17 @@ impl MutationEngine {
                 content,
                 expected,
             } => self.write_note(path, content, expected),
+            Mutation::CreateFolder { path } => self.create_folder(path),
+            Mutation::DeleteNote {
+                path,
+                mode,
+                expected,
+            } => self.delete_note(path, *mode, expected),
+            Mutation::DeleteFolder {
+                path,
+                mode,
+                recursive,
+            } => self.delete_folder(path, *mode, *recursive),
         }
     }
 
@@ -766,6 +845,34 @@ impl MutationEngine {
             .unwrap_or(fallback)
     }
 
+    /// The stored spelling of a target a mutation is about to **remove**,
+    /// captured while it still exists.
+    ///
+    /// The mirror image of [`MutationEngine::written_path`], and it exists
+    /// because that one cannot serve here: it canonicalizes *after* the
+    /// mutation, and a canonicalize of a path that is now gone fails and falls
+    /// back to the caller's own spelling. For a delete that is the phantom-key
+    /// hazard in its purest form — a reconciliation hint keyed to a name the
+    /// scanner never emitted, so the index row for the file that really went
+    /// away outlives it. Every removing operation therefore captures its
+    /// spelling first and reports what it captured.
+    ///
+    /// A symlink at the target is deliberately *not* followed. A delete
+    /// unlinks the name, not what the name points at, so the link's own
+    /// spelling is what disappeared; canonicalizing would report the link's
+    /// target instead — a path that still exists and is not gone at all.
+    fn captured_path(&self, path: &VaultPath, resolved: &Path) -> Result<VaultPath, MutationError> {
+        let is_symlink = std::fs::symlink_metadata(resolved)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_symlink {
+            if let Ok(canonical) = std::fs::canonicalize(resolved) {
+                return self.stored_path(path, &canonical);
+            }
+        }
+        self.stored_path(path, resolved)
+    }
+
     fn write_note(
         &self,
         path: &VaultPath,
@@ -823,6 +930,282 @@ impl MutationEngine {
             semantic: true,
         })
     }
+
+    /// The vault's own configured disposition for a delete a client did not
+    /// qualify. Any failure to read or parse `app.json` falls back to the
+    /// system trash, which is Obsidian's own default: a delete must never
+    /// fail because a configuration file is unreadable, and the safest
+    /// fallback is the recoverable one.
+    pub fn configured_delete_mode(&self) -> DeleteMode {
+        let path = self.canonical_root.join(CONFIG_ZONE).join("app.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return DeleteMode::TrashSystem;
+        };
+        let Ok(parsed) = serde_json::from_str::<AppJson>(&text) else {
+            return DeleteMode::TrashSystem;
+        };
+        match parsed.trash_option.as_deref() {
+            Some("local") => DeleteMode::TrashLocal,
+            Some("none") => DeleteMode::Permanent,
+            _ => DeleteMode::TrashSystem,
+        }
+    }
+
+    /// `mkdir -p`, bounded by the vault.
+    ///
+    /// An existing folder is success, not a conflict: the postcondition a
+    /// caller wants is "a folder is there", and Obsidian's own
+    /// `createFolder` is the only thing that would tell them otherwise.
+    ///
+    /// The outcome names **no** changed path, and that is deliberate rather
+    /// than an omission of the folders it created. `changed_paths` is what
+    /// the coordinator turns into a generation, and an empty folder holds
+    /// nothing any client can read back — so publishing a generation for it
+    /// would hand every subscriber a barrier that carries no content. The
+    /// watcher observes the new directory on its own and the tree row lands
+    /// with it, one debounce later, which is the only route that needs to
+    /// exist for something no read-your-writes claim depends on.
+    fn create_folder(&self, path: &VaultPath) -> Result<MutationOutcome, MutationError> {
+        if in_config_zone(path) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        // `resolve` requires an existing parent, which a folder chain need
+        // not have. Walk the segments instead, checking containment at every
+        // level that already exists, and creating the rest.
+        let mut current = self.canonical_root.clone();
+        for segment in path.as_str().split('/') {
+            current = current.join(segment);
+            match current.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.starts_with(&self.canonical_root) {
+                        return Err(MutationError::ZoneViolation { path: path.clone() });
+                    }
+                    if canonical.is_file() {
+                        return Err(MutationError::TargetExists { path: path.clone() });
+                    }
+                    current = canonical;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&current).map_err(io)?;
+                }
+                Err(error) => return Err(io(error)),
+            }
+        }
+        Ok(MutationOutcome::default())
+    }
+
+    /// Delete one file — a note or an attachment — under a precondition.
+    ///
+    /// The unindexable refusal is the same one `write_note` carries, applied
+    /// to the caller's spelling before the resolve and to the stored spelling
+    /// after it: a path the scan never lists is a path this operation cannot
+    /// address, in either direction. Deleting inside `.trash` or the
+    /// configuration zone is refused rather than served, so the addressable
+    /// surface is one set of paths and not two.
+    fn delete_note(
+        &self,
+        path: &VaultPath,
+        mode: Option<DeleteMode>,
+        expected: &Precondition,
+    ) -> Result<MutationOutcome, MutationError> {
+        if is_unindexable(path) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        // An `absent` precondition on a delete is a contradiction, not a
+        // guard: it asks for nothing to be there, and the operation's whole
+        // purpose is to remove what is. Refused as an invalid request rather
+        // than silently read as "delete if present", which is the meaning a
+        // caller would then rely on.
+        if expected == &Precondition::Absent {
+            return Err(MutationError::InvalidPrecondition {
+                expected: expected.clone(),
+            });
+        }
+        let resolved = self.resolve(path)?;
+        // Captured *before* the delete: afterwards there is nothing left to
+        // canonicalize, and the caller's own spelling would reach the index
+        // as a key the scanner never emits.
+        let stored = self.captured_path(path, &resolved)?;
+        if is_unindexable(&stored) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        // Deletion is never idempotent-silent: a caller deleting something
+        // that is already gone had a wrong model of the vault and should
+        // hear so.
+        let present = match expected {
+            // The bytes are read only because hashing them is the precondition
+            // itself. `check_resolved` answers `not_found` for an absent target
+            // under a revision, so the `is_some` here is the non-regular case
+            // it already refused above turning into a plain absence.
+            Precondition::Revision(_) => self.check_resolved(path, &resolved, expected)?.is_some(),
+            // Existence is the whole question, so it is answered with a stat
+            // and not with a read of a file the daemon has no use for: see
+            // [`DEFAULT_MAX_FILE_BYTES`].
+            Precondition::Any => self.regular_file_exists(path, &resolved)?,
+            // Unreachable — refused above — and answered rather than panicked
+            // on, because a future variant reaching here must not take the
+            // daemon down with it.
+            Precondition::Absent => {
+                return Err(MutationError::InvalidPrecondition {
+                    expected: expected.clone(),
+                });
+            }
+        };
+        if !present {
+            return Err(MutationError::NotFound { path: path.clone() });
+        }
+        self.dispose(
+            &resolved,
+            mode.unwrap_or_else(|| self.configured_delete_mode()),
+        )?;
+        Ok(MutationOutcome {
+            // The stored spelling, per `MutationOutcome::changed_paths`: the
+            // index is keyed by what the scanner emits, so a delete hint keyed
+            // any other way leaves the real row behind.
+            changed_paths: BTreeSet::from([stored.clone()]),
+            revision: None,
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            semantic: stored.is_markdown(),
+        })
+    }
+
+    fn delete_folder(
+        &self,
+        path: &VaultPath,
+        mode: Option<DeleteMode>,
+        recursive: bool,
+    ) -> Result<MutationOutcome, MutationError> {
+        if in_config_zone(path) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        let resolved = self.resolve(path)?;
+        if !resolved.is_dir() {
+            return Err(MutationError::NotFound { path: path.clone() });
+        }
+        let empty = std::fs::read_dir(&resolved).map_err(io)?.next().is_none();
+        if !empty && !recursive {
+            return Err(MutationError::FolderNotEmpty { path: path.clone() });
+        }
+        // The folder's own stored spelling, captured while it still exists, so
+        // the enumeration below walks the vault as the filesystem spells it
+        // rather than as the caller did — every path it yields is then a key
+        // the scanner would emit.
+        let stored = self.captured_path(path, &resolved)?;
+        // Enumerated *before* the delete: every note that disappears has to
+        // reach reconciliation, or its rows outlive the file.
+        let removed = markdown_paths_under(&self.canonical_root, &stored)?;
+        self.dispose(
+            &resolved,
+            mode.unwrap_or_else(|| self.configured_delete_mode()),
+        )?;
+        let changed_paths: BTreeSet<VaultPath> = removed.into_iter().collect();
+        Ok(MutationOutcome {
+            // `semantic == !changed_paths.is_empty()`, per the invariant on
+            // `MutationOutcome`: a folder of attachments removes no indexed
+            // row, and claiming otherwise would make an empty reconciliation
+            // batch look like a missing generation.
+            semantic: !changed_paths.is_empty(),
+            changed_paths,
+            revision: None,
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+        })
+    }
+
+    /// Dispose of one already-resolved path. `TrashLocal` moves it into the
+    /// vault's own `.trash/`, numbering the name on collision the way
+    /// Obsidian does; `TrashSystem` hands it to the platform trash;
+    /// `Permanent` unlinks it.
+    fn dispose(&self, resolved: &Path, mode: DeleteMode) -> Result<(), MutationError> {
+        match mode {
+            DeleteMode::Permanent => {
+                if resolved.is_dir() {
+                    std::fs::remove_dir_all(resolved).map_err(io)
+                } else {
+                    std::fs::remove_file(resolved).map_err(io)
+                }
+            }
+            DeleteMode::TrashSystem => trash::delete(resolved).map_err(|error| MutationError::Io {
+                message: error.to_string(),
+            }),
+            DeleteMode::TrashLocal => {
+                let trash = self.canonical_root.join(LOCAL_TRASH);
+                std::fs::create_dir_all(&trash).map_err(io)?;
+                let name = resolved
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| MutationError::Io {
+                        message: format!("{} has no usable file name", resolved.display()),
+                    })?;
+                let (stem, extension) = match name.rsplit_once('.') {
+                    Some((stem, extension)) => (stem, format!(".{extension}")),
+                    None => (name, String::new()),
+                };
+                let mut candidate = trash.join(name);
+                let mut suffix = 1u32;
+                while candidate.exists() {
+                    candidate = trash.join(format!("{stem} {suffix}{extension}"));
+                    suffix += 1;
+                }
+                std::fs::rename(resolved, &candidate).map_err(io)
+            }
+        }
+    }
+}
+
+/// Every Markdown path under `folder`, vault-relative. Mirrors the scanner's
+/// hidden-directory rule so a folder delete names exactly the notes the index
+/// knows about.
+///
+/// `folder` must be the spelling the filesystem stores, not the one a caller
+/// sent: the walk starts at `root.join(folder)` and every path it yields keeps
+/// that prefix verbatim, so a caller's `folder/` against a stored `Folder/`
+/// would key every removed note under a name no scan emits.
+pub(crate) fn markdown_paths_under(
+    root: &Path,
+    folder: &VaultPath,
+) -> Result<Vec<VaultPath>, MutationError> {
+    let mut found = Vec::new();
+    let base = root.join(folder.as_str());
+    let walker = walkdir::WalkDir::new(&base)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 || !entry.file_type().is_dir() {
+                return true;
+            }
+            !entry.file_name().to_string_lossy().starts_with('.')
+        });
+    for entry in walker {
+        let entry = entry.map_err(|error| MutationError::Io {
+            message: error.to_string(),
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_markdown_file = entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+        if !is_markdown_file {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let mut parts = Vec::new();
+        for component in relative.components() {
+            match component.as_os_str().to_str() {
+                Some(text) => parts.push(text.to_string()),
+                None => break,
+            }
+        }
+        if let Ok(path) = VaultPath::new(parts.join("/")) {
+            found.push(path);
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
