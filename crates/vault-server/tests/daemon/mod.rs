@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! A spawned `vaultd` over stdio, for the tests that must cross the real
 //! transport. Deliberately smaller than `tests/live_stdio.rs`'s harness: that
 //! one classifies events as well as responses, and duplicating its `Line`
@@ -100,6 +98,12 @@ impl Daemon {
     }
 
     /// Close stdin and wait. The daemon must exit rather than hang.
+    ///
+    /// Allowed dead because this module is compiled into each test binary
+    /// separately and no current consumer calls it; Tasks 14/16/17 are its
+    /// intended callers. The allow is on this one item rather than the file,
+    /// so anything else that goes dead here still shows up.
+    #[allow(dead_code)]
     pub fn disconnect(&mut self) -> std::process::ExitStatus {
         drop(self.stdin.take());
         self.child.wait().expect("the daemon exits")

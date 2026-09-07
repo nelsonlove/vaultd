@@ -190,7 +190,7 @@ One committed generation's change, across both axes the cache indexes: a note wh
 
 **Apply `deleted` before `created`.** One path may appear in both lists in the same generation, and that pairing has exactly one meaning: the thing at that path was removed and a different thing was created there — a folder replaced by a file of the same name is the case that produces it. Applying `deleted` first gets that right, and takes the removed folder's subtree with it; applying `created` first drops the new entry again.
 
-`changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, `verified`, or `mutation` — `mutation` being a generation this daemon's own write path produced, which a client may already have read its own write at.
+`changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, `verified`, or `mutation` — `mutation` being a generation this daemon's own write path produced, which a client may already have read its own write at. A client must not depend on the order of a mutation's own response line and the `generation_committed` event for that mutation: they are written by different producers, and the response already carries a generation the write is readable at, so the event is a confirmation rather than a barrier.
 
 ```json
 {"version":1,"subscription_id":"sub-1","event":{"type":"generation_committed","value":{"previous_generation":3,"generation":4,"cause":"watcher","changes":{"kind":"detailed","created":[],"modified":["Folder/Note.md"],"deleted":[]},"affected_note_count":1,"affected_reference_count":7}}}
@@ -260,7 +260,12 @@ Stable version 1 codes and when each occurs:
 ```
 
 - `incompatible_index` — the index belongs to another vault or an incompatible version that cannot be rebuilt safely.
-- `storage_failure` — an index storage or filesystem failure not representable as a note diagnostic.
+- `storage_failure` — an index storage or filesystem failure not representable as a note diagnostic. On a mutation, `current_revision` says whether the write reached disk, and a client must branch on it rather than retry blindly: **present** means the bytes landed and only the index is behind — it catches up at the next reconciliation, and an immediate retry may now meet `target_exists` or `revision_conflict`; **absent** means nothing was written and a retry is safe. Operations that report no content revision on success — the folder operations and the deletes — carry no `current_revision` here either.
+
+```json
+{"version":1,"id":"w","outcome":{"status":"err","value":{"code":"storage_failure","message":"index storage failed","current_revision":"blake3:8dd1ae6e…"}}}
+```
+
 - `internal` — an unexpected server failure.
 - `index_in_use` — another process holds the exclusive writer lease on this index. Nothing is damaged and nothing this process does will release it.
 - `runtime_not_ready` — the operation needs the live runtime and there is none: health-only mode, or a runtime that has stopped.

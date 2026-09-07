@@ -5,15 +5,21 @@
 mod daemon;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 
 use tempfile::TempDir;
 use vault_core::{TreeEntryKind, VaultPath};
 use vault_index::{IndexConfig, IndexError, Mutation, MutationError, Precondition, revision_of};
-use vault_protocol::{ErrorCode, Response, ResponseOutcome};
-use vault_server::runtime::{
-    MutationFailure, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions,
+use vault_protocol::{
+    ErrorCode, ExpectedDto, Request, RequestEnvelope, Response, ResponseOutcome, WriteNoteParams,
 };
+use vault_server::Server;
+use vault_server::runtime::{
+    MutationFailure, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
+};
+use vault_server::subscriptions::SubscriptionRegistry;
 
 use daemon::Daemon;
 
@@ -214,7 +220,12 @@ fn a_stale_revision_is_refused_without_moving_the_generation() {
             .expect("vault info")
             .generation,
         before,
-        "a refused mutation must not move the generation"
+        // Conditional on purpose: `apply_mutation` flushes before it calls
+        // the engine, so with pending watcher hints a refused mutation can
+        // coincide with a generation move — one that belongs to the watcher,
+        // not to the refusal. This fixture has no watcher and nothing
+        // pending, so the refusal is the only thing that could have moved it.
+        "with nothing else pending, a refused mutation must not move the generation"
     );
 }
 
@@ -422,6 +433,15 @@ fn an_io_refusal_never_leaks_a_filesystem_path_on_the_wire() {
     };
     assert_eq!(error.code, ErrorCode::StorageFailure);
     assert_eq!(error.message, "the vault filesystem write failed");
+    // The absent half of the `storage_failure` split: the engine writes
+    // temp-then-rename, so a failure here means nothing landed, and no
+    // revision exists to report. A client that sees no `current_revision` may
+    // retry safely. The present half is pinned by
+    // `a_write_that_landed_but_could_not_publish_names_the_revision_on_disk`.
+    assert!(
+        error.current_revision.is_none(),
+        "nothing was written, so there is no revision to name: {error:?}"
+    );
     let root = vault.path().to_string_lossy().into_owned();
     assert!(
         !error.message.contains(&root) && !error.message.contains("Folder"),
@@ -432,5 +452,173 @@ fn an_io_refusal_never_leaks_a_filesystem_path_on_the_wire() {
         std::fs::read(folder.join("A.md")).expect("read back"),
         b"# a\n",
         "the refused write must have changed nothing"
+    );
+}
+
+/// **TRIPWIRE — Task 12 must flip this test, not delete it.**
+///
+/// `rename_note` accepts `rewrite_links` (wire default `true`) and the engine
+/// destructures it to `_`. Nothing repairs an inbound reference yet, so today
+/// a rename breaks every link into the renamed note while answering
+/// `links_rewritten: 0` with an empty `link_rewrite_failures` — which is an
+/// affirmative statement that nothing failed. That is a contract violation:
+/// the design says `rewrite_links` defaults true and repairs inbound
+/// references, and a client that spells nothing gets silent link rot.
+///
+/// This test pins the honest-but-broken shape on purpose, so the gap is
+/// visible in the suite rather than only in a plan document. It is not an
+/// endorsement. When Task 12 lands the link-repair burst, these assertions
+/// invert: `links_rewritten` becomes 1 and the referrer's bytes become
+/// `[[Renamed]]`. A descoped Task 12 leaves behind a test that documents the
+/// hazard instead of a green suite that hides it.
+#[test]
+fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index = TempDir::new().expect("index tempdir");
+    std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
+    std::fs::write(vault.path().join("Two.md"), "# Two\n[[One]]\n").expect("write Two");
+    let mut daemon = Daemon::for_vault(&vault, &index);
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+
+    // `rewrite_links` is deliberately not spelled: the wire default is `true`,
+    // so this is the request an ordinary client sends.
+    let renamed = daemon.call(
+        r#"{"version":1,"id":"n","request":{"method":"rename_note","params":{"from":"One.md","to":"Renamed.md","expected":{"any":true}}}}"#,
+    );
+    match renamed.outcome {
+        ResponseOutcome::Ok(Response::RenameNote(response)) => {
+            assert_eq!(
+                response.links_rewritten, 0,
+                "TASK 12: this must become 1 when link repair lands"
+            );
+            assert!(
+                response.link_rewrite_failures.is_empty(),
+                "TASK 12: nothing is even attempted yet, so nothing can fail"
+            );
+        }
+        other => panic!("rename_note did not reach the engine: {other:?}"),
+    }
+
+    assert!(vault.path().join("Renamed.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(vault.path().join("Two.md")).expect("read Two back"),
+        "# Two\n[[One]]\n",
+        "TASK 12: this must become \"# Two\\n[[Renamed]]\\n\" when link repair lands"
+    );
+
+    // And the index agrees the link is now broken — the honest reading of the
+    // bytes above, not a stale row.
+    let read_back = daemon.call(
+        r#"{"version":1,"id":"g","request":{"method":"get_note","params":{"path":"Two.md"}}}"#,
+    );
+    match read_back.outcome {
+        ResponseOutcome::Ok(Response::GetNote(response)) => {
+            assert_eq!(response.note.outgoing.len(), 1);
+            assert_eq!(
+                response.note.outgoing[0].resolution,
+                vault_protocol::ResolutionDto::Unresolved,
+                "TASK 12: this must resolve to Renamed.md when link repair lands"
+            );
+        }
+        other => panic!("get_note failed: {other:?}"),
+    }
+}
+
+/// The other half of `storage_failure`, and the one a client can act on
+/// wrongly. `MutationError::Io` means **nothing landed** — retry is safe. A
+/// reconciliation that fails *after* the engine's rename means **the bytes are
+/// on disk** and only the index is behind — a retry under
+/// `expected: {"absent": true}` will now meet `target_exists`, and one under
+/// the old revision will meet `revision_conflict`. Same code, opposite next
+/// move, so the two are told apart by the payload the protocol already
+/// carries: `current_revision` names the revision the write put on disk.
+///
+/// Driven in-process rather than through a spawned daemon on purpose. The
+/// failure has to happen *inside* the coordinator, after the engine's rename
+/// and before publication, and no external lever reaches there: chmod cannot
+/// revoke write access from a file descriptor SQLite already holds open, so
+/// souring the index under a running daemon is not possible on Unix. The
+/// injected fault is the only instrument that reaches this window, and the
+/// request still travels the real `Server::handle` dispatch arm and the real
+/// `convert::mutation_failure` conversion — everything the wire shape depends
+/// on.
+#[test]
+fn a_write_that_landed_but_could_not_publish_names_the_revision_on_disk() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index = TempDir::new().expect("index tempdir");
+    std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
+    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
+        .expect("runtime config");
+    let (sink, _notices) = sync_channel(64);
+
+    // Stage 0 is disarmed. The test moves it to 1 immediately before the
+    // write; the next call into the `IndexService` is the engine's own, which
+    // must succeed, and the one after it is the reconciliation — the one that
+    // fails. Counting from the arming point rather than from process start
+    // keeps this immune to a retry renumbering the startup catch-up.
+    let stage = Arc::new(AtomicUsize::new(0));
+    let hooks = RuntimeTestHooks {
+        mutation_fault: Some(Arc::new({
+            let stage = Arc::clone(&stage);
+            move |_| match stage.load(Ordering::Acquire) {
+                1 => {
+                    stage.store(2, Ordering::Release);
+                    None
+                }
+                2 => {
+                    stage.store(3, Ordering::Release);
+                    Some(IndexError::Storage("injected publication failure".into()))
+                }
+                _ => None,
+            }
+        })),
+        ..RuntimeTestHooks::default()
+    };
+    let options = RuntimeOptions {
+        watch: false,
+        reconcile_interval: None,
+        ..RuntimeOptions::default()
+    };
+    let handle =
+        Runtime::start_with_hooks(config, options, sink, hooks).expect("start the runtime");
+    handle.refresh(false).expect("cold build");
+
+    let server = Server::for_runtime(handle);
+    let mut subscriptions = SubscriptionRegistry::new();
+    stage.store(1, Ordering::Release);
+    let response = server.handle(
+        RequestEnvelope {
+            version: 1,
+            id: "w".into(),
+            request: Request::WriteNote(WriteNoteParams {
+                path: "One.md".into(),
+                content: "# One changed\n".into(),
+                expected: Some(ExpectedDto {
+                    revision: None,
+                    absent: None,
+                    any: Some(true),
+                }),
+            }),
+        },
+        &mut subscriptions,
+    );
+
+    let error = match response.outcome {
+        ResponseOutcome::Err(error) => error,
+        other => {
+            panic!("the reconciliation failed, so the write must not report success: {other:?}")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::StorageFailure);
+    assert_eq!(
+        error.current_revision.as_deref(),
+        Some(revision_of(b"# One changed\n").as_str()),
+        "a write that reached disk must name the revision it wrote, so the client \
+         knows not to retry blindly: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(vault.path().join("One.md")).expect("read back"),
+        b"# One changed\n",
+        "the point of the distinction: the bytes really are on disk"
     );
 }

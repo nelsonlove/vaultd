@@ -182,6 +182,30 @@ impl Server {
             .ok_or_else(index_unavailable)
     }
 
+    /// The revision a `MutationResponse` reports. Every operation answering
+    /// with that shape wrote bytes, so the engine always has a revision for
+    /// it, and a missing one is an engine invariant violation rather than a
+    /// state a client should be handed.
+    ///
+    /// It refuses rather than defaulting because `MutationResponse.revision`
+    /// is a bare `String`: `unwrap_or_default` would put `""` on the wire,
+    /// which is a *well-formed* revision as far as the schema is concerned
+    /// and which a client would then compare-and-swap against. That is the
+    /// same empty-string spelling checkpoint-1 ruled out for
+    /// `RenameResponse` — a thing with no revision reports no revision. Here
+    /// there is no key to omit, so the honest answer is to fail. The message
+    /// is deliberately contentless: an invariant violation tells a client
+    /// nothing it can act on, and internals stay off the wire.
+    fn mutation_revision(report: &MutationReport) -> Result<String, ProtocolError> {
+        report.revision.clone().ok_or_else(|| ProtocolError {
+            code: ErrorCode::Internal,
+            message: "the mutation reported no content revision".into(),
+            supported_version: None,
+            current_generation: None,
+            current_revision: None,
+        })
+    }
+
     fn subscribe(
         &self,
         subscriptions: &mut SubscriptionRegistry,
@@ -399,13 +423,16 @@ impl Server {
                         expected,
                     }) {
                         Err(error) => ResponseEnvelope::error(id, error),
-                        Ok(report) => match Self::mutation_generation(&report) {
-                            Err(error) => ResponseEnvelope::error(id, error),
-                            Ok(generation) => ResponseEnvelope::success(
+                        Ok(report) => match (
+                            Self::mutation_generation(&report),
+                            Self::mutation_revision(&report),
+                        ) {
+                            (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                            (Ok(generation), Ok(revision)) => ResponseEnvelope::success(
                                 id,
                                 Response::WriteNote(MutationResponse {
                                     generation,
-                                    revision: report.revision.unwrap_or_default(),
+                                    revision,
                                 }),
                             ),
                         },
@@ -496,13 +523,18 @@ impl Server {
                             if_exists: convert::copy_conflict(params.if_exists),
                         }) {
                             Err(error) => ResponseEnvelope::error(id, error),
-                            Ok(report) => match Self::mutation_generation(&report) {
-                                Err(error) => ResponseEnvelope::error(id, error),
-                                Ok(generation) => ResponseEnvelope::success(
+                            Ok(report) => match (
+                                Self::mutation_generation(&report),
+                                Self::mutation_revision(&report),
+                            ) {
+                                (Err(error), _) | (_, Err(error)) => {
+                                    ResponseEnvelope::error(id, error)
+                                }
+                                (Ok(generation), Ok(revision)) => ResponseEnvelope::success(
                                     id,
                                     Response::CopyFile(MutationResponse {
                                         generation,
-                                        revision: report.revision.unwrap_or_default(),
+                                        revision,
                                     }),
                                 ),
                             },
@@ -561,13 +593,18 @@ impl Server {
                             expected,
                         }) {
                             Err(error) => ResponseEnvelope::error(id, error),
-                            Ok(report) => match Self::mutation_generation(&report) {
-                                Err(error) => ResponseEnvelope::error(id, error),
-                                Ok(generation) => ResponseEnvelope::success(
+                            Ok(report) => match (
+                                Self::mutation_generation(&report),
+                                Self::mutation_revision(&report),
+                            ) {
+                                (Err(error), _) | (_, Err(error)) => {
+                                    ResponseEnvelope::error(id, error)
+                                }
+                                (Ok(generation), Ok(revision)) => ResponseEnvelope::success(
                                     id,
                                     Response::PatchFrontmatter(MutationResponse {
                                         generation,
-                                        revision: report.revision.unwrap_or_default(),
+                                        revision,
                                     }),
                                 ),
                             },
@@ -589,5 +626,45 @@ impl Server {
                 ResponseEnvelope::error(id, runtime_not_ready("snapshots are not wired yet"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(revision: Option<&str>) -> MutationReport {
+        MutationReport {
+            generation: None,
+            revision: revision.map(str::to_string),
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            semantic: true,
+        }
+    }
+
+    /// Reachable only by doctoring the report, because every engine operation
+    /// that answers with a `MutationResponse` sets a revision — which is
+    /// exactly why the guard is worth having: the invariant is enforced here
+    /// rather than assumed here and stated somewhere else. A fabricated `""`
+    /// would be worse than an error, because `""` is a well-formed revision
+    /// on the wire and a client would compare-and-swap against it.
+    #[test]
+    fn a_content_mutation_with_no_revision_is_an_internal_error_not_an_empty_string() {
+        let error = Server::mutation_revision(&report(None))
+            .expect_err("a missing content revision must never be defaulted");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            !error.message.is_empty() && error.current_revision.is_none(),
+            "the refusal says nothing a client could act on, and leaks nothing: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_content_mutation_reports_the_revision_it_wrote() {
+        assert_eq!(
+            Server::mutation_revision(&report(Some("blake3:abc"))).expect("a revision is present"),
+            "blake3:abc"
+        );
     }
 }

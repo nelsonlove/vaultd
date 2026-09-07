@@ -117,7 +117,7 @@ pub enum RuntimeCommand {
     /// largest variant.
     Mutate {
         mutation: Box<Mutation>,
-        reply: std::sync::mpsc::SyncSender<Result<MutationReport, IndexError>>,
+        reply: std::sync::mpsc::SyncSender<Result<MutationReport, MutationFailure>>,
     },
     Stop,
 }
@@ -610,13 +610,37 @@ pub struct MutationReport {
     pub semantic: bool,
 }
 
-/// Why a requested mutation produced no report. Mirrors [`RefreshFailure`]'s
-/// three-way split, because a client can act on the same difference.
+/// Why a requested mutation produced no report. Extends [`RefreshFailure`]'s
+/// three-way split with the one distinction that only exists for a write:
+/// whether the bytes reached disk before things went wrong.
+///
+/// [`Self::Overloaded`] and [`Self::NotReady`] are produced by
+/// [`RuntimeHandle::mutate`] — the mutation never reached the coordinator at
+/// all. [`Self::Failed`] and [`Self::Unpublished`] are produced by the
+/// coordinator, and are what its reply channel carries.
 #[derive(Debug)]
 pub enum MutationFailure {
     Overloaded,
     NotReady,
+    /// Nothing was written. The engine refused before touching the vault (or
+    /// its own write failed and rolled itself back), so the vault is
+    /// byte-identical to what it was and a retry is safe.
     Failed(IndexError),
+    /// The write landed and the generation that would have published it did
+    /// not. The vault and the index have diverged, the coordinator has
+    /// re-queued the paths so they still reach a generation, and the caller's
+    /// read-your-writes fence did not close.
+    ///
+    /// `revision` is what the mutation put on disk, when it wrote bytes at
+    /// all — the caller's proof that its write is *not* undone and that a
+    /// blind retry may now meet `target_exists` or a revision conflict. The
+    /// operations with no content revision of their own (the folder
+    /// operations, the deletes) carry `None` here, exactly as they do on
+    /// success.
+    Unpublished {
+        error: IndexError,
+        revision: Option<String>,
+    },
 }
 
 impl std::fmt::Display for MutationFailure {
@@ -625,6 +649,7 @@ impl std::fmt::Display for MutationFailure {
             Self::Overloaded => formatter.write_str("the runtime is overloaded"),
             Self::NotReady => formatter.write_str("the runtime is not running"),
             Self::Failed(error) => write!(formatter, "{error}"),
+            Self::Unpublished { error, .. } => write!(formatter, "{error}"),
         }
     }
 }
@@ -763,8 +788,9 @@ impl RuntimeHandle {
         }
     }
 
-    /// Apply one mutation and wait for it to be published. Hints already in
-    /// the mailbox are processed first; hints that arrive later wait.
+    /// Apply one mutation and wait for it to be published. Hints already
+    /// pending are flushed first, unless they are waiting out a reconcile
+    /// retry backoff; hints that arrive later wait.
     ///
     /// Blocks until the coordinator has reconciled what the write changed, so
     /// a caller that gets a report may immediately read its own write at the
@@ -782,7 +808,7 @@ impl RuntimeHandle {
         // The coordinator answers every mutation it takes, so a dropped reply
         // channel means it stopped without answering this one.
         match replies.recv() {
-            Ok(result) => result.map_err(MutationFailure::Failed),
+            Ok(result) => result,
             Err(_) => Err(MutationFailure::NotReady),
         }
     }
@@ -1194,13 +1220,25 @@ impl Coordinator {
     /// Apply one mutation and publish what it changed **before** answering,
     /// so a client that completes a write can immediately read its result.
     ///
-    /// The flush first is what keeps mailbox order mutation order: a watcher
-    /// hint that arrived before this command describes an older state of the
-    /// very path about to change, and reconciling it afterwards would publish
-    /// that older state on top of this write.
-    fn apply_mutation(&mut self, mutation: Mutation) -> Result<MutationReport, IndexError> {
+    /// The flush first keeps generation attribution honest and keeps a batch
+    /// that was already waiting from delaying this write's fence. It is *not*
+    /// what makes the ordering safe: `refresh_paths` re-reads every path it
+    /// is given from disk rather than replaying a captured state, so a hint
+    /// reconciled after this mutation can only re-observe what the mutation
+    /// already published, and publishes nothing. That property —
+    /// reconciliation is state-based, never a replayed diff — is what makes
+    /// every interleaving of hints and mutations converge, and it is worth
+    /// stating because the obvious worry (an old hint republishing an old
+    /// view on top of this write) is unreachable for that reason and not
+    /// because of the flush.
+    fn apply_mutation(&mut self, mutation: Mutation) -> Result<MutationReport, MutationFailure> {
         self.flush();
-        let outcome = self.mutation(|index| index.apply_mutation(&mutation))?;
+        // Every failure up to and including this call leaves the vault
+        // byte-identical: the engine refuses before it writes, and its own
+        // write is temp-then-rename.
+        let outcome = self
+            .mutation(|index| index.apply_mutation(&mutation))
+            .map_err(MutationFailure::Failed)?;
         if outcome.changed_paths.is_empty() {
             // A byte-identical patch, or a write into a zone the index does
             // not track: nothing the index holds moved, so report the
@@ -1229,10 +1267,15 @@ impl Coordinator {
             Err(error) => {
                 // The bytes are on disk; only the index is behind. Hand the
                 // paths back so they still reach a generation, and tell the
-                // caller its read-your-writes fence did not close.
+                // caller its read-your-writes fence did not close — naming
+                // the revision it wrote, because that is the only thing that
+                // distinguishes this from a failure that wrote nothing.
                 self.fail(&error);
                 self.rehint(paths);
-                Err(error)
+                Err(MutationFailure::Unpublished {
+                    error,
+                    revision: outcome.revision,
+                })
             }
         }
     }
@@ -1254,7 +1297,6 @@ impl Coordinator {
         &mut self,
         paths: BTreeSet<VaultPath>,
     ) -> Result<LiveRefreshReport, IndexError> {
-        let mut last = IndexError::IndexUnavailable;
         for attempt in 0..MAX_MUTATION_ATTEMPTS {
             let final_attempt = attempt + 1 == MAX_MUTATION_ATTEMPTS;
             let batch = paths.clone();
@@ -1267,6 +1309,10 @@ impl Coordinator {
                             | IndexError::LiveStateStale(_)
                             | IndexError::VaultChangedDuringRefresh
                     );
+                    // The final attempt returns whatever it got, so the loop
+                    // never falls through and there is no post-loop fallback
+                    // to get wrong. Keeping a "last error" here would be a
+                    // value nothing can ever read.
                     if !retryable || final_attempt {
                         return Err(error);
                     }
@@ -1277,11 +1323,10 @@ impl Coordinator {
                         }
                         _ => {}
                     }
-                    last = error;
                 }
             }
         }
-        Err(last)
+        unreachable!("MAX_MUTATION_ATTEMPTS is non-zero and its final attempt always returns")
     }
 
     /// Put a batch back for another attempt, or give up on being incremental
