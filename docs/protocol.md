@@ -190,7 +190,7 @@ One committed generation's change, across both axes the cache indexes: a note wh
 
 **Apply `deleted` before `created`.** One path may appear in both lists in the same generation, and that pairing has exactly one meaning: the thing at that path was removed and a different thing was created there — a folder replaced by a file of the same name is the case that produces it. Applying `deleted` first gets that right, and takes the removed folder's subtree with it; applying `created` first drops the new entry again.
 
-`changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, or `verified`.
+`changes` is `detailed` with explicit path lists while the change set holds at most 1024 paths, and `counts_only` beyond that — in which case a `resync_required { oversized_change_set }` follows it immediately. `cause` is one of `watcher`, `startup`, `periodic`, `manual`, `verified`, or `mutation` — `mutation` being a generation this daemon's own write path produced, which a client may already have read its own write at.
 
 ```json
 {"version":1,"subscription_id":"sub-1","event":{"type":"generation_committed","value":{"previous_generation":3,"generation":4,"cause":"watcher","changes":{"kind":"detailed","created":[],"modified":["Folder/Note.md"],"deleted":[]},"affected_note_count":1,"affected_reference_count":7}}}

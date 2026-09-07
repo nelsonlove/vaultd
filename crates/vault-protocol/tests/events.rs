@@ -198,10 +198,9 @@ fn all_five_resync_reasons_round_trip_with_stable_wire_spellings() {
 }
 
 /// Every `GenerationCauseDto` variant round-trips through serde. This does
-/// NOT assert the runtime can produce all five on the wire today — only
-/// `Watcher` is reachable through the live runtime as of Task 10/11; the
-/// others become reachable through a future vault-index API handoff (Task
-/// 12 and later).
+/// NOT assert the runtime can produce all of them on the wire today: the
+/// live runtime produces `watcher` and `mutation`, and the rest become
+/// reachable when `vault-index` attributes a cycle to them.
 #[test]
 fn all_generation_causes_round_trip_with_stable_wire_spellings() {
     let cases = [
@@ -210,6 +209,7 @@ fn all_generation_causes_round_trip_with_stable_wire_spellings() {
         (GenerationCauseDto::Periodic, "\"periodic\""),
         (GenerationCauseDto::Manual, "\"manual\""),
         (GenerationCauseDto::Verified, "\"verified\""),
+        (GenerationCauseDto::Mutation, "\"mutation\""),
     ];
     for (cause, expected) in cases {
         let json = serde_json::to_string(&cause).expect("serialize cause");

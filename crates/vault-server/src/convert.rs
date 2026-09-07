@@ -2,15 +2,19 @@ use vault_core::{
     Diagnostic, DiagnosticCode, PropertyValue, ReferenceKind, ReferenceOrigin, Resolution,
     ResolvedReference, Severity, SourceSpan, Subpath,
 };
-use vault_index::{IndexError, IndexState, IndexedNote, NoteSummary, VaultInfo};
+use vault_index::{
+    CopyConflict, DeleteMode, FrontmatterEdit, IndexError, IndexState, IndexedNote, NoteSummary,
+    PatchValue, Precondition, VaultInfo,
+};
 use vault_protocol::{
-    AliasDto, BlockDto, DiagnosticDto, ErrorCode, GetVaultInfoResponse, HeadingDto, IndexStateDto,
-    LiveStateDto, NoteDto, NoteSummaryDto, PropertyDto, PropertyMappingEntryDto, PropertyValueDto,
-    ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto, ResolutionDto, SeverityDto,
-    SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto,
+    AliasDto, BlockDto, CopyConflictDto, DeleteModeDto, DiagnosticDto, ErrorCode, ExpectedDto,
+    FrontmatterEditDto, GetVaultInfoResponse, HeadingDto, IndexStateDto, LinkRewriteFailureDto,
+    LiveStateDto, NoteDto, NoteSummaryDto, PatchValueDto, PropertyDto, PropertyMappingEntryDto,
+    PropertyValueDto, ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto,
+    ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto,
 };
 
-use crate::runtime::RefreshFailure;
+use crate::runtime::{MutationFailure, RefreshFailure};
 
 pub(crate) fn span(value: SourceSpan) -> SpanDto {
     // usize -> u64 cannot lose range on supported platforms; use try_from to
@@ -358,48 +362,187 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::IndexInUse;
             error.message = "the index is held by another writer".into();
         }
-        // Nothing constructs this variant yet: the mutation engine's refusals
-        // get a home in `IndexError` here, and the coordinator that produces
-        // them arrives with the mutation dispatch layer — which replaces this
-        // arm with a shared `mutation_error` helper the dispatch path also
-        // calls directly. The arm is written out rather than folded into
-        // `Internal` so no refusal can reach a client as an unexplained
-        // internal error in the meantime, and so it stays exhaustive: a new
-        // `MutationError` variant fails to compile here until it is mapped.
-        IndexError::Mutation(refusal) => {
-            use vault_index::MutationError;
+        // One mapping, one place. The dispatch path calls `mutation_error`
+        // directly for the refusals it produces itself, and this arm routes
+        // the ones that arrive wrapped in an `IndexError` to exactly the same
+        // table — a refusal must never mean two different things depending on
+        // which layer carried it.
+        IndexError::Mutation(refusal) => return mutation_error(refusal),
+    }
+    error
+}
 
-            error.message = match &refusal {
-                // Never leak a filesystem path or an OS error string.
-                MutationError::Io { .. } => "the vault filesystem write failed".into(),
-                other => other.to_string(),
-            };
-            match refusal {
-                MutationError::RevisionConflict { current, .. } => {
-                    error.code = ErrorCode::RevisionConflict;
-                    error.current_revision = current;
-                }
-                MutationError::NotFound { .. } => error.code = ErrorCode::NotFound,
-                MutationError::ParentNotFound { .. } => error.code = ErrorCode::ParentNotFound,
-                MutationError::TargetExists { .. } | MutationError::FolderNotEmpty { .. } => {
-                    error.code = ErrorCode::TargetExists;
-                }
-                MutationError::CaseCollision { .. } => error.code = ErrorCode::CaseCollision,
-                MutationError::ZoneViolation { .. } => error.code = ErrorCode::ZoneViolation,
-                MutationError::TooLarge { .. } => error.code = ErrorCode::PayloadTooLarge,
-                MutationError::ReadOnly => error.code = ErrorCode::ReadOnly,
-                // Malformed requests rather than state conflicts: no retry
-                // helps, and the caller has to change what it asked for.
-                MutationError::NotANote { .. }
-                | MutationError::IsANote { .. }
-                | MutationError::InvalidPrecondition { .. }
-                | MutationError::UnaddressablePatch { .. }
-                | MutationError::MalformedFrontmatter { .. }
-                | MutationError::AnchoredProperty { .. }
-                | MutationError::OverlappingPatch => error.code = ErrorCode::InvalidRequest,
-                MutationError::Io { .. } => error.code = ErrorCode::StorageFailure,
-            }
+/// Map one mutation refusal onto its typed protocol error. Every one of these
+/// means *nothing changed*, so the codes are precise on purpose: a client
+/// retries a `revision_conflict`, fixes a `parent_not_found`, and gives up on
+/// a `read_only`.
+pub(crate) fn mutation_error(value: vault_index::MutationError) -> ProtocolError {
+    use vault_index::MutationError;
+
+    let mut error = ProtocolError {
+        code: ErrorCode::Internal,
+        message: value.to_string(),
+        supported_version: None,
+        current_generation: None,
+        current_revision: None,
+    };
+    match value {
+        MutationError::RevisionConflict { current, .. } => {
+            error.code = ErrorCode::RevisionConflict;
+            error.current_revision = current;
+        }
+        MutationError::NotFound { .. } => error.code = ErrorCode::NotFound,
+        MutationError::ParentNotFound { .. } => error.code = ErrorCode::ParentNotFound,
+        // A folder that is not empty is refused for the same reason a taken
+        // path is: something is already there.
+        MutationError::TargetExists { .. } | MutationError::FolderNotEmpty { .. } => {
+            error.code = ErrorCode::TargetExists;
+        }
+        MutationError::CaseCollision { .. } => error.code = ErrorCode::CaseCollision,
+        MutationError::ZoneViolation { .. } => error.code = ErrorCode::ZoneViolation,
+        MutationError::TooLarge { .. } => error.code = ErrorCode::PayloadTooLarge,
+        MutationError::ReadOnly => error.code = ErrorCode::ReadOnly,
+        // Every one of these is a malformed request rather than a state
+        // conflict: no retry helps, and the caller has to change what it
+        // asked for. `UnaddressablePatch` is the narrowed post-correction-#9
+        // variant — a path with no value to address at all — not the old
+        // "below stored-span granularity", which is now served rather than
+        // refused.
+        MutationError::NotANote { .. }
+        | MutationError::IsANote { .. }
+        | MutationError::InvalidPrecondition { .. }
+        | MutationError::UnaddressablePatch { .. }
+        | MutationError::MalformedFrontmatter { .. }
+        | MutationError::AnchoredProperty { .. }
+        | MutationError::OverlappingPatch => error.code = ErrorCode::InvalidRequest,
+        MutationError::Io { .. } => {
+            error.code = ErrorCode::StorageFailure;
+            // Never leak a filesystem path or an OS error string.
+            error.message = "the vault filesystem write failed".into();
         }
     }
     error
+}
+
+/// A mutation that produced no report. The same three-way split
+/// [`refresh_failure`] makes, for the same reason: retry soon, never retry, or
+/// treat it as the refusal it is.
+pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
+    match value {
+        MutationFailure::Overloaded => ProtocolError {
+            code: ErrorCode::RuntimeOverloaded,
+            message: "the runtime is saturated; retry this mutation".into(),
+            supported_version: None,
+            current_generation: None,
+            current_revision: None,
+        },
+        MutationFailure::NotReady => ProtocolError {
+            code: ErrorCode::RuntimeNotReady,
+            message: "the runtime is not running".into(),
+            supported_version: None,
+            current_generation: None,
+            current_revision: None,
+        },
+        MutationFailure::Failed(error) => index_error(error),
+    }
+}
+
+fn invalid_request(message: &str) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::InvalidRequest,
+        message: message.into(),
+        supported_version: None,
+        current_generation: None,
+        current_revision: None,
+    }
+}
+
+/// Exactly one precondition field may be set. A two-field precondition has no
+/// meaning, and silently preferring one would turn a client's typo into an
+/// unconditional overwrite.
+pub(crate) fn precondition(value: Option<&ExpectedDto>) -> Result<Precondition, ProtocolError> {
+    // Omitting `expected` entirely means unconditional. An expected object
+    // that is PRESENT but names no field is a typo-shaped client bug and is
+    // refused (checkpoint-1 ruling I1).
+    let Some(value) = value else {
+        return Ok(Precondition::Any);
+    };
+    match (&value.revision, value.absent, value.any) {
+        (Some(revision), None, None) => Ok(Precondition::Revision(revision.clone())),
+        (None, Some(true), None) => Ok(Precondition::Absent),
+        (None, None, Some(true)) => Ok(Precondition::Any),
+        (None, Some(false), None) | (None, None, Some(false)) => Err(invalid_request(
+            "expected.absent and expected.any must be true when present",
+        )),
+        _ => Err(invalid_request(
+            "expected must name exactly one of revision, absent, or any",
+        )),
+    }
+}
+
+pub(crate) fn delete_mode(value: DeleteModeDto) -> DeleteMode {
+    match value {
+        DeleteModeDto::TrashSystem => DeleteMode::TrashSystem,
+        DeleteModeDto::TrashLocal => DeleteMode::TrashLocal,
+        DeleteModeDto::Permanent => DeleteMode::Permanent,
+    }
+}
+
+pub(crate) fn copy_conflict(value: CopyConflictDto) -> CopyConflict {
+    match value {
+        CopyConflictDto::Error => CopyConflict::Error,
+        CopyConflictDto::Suffix => CopyConflict::Suffix,
+    }
+}
+
+pub(crate) fn patch_value(value: &PatchValueDto) -> PatchValue {
+    match value {
+        PatchValueDto::Boolean(value) => PatchValue::Boolean(*value),
+        PatchValueDto::Integer(value) => PatchValue::Integer(*value),
+        PatchValueDto::Float(value) => PatchValue::Float(*value),
+        PatchValueDto::String(value) => PatchValue::String(value.clone()),
+        PatchValueDto::Sequence(items) => {
+            PatchValue::Sequence(items.iter().map(patch_value).collect())
+        }
+        PatchValueDto::Mapping(entries) => PatchValue::Mapping(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), patch_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// Split each wire dot-path into segments. An empty path, or a path with an
+/// empty segment, is a client bug rather than a key named "".
+pub(crate) fn frontmatter_edits(
+    edits: &[FrontmatterEditDto],
+) -> Result<Vec<FrontmatterEdit>, ProtocolError> {
+    let mut converted = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let segments: Vec<String> = edit.key_path.split('.').map(str::to_string).collect();
+        if segments.iter().any(String::is_empty) {
+            return Err(invalid_request(&format!(
+                "invalid frontmatter key path: {:?}",
+                edit.key_path
+            )));
+        }
+        converted.push(FrontmatterEdit {
+            key_path: segments,
+            value: edit.value.as_ref().map(patch_value),
+        });
+    }
+    Ok(converted)
+}
+
+pub(crate) fn link_rewrite_failures(
+    failures: Vec<vault_index::LinkRewriteFailure>,
+) -> Vec<LinkRewriteFailureDto> {
+    failures
+        .into_iter()
+        .map(|failure| LinkRewriteFailureDto {
+            path: failure.path.as_str().to_string(),
+            reason: failure.reason,
+        })
+        .collect()
 }

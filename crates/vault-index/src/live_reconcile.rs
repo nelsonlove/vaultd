@@ -45,6 +45,9 @@ pub enum ChangeCause {
     Periodic,
     Manual,
     Verified,
+    /// This daemon's own write path. Distinct from `Watcher` so a subscriber
+    /// can tell a change it asked for from a change it must react to.
+    Mutation,
 }
 
 /// The change one cycle published, by path. A path only appears here when the

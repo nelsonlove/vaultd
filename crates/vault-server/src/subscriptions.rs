@@ -83,6 +83,7 @@ fn generation_cause(value: ChangeCause) -> GenerationCauseDto {
         ChangeCause::Periodic => GenerationCauseDto::Periodic,
         ChangeCause::Manual => GenerationCauseDto::Manual,
         ChangeCause::Verified => GenerationCauseDto::Verified,
+        ChangeCause::Mutation => GenerationCauseDto::Mutation,
     }
 }
 

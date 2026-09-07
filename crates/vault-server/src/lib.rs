@@ -9,12 +9,12 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexReader, LiveState, ReferenceStatus};
 use vault_protocol::{
-    ErrorCode, PageResponse, ProtocolError, ReferenceStatusFilter, RefreshIndexResponse, Request,
-    RequestEnvelope, ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto,
-    validate_version,
+    ErrorCode, GenerationResponse, MutationResponse, PageResponse, ProtocolError,
+    ReferenceStatusFilter, RefreshIndexResponse, RenameResponse, Request, RequestEnvelope,
+    ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto, validate_version,
 };
 
-use crate::runtime::{Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
+use crate::runtime::{MutationReport, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
 use crate::subscriptions::SubscriptionRegistry;
 
 /// How many runtime notices may be in flight between the coordinator and the
@@ -156,6 +156,30 @@ impl Server {
             return Ok(LiveState::Stopped);
         }
         Ok(published)
+    }
+
+    /// Send one mutation to the coordinator and wait for it to be published.
+    /// Every mutation arm below shares this, so "reconcile before you answer"
+    /// is one decision rather than ten.
+    fn mutate(&self, mutation: vault_index::Mutation) -> Result<MutationReport, ProtocolError> {
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| runtime_not_ready("no vault is configured, so there is no runtime"))?;
+        live.handle
+            .mutate(mutation)
+            .map_err(convert::mutation_failure)
+    }
+
+    /// The generation a mutation response reports. `None` means nothing has
+    /// ever been committed, which a client cannot act on — every mutation
+    /// that reaches a running runtime has a generation, so this is a
+    /// last-resort refusal rather than a shape a caller must handle.
+    fn mutation_generation(report: &MutationReport) -> Result<u64, ProtocolError> {
+        report
+            .generation
+            .map(vault_index::Generation::get)
+            .ok_or_else(index_unavailable)
     }
 
     fn subscribe(
@@ -365,22 +389,204 @@ impl Server {
                     Err(error) => ResponseEnvelope::error(id, error),
                 }
             }
-            // Wired in Task 9 (mutations) and Tasks 13-15 (snapshots).
-            Request::WriteNote(_)
-            | Request::CreateFolder(_)
-            | Request::RenameNote(_)
-            | Request::RenameFolder(_)
-            | Request::CopyFile(_)
-            | Request::DeleteNote(_)
-            | Request::DeleteFolder(_)
-            | Request::PatchFrontmatter(_)
-            | Request::WriteFile(_)
-            | Request::ReadFile(_)
-            | Request::OpenSnapshot(_)
+            Request::WriteNote(params) => match parse_path(&params.path) {
+                Err(error) => ResponseEnvelope::error(id, error),
+                Ok(path) => match convert::precondition(params.expected.as_ref()) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(expected) => match self.mutate(vault_index::Mutation::WriteNote {
+                        path,
+                        content: params.content,
+                        expected,
+                    }) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(report) => match Self::mutation_generation(&report) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            Ok(generation) => ResponseEnvelope::success(
+                                id,
+                                Response::WriteNote(MutationResponse {
+                                    generation,
+                                    revision: report.revision.unwrap_or_default(),
+                                }),
+                            ),
+                        },
+                    },
+                },
+            },
+            Request::CreateFolder(params) => match parse_path(&params.path) {
+                Err(error) => ResponseEnvelope::error(id, error),
+                Ok(path) => match self.mutate(vault_index::Mutation::CreateFolder { path }) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(report) => match Self::mutation_generation(&report) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(generation) => ResponseEnvelope::success(
+                            id,
+                            Response::CreateFolder(GenerationResponse { generation }),
+                        ),
+                    },
+                },
+            },
+            Request::RenameNote(params) => {
+                match (parse_path(&params.from), parse_path(&params.to)) {
+                    (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                    (Ok(from), Ok(to)) => match convert::precondition(params.expected.as_ref()) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(expected) => match self.mutate(vault_index::Mutation::RenameNote {
+                            from,
+                            to,
+                            expected,
+                            rewrite_links: params.rewrite_links,
+                        }) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            Ok(report) => match Self::mutation_generation(&report) {
+                                Err(error) => ResponseEnvelope::error(id, error),
+                                Ok(generation) => ResponseEnvelope::success(
+                                    id,
+                                    Response::RenameNote(RenameResponse {
+                                        generation,
+                                        revision: report.revision,
+                                        links_rewritten: report.links_rewritten,
+                                        link_rewrite_failures: convert::link_rewrite_failures(
+                                            report.link_rewrite_failures,
+                                        ),
+                                    }),
+                                ),
+                            },
+                        },
+                    },
+                }
+            }
+            Request::RenameFolder(params) => {
+                match (parse_path(&params.from), parse_path(&params.to)) {
+                    (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                    (Ok(from), Ok(to)) => match self.mutate(vault_index::Mutation::RenameFolder {
+                        from,
+                        to,
+                        rewrite_links: params.rewrite_links,
+                    }) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(report) => match Self::mutation_generation(&report) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            // A folder has no bytes to hash, so the engine
+                            // reports no revision and the key is omitted
+                            // outright rather than sent as an empty string.
+                            Ok(generation) => ResponseEnvelope::success(
+                                id,
+                                Response::RenameFolder(RenameResponse {
+                                    generation,
+                                    revision: report.revision,
+                                    links_rewritten: report.links_rewritten,
+                                    link_rewrite_failures: convert::link_rewrite_failures(
+                                        report.link_rewrite_failures,
+                                    ),
+                                }),
+                            ),
+                        },
+                    },
+                }
+            }
+            Request::CopyFile(params) => match (parse_path(&params.from), parse_path(&params.to)) {
+                (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                (Ok(from), Ok(to)) => {
+                    match convert::precondition(params.expected_source.as_ref()) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(expected_source) => match self.mutate(vault_index::Mutation::CopyFile {
+                            from,
+                            to,
+                            expected_source,
+                            if_exists: convert::copy_conflict(params.if_exists),
+                        }) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            Ok(report) => match Self::mutation_generation(&report) {
+                                Err(error) => ResponseEnvelope::error(id, error),
+                                Ok(generation) => ResponseEnvelope::success(
+                                    id,
+                                    Response::CopyFile(MutationResponse {
+                                        generation,
+                                        revision: report.revision.unwrap_or_default(),
+                                    }),
+                                ),
+                            },
+                        },
+                    }
+                }
+            },
+            Request::DeleteNote(params) => match parse_path(&params.path) {
+                Err(error) => ResponseEnvelope::error(id, error),
+                Ok(path) => match convert::precondition(params.expected.as_ref()) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(expected) => match self.mutate(vault_index::Mutation::DeleteNote {
+                        path,
+                        mode: params.mode.map(convert::delete_mode),
+                        expected,
+                    }) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(report) => match Self::mutation_generation(&report) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            Ok(generation) => ResponseEnvelope::success(
+                                id,
+                                Response::DeleteNote(GenerationResponse { generation }),
+                            ),
+                        },
+                    },
+                },
+            },
+            Request::DeleteFolder(params) => match parse_path(&params.path) {
+                Err(error) => ResponseEnvelope::error(id, error),
+                Ok(path) => match self.mutate(vault_index::Mutation::DeleteFolder {
+                    path,
+                    mode: params.mode.map(convert::delete_mode),
+                    recursive: params.recursive,
+                }) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(report) => match Self::mutation_generation(&report) {
+                        Err(error) => ResponseEnvelope::error(id, error),
+                        Ok(generation) => ResponseEnvelope::success(
+                            id,
+                            Response::DeleteFolder(GenerationResponse { generation }),
+                        ),
+                    },
+                },
+            },
+            Request::PatchFrontmatter(params) => match parse_path(&params.path) {
+                Err(error) => ResponseEnvelope::error(id, error),
+                Ok(path) => match (
+                    convert::precondition(params.expected.as_ref()),
+                    convert::frontmatter_edits(&params.patch),
+                ) {
+                    (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                    (Ok(expected), Ok(patch)) => {
+                        match self.mutate(vault_index::Mutation::PatchFrontmatter {
+                            path,
+                            patch,
+                            expected,
+                        }) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            Ok(report) => match Self::mutation_generation(&report) {
+                                Err(error) => ResponseEnvelope::error(id, error),
+                                Ok(generation) => ResponseEnvelope::success(
+                                    id,
+                                    Response::PatchFrontmatter(MutationResponse {
+                                        generation,
+                                        revision: report.revision.unwrap_or_default(),
+                                    }),
+                                ),
+                            },
+                        }
+                    }
+                },
+            },
+            // The raw pair lands in Task 16; until then it refuses rather
+            // than pretending the zone rules are in place.
+            Request::WriteFile(_) | Request::ReadFile(_) => ResponseEnvelope::error(
+                id,
+                runtime_not_ready("raw file operations are not wired yet"),
+            ),
+            // Snapshot sessions land in Tasks 13-15.
+            Request::OpenSnapshot(_)
             | Request::SnapshotTree(_)
             | Request::SnapshotNotes(_)
             | Request::CloseSnapshot(_) => {
-                ResponseEnvelope::error(id, runtime_not_ready("mutations are not wired yet"))
+                ResponseEnvelope::error(id, runtime_not_ready("snapshots are not wired yet"))
             }
         }
     }

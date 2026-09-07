@@ -66,6 +66,11 @@ pub struct IndexService {
     /// Test-only rendezvous points inside one reconciliation cycle. `None`
     /// in every production build; see [`crate::test_hook`].
     pub(crate) test_hook: crate::test_hook::InstalledHook,
+    /// The one engine that writes into this vault. Owned by the service so
+    /// that a write and the reconciliation that publishes it happen on the
+    /// same thread, under the same single-writer guarantee everything else
+    /// here has.
+    engine: crate::mutate::MutationEngine,
 }
 
 enum TryOutcome {
@@ -127,6 +132,8 @@ impl IndexService {
         let published: PublicationBarrier = Arc::new(RwLock::new(PublishedState::starting()));
         seed_published(&store, &published)?;
         let reader = IndexReader::open(&config, Arc::clone(&published))?;
+        // Built before the struct literal because `config` is moved into it.
+        let engine = crate::mutate::MutationEngine::new(&config.canonical_vault_root);
         Ok(Self {
             config,
             store,
@@ -139,7 +146,27 @@ impl IndexService {
             last_metrics: None,
             live_threshold_override: None,
             test_hook: None,
+            engine,
         })
+    }
+
+    /// Apply one mutation to the vault. Filesystem-only: publishing what it
+    /// changed is the caller's next step, through `refresh_paths`.
+    pub fn apply_mutation(
+        &mut self,
+        mutation: &crate::mutate::Mutation,
+    ) -> Result<crate::mutate::MutationOutcome, IndexError> {
+        Ok(self.engine.apply(mutation)?)
+    }
+
+    /// Refuse every mutation. Reads, snapshots, and reconciliation are
+    /// unaffected.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.engine = self.engine.clone().with_read_only(read_only);
+    }
+
+    pub fn mutation_engine(&self) -> &crate::mutate::MutationEngine {
+        &self.engine
     }
 
     pub fn current_generation(&self) -> Result<Option<Generation>, IndexError> {

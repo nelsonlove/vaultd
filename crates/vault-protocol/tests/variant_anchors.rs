@@ -64,6 +64,7 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
             | GenerationCauseDto::Periodic
             | GenerationCauseDto::Manual
             | GenerationCauseDto::Verified
+            | GenerationCauseDto::Mutation
             | GenerationCauseDto::Unknown => {}
         }
     }

@@ -51,10 +51,12 @@ impl<'de> Deserialize<'de> for LiveStateDto {
 
 /// Why a generation advanced, mirroring `vault_index::live_reconcile::ChangeCause`.
 ///
-/// Only `Watcher` is reachable on the wire through the live runtime today
-/// (Task 10/11); the others become reachable through a future
-/// `vault-index` API handoff. All five are defined now because the DTO
-/// enum must be complete and additive from the start.
+/// `Watcher` and `Mutation` are what the live runtime produces today: a
+/// targeted reconciliation the watcher asked for, and one this daemon's own
+/// write path asked for. The rest mirror `ChangeCause` variants that reach
+/// the wire only when `vault-index` attributes a cycle to them, and are
+/// defined here because the DTO enum must be complete and additive from the
+/// start.
 ///
 /// Open-ended for the same reason [`LiveStateDto`] is: `mutation` was added
 /// after the first subscribers shipped, and any later cause must degrade
@@ -67,6 +69,9 @@ pub enum GenerationCauseDto {
     Periodic,
     Manual,
     Verified,
+    /// This daemon's own write path, distinct from `watcher` so a subscriber
+    /// can tell a change it asked for from a change it must react to.
+    Mutation,
     /// A cause this build does not know. Never produced by this server.
     Unknown,
 }
@@ -82,6 +87,7 @@ impl<'de> Deserialize<'de> for GenerationCauseDto {
             "periodic" => Self::Periodic,
             "manual" => Self::Manual,
             "verified" => Self::Verified,
+            "mutation" => Self::Mutation,
             _ => Self::Unknown,
         })
     }

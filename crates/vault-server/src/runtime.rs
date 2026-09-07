@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 use vault_core::VaultPath;
 use vault_index::{
     ChangeCause, FileSystemIndexSource, Generation, IndexConfig, IndexError, IndexReader,
-    IndexService, LiveRefreshReport, LiveState, ReconcileSource, RefreshReport,
+    IndexService, LinkRewriteFailure, LiveRefreshReport, LiveState, Mutation, MutationOutcome,
+    ReconcileSource, RefreshReport,
 };
 use vault_watch::{ChangeHint, WatchStream};
 
@@ -111,6 +112,13 @@ pub enum RuntimeCommand {
         verify: bool,
         reply: std::sync::mpsc::SyncSender<Result<RefreshReport, IndexError>>,
     },
+    /// One write into the vault. Boxed because a `Mutation` carries a whole
+    /// note's content, and this enum sits in a bounded queue sized by its
+    /// largest variant.
+    Mutate {
+        mutation: Box<Mutation>,
+        reply: std::sync::mpsc::SyncSender<Result<MutationReport, IndexError>>,
+    },
     Stop,
 }
 
@@ -121,6 +129,10 @@ impl std::fmt::Debug for RuntimeCommand {
             Self::Refresh { verify, .. } => formatter
                 .debug_struct("Refresh")
                 .field("verify", verify)
+                .finish_non_exhaustive(),
+            Self::Mutate { mutation, .. } => formatter
+                .debug_struct("Mutate")
+                .field("mutation", mutation)
                 .finish_non_exhaustive(),
             Self::Stop => formatter.write_str("Stop"),
         }
@@ -580,6 +592,45 @@ impl std::fmt::Display for RefreshFailure {
 
 impl std::error::Error for RefreshFailure {}
 
+/// What one applied mutation produced.
+///
+/// `generation` is the generation a client may now read its own write at —
+/// `None` only when nothing has ever been committed. `revision` is the
+/// content revision the mutation wrote, and is `None` for everything with no
+/// bytes to hash: a folder operation, or a delete. `semantic` is the engine's
+/// own statement about whether the Markdown half of the index moved, never a
+/// fact derived from `generation` — a folder creation moves the generation
+/// through the file tree while nothing semantic happened at all.
+#[derive(Clone, Debug)]
+pub struct MutationReport {
+    pub generation: Option<Generation>,
+    pub revision: Option<String>,
+    pub links_rewritten: u64,
+    pub link_rewrite_failures: Vec<LinkRewriteFailure>,
+    pub semantic: bool,
+}
+
+/// Why a requested mutation produced no report. Mirrors [`RefreshFailure`]'s
+/// three-way split, because a client can act on the same difference.
+#[derive(Debug)]
+pub enum MutationFailure {
+    Overloaded,
+    NotReady,
+    Failed(IndexError),
+}
+
+impl std::fmt::Display for MutationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overloaded => formatter.write_str("the runtime is overloaded"),
+            Self::NotReady => formatter.write_str("the runtime is not running"),
+            Self::Failed(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for MutationFailure {}
+
 /// Clears its flag when the coordinator thread leaves `run` by any route.
 ///
 /// A `Drop` guard rather than a store at the end of `run`, because the route
@@ -709,6 +760,30 @@ impl RuntimeHandle {
         match replies.recv() {
             Ok(result) => result.map_err(RefreshFailure::Failed),
             Err(_) => Err(RefreshFailure::NotReady),
+        }
+    }
+
+    /// Apply one mutation and wait for it to be published. Hints already in
+    /// the mailbox are processed first; hints that arrive later wait.
+    ///
+    /// Blocks until the coordinator has reconciled what the write changed, so
+    /// a caller that gets a report may immediately read its own write at the
+    /// generation the report names.
+    pub fn mutate(&self, mutation: Mutation) -> Result<MutationReport, MutationFailure> {
+        let (reply, replies) = sync_channel(1);
+        match self.send_command(RuntimeCommand::Mutate {
+            mutation: Box::new(mutation),
+            reply,
+        }) {
+            Dispatch::Accepted => {}
+            Dispatch::Overflowed => return Err(MutationFailure::Overloaded),
+            Dispatch::MailboxClosed => return Err(MutationFailure::NotReady),
+        }
+        // The coordinator answers every mutation it takes, so a dropped reply
+        // channel means it stopped without answering this one.
+        match replies.recv() {
+            Ok(result) => result.map_err(MutationFailure::Failed),
+            Err(_) => Err(MutationFailure::NotReady),
         }
     }
 
@@ -917,6 +992,10 @@ impl Coordinator {
                 let result = self.foreground_refresh(verify);
                 let _ = reply.try_send(result);
             }
+            RuntimeCommand::Mutate { mutation, reply } => {
+                let result = self.apply_mutation(*mutation);
+                let _ = reply.try_send(result);
+            }
             RuntimeCommand::Stop => self.running.store(false, Ordering::Release),
         }
     }
@@ -1110,6 +1189,99 @@ impl Coordinator {
             }
         }
         self.rehint(batch);
+    }
+
+    /// Apply one mutation and publish what it changed **before** answering,
+    /// so a client that completes a write can immediately read its result.
+    ///
+    /// The flush first is what keeps mailbox order mutation order: a watcher
+    /// hint that arrived before this command describes an older state of the
+    /// very path about to change, and reconciling it afterwards would publish
+    /// that older state on top of this write.
+    fn apply_mutation(&mut self, mutation: Mutation) -> Result<MutationReport, IndexError> {
+        self.flush();
+        let outcome = self.mutation(|index| index.apply_mutation(&mutation))?;
+        if outcome.changed_paths.is_empty() {
+            // A byte-identical patch, or a write into a zone the index does
+            // not track: nothing the index holds moved, so report the
+            // generation the client can already read at rather than
+            // manufacturing one.
+            return Ok(self.report(&outcome, self.committed_generation()));
+        }
+        let paths = outcome.changed_paths.clone();
+        match self.reconcile_mutation(paths.clone()) {
+            Ok(report) => {
+                self.rehints = 0;
+                self.clear_reconcile_error();
+                if report.previous_generation != Some(report.generation) {
+                    self.emit(RuntimeNotice::Generation(Box::new(report.clone())));
+                }
+                Ok(self.report(&outcome, Some(report.generation)))
+            }
+            // Nothing has ever been committed, so there is no generation to
+            // be incremental against. The complete reconciliation covers this
+            // write and everything else besides.
+            Err(IndexError::IndexUnavailable) => {
+                self.full_reconcile(ResyncReason::RuntimeRecovered);
+                self.settle();
+                Ok(self.report(&outcome, self.committed_generation()))
+            }
+            Err(error) => {
+                // The bytes are on disk; only the index is behind. Hand the
+                // paths back so they still reach a generation, and tell the
+                // caller its read-your-writes fence did not close.
+                self.fail(&error);
+                self.rehint(paths);
+                Err(error)
+            }
+        }
+    }
+
+    fn report(&self, outcome: &MutationOutcome, generation: Option<Generation>) -> MutationReport {
+        MutationReport {
+            generation,
+            revision: outcome.revision.clone(),
+            links_rewritten: outcome.links_rewritten,
+            link_rewrite_failures: outcome.link_rewrite_failures.clone(),
+            semantic: outcome.semantic,
+        }
+    }
+
+    /// Reconcile exactly the paths a mutation changed, retrying the errors
+    /// that are retryable by construction — the same three
+    /// `refresh_with_retries` retries, against a targeted batch.
+    fn reconcile_mutation(
+        &mut self,
+        paths: BTreeSet<VaultPath>,
+    ) -> Result<LiveRefreshReport, IndexError> {
+        let mut last = IndexError::IndexUnavailable;
+        for attempt in 0..MAX_MUTATION_ATTEMPTS {
+            let final_attempt = attempt + 1 == MAX_MUTATION_ATTEMPTS;
+            let batch = paths.clone();
+            match self.mutation(|index| index.refresh_paths(batch, ChangeCause::Mutation)) {
+                Ok(report) => return Ok(report),
+                Err(error) => {
+                    let retryable = matches!(
+                        error,
+                        IndexError::Busy(_)
+                            | IndexError::LiveStateStale(_)
+                            | IndexError::VaultChangedDuringRefresh
+                    );
+                    if !retryable || final_attempt {
+                        return Err(error);
+                    }
+                    match &error {
+                        IndexError::Busy(_) => std::thread::sleep(BUSY_BACKOFF),
+                        IndexError::LiveStateStale(_) => {
+                            self.mutation(IndexService::resync_published)?;
+                        }
+                        _ => {}
+                    }
+                    last = error;
+                }
+            }
+        }
+        Err(last)
     }
 
     /// Put a batch back for another attempt, or give up on being incremental
