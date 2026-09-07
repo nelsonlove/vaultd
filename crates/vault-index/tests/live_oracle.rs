@@ -28,6 +28,17 @@
 //! The operation alphabet deliberately includes the changes that are
 //! invisible to the cheap signals: `Touch` moves metadata without content,
 //! and `PreserveFingerprintWrite` moves content without metadata.
+//!
+//! It also includes the daemon's *own* writes. A mutation and an external
+//! edit must be indistinguishable to the semantic layer: the same five claims
+//! hold whether the bytes arrived through `std::fs` or through
+//! `MutationEngine`, and a batch carrying a mutation reconciles under
+//! `ChangeCause::Mutation` rather than `ChangeCause::Watcher`. The generator
+//! picks paths freely, so a mutation that the engine refuses — a rename whose
+//! source is gone, a copy onto an occupied path, a patch of unparseable
+//! frontmatter — is an expected draw, not a failure: a refusal leaves the
+//! vault untouched, and the batch still has to reconcile to a scan-equivalent
+//! state.
 
 mod common;
 
@@ -113,13 +124,49 @@ const DESTINATIONS: &[&str] = &[
 
 #[derive(Clone, Debug)]
 enum Operation {
-    Write { path: String, body: String },
-    Delete { path: String },
-    Rename { from: String, to: String },
-    Touch { path: String },
-    PreserveFingerprintWrite { path: String, body: String },
-    MakeInvalidUtf8 { path: String },
-    RestoreUtf8 { path: String, body: String },
+    Write {
+        path: String,
+        body: String,
+    },
+    Delete {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Touch {
+        path: String,
+    },
+    PreserveFingerprintWrite {
+        path: String,
+        body: String,
+    },
+    MakeInvalidUtf8 {
+        path: String,
+    },
+    RestoreUtf8 {
+        path: String,
+        body: String,
+    },
+    /// The same content change as `Write`, routed through the mutation
+    /// engine instead of `std::fs`. The oracle's whole point here: the
+    /// semantic layer must not be able to tell the two apart.
+    MutateWrite {
+        path: String,
+        body: String,
+    },
+    MutateDelete {
+        path: String,
+    },
+    MutateRename {
+        from: String,
+        to: String,
+    },
+    MutatePatch {
+        path: String,
+        value: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +229,17 @@ fn write_preserving_fingerprint(root: &Path, name: &str, body: &str) {
 
 /// Apply one operation and report every path whose state a perfect watcher
 /// would have hinted.
-fn apply(root: &Path, operation: &Operation) -> BTreeSet<VaultPath> {
+///
+/// The mutation arms hint the same paths their `std::fs` twins do, on purpose:
+/// this oracle's claim is about reconciliation, so the hint set is the test's
+/// own, never the engine's `changed_paths`. What an outcome reports is the
+/// coordinator's business, and `vault-server`'s `tests/mutation_oracle.rs`
+/// checks it where it is actually consumed.
+fn apply(
+    root: &Path,
+    engine: &vault_index::MutationEngine,
+    operation: &Operation,
+) -> BTreeSet<VaultPath> {
     fn touch(name: &str, touched: &mut BTreeSet<VaultPath>) {
         touched.insert(VaultPath::new(name).expect("valid vault path"));
     }
@@ -230,6 +287,64 @@ fn apply(root: &Path, operation: &Operation) -> BTreeSet<VaultPath> {
             write_file(root, path, body);
             touch(path, &mut touched);
         }
+        Operation::MutateWrite { path, body } => {
+            let vault_path = VaultPath::new(path).expect("valid vault path");
+            // The generator picks freely, so a create into a folder that does
+            // not exist yet is expected and is not a failure: the refusal
+            // leaves the vault untouched, and the batch still has to
+            // reconcile to a scan-equivalent state.
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(root.join(parent)).expect("create parent directory");
+                }
+            }
+            let _ = engine.apply(&vault_index::Mutation::WriteNote {
+                path: vault_path,
+                content: body.clone(),
+                expected: vault_index::Precondition::Any,
+            });
+            touch(path, &mut touched);
+        }
+        Operation::MutateDelete { path } => {
+            let _ = engine.apply(&vault_index::Mutation::DeleteNote {
+                path: VaultPath::new(path).expect("valid vault path"),
+                mode: Some(vault_index::DeleteMode::Permanent),
+                expected: vault_index::Precondition::Any,
+            });
+            touch(path, &mut touched);
+        }
+        Operation::MutateRename { from, to } => {
+            if from != to {
+                if let Some(parent) = std::path::Path::new(to).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(root.join(parent))
+                            .expect("create parent directory");
+                    }
+                }
+                let _ = engine.apply(&vault_index::Mutation::RenameNote {
+                    from: VaultPath::new(from).expect("valid vault path"),
+                    to: VaultPath::new(to).expect("valid vault path"),
+                    expected: vault_index::Precondition::Any,
+                    // Repair is exercised by `tests/rename_repair.rs`; here
+                    // the claim is that a moved file reconciles exactly like
+                    // an externally moved one.
+                    rewrite_links: false,
+                });
+            }
+            touch(from, &mut touched);
+            touch(to, &mut touched);
+        }
+        Operation::MutatePatch { path, value } => {
+            let _ = engine.apply(&vault_index::Mutation::PatchFrontmatter {
+                path: VaultPath::new(path).expect("valid vault path"),
+                patch: vec![vault_index::FrontmatterEdit {
+                    key_path: vec!["title".to_string()],
+                    value: value.clone().map(vault_index::PatchValue::String),
+                }],
+                expected: vault_index::Precondition::Any,
+            });
+            touch(path, &mut touched);
+        }
     }
     touched
 }
@@ -241,6 +356,11 @@ fn apply(root: &Path, operation: &Operation) -> BTreeSet<VaultPath> {
 struct Oracle {
     service: IndexService,
     root: PathBuf,
+    /// The daemon's own writer, over the same vault. Held here rather than
+    /// built per batch because a `MutationEngine` is just a canonical root
+    /// and a policy, and rebuilding it would re-canonicalize on every
+    /// operation for nothing.
+    engine: vault_index::MutationEngine,
     /// The scan-derived truth as of the last verified batch, for the
     /// "advanced exactly once iff something changed" comparison.
     expected: common::SemanticSnapshot,
@@ -296,9 +416,13 @@ impl Oracle {
         let expected = common::snapshot_from_scan(&scan(&root));
         let expected_tree = scanned_tree(&root);
 
+        let engine =
+            vault_index::MutationEngine::new(root.canonicalize().expect("canonical vault root"));
+
         Self {
             service,
             root,
+            engine,
             expected,
             expected_tree,
             generation,
@@ -313,7 +437,7 @@ impl Oracle {
     fn run_batch(&mut self, batch: &[Operation]) -> Result<(), TestCaseError> {
         let mut touched: BTreeSet<VaultPath> = BTreeSet::new();
         for operation in batch {
-            touched.extend(apply(&self.root, operation));
+            touched.extend(apply(&self.root, &self.engine, operation));
         }
         let vault_after_operations = common::digest_tree(&self.root);
 
@@ -322,10 +446,32 @@ impl Oracle {
         let expected_tree = scanned_tree(&self.root);
         let changed = expected != self.expected || expected_tree != self.expected_tree;
 
+        // A batch the daemon caused reconciles as the daemon's own write, so a
+        // subscriber can tell a change it asked for from one it must react to.
+        // Every claim below is the same either way — that is the point.
+        let cause = if batch.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::MutateWrite { .. }
+                    | Operation::MutateDelete { .. }
+                    | Operation::MutateRename { .. }
+                    | Operation::MutatePatch { .. }
+            )
+        }) {
+            ChangeCause::Mutation
+        } else {
+            ChangeCause::Watcher
+        };
         let report = self
             .service
-            .refresh_paths(touched, ChangeCause::Watcher)
+            .refresh_paths(touched, cause)
             .map_err(|error| TestCaseError::fail(format!("targeted refresh failed: {error}")))?;
+        prop_assert_eq!(
+            report.cause,
+            cause,
+            "the report must carry the cause the batch was reconciled under after {:?}",
+            batch
+        );
 
         // (3) Generation exactness, in both directions.
         let wanted = if changed {
@@ -485,6 +631,11 @@ fn operation() -> impl Strategy<Value = Operation> {
             .prop_map(|(path, body)| Operation::PreserveFingerprintWrite { path, body }),
         1 => slot().prop_map(|path| Operation::MakeInvalidUtf8 { path }),
         1 => (slot(), body()).prop_map(|(path, body)| Operation::RestoreUtf8 { path, body }),
+        3 => (slot(), body()).prop_map(|(path, body)| Operation::MutateWrite { path, body }),
+        2 => slot().prop_map(|path| Operation::MutateDelete { path }),
+        1 => (slot(), slot()).prop_map(|(from, to)| Operation::MutateRename { from, to }),
+        1 => (slot(), prop::option::of("[a-z]{1,6}"))
+            .prop_map(|(path, value)| Operation::MutatePatch { path, value }),
     ]
 }
 
@@ -567,6 +718,54 @@ fn regression_scenario() -> Vec<Vec<Operation>> {
             Operation::Write {
                 path: "Nested/Beta.md".into(),
                 body: "[[./Alpha]]\n[[../Alpha]]\n".into(),
+            },
+        ],
+        // From here the same transitions again, driven by the daemon's own
+        // writer instead of by `std::fs`. Scripted rather than seeded for the
+        // reason above, and doubly so here: a shrunken seed is drawn against
+        // one exact generator, and this alphabet is the one most likely to be
+        // reweighted next.
+        //
+        // A mutation write that answers a reference which was waiting for it.
+        // This is the case an under-selecting engine gets wrong, and it is
+        // what caught the deliberate under-selection this alphabet was
+        // validated against.
+        vec![Operation::MutateWrite {
+            path: "Gamma.md".into(),
+            body: "# Heading\n\ntext ^block\n".into(),
+        }],
+        // Frontmatter surgery through the engine: the note's bytes and its
+        // revision move, and everything pointing at it has to follow.
+        vec![Operation::MutatePatch {
+            path: "Beta.md".into(),
+            value: Some("titled".into()),
+        }],
+        // ...and the deletion spelling, which removes the key again.
+        vec![Operation::MutatePatch {
+            path: "Beta.md".into(),
+            value: None,
+        }],
+        // A mutation delete drops the exact spelling, so the reference falls
+        // back to the nested one — a resolution moving under a note that did
+        // not itself change.
+        vec![Operation::MutateDelete {
+            path: "Gamma.md".into(),
+        }],
+        // A mutation rename: the vacated path and the occupied one both have
+        // to reconcile, exactly as they do for an external move.
+        vec![Operation::MutateRename {
+            from: "Nested/Deep/Gamma.md".into(),
+            to: "Gamma.md".into(),
+        }],
+        // One batch holding both kinds of write. The cause is `Mutation`, and
+        // every claim is the same as it would be for either alone.
+        vec![
+            Operation::Write {
+                path: "Nested/Alpha.md".into(),
+                body: "# Heading\n[[../Gamma]]\n".into(),
+            },
+            Operation::MutateDelete {
+                path: "Alpha.md".into(),
             },
         ],
     ]
@@ -712,6 +911,9 @@ const INTERESTING_STATES: &[&str] = &[
     "content moves while the fingerprint does not",
     "an unresolved reference becomes resolved without its own note changing",
     "a resolved reference becomes unresolved without its own note changing",
+    "a note is written through the mutation engine",
+    "a note is deleted through the mutation engine",
+    "frontmatter is patched through the mutation engine",
 ];
 
 /// Whether any reference belonging to a note that did **not** itself change
@@ -763,6 +965,9 @@ fn the_generators_reach_every_interesting_state() {
     let vault = TempDir::new().expect("vault tempdir");
     let root = vault.path().to_path_buf();
     seed_vault(&root);
+    // This test builds its own scratch vault, so it needs its own writer over
+    // that vault rather than the `Oracle`'s.
+    let engine = vault_index::MutationEngine::new(root.canonicalize().expect("canonical root"));
 
     let mut runner = proptest::test_runner::TestRunner::deterministic();
     let strategy = batch();
@@ -785,23 +990,49 @@ fn the_generators_reach_every_interesting_state() {
                     if is_note && !before.graph.backlinks(&vault_path).is_empty() {
                         reached.insert("a referenced note is deleted");
                     }
-                    apply(&root, operation);
+                    apply(&root, &engine, operation);
                 }
                 Operation::Rename { from, to } => {
                     if from != to && root.join(from).is_file() {
                         reached.insert("a note is renamed to a different path");
                     }
-                    apply(&root, operation);
+                    apply(&root, &engine, operation);
                 }
                 Operation::PreserveFingerprintWrite { path, .. } => {
                     let bytes = std::fs::read(root.join(path)).ok();
-                    apply(&root, operation);
+                    apply(&root, &engine, operation);
                     if bytes.is_some() && bytes != std::fs::read(root.join(path)).ok() {
                         reached.insert("content moves while the fingerprint does not");
                     }
                 }
+                // The three mutation states are recorded from what the vault
+                // holds *afterwards*, not from the draw. A mutation the
+                // engine refuses is a legitimate draw, and counting it as
+                // reached would let the alphabet decay into refusals while
+                // this test kept reporting full coverage.
+                Operation::MutateWrite { path, body } => {
+                    apply(&root, &engine, operation);
+                    if std::fs::read(root.join(path)).ok().as_deref() == Some(body.as_bytes()) {
+                        reached.insert("a note is written through the mutation engine");
+                    }
+                }
+                Operation::MutateDelete { path } => {
+                    let existed = root.join(path).is_file();
+                    apply(&root, &engine, operation);
+                    if existed && !root.join(path).exists() {
+                        reached.insert("a note is deleted through the mutation engine");
+                    }
+                }
+                Operation::MutatePatch { path, .. } => {
+                    let before_bytes = std::fs::read(root.join(path)).ok();
+                    apply(&root, &engine, operation);
+                    if before_bytes.is_some() && before_bytes != std::fs::read(root.join(path)).ok()
+                    {
+                        reached.insert("frontmatter is patched through the mutation engine");
+                    }
+                }
                 _ => {
-                    apply(&root, operation);
+                    apply(&root, &engine, operation);
                 }
             }
         }
