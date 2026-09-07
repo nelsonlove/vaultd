@@ -234,6 +234,10 @@ impl IndexService {
     /// check per point.
     #[doc(hidden)]
     pub fn install_test_hook(&mut self, hook: std::sync::Arc<dyn crate::TestHook>) {
+        self.engine = self
+            .engine
+            .clone()
+            .with_test_hook(std::sync::Arc::clone(&hook));
         self.test_hook = Some(hook);
     }
 

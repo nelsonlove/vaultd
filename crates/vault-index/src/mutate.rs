@@ -227,11 +227,30 @@ fn refuse_nul(path: &VaultPath) -> Result<(), MutationError> {
 }
 
 /// The one writer into the vault.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MutationEngine {
     canonical_root: PathBuf,
     read_only: bool,
     max_file_bytes: u64,
+    /// Test-only rendezvous. Production leaves it empty and pays one
+    /// `Option` check per write.
+    hook: Option<std::sync::Arc<dyn crate::TestHook>>,
+}
+
+/// Written by hand rather than derived: `dyn TestHook` carries no `Debug`
+/// bound — a hook is a test's closure, and requiring it to be printable would
+/// buy nothing — so the slot is reported as present or absent and nothing
+/// else.
+impl std::fmt::Debug for MutationEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MutationEngine")
+            .field("canonical_root", &self.canonical_root)
+            .field("read_only", &self.read_only)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("hook", &self.hook.is_some())
+            .finish()
+    }
 }
 
 impl MutationEngine {
@@ -245,12 +264,46 @@ impl MutationEngine {
             canonical_root: canonical_root.as_ref().to_path_buf(),
             read_only: false,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            hook: None,
         }
     }
 
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
+    }
+
+    #[doc(hidden)]
+    pub fn with_test_hook(mut self, hook: std::sync::Arc<dyn crate::TestHook>) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
+    fn reach(&self, point: crate::HookPoint) {
+        if let Some(hook) = &self.hook {
+            hook.reach(point);
+        }
+    }
+
+    /// Re-read the target and require the precondition to still hold.
+    ///
+    /// The first check happens before any work; this one happens immediately
+    /// before the write, so a writer that lost the race in between refuses
+    /// rather than clobbering. Both checks are cheap — one read of a file
+    /// already in the page cache — and the second is what makes
+    /// "never a lost update" true rather than likely.
+    ///
+    /// It narrows the window; it does not close it. Nothing here holds a lock
+    /// across the check and the rename, so an external writer that lands
+    /// between them still wins, and the atomic rename bounds the damage to
+    /// last-writer-wins over whole files rather than a blend of two. Inside
+    /// the daemon the window is closed by construction — one mutation is in
+    /// flight at a time — and this re-check is what covers the writer the
+    /// daemon does not own: Obsidian, a sync client, a shell.
+    fn recheck(&self, path: &VaultPath, expected: &Precondition) -> Result<(), MutationError> {
+        self.reach(crate::HookPoint::AfterMutationPrecondition);
+        self.check(path, expected)?;
+        Ok(())
     }
 
     pub fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Self {
@@ -1039,6 +1092,7 @@ impl MutationEngine {
             });
         }
         self.check_resolved(path, &resolved, expected)?;
+        self.recheck(path, expected)?;
         write_atomically(&resolved, bytes)?;
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
@@ -1139,6 +1193,7 @@ impl MutationEngine {
                 semantic: true,
             });
         }
+        self.recheck(path, expected)?;
         write_atomically(&resolved, patched.as_bytes())?;
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
@@ -1687,6 +1742,15 @@ impl MutationEngine {
             return Err(MutationError::ZoneViolation { path: to.clone() });
         }
 
+        // The same window `recheck` opens for the two note writers, opened
+        // here by hand — and *only* the rendezvous, not a second `check`.
+        // `stream_copy` already re-verifies: it hashes exactly the bytes it
+        // read and refuses before persisting, so a source rewritten from this
+        // point is caught with no extra read. Calling `recheck` would instead
+        // pull the whole source into memory, which is precisely the guarantee
+        // this verb documents it does not break — an attachment larger than
+        // the buffer is streamed, never held.
+        self.reach(crate::HookPoint::AfterMutationPrecondition);
         let revision = self.stream_copy(&source, &destination, expected_source, from)?;
         let written = self.written_path(&destination_path, &destination, stored_to);
         let semantic = written.is_markdown();

@@ -33,6 +33,11 @@ pub enum HookPoint {
     /// connection, as another process would — forces the delta to lose its
     /// compare-and-swap and re-plan.
     BeforeDeltaPublication,
+    /// A mutation's precondition has been satisfied and its bytes have not
+    /// been written yet. Writing the same path from here — as another process
+    /// would — is what makes the compare-and-swap's re-check deterministic
+    /// instead of a matter of timing.
+    AfterMutationPrecondition,
 }
 
 /// A test's callback into the engine. `Send + Sync` because the writer may
