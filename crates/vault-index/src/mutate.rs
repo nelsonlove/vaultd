@@ -1426,6 +1426,35 @@ impl MutationEngine {
             });
         }
         let source = self.resolve(from)?;
+        // A symlink is not the file it points at, and here that is a
+        // containment hole rather than a philosophical point. `resolve`
+        // canonicalizes only the *parent* and appends the caller's final
+        // component unresolved, because a mutation target need not exist yet —
+        // so a link planted at the final component keeps its own innocent name
+        // through `stored_path`, and the stored-spelling zone check below sees
+        // `Bait.md` rather than the `.obsidian/plugins/…/data.json` it points
+        // at, while `metadata` and `File::open` follow it happily. A copy
+        // through such a link lands unindexable bytes at an indexed path and
+        // reports them as semantic. Only `symlink_metadata`, which does not
+        // follow, can tell the two apart.
+        //
+        // The refusal is total rather than conditional on where the link goes,
+        // which also settles what a symlinked source means for this verb:
+        // `rename_paths` refuses one, so `copy_file` refuses one, and the two
+        // movement verbs cannot disagree. Copying *through* a link to an
+        // ordinary indexed file would be a defensible answer on its own, but it
+        // is not worth a second rule about links, and a caller who wants the
+        // target's bytes can name the target.
+        match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(MutationError::TargetExists { path: from.clone() });
+            }
+            Ok(_) => {}
+            // Absent is the ordinary `not_found` below, and every other error
+            // is the filesystem's own.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io(error)),
+        }
         let stored_from = self.stored_path(from, &source)?;
         if is_unindexable(&stored_from) {
             return Err(MutationError::ZoneViolation { path: from.clone() });
@@ -1516,6 +1545,14 @@ impl MutationEngine {
     /// until `persist` makes it so, which is the same atomicity
     /// [`write_atomically`] provides, and it carries the same `.vaultd-` prefix
     /// with no extension so the scanner can never mistake it for a note.
+    ///
+    /// The price of the single pass, stated rather than discovered: a copy that
+    /// is going to be refused still writes the source's size to disk first, in
+    /// the destination's own directory, and reclaims it immediately. On a
+    /// nearly-full volume a large copy that would have ended in
+    /// `revision_conflict` can therefore surface as an `Io` ENOSPC instead.
+    /// That is the better of the two failures — a wrong revision is a token the
+    /// client would go on to trust, and a full disk is a fact it can act on.
     fn stream_copy(
         &self,
         source: &Path,
@@ -1809,8 +1846,18 @@ impl MutationEngine {
         // A folder cannot become its own descendant. The kernel refuses that
         // rename with `EINVAL`, which would reach a client as
         // `storage_failure` — a claim the daemon is broken and an invitation to
-        // retry a request that can never succeed. Refused as an invalid target
-        // for this operation instead, which is what the message says.
+        // retry a request that can never succeed. Refused before the syscall
+        // instead.
+        //
+        // `ZoneViolation` is the least-wrong code, not a right one, and is
+        // recorded as a compromise: no zone is involved here. Its message
+        // already reads "is outside the vault, **or is not a valid target for
+        // this operation**", which is the half that applies, but the wire code
+        // it maps to is `zone_violation` where `invalid_request` — where
+        // `InvalidPrecondition` and `OverlappingPatch` land — is the truer
+        // answer. `MutationError` carries no "invalid target" variant, and
+        // adding one costs a `convert.rs` row and a protocol conversation this
+        // task does not own. Revisit if a second such refusal appears.
         if stored_to
             .as_str()
             .starts_with(&format!("{}/", stored_from.as_str()))
@@ -1844,22 +1891,7 @@ impl MutationEngine {
         changed.insert(stored_from);
 
         if case_only {
-            // On a case-insensitive filesystem the source and the destination
-            // are the same file, so a direct rename is either a no-op or
-            // refused. A staging directory beside the destination gives the
-            // file a name that folds onto neither. `.vaultd-` with no extension
-            // again, so the scanner can never see it as a note, and the
-            // `TempDir` removes it on drop however this returns.
-            let parent = destination.parent().ok_or_else(|| MutationError::Io {
-                message: format!("{} has no parent directory", destination.display()),
-            })?;
-            let staging = tempfile::Builder::new()
-                .prefix(".vaultd-")
-                .tempdir_in(parent)
-                .map_err(io)?;
-            let intermediate = staging.path().join("staged");
-            std::fs::rename(&source, &intermediate).map_err(io)?;
-            std::fs::rename(&intermediate, &destination).map_err(io)?;
+            staged_rename(&source, &destination, |from, to| std::fs::rename(from, to))?;
         } else {
             std::fs::rename(&source, &destination).map_err(io)?;
         }
@@ -1881,6 +1913,92 @@ impl MutationEngine {
 /// case-insensitive filesystem cannot serve directly.
 fn is_case_only_rename(from: &VaultPath, to: &VaultPath) -> bool {
     from.as_str() != to.as_str() && from.as_str().to_lowercase() == to.as_str().to_lowercase()
+}
+
+/// Move `source` to `destination` via an intermediate name, for the case-only
+/// rename a case-insensitive filesystem cannot serve directly: there the two
+/// paths address the same file, so a direct rename is either a no-op or a
+/// refusal.
+///
+/// **The intermediate is a sibling *name*, never a container.** An earlier
+/// draft staged into a `tempfile::TempDir`, whose `Drop` runs `remove_dir_all`
+/// — so a failing second rename took the `?`, dropped the directory, and
+/// deleted the only copy of the file, and a crash between the two renames left
+/// the note inside a dot-prefixed directory the scanner never enumerates and
+/// nothing sweeps. A sibling name has neither property. The worst case here is
+/// that the file sits in its own directory under a `.vaultd-` name: visible to
+/// anyone looking, trivially renamed back by hand, and never destroyed.
+///
+/// The failure ladder, in order:
+///
+/// 1. The first rename fails — nothing has moved, the placeholder is removed,
+///    and the vault is untouched.
+/// 2. The second rename fails — the file is renamed **back** to `source`, and
+///    the caller gets the second rename's error. The vault is untouched.
+/// 3. The restore also fails — the file stays under the staging name and the
+///    error says so, naming the path, because that is the one thing a caller
+///    cannot work out for themselves.
+///
+/// The name carries the `.vaultd-` prefix and no extension for the reason
+/// [`write_atomically`]'s temporary does: `FileSystemVaultSource` enumerates
+/// only `*.md`, so the intermediate is never mistaken for a note even in the
+/// microseconds it exists, and never produces a spurious generation pair.
+///
+/// `rename` is injected so the second-rename failure — which no case-folding
+/// filesystem will produce on demand — can be exercised as a unit test, the
+/// same treatment `collision()` gets for the listing APFS cannot hold.
+fn staged_rename(
+    source: &Path,
+    destination: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), MutationError> {
+    let directory = source.parent().ok_or_else(|| MutationError::Io {
+        message: format!("{} has no parent directory", source.display()),
+    })?;
+    // Reserved by creating it, so a concurrent writer cannot pick the same
+    // name — and reserved *as the same kind as the source*, because POSIX
+    // `rename` will not put a directory over a regular file (`ENOTDIR`) or a
+    // regular file over a directory (`EISDIR`). An empty directory is a legal
+    // destination for a directory rename, and a regular file for a file one, so
+    // matching the kind keeps the reservation without costing a syscall.
+    //
+    // `keep` then disarms `tempfile`'s own delete-on-drop in both cases. That
+    // is the whole point: after the first rename that path holds the caller's
+    // file, and `TempDir`'s drop in particular is `remove_dir_all` — the
+    // deletion this function exists to prevent.
+    let source_is_dir = std::fs::symlink_metadata(source).map_err(io)?.is_dir();
+    let mut builder = tempfile::Builder::new();
+    let builder = builder.prefix(".vaultd-");
+    let staged = if source_is_dir {
+        builder.tempdir_in(directory).map_err(io)?.keep()
+    } else {
+        builder
+            .tempfile_in(directory)
+            .map_err(io)?
+            .into_temp_path()
+            .keep()
+            .map_err(|error| MutationError::Io {
+                message: error.error.to_string(),
+            })?
+    };
+    if let Err(error) = rename(source, &staged) {
+        // Still the untouched placeholder, so exactly one of these applies.
+        let _ = std::fs::remove_file(&staged).or_else(|_| std::fs::remove_dir(&staged));
+        return Err(io(error));
+    }
+    if let Err(error) = rename(&staged, destination) {
+        return match rename(&staged, source) {
+            Ok(()) => Err(io(error)),
+            Err(_) => Err(MutationError::Io {
+                message: format!(
+                    "{error}; {} could not be restored and is left at {}",
+                    source.display(),
+                    staged.display()
+                ),
+            }),
+        };
+    }
+    Ok(())
 }
 
 /// The first `name N.ext` spelling beside `path` that `occupied` says is free,
@@ -2064,6 +2182,208 @@ mod tests {
     fn a_normalization_variant_is_not_a_case_variant() {
         let scan = classify_names(names(&["Cafe\u{301}.md"]), "Caf\u{e9}.md");
         assert_eq!(scan, CaseScan::default());
+    }
+
+    fn vault_path(spelling: &str) -> VaultPath {
+        VaultPath::new(spelling).expect("valid vault path")
+    }
+
+    /// The same treatment `collision()` gets, and for the same reason: the
+    /// decision is pinned here even where the filesystem cannot be made to
+    /// exercise it. On a case-folding volume no outcome-level assertion can
+    /// tell a two-step rename from a direct one, so what this function *decides*
+    /// is the only thing a test can hold.
+    #[test]
+    fn only_a_difference_of_case_is_a_case_only_rename() {
+        for (from, to) in [
+            ("One.md", "ONE.md"),
+            ("ONE.md", "One.md"),
+            ("one.md", "ONE.md"),
+            ("Folder/Three.md", "folder/Three.md"),
+            ("Folder", "FOLDER"),
+        ] {
+            assert!(
+                is_case_only_rename(&vault_path(from), &vault_path(to)),
+                "{from} -> {to} differs only in case"
+            );
+        }
+        for (from, to) in [
+            // Identical is not a *rename*, and must not take the exemption:
+            // taking it would skip the destination checks and let a rename onto
+            // itself through unexamined.
+            ("One.md", "One.md"),
+            ("One.md", "Two.md"),
+            ("One.md", "ONE.markdown"),
+            ("Folder/One.md", "Folder/ONE.mdx"),
+            // A move that also changes case is not case-only: the destination
+            // is a genuinely different name and must face every check.
+            ("Folder/One.md", "Deep/ONE.md"),
+        ] {
+            assert!(
+                !is_case_only_rename(&vault_path(from), &vault_path(to)),
+                "{from} -> {to} is not a case-only rename"
+            );
+        }
+    }
+
+    /// The numbering rule, pinned as a function so the shapes that matter can
+    /// be asserted without staging a file for each: the number goes on the
+    /// file name, a dot in a folder segment is not an extension separator, and
+    /// a leading dot is not one either.
+    #[test]
+    fn the_suffix_numbering_names_the_file_and_not_the_path() {
+        let free = |_: &VaultPath| Ok(false);
+        for (path, expected) in [
+            ("Two.md", "Two 1.md"),
+            ("Plain", "Plain 1"),
+            ("a.b.md", "a.b 1.md"),
+            (".env", ".env 1"),
+            ("Folder/One.md", "Folder/One 1.md"),
+            // The dot belongs to the folder; splitting the whole string on its
+            // last dot would answer `v1 1.0/Note`.
+            ("v1.0/Note", "v1.0/Note 1"),
+            ("v1.0/Note.md", "v1.0/Note 1.md"),
+        ] {
+            assert_eq!(
+                available_sibling(&vault_path(path), free)
+                    .expect("a free name")
+                    .as_str(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn the_suffix_numbering_counts_past_every_occupied_name() {
+        let taken = |candidate: &VaultPath| {
+            Ok(["Two 1.md", "Two 2.md", "Two 3.md"].contains(&candidate.as_str()))
+        };
+        assert_eq!(
+            available_sibling(&vault_path("Two.md"), taken)
+                .expect("a free name")
+                .as_str(),
+            "Two 4.md"
+        );
+        // And it gives up rather than looping forever when nothing is free.
+        assert!(matches!(
+            available_sibling(&vault_path("Two.md"), |_| Ok(true)).expect_err("nothing is free"),
+            MutationError::TargetExists { .. }
+        ));
+    }
+
+    /// The failure ladder `staged_rename`'s doc describes, exercised through
+    /// the injected rename because no case-folding filesystem will fail a
+    /// second rename on demand. The first case is the one that used to destroy
+    /// the file: staging into a `TempDir` whose `Drop` is `remove_dir_all`
+    /// meant a failing second rename deleted the only copy.
+    #[test]
+    fn a_failing_second_rename_restores_the_original_name() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let source = directory.path().join("One.md");
+        let destination = directory.path().join("ONE.md");
+        std::fs::write(&source, "# One\n").expect("write One");
+
+        let mut calls = std::cell::Cell::new(0u32);
+        let error = staged_rename(&source, &destination, |from, to| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                return Err(std::io::Error::other("the second rename fails"));
+            }
+            std::fs::rename(from, to)
+        })
+        .expect_err("the second rename failed");
+        assert!(matches!(error, MutationError::Io { .. }), "{error:?}");
+        assert_eq!(
+            calls.get_mut(),
+            &mut 3,
+            "first, failed second, then restore"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("the file is back under its own name"),
+            b"# One\n",
+            "a failing second rename must never destroy the file"
+        );
+        let staged: Vec<String> = std::fs::read_dir(directory.path())
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".vaultd-"))
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "no staging name is left behind: {staged:?}"
+        );
+    }
+
+    /// The bottom rung: even when the restore fails too, the file is still a
+    /// visible entry in its own directory under the staging name — never
+    /// inside a container that deletes itself — and the error says where.
+    #[test]
+    fn a_failing_restore_leaves_the_file_visible_and_says_where() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let source = directory.path().join("One.md");
+        let destination = directory.path().join("ONE.md");
+        std::fs::write(&source, "# One\n").expect("write One");
+
+        let calls = std::cell::Cell::new(0u32);
+        let error = staged_rename(&source, &destination, |from, to| {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 {
+                return Err(std::io::Error::other("every later rename fails"));
+            }
+            std::fs::rename(from, to)
+        })
+        .expect_err("the second rename and the restore both failed");
+        let MutationError::Io { message } = &error else {
+            panic!("expected an io refusal, got {error:?}");
+        };
+        assert!(
+            message.contains(".vaultd-"),
+            "the refusal must name where the file was left: {message}"
+        );
+        let staged: Vec<String> = std::fs::read_dir(directory.path())
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".vaultd-"))
+            .collect();
+        assert_eq!(staged.len(), 1, "the file is still there: {staged:?}");
+        assert_eq!(
+            std::fs::read(directory.path().join(&staged[0])).expect("read the staged file"),
+            b"# One\n"
+        );
+    }
+
+    /// And the ordinary path: the file arrives, and nothing is left over.
+    #[test]
+    fn a_staged_rename_leaves_no_intermediate_behind() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let source = directory.path().join("One.md");
+        let destination = directory.path().join("Renamed.md");
+        std::fs::write(&source, "# One\n").expect("write One");
+        staged_rename(&source, &destination, |from, to| std::fs::rename(from, to))
+            .expect("a staged rename");
+        let names: Vec<String> = std::fs::read_dir(directory.path())
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["Renamed.md".to_string()], "{names:?}");
     }
 
     #[test]

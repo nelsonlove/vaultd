@@ -371,6 +371,105 @@ fn copying_into_or_out_of_an_unindexable_path_is_refused() {
     assert!(!fixture.root.join(".trash").exists());
 }
 
+/// The shape the stored-spelling guard alone cannot see, and the one that
+/// leaked: a link at the source's **final** component.
+///
+/// `resolve` canonicalizes only the parent and appends the last component
+/// unresolved, because a mutation target need not exist yet — so a link planted
+/// at the last component keeps its own innocent name all the way through
+/// `stored_path`, while `metadata` and `File::open` both follow it. Without a
+/// no-follow check the copy reads through the link and lands unindexable bytes
+/// at an indexed path: the configuration zone's plugin data, a repository's
+/// config, a note in the trash. The guard `rename_paths` already had, applied
+/// here.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_copy_source_is_refused_rather_than_followed() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".obsidian/plugins/secret")).expect("create plugins");
+    std::fs::write(
+        fixture.root.join(".obsidian/plugins/secret/data.json"),
+        r#"{"apiKey":"SEKRIT"}"#,
+    )
+    .expect("write plugin data");
+    std::fs::create_dir_all(fixture.root.join(".git")).expect("create .git");
+    std::fs::write(fixture.root.join(".git/config"), "[remote]\n").expect("write git config");
+    std::fs::create_dir_all(fixture.root.join(".trash")).expect("create .trash");
+    std::fs::write(fixture.root.join(".trash/Deleted.md"), "# Deleted\n").expect("write Deleted");
+
+    for (name, target) in [
+        ("ZoneBait.md", ".obsidian/plugins/secret/data.json"),
+        ("GitBait.md", ".git/config"),
+        ("TrashBait.md", ".trash/Deleted.md"),
+        // An ordinary indexed file too. Copying through the link would be a
+        // defensible answer on its own, but `rename_paths` refuses a symlinked
+        // source and the two verbs must not disagree about what a link means.
+        ("PlainBait.md", "Two.md"),
+    ] {
+        std::os::unix::fs::symlink(fixture.root.join(target), fixture.root.join(name))
+            .expect("plant the link");
+        let error = fixture
+            .engine
+            .apply(&Mutation::CopyFile {
+                from: path(name),
+                to: path("leaked.md"),
+                expected_source: Precondition::Any,
+                if_exists: CopyConflict::Error,
+            })
+            .expect_err("a link is not the file it points at");
+        assert!(
+            matches!(error, MutationError::TargetExists { .. }),
+            "expected target_exists for {name} -> {target}, got {error:?}"
+        );
+        assert!(
+            !fixture.root.join("leaked.md").exists(),
+            "{target} must not have been copied out through {name}"
+        );
+    }
+
+    // The link's own target is untouched by any of it, and the links survive:
+    // a refusal removes nothing.
+    assert!(
+        fixture
+            .root
+            .join(".obsidian/plugins/secret/data.json")
+            .is_file()
+    );
+    assert!(fixture.root.join(".git/config").is_file());
+    assert!(fixture.root.join(".trash/Deleted.md").is_file());
+}
+
+/// The out-of-vault case was already refused before this guard existed, by
+/// `resolve`'s own final-component canonicalize and containment check. Pinned
+/// so the stronger guard above cannot quietly become the only thing standing
+/// between a link and the rest of the filesystem.
+#[cfg(unix)]
+#[test]
+fn a_copy_source_linking_out_of_the_vault_is_refused_by_containment() {
+    let fixture = fixture();
+    let outside = TempDir::new().expect("outside tempdir");
+    std::fs::write(outside.path().join("secrets"), "OUTSIDE\n").expect("write outside");
+    std::os::unix::fs::symlink(
+        outside.path().join("secrets"),
+        fixture.root.join("Escape.md"),
+    )
+    .expect("link out of the vault");
+    let error = fixture
+        .engine
+        .apply(&Mutation::CopyFile {
+            from: path("Escape.md"),
+            to: path("leaked.md"),
+            expected_source: Precondition::Any,
+            if_exists: CopyConflict::Error,
+        })
+        .expect_err("a link out of the vault is not a source");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(!fixture.root.join("leaked.md").exists());
+}
+
 /// The stored-spelling half. `Link/One.md` is hidden nowhere in its spelling;
 /// only the resolve reveals that the destination folder *is* the configuration
 /// zone.
@@ -751,6 +850,56 @@ fn a_case_only_rename_from_a_folded_source_spelling_still_moves_the_stored_file(
     assert!(
         names.iter().all(|name| !name.starts_with(".vaultd-")),
         "the intermediate name must not survive: {names:?}"
+    );
+}
+
+/// The folder shape of the same rename, which is the one where the staging
+/// name holds a whole subtree rather than a single file. Every path on both
+/// sides is named, and the staging name is gone whatever it was.
+#[test]
+fn a_case_only_folder_rename_moves_the_whole_subtree() {
+    let fixture = fixture();
+    std::fs::write(fixture.root.join("Folder/pic.png"), b"png").expect("write an attachment");
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::RenameFolder {
+            from: path("Folder"),
+            to: path("FOLDER"),
+            rewrite_links: false,
+        })
+        .expect("a case-only folder rename is supported internally");
+    assert_eq!(
+        std::fs::read(fixture.root.join("FOLDER/Deep/Three.md")).expect("read the moved note"),
+        b"# Three\n"
+    );
+    assert_eq!(
+        outcome.changed_paths,
+        BTreeSet::from([
+            path("FOLDER"),
+            path("FOLDER/Deep"),
+            path("FOLDER/Deep/Three.md"),
+            path("FOLDER/pic.png"),
+            path("Folder"),
+            path("Folder/Deep"),
+            path("Folder/Deep/Three.md"),
+            path("Folder/pic.png"),
+        ])
+    );
+    assert!(outcome.semantic, "a note moved");
+    let names: BTreeSet<String> = std::fs::read_dir(&fixture.root)
+        .expect("read the vault root")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(names.contains("FOLDER"), "{names:?}");
+    assert!(
+        names.iter().all(|name| !name.starts_with(".vaultd-")),
+        "the staging name must not survive: {names:?}"
     );
 }
 
