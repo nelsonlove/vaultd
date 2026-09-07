@@ -33,15 +33,47 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
         return parse;
     }
 
-    let tree = match to_mdast(body, &parse_options()) {
-        Ok(tree) => tree,
-        Err(error) => {
+    // `to_mdast` can **panic** on legal Markdown, not merely return `Err`:
+    // markdown 1.0.0 aborts with "Cannot push to non-parent"
+    // (`to_mdast.rs:193`) on a run of setext-ish underlines such as
+    // `a\n-\n--\nA\n-\n`. A note body is arbitrary content that arrives from
+    // the filesystem, and `vaultd` runs this parser on its coordinator
+    // thread — so an unwind here aborts the daemon over a file somebody
+    // merely saved, with no request involved at all.
+    //
+    // Every route into the parser reaches this one call (the cold scan, the
+    // live reconcile, and the semantic graph build), so the boundary belongs
+    // here rather than repeated at each caller.
+    //
+    // This is containment for an upstream defect and nothing more. Fixing
+    // markdown-rs is out of scope for this branch, and a panicking dependency
+    // must not be able to take the process with it. Degrading to the same
+    // shape the `Err` arm already produces keeps the note indexable — its
+    // frontmatter is parsed before this point and survives — and records the
+    // loss of body semantics as a diagnostic rather than swallowing it.
+    // `AssertUnwindSafe` is honest here: nothing is mutated across the
+    // boundary, `to_mdast` gets a `&str` and a fresh options value, and a
+    // panic leaves no partial state behind because the tree is the only
+    // output and it is discarded.
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        to_mdast(body, &parse_options())
+    }));
+
+    let tree = match parsed {
+        Ok(Ok(tree)) => tree,
+        outcome => {
+            let reason = match outcome {
+                Ok(Err(error)) => format!("markdown body failed to parse: {error}"),
+                _ => "the markdown parser panicked on this body and was contained; \
+                      the note's frontmatter is indexed and its body semantics are not"
+                    .to_string(),
+            };
             let span = SourceSpan::new(body_start, text.len()).expect("body span is ordered");
             parse.diagnostics.push(
                 Diagnostic::new(
                     DiagnosticCode::MarkdownParseError,
                     Severity::Warning,
-                    format!("markdown body failed to parse: {error}"),
+                    reason,
                 )
                 .with_path(document.path().clone())
                 .with_span(span),

@@ -1495,3 +1495,73 @@ fn an_unaddressable_key_path_refuses_before_anything_is_written() {
         NOTE
     );
 }
+
+// ---------------------------------------------------------------------------
+// The note body is not the patch path's business, and must not be able to
+// stop it. markdown 1.0.0 panics on some legal bodies, and the patch path was
+// running the full parse — so an ordinary `Set` on `title` aborted the whole
+// process over content the patch never even looks at.
+// ---------------------------------------------------------------------------
+
+/// The minimal body from the reviewer's shrunken proptest case. Every draw of
+/// the body strategy could produce it; over 200 000 draws none did, so it is
+/// pinned deterministically here rather than left to seed luck.
+const PANICKING_BODY_NOTE: &str = "---\ntitle: x\ncount: 0\n---\na\n-\n--\nA\n-\n";
+
+#[test]
+fn a_body_that_panics_the_markdown_parser_does_not_reach_the_patch_path() {
+    let patched = patch_source(
+        &path(),
+        PANICKING_BODY_NOTE,
+        &[edit("title", Some(PatchValue::String("New".into())))],
+    )
+    .expect("the body is not the patch path's business");
+    assert_eq!(
+        patched, "---\ntitle: New\ncount: 0\n---\na\n-\n--\nA\n-\n",
+        "and the body is preserved byte for byte, as for any other patch"
+    );
+}
+
+/// The same content through the engine, which is the route a wire request
+/// takes: `apply_mutation` → `MutationEngine::apply` → here.
+#[test]
+fn the_engine_patches_a_note_whose_body_panics_the_markdown_parser() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    std::fs::write(root.join("One.md"), PANICKING_BODY_NOTE).expect("write One");
+    let engine = MutationEngine::new(&root);
+
+    let outcome = engine
+        .apply(&patch(
+            "One.md",
+            vec![edit("title", Some(PatchValue::String("New".into())))],
+            Precondition::Any,
+        ))
+        .expect("an ordinary request against ordinary vault content");
+    assert!(outcome.semantic);
+    assert_eq!(
+        std::fs::read_to_string(root.join("One.md")).expect("read back"),
+        "---\ntitle: New\ncount: 0\n---\na\n-\n--\nA\n-\n"
+    );
+}
+
+/// `write_note` never parses — it writes the bytes it is given — so the same
+/// content through the write path is a control, not a second exposure.
+#[test]
+fn write_note_is_unaffected_by_a_body_that_panics_the_markdown_parser() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    let engine = MutationEngine::new(&root);
+
+    engine
+        .apply(&Mutation::WriteNote {
+            path: at("Poison.md"),
+            content: PANICKING_BODY_NOTE.into(),
+            expected: Precondition::Absent,
+        })
+        .expect("write_note passes bytes through without parsing them");
+    assert_eq!(
+        std::fs::read_to_string(root.join("Poison.md")).expect("read back"),
+        PANICKING_BODY_NOTE
+    );
+}

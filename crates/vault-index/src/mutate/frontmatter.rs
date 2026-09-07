@@ -27,7 +27,7 @@
 //! [`MutationError::AnchoredProperty`]) for frontmatter where *any* edit
 //! would damage bytes outside the property it addresses.
 //!
-//! Spans come from `vault_core::parse_note`, which already converts saphyr's
+//! Spans come from `vault_core::parse_properties`, which already converts saphyr's
 //! char-indexed markers into byte offsets into the whole document. Nothing
 //! here re-derives them — but two stored shapes need correcting before they
 //! can be spliced, and [`value_end`] is the one place that happens.
@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use vault_core::{ParsedNote, Property, PropertyValue, SourceDocument, VaultPath, parse_note};
+use vault_core::{Property, PropertyValue, SourceDocument, VaultPath, parse_properties};
 
 use super::MutationError;
 
@@ -146,7 +146,11 @@ pub fn patch_source(
     if edits.is_empty() {
         return Ok(source.to_string());
     }
-    let note = parse_note(SourceDocument::new(path.clone(), source.to_string()));
+    // `parse_properties`, not `parse_note`: a frontmatter edit never looks at
+    // the body, and the body parse is where arbitrary user content meets an
+    // upstream Markdown parser that panics on some legal input. A patch had no
+    // use for the result and every reason not to run it.
+    let properties = parse_properties(&SourceDocument::new(path.clone(), source.to_string()));
 
     // Group by top-level key, keeping first-appearance order so additions land
     // in the order the caller wrote them. Grouping is what lets two edits under
@@ -189,8 +193,7 @@ pub fn patch_source(
     let mut additions: Vec<String> = Vec::new();
     for key in &order {
         let group = &groups[key];
-        match note
-            .properties
+        match properties
             .iter()
             .find(|property| &property.key.value == key)
         {
@@ -222,7 +225,9 @@ pub fn patch_source(
     // a *duplicate* into a document nobody can read — and report success.
     // Checked only once something would actually change, so a delete of a key
     // that is not there stays the no-op it is at every other granularity.
-    if !(splices.is_empty() && additions.is_empty()) && frontmatter_is_unreadable(source, &note) {
+    if !(splices.is_empty() && additions.is_empty())
+        && frontmatter_is_unreadable(source, &properties)
+    {
         return Err(MutationError::MalformedFrontmatter { path: path.clone() });
     }
 
@@ -274,7 +279,7 @@ pub fn patch_source(
     // note per changed patch, which is the right price for never handing back
     // a document that has quietly stopped being frontmatter.
     if patched != source {
-        let reparsed = parse_note(SourceDocument::new(path.clone(), patched.clone()));
+        let reparsed = parse_properties(&SourceDocument::new(path.clone(), patched.clone()));
         if frontmatter_is_unreadable(&patched, &reparsed) {
             return Err(MutationError::MalformedFrontmatter { path: path.clone() });
         }
@@ -622,8 +627,8 @@ fn payload_range(source: &str) -> Option<Range<usize>> {
 /// `UnsupportedPropertyShape` is *also* raised for a malformed `aliases:` or
 /// `tags:` **value** in a block whose properties all parsed perfectly, and
 /// refusing to patch that note would be wrong.
-fn frontmatter_is_unreadable(source: &str, note: &ParsedNote) -> bool {
-    if !note.properties.is_empty() {
+fn frontmatter_is_unreadable(source: &str, properties: &[Property]) -> bool {
+    if !properties.is_empty() {
         return false;
     }
     let Some(payload) = payload_range(source) else {

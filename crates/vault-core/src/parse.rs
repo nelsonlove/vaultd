@@ -3,6 +3,19 @@ use crate::markdown::parse_markdown;
 use crate::obsidian::{scan_property_wikilinks, scan_text_ranges};
 use crate::{BlockId, ParsedNote, Section, SectionKind, SourceDocument};
 
+/// Parse a document's frontmatter properties and nothing else.
+///
+/// For a caller that needs properties and has no use for body semantics —
+/// `patch_frontmatter` is the one in tree, since a frontmatter edit never
+/// looks at the body. It is not only cheaper than [`parse_note`]: the body
+/// parse is where arbitrary user content meets an upstream Markdown parser,
+/// and a caller with no use for the result should not be exposed to it at
+/// all. (`parse_markdown` contains that parser's panics, so this is defence
+/// in depth rather than the only guard.)
+pub fn parse_properties(document: &SourceDocument) -> Vec<crate::Property> {
+    parse_frontmatter(document).properties
+}
+
 pub fn parse_note(source: SourceDocument) -> ParsedNote {
     let frontmatter = parse_frontmatter(&source);
     let markdown = parse_markdown(&source, frontmatter.body_start);
