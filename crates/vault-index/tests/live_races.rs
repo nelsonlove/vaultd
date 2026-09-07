@@ -20,7 +20,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -31,6 +31,8 @@ use vault_index::{
     ChangeCause, FileSystemIndexSource, Generation, HookPoint, IndexConfig, IndexError,
     IndexService, LiveRefreshReport, ReconcileSource, TestHook,
 };
+
+use common::once_at;
 
 /// How long a test waits before concluding a thread is genuinely blocked.
 /// Deliberately far larger than any real publication: the assertion is
@@ -175,36 +177,6 @@ fn vault_paths(names: &[&str]) -> BTreeSet<VaultPath> {
         .iter()
         .map(|name| VaultPath::new(*name).expect("valid vault path"))
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Hooks
-// ---------------------------------------------------------------------------
-
-/// Runs `action` the first time `point` is reached, and never again — so a
-/// hook that provokes a failure disarms itself, and the very next attempt
-/// runs against an undisturbed engine.
-struct OnceAt {
-    point: HookPoint,
-    fired: AtomicBool,
-    action: Box<dyn Fn() + Send + Sync>,
-}
-
-impl TestHook for OnceAt {
-    fn reach(&self, point: HookPoint) {
-        if point != self.point || self.fired.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        (self.action)();
-    }
-}
-
-fn once_at(point: HookPoint, action: impl Fn() + Send + Sync + 'static) -> Arc<dyn TestHook> {
-    Arc::new(OnceAt {
-        point,
-        fired: AtomicBool::new(false),
-        action: Box::new(action),
-    })
 }
 
 // ---------------------------------------------------------------------------

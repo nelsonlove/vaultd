@@ -285,25 +285,90 @@ impl MutationEngine {
         }
     }
 
-    /// Re-read the target and require the precondition to still hold.
+    /// Re-evaluate `expected` against the object the write is about to touch,
+    /// immediately before it touches it.
     ///
-    /// The first check happens before any work; this one happens immediately
-    /// before the write, so a writer that lost the race in between refuses
-    /// rather than clobbering. Both checks are cheap — one read of a file
-    /// already in the page cache — and the second is what makes
-    /// "never a lost update" true rather than likely.
+    /// The first check happens before any work; this one happens with nothing
+    /// between it and the write, so a writer that lost the race in between
+    /// refuses rather than clobbering.
     ///
-    /// It narrows the window; it does not close it. Nothing here holds a lock
-    /// across the check and the rename, so an external writer that lands
-    /// between them still wins, and the atomic rename bounds the damage to
-    /// last-writer-wins over whole files rather than a blend of two. Inside
-    /// the daemon the window is closed by construction — one mutation is in
-    /// flight at a time — and this re-check is what covers the writer the
-    /// daemon does not own: Obsidian, a sync client, a shell.
-    fn recheck(&self, path: &VaultPath, expected: &Precondition) -> Result<(), MutationError> {
+    /// **`resolved` is the caller's own resolution, never a fresh one.**
+    /// `check_resolved` states the rule this obeys: re-resolving would be
+    /// "three canonicalize chains for one write, and three chances for them
+    /// to disagree under a racing rename". A guard that validated its own
+    /// resolution while the write landed on the caller's would be worse than
+    /// no guard, because it would read as one.
+    ///
+    /// Bounded, for the reason [`MutationEngine::streamed_revision`] gives:
+    /// the comparison needs a revision, not a payload, and pulling a whole
+    /// file into memory for one hash comparison would put a ceiling on what
+    /// vaultd can rewrite that no other part of this engine has.
+    ///
+    /// What each precondition costs, and how far each one is guarded:
+    ///
+    /// * `revision` — one bounded re-hash. **Narrowed, not closed.** Nothing
+    ///   holds a lock across this and the rename, so an external writer that
+    ///   lands in the last instant still wins, bounded by the atomic rename to
+    ///   last-writer-wins over whole files rather than a blend of two. There is
+    ///   no portable primitive that makes a compare-and-swap over a path atomic
+    ///   against a foreign writer, and `flock` would be theatre: the writers
+    ///   this exists to cover — Obsidian, a sync client, a shell — take no
+    ///   advisory lock, so a lock vaultd held would constrain only vaultd,
+    ///   which is already serialised by its lease.
+    /// * `absent` — nothing at all, deliberately. A create *can* be made
+    ///   atomic, so it is: [`create_atomically`] links the new name into place
+    ///   and fails if anything is there, which **closes** the window instead of
+    ///   narrowing it. Re-reading here would only narrow it a second time.
+    /// * `any` — one `stat`. `any` cannot fail a compare-and-swap, but the
+    ///   refusals that ride along with reading the target can: a directory or a
+    ///   fifo appearing at the name is [`MutationError::TargetExists`], not an
+    ///   `EISDIR` from the rename.
+    fn recheck(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+        expected: &Precondition,
+    ) -> Result<(), MutationError> {
         self.reach(crate::HookPoint::AfterMutationPrecondition);
-        self.check(path, expected)?;
+        match expected {
+            Precondition::Any => {
+                self.regular_file_exists(path, resolved)?;
+            }
+            Precondition::Absent => {}
+            Precondition::Revision(wanted) => match self.streamed_revision(path, resolved)? {
+                None => return Err(MutationError::NotFound { path: path.clone() }),
+                Some(actual) if &actual != wanted => {
+                    return Err(MutationError::RevisionConflict {
+                        path: path.clone(),
+                        current: Some(actual),
+                    });
+                }
+                Some(_) => {}
+            },
+        }
         Ok(())
+    }
+
+    /// [`MutationEngine::recheck`] for a verb that *removes* rather than
+    /// writes: the same rendezvous, but the target must still be there.
+    ///
+    /// It routes through [`MutationEngine::require_regular_file`] so a delete
+    /// keeps its "never idempotent-silent" contract on the second look as well
+    /// as the first, and so the `revision` case re-hashes in the same bounded
+    /// chunks that check already used — no memory cost at all on the one verb
+    /// whose payload is explicitly uncapped.
+    ///
+    /// A destructive verb needs this more than a write does, not less. A
+    /// clobbered write leaves the loser a revision to retry against; a delete
+    /// that acted on bytes it never verified leaves nothing, and answers `ok`.
+    fn recheck_present(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+        expected: &Precondition,
+    ) -> Result<(), MutationError> {
+        self.reach(crate::HookPoint::AfterMutationPrecondition);
+        self.require_regular_file(path, resolved, expected)
     }
 
     pub fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Self {
@@ -890,6 +955,60 @@ fn adopt_permissions(_target: &Path, _replacement: &std::fs::File) -> Result<(),
 /// temporary is never mistaken for a note even in the microseconds it exists,
 /// and never produces a spurious create-then-delete generation pair.
 pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), MutationError> {
+    staged(target, bytes)?
+        .persist(target)
+        .map_err(|error| MutationError::Io {
+            message: error.error.to_string(),
+        })?;
+    Ok(())
+}
+
+/// What a no-clobber persist found at the name it tried to claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Claimed {
+    /// The name was free and now holds the new bytes.
+    Yes,
+    /// Something was already there. Nothing was written, and the temporary is
+    /// gone.
+    Taken,
+}
+
+/// [`write_atomically`], except the name must be **free**: the new bytes are
+/// linked into place and the call fails rather than replacing anything.
+///
+/// This is what makes an `absent` precondition airtight rather than merely
+/// re-checked. `write_atomically` ends in `rename(2)`, which replaces
+/// unconditionally, so a create can only ever *narrow* the window between its
+/// check and its write. `persist_noclobber` is `link(2)` + `unlink(2)` on
+/// Unix, and `link` fails `EEXIST` against anything already at the name — the
+/// kernel does the compare and the swap in one step, so there is no window
+/// left for a foreign writer to land in.
+///
+/// A `revision` precondition gets no such treatment because none exists:
+/// "replace this name, but only if it still holds exactly these bytes" is not
+/// a thing any portable syscall offers. Absence is the one condition the
+/// filesystem itself can test.
+///
+/// The price, stated rather than discovered: `link` needs hard-link support in
+/// the target directory's filesystem. Every filesystem a vault realistically
+/// lives on has it; one that does not would surface this as an `Io` refusal
+/// on create — a refusal, never a silent clobber.
+pub(crate) fn create_atomically(target: &Path, bytes: &[u8]) -> Result<Claimed, MutationError> {
+    match staged(target, bytes)?.persist_noclobber(target) {
+        Ok(_) => Ok(Claimed::Yes),
+        // The temporary rides along inside the error and is removed when that
+        // error drops, so a refused create leaves the vault byte-identical.
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Claimed::Taken),
+        Err(error) => Err(MutationError::Io {
+            message: error.error.to_string(),
+        }),
+    }
+}
+
+/// The half both persists share: a `.vaultd-` temporary in the target's own
+/// directory, holding `bytes`, wearing the permissions the target implies, and
+/// flushed to disk. Same-directory so that either persist is same-filesystem.
+fn staged(target: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile, MutationError> {
     let directory = target.parent().ok_or_else(|| MutationError::Io {
         message: format!("{} has no parent directory", target.display()),
     })?;
@@ -900,12 +1019,7 @@ pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), Mutati
     temporary.write_all(bytes).map_err(io)?;
     adopt_permissions(target, temporary.as_file())?;
     temporary.as_file().sync_all().map_err(io)?;
-    temporary
-        .persist(target)
-        .map_err(|error| MutationError::Io {
-            message: error.error.to_string(),
-        })?;
-    Ok(())
+    Ok(temporary)
 }
 
 impl MutationEngine {
@@ -1092,8 +1206,24 @@ impl MutationEngine {
             });
         }
         self.check_resolved(path, &resolved, expected)?;
-        self.recheck(path, expected)?;
-        write_atomically(&resolved, bytes)?;
+        self.recheck(path, &resolved, expected)?;
+        // A create claims the name; every other write replaces it. The split
+        // is what closes the `absent` window rather than narrowing it — see
+        // [`create_atomically`].
+        if expected == &Precondition::Absent {
+            if create_atomically(&resolved, bytes)? == Claimed::Taken {
+                // Between the re-check and the link, somebody else claimed the
+                // name. That is the same answer `check_resolved` gives an
+                // `absent` precondition against an occupied path, reported with
+                // whatever is there now so the caller can decide to replace it.
+                return Err(MutationError::RevisionConflict {
+                    path: path.clone(),
+                    current: self.streamed_revision(path, &resolved)?,
+                });
+            }
+        } else {
+            write_atomically(&resolved, bytes)?;
+        }
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
             revision: Some(revision_of(bytes)),
@@ -1193,7 +1323,7 @@ impl MutationEngine {
                 semantic: true,
             });
         }
-        self.recheck(path, expected)?;
+        self.recheck(path, &resolved, expected)?;
         write_atomically(&resolved, patched.as_bytes())?;
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
@@ -1369,10 +1499,22 @@ impl MutationEngine {
         // that is already gone had a wrong model of the vault and should
         // hear so.
         self.require_regular_file(path, &resolved, expected)?;
-        self.dispose(
-            &resolved,
-            mode.unwrap_or_else(|| self.configured_delete_mode()),
-        )?;
+        // Resolved *before* the re-check, not inside the `dispose` call, and
+        // that ordering is the whole point. An unqualified delete asks the
+        // vault for its configured disposition, which opens and parses
+        // `.obsidian/app.json` — a file read and a JSON parse sitting between
+        // the precondition and the unlink. That is not a syscall-sized gap; it
+        // is the widest check-then-act window any verb here has, on the one
+        // verb whose act cannot be retried against anything.
+        let mode = mode.unwrap_or_else(|| self.configured_delete_mode());
+        // So the guard is taken again with nothing left between it and the
+        // disposal. `write_note` takes the same re-check for the same reason;
+        // a delete needs it more, because a clobbered write leaves its loser a
+        // revision to retry against and a wrong delete leaves nothing. The
+        // price is one extra bounded re-hash on a `revision` delete, and two
+        // `stat` calls on any other kind.
+        self.recheck_present(path, &resolved, expected)?;
+        self.dispose(&resolved, mode)?;
         Ok(MutationOutcome {
             // The stored spelling, per `MutationOutcome::changed_paths`: the
             // index is keyed by what the scanner emits, so a delete hint keyed
@@ -1751,7 +1893,13 @@ impl MutationEngine {
         // this verb documents it does not break — an attachment larger than
         // the buffer is streamed, never held.
         self.reach(crate::HookPoint::AfterMutationPrecondition);
-        let revision = self.stream_copy(&source, &destination, expected_source, from)?;
+        let revision = self.stream_copy(
+            &source,
+            &destination,
+            expected_source,
+            from,
+            &destination_path,
+        )?;
         let written = self.written_path(&destination_path, &destination, stored_to);
         let semantic = written.is_markdown();
         Ok(MutationOutcome {
@@ -1796,6 +1944,7 @@ impl MutationEngine {
         destination: &Path,
         expected: &Precondition,
         from: &VaultPath,
+        to: &VaultPath,
     ) -> Result<String, MutationError> {
         let directory = destination.parent().ok_or_else(|| MutationError::Io {
             message: format!("{} has no parent directory", destination.display()),
@@ -1840,11 +1989,24 @@ impl MutationEngine {
         // rather than `tempfile`'s owner-only default.
         adopt_permissions(destination, temporary.as_file())?;
         temporary.as_file().sync_all().map_err(io)?;
-        temporary
-            .persist(destination)
-            .map_err(|error| MutationError::Io {
-                message: error.error.to_string(),
-            })?;
+        // And the *link* is what makes the sentence above true rather than
+        // merely intended. Both conflict modes promise never to overwrite —
+        // `error` refuses an occupied destination, `suffix` numbers past one —
+        // and both check before the stream, which leaves a window a foreign
+        // writer can fill while the bytes are copying. `persist_noclobber`
+        // closes it: the caller who asked to be refused is refused, instead of
+        // silently clobbering a file that appeared while the copy ran.
+        match temporary.persist_noclobber(destination) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(MutationError::TargetExists { path: to.clone() });
+            }
+            Err(error) => {
+                return Err(MutationError::Io {
+                    message: error.error.to_string(),
+                });
+            }
+        }
         Ok(revision)
     }
 

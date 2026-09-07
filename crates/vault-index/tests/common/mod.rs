@@ -91,6 +91,37 @@ pub fn rendezvous(label: &'static str) -> (Rendezvous, std::sync::Arc<dyn Fn() +
     )
 }
 
+/// Runs `action` the first time `point` is reached, and never again — so a
+/// hook that provokes a failure disarms itself, and the very next attempt
+/// runs against an undisturbed engine.
+struct OnceAt {
+    point: vault_index::HookPoint,
+    fired: std::sync::atomic::AtomicBool,
+    action: Box<dyn Fn() + Send + Sync>,
+}
+
+impl vault_index::TestHook for OnceAt {
+    fn reach(&self, point: vault_index::HookPoint) {
+        if point != self.point || self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        (self.action)();
+    }
+}
+
+/// The hook the forced-window suites install: one shot, at one
+/// [`vault_index::HookPoint`].
+pub fn once_at(
+    point: vault_index::HookPoint,
+    action: impl Fn() + Send + Sync + 'static,
+) -> std::sync::Arc<dyn vault_index::TestHook> {
+    std::sync::Arc::new(OnceAt {
+        point,
+        fired: std::sync::atomic::AtomicBool::new(false),
+        action: Box::new(action),
+    })
+}
+
 pub struct FixtureStore {
     pub store: IndexStore,
     pub scan: ScanReport,

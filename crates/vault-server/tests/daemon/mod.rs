@@ -73,14 +73,19 @@ impl Daemon {
         ])
     }
 
-    /// Send one request line and return the next *response*, skipping any
-    /// events that interleave.
-    pub fn call(&mut self, line: &str) -> ResponseEnvelope {
-        {
-            let stdin = self.stdin.as_mut().expect("stdin is open");
-            writeln!(stdin, "{line}").expect("write a request");
-            stdin.flush().expect("flush the request");
-        }
+    /// Send one request line without waiting for its answer.
+    ///
+    /// Split out from [`Daemon::call`] because a race test sends **two**
+    /// requests before reading either response, and a `call`-shaped helper
+    /// serialises exactly the pipelining such a test exists to exercise.
+    pub fn send(&mut self, line: &str) {
+        let stdin = self.stdin.as_mut().expect("stdin is open");
+        writeln!(stdin, "{line}").expect("write a request");
+        stdin.flush().expect("flush the request");
+    }
+
+    /// The next *response* line, skipping any events that interleave.
+    pub fn response(&mut self) -> ResponseEnvelope {
         loop {
             let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
                 Ok(raw) => raw,
@@ -95,6 +100,13 @@ impl Daemon {
                 return serde_json::from_str(&raw).expect("decode a response envelope");
             }
         }
+    }
+
+    /// Send one request line and return its response — the ordinary shape,
+    /// for a test that is not deliberately pipelining.
+    pub fn call(&mut self, line: &str) -> ResponseEnvelope {
+        self.send(line);
+        self.response()
     }
 
     /// Close stdin and wait. The daemon must exit rather than hang.
