@@ -259,6 +259,26 @@ pub fn patch_source(
     for splice in splices.iter().rev() {
         patched.replace_range(splice.range.clone(), &splice.replacement);
     }
+
+    // The gate above validates the **input**; this validates the **result**,
+    // and they are not the same check. `---\na: 1\n...\n---` is perfectly
+    // readable — one document, one property — so it passes every input test,
+    // and a key added after the `...` document-end marker starts a *second*
+    // YAML document. The frontmatter then re-parses with zero properties: the
+    // index loses every one of them while the caller is told the write
+    // succeeded. Only re-reading what was actually produced catches that
+    // class, so the last thing this function does is read its own output.
+    //
+    // Reached only when something changed, so a no-op on a document that was
+    // already broken is still the no-op it was. Costs one extra parse of one
+    // note per changed patch, which is the right price for never handing back
+    // a document that has quietly stopped being frontmatter.
+    if patched != source {
+        let reparsed = parse_note(SourceDocument::new(path.clone(), patched.clone()));
+        if frontmatter_is_unreadable(&patched, &reparsed) {
+            return Err(MutationError::MalformedFrontmatter { path: path.clone() });
+        }
+    }
     Ok(patched)
 }
 
@@ -485,6 +505,16 @@ fn entry_range(source: &str, property: &Property) -> Range<usize> {
 ///
 /// One clamp fixes both: never before the start, and never past the last
 /// non-blank byte the value's own text occupies.
+///
+/// Known cosmetic limitation, deliberately not fixed here. Under keep
+/// chomping (`|+`) the trailing blank lines *are* part of the value, so a set
+/// on `desc: |+` leaves them behind as blank lines between properties. The
+/// result is valid YAML and the neighbouring property is untouched — the
+/// safety claim holds — it is only untidy. Consuming them would mean telling
+/// a value's own kept blank lines apart from an author's blank separator
+/// lines, which needs the chomping indicator and is not a one-line change;
+/// guessing wrong would delete formatting nobody asked this to touch, which
+/// is worse than an extra blank line.
 fn value_end(source: &str, start: usize, span_end: usize) -> usize {
     let clamped = span_end.clamp(start, source.len());
     // Trims the overshoot of a block scalar's span; a no-op for every other

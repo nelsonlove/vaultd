@@ -646,6 +646,69 @@ fn a_malformed_aliases_value_does_not_block_an_unrelated_patch() {
     assert!(patched.contains("title: New\n"), "{patched}");
 }
 
+/// The gate on unreadable frontmatter validates the **input**. This is the
+/// separate claim that the **result** parses, and the two are not the same
+/// check: `---\na: 1\n...\n---` is perfectly readable — one document, one
+/// property — and a key added after the `...` document-end marker starts a
+/// *second* YAML document. The frontmatter then re-parses with zero
+/// properties, so the index loses every one of them while the caller is told
+/// the write succeeded.
+#[test]
+fn a_patch_whose_result_stops_parsing_is_refused_even_though_the_input_parsed() {
+    let source = "---\na: 1\n...\n---\n# Body\n";
+
+    // The input really is readable, so the input gate cannot be what refuses:
+    // an ordinary edit to the same document succeeds.
+    assert_eq!(
+        read_back(source, "a"),
+        PropertyValue::Integer(1),
+        "the fixture's own premise"
+    );
+    assert!(
+        patch_source(&path(), source, &[edit("a", Some(PatchValue::Integer(2)))]).is_ok(),
+        "an edit that keeps one document is fine"
+    );
+
+    let error = patch_source(
+        &path(),
+        source,
+        &[edit("added", Some(PatchValue::String("x".into())))],
+    )
+    .expect_err("the result would re-parse with no properties at all");
+    assert!(
+        matches!(error, MutationError::MalformedFrontmatter { .. }),
+        "expected malformed_frontmatter, got {error:?}"
+    );
+}
+
+/// Result validation must change nothing for an ordinary patch. The whole
+/// rest of this file is that assertion; these pin the two shapes a
+/// result check is most likely to mistake for damage.
+#[test]
+fn result_validation_leaves_ordinary_patches_alone() {
+    let patched = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit("title", Some(PatchValue::String("Replaced".into())))],
+    )
+    .expect("an ordinary patch still succeeds");
+    assert!(patched.contains("title: Replaced\n"), "{patched}");
+    assert_eq!(read_back(&patched, "count"), PropertyValue::Integer(3));
+
+    // Deleting the last key empties the block rather than breaking it. A
+    // result check keyed on "it had properties and now has none" would refuse
+    // this; one keyed on "content the parser turned into nothing" does not.
+    assert_eq!(
+        patch_source(
+            &path(),
+            "---\ntitle: x\n---\n# Body\n",
+            &[edit("title", None)]
+        )
+        .expect("delete the only key"),
+        "---\n---\n# Body\n"
+    );
+}
+
 /// `vault-core` resolves a YAML alias before this module sees it, so
 /// re-emitting or deleting the anchored property leaves `*anchor` pointing at
 /// nothing and the **whole** frontmatter stops parsing. That is damage
@@ -933,14 +996,24 @@ fn any_edit() -> impl Strategy<Value = FrontmatterEdit> {
     ]
 }
 
-/// 256 cases by default, and `PROPTEST_CASES` honoured when it is set.
+/// 256 cases by default, and `PROPTEST_CASES` honoured when it is set —
+/// which is **exactly what `ProptestConfig::with_cases(256)` already does**.
 ///
-/// `ProptestConfig::with_cases(256)` would look equivalent and is not: it
-/// builds `Config::default()` — which *has* already read `PROPTEST_CASES` —
-/// and then overwrites the field with the literal. So the environment
-/// variable silently did nothing, and "run it at 2000 cases to prove it is
-/// stable" quietly ran 256. That is exactly the check a flaky property needs
-/// to be provable against, so the override has to survive.
+/// This helper is equivalent, not a fix. An earlier revision of this comment
+/// claimed `with_cases` swallowed the environment variable; a reviewer
+/// disproved that against proptest 1.11.0's own source and was right.
+/// `sugar.rs` passes *any* config expression through
+/// `test_runner::contextualize_config` (`config.rs:20`), which re-applies
+/// `PROPTEST_CASES` on top of whatever it is given, so the variable survives
+/// either spelling. The observation that suggested otherwise was a
+/// measurement error: both runs being compared had the variable set to the
+/// same value, so there was no 256-case baseline in the comparison at all.
+/// Measured after the correction, both spellings scale identically — 0.19 s
+/// at 256 against ~12 s at 20000.
+///
+/// Kept only because it states the default at the call site and costs
+/// nothing. The other five proptest suites in this workspace deliberately
+/// keep `with_cases`; there is nothing to migrate.
 fn cases() -> ProptestConfig {
     let mut config = ProptestConfig::default();
     if std::env::var_os("PROPTEST_CASES").is_none() {
