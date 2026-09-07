@@ -161,6 +161,21 @@ pub enum MutationError {
     UnaddressablePatch { key_path: String },
     #[error("two patch entries edit overlapping spans")]
     OverlappingPatch,
+    /// The addressed property declares a YAML anchor that another property in
+    /// the same frontmatter aliases.
+    ///
+    /// `vault-core` resolves an alias before the patcher ever sees the value,
+    /// so re-serializing or deleting the anchored property emits a document
+    /// in which `*anchor` points at nothing — and then the *whole*
+    /// frontmatter stops parsing, including the properties the caller never
+    /// touched. Damage outside the edited property is the one thing
+    /// correction #9 forbids absolutely, so this refuses rather than
+    /// half-succeeding.
+    #[error(
+        "{} anchors &{anchor}, which another property aliases; editing it would orphan that alias",
+        path.as_str()
+    )]
+    AnchoredProperty { path: VaultPath, anchor: String },
     /// The document opens a frontmatter fence it never closes. A patch that
     /// added a key would have to prepend a second fence, burying the first, so
     /// it refuses instead and the caller fixes the document.
@@ -1022,13 +1037,19 @@ impl MutationEngine {
     ///
     /// The guards are `write_note`'s, for `write_note`'s reasons: this writes
     /// a note through the same atomic rename, so the same paths must be
-    /// unreachable. It carries no size cap, and that is deliberate. The cap
+    /// unreachable.
+    ///
+    /// The size cap applies to the **edits**, never to the result. The cap
     /// governs a payload a client hands the daemon, and a patch's payload is
     /// its edits, not a file; capping the *result* would make a note that is
     /// already over the cap permanently unpatchable — a refusal with no
     /// remedy, since the only interface that could shrink it is the one
     /// refusing. That is the same reasoning [`DEFAULT_MAX_FILE_BYTES`] gives
-    /// for an uncapped delete.
+    /// for an uncapped delete. But leaving the *input* uncapped too would
+    /// make this operation a hole in the payload rule: a client that cannot
+    /// `write_note` a 100 MB note could patch one key to a 100 MB string and
+    /// get the same file. So the edits are weighed, and weighed first — a
+    /// refusal here reads nothing and touches nothing.
     fn patch_frontmatter(
         &self,
         path: &VaultPath,
@@ -1049,6 +1070,13 @@ impl MutationEngine {
         if expected == &Precondition::Absent {
             return Err(MutationError::InvalidPrecondition {
                 expected: expected.clone(),
+            });
+        }
+        let weight = frontmatter::patch_weight(edits);
+        if weight > self.max_file_bytes {
+            return Err(MutationError::TooLarge {
+                limit: self.max_file_bytes,
+                actual: weight,
             });
         }
         let resolved = self.resolve(path)?;

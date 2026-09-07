@@ -14,21 +14,28 @@
 //! * an edit addressing anything *below* a top-level key has no stored span of
 //!   its own, so the smallest enclosing top-level property is deserialized,
 //!   edited in memory, and re-emitted in the addition dialect. One property's
-//!   lines move; key order, every other property, comments, whitespace, and
-//!   the entire body do not.
+//!   lines move; key order, every other property, and the entire body do not.
+//!   Inside that one property the re-emit normalizes: indentation becomes the
+//!   dialect's two spaces and **comments between its own lines are dropped**.
+//!   Correction #9 licenses exactly that, and nothing outside the property is
+//!   touched either way.
 //!
 //! What is still refused is only what has no value to address at all:
 //! descending into a scalar, indexing a sequence with a non-numeric segment,
-//! or indexing one past its end on a set.
+//! or indexing one past its end on a set — plus two document-level refusals
+//! ([`MutationError::MalformedFrontmatter`] and
+//! [`MutationError::AnchoredProperty`]) for frontmatter where *any* edit
+//! would damage bytes outside the property it addresses.
 //!
 //! Spans come from `vault_core::parse_note`, which already converts saphyr's
 //! char-indexed markers into byte offsets into the whole document. Nothing
-//! here re-derives them.
+//! here re-derives them — but two stored shapes need correcting before they
+//! can be spliced, and [`value_end`] is the one place that happens.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use vault_core::{Property, PropertyValue, SourceDocument, VaultPath, parse_note};
+use vault_core::{ParsedNote, Property, PropertyValue, SourceDocument, VaultPath, parse_note};
 
 use super::MutationError;
 
@@ -172,6 +179,12 @@ pub fn patch_source(
         }
     }
 
+    // Emitted lines take the document's own terminator. Mixing them parses
+    // fine and churns every diff, which is the opposite of what this module
+    // is for.
+    let newline = dominant_newline(source);
+    let payload = payload_range(source);
+
     let mut splices: Vec<Splice> = Vec::new();
     let mut additions: Vec<String> = Vec::new();
     for key in &order {
@@ -182,16 +195,35 @@ pub fn patch_source(
             .find(|property| &property.key.value == key)
         {
             Some(property) => {
-                if let Some(splice) = plan_existing(source, property, group)? {
+                if let Some(payload) = payload.clone() {
+                    if let Some(anchor) =
+                        aliased_anchor(source, payload, entry_range(source, property))
+                    {
+                        return Err(MutationError::AnchoredProperty {
+                            path: path.clone(),
+                            anchor,
+                        });
+                    }
+                }
+                if let Some(splice) = plan_existing(source, property, group, newline)? {
                     splices.push(splice);
                 }
             }
             None => {
-                if let Some(line) = plan_addition(key, group)? {
+                if let Some(line) = plan_addition(key, group, newline)? {
                     additions.push(line);
                 }
             }
         }
+    }
+
+    // A frontmatter block the parser turned into no properties at all is the
+    // state in which every key looks absent, so every set below would append
+    // a *duplicate* into a document nobody can read — and report success.
+    // Checked only once something would actually change, so a delete of a key
+    // that is not there stays the no-op it is at every other granularity.
+    if !(splices.is_empty() && additions.is_empty()) && frontmatter_is_unreadable(source, &note) {
+        return Err(MutationError::MalformedFrontmatter { path: path.clone() });
     }
 
     // Every addition shares one anchor, and the fence is synthesized **once**.
@@ -206,7 +238,7 @@ pub fn patch_source(
             }),
             Fence::Absent => splices.push(Splice {
                 range: 0..0,
-                replacement: format!("---\n{}---\n", additions.concat()),
+                replacement: format!("---{newline}{}---{newline}", additions.concat()),
             }),
             Fence::Unterminated => {
                 return Err(MutationError::MalformedFrontmatter { path: path.clone() });
@@ -235,12 +267,10 @@ fn plan_existing(
     source: &str,
     property: &Property,
     group: &[&FrontmatterEdit],
+    newline: &str,
 ) -> Result<Option<Splice>, MutationError> {
     let indent = indent_of(source, property.key.span.start());
-    // The key's whole entry, terminator included: the stored span stops at the
-    // value, so a deletion that used it would leave a blank line behind.
-    let entry =
-        line_start(source, property.span.start())..line_end(source, property.value.span.end());
+    let entry = entry_range(source, property);
 
     // At the stored granularity: pure span surgery, nothing re-serialized.
     if group.len() == 1 && group[0].key_path.len() == 1 {
@@ -248,8 +278,8 @@ fn plan_existing(
             Some(value) => Splice {
                 // The replacement owns the separator after the `:`, so it can
                 // choose one space for a scalar and a newline for a block.
-                range: after_colon(source, property.key.span.end())..property.value.span.end(),
-                replacement: after_key(&Yaml::from(value), indent),
+                range: value_range(source, property),
+                replacement: after_key(&Yaml::from(value), indent, newline),
             },
             None => Splice {
                 range: entry,
@@ -278,10 +308,10 @@ fn plan_existing(
     Ok(Some(Splice {
         range: entry,
         replacement: format!(
-            "{}{}:{}\n",
+            "{}{}:{}{newline}",
             " ".repeat(indent),
-            property.key.value,
-            after_key(&root, indent)
+            scalar(&property.key.value),
+            after_key(&root, indent, newline)
         ),
     }))
 }
@@ -291,7 +321,11 @@ fn plan_existing(
 /// A multi-segment path creates every intermediate mapping — `processFrontMatter`
 /// parity, and the alternative would make a plugin's first write to a nested
 /// key fail while its second succeeded.
-fn plan_addition(key: &str, group: &[&FrontmatterEdit]) -> Result<Option<String>, MutationError> {
+fn plan_addition(
+    key: &str,
+    group: &[&FrontmatterEdit],
+    newline: &str,
+) -> Result<Option<String>, MutationError> {
     // Deleting a key that is not there is a no-op, at every depth.
     if group.iter().all(|edit| edit.value.is_none()) {
         return Ok(None);
@@ -302,8 +336,9 @@ fn plan_addition(key: &str, group: &[&FrontmatterEdit]) -> Result<Option<String>
             .as_ref()
             .expect("a set was established just above");
         return Ok(Some(format!(
-            "{key}:{}\n",
-            after_key(&Yaml::from(value), 0)
+            "{}:{}{newline}",
+            scalar(key),
+            after_key(&Yaml::from(value), 0, newline)
         )));
     }
     let mut root = Yaml::Mapping(Vec::new());
@@ -320,7 +355,11 @@ fn plan_addition(key: &str, group: &[&FrontmatterEdit]) -> Result<Option<String>
             &key_path,
         )?;
     }
-    Ok(Some(format!("{key}:{}\n", after_key(&root, 0))))
+    Ok(Some(format!(
+        "{}:{}{newline}",
+        scalar(key),
+        after_key(&root, 0, newline)
+    )))
 }
 
 /// Apply one edit to an in-memory value, `segments` deep.
@@ -385,6 +424,18 @@ fn apply_nested(
             }
             Ok(())
         }
+        // `title:` — the linter's empty-property spelling. A null holds no
+        // value, so building the path through it discards nothing, and this
+        // is the same `fm.a = fm.a ?? {}` parity that makes a missing
+        // top-level key create its whole structure. A *scalar* is the case
+        // below, and stays refused precisely because it does hold something.
+        Yaml::Null => match new {
+            Some(value) => {
+                *target = wrap(segments, value);
+                Ok(())
+            }
+            None => Ok(()),
+        },
         _ => Err(unaddressable()),
     }
 }
@@ -394,6 +445,63 @@ fn wrap(segments: &[String], value: &Yaml) -> Yaml {
     match segments.split_first() {
         None => value.clone(),
         Some((head, rest)) => Yaml::Mapping(vec![(head.clone(), wrap(rest, value))]),
+    }
+}
+
+/// The byte range a **set** replaces: everything after the key's `:` that
+/// belongs to this property's value, separator included, so the replacement
+/// can choose one space for a scalar and a line break for a block.
+fn value_range(source: &str, property: &Property) -> Range<usize> {
+    let start = after_colon(source, property.key.span.end());
+    start..value_end(source, start, property.value.span.end())
+}
+
+/// The property's whole entry, trailing line terminator included: the stored
+/// span stops at the value, so a deletion that used it would leave a blank
+/// line behind.
+fn entry_range(source: &str, property: &Property) -> Range<usize> {
+    let start = line_start(source, property.span.start());
+    let value = value_range(source, property);
+    start..line_end(source, value.end.max(start))
+}
+
+/// The offset just past the last byte of a property's value.
+///
+/// The one place stored span geometry is corrected, because exactly two
+/// shapes report an end that cannot be spliced as-is — and both were found by
+/// a reviewer running documents the brief never imagined, not by reasoning:
+///
+/// * a **null** value (`title:`, the linter's own empty-property spelling) is
+///   a zero-width span sitting *at* the colon, so its stored end is *behind*
+///   `start`. Used raw it builds a reversed range and `replace_range` panics
+///   — and nothing above the engine installs a `catch_unwind`, so that panic
+///   takes the coordinator thread down.
+/// * a **block scalar** (`|`, `>`, and their chomping variants) reports an
+///   end at the first byte of the *next key*, past its own last line. Used
+///   raw, a set splices away the neighbouring property — or the closing
+///   fence, when the block scalar is last — and the engine commits the
+///   wreckage as `Ok`. That is the exact damage correction #9 exists to
+///   prevent, and worse than the naive full re-serialization it replaced.
+///
+/// One clamp fixes both: never before the start, and never past the last
+/// non-blank byte the value's own text occupies.
+fn value_end(source: &str, start: usize, span_end: usize) -> usize {
+    let clamped = span_end.clamp(start, source.len());
+    // Trims the overshoot of a block scalar's span; a no-op for every other
+    // shape, whose span already ends at its last content byte.
+    let end = start + source[start..clamped].trim_end().len();
+    // A value that is empty or trailing-padded leaves spaces between the
+    // colon and the line break. They belong to this value, so a replacement
+    // takes them rather than leaving `key:  new`. Anything else on the line
+    // is not ours to take — not a trailing `# comment`, and not the `\r` of a
+    // CRLF terminator.
+    let padding = source[end..]
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    match source.as_bytes().get(end + padding) {
+        None | Some(b'\n') | Some(b'\r') => end + padding,
+        Some(_) => end,
     }
 }
 
@@ -453,12 +561,163 @@ fn closing_fence(source: &str) -> Fence {
     Fence::Unterminated
 }
 
+/// The byte range of the frontmatter payload — everything between the fences
+/// — or `None` when the document opens no fence at all.
+fn payload_range(source: &str) -> Option<Range<usize>> {
+    let start = if source.starts_with("---\n") {
+        4
+    } else if source.starts_with("---\r\n") {
+        5
+    } else {
+        return None;
+    };
+    Some(match closing_fence(source) {
+        Fence::Closing(end) => start..end,
+        // An unterminated block has no end. Treating the rest of the file as
+        // payload is conservative in the direction that refuses.
+        Fence::Unterminated | Fence::Absent => start..source.len(),
+    })
+}
+
+/// Whether the frontmatter holds content the parser turned into no properties
+/// at all.
+///
+/// That is exactly the state in which every key looks absent, so every set
+/// appends a **duplicate** into a document nobody can parse: `title:
+/// [unclosed`, a non-mapping root (`- a`), a `null` document, a bare `{}`,
+/// and tab-indented YAML all land here. A comment-only or blank payload does
+/// not — appending to one of those is well-defined and right.
+///
+/// Deliberately structural rather than keyed on a diagnostic code.
+/// `UnsupportedPropertyShape` is *also* raised for a malformed `aliases:` or
+/// `tags:` **value** in a block whose properties all parsed perfectly, and
+/// refusing to patch that note would be wrong.
+fn frontmatter_is_unreadable(source: &str, note: &ParsedNote) -> bool {
+    if !note.properties.is_empty() {
+        return false;
+    }
+    let Some(payload) = payload_range(source) else {
+        return false;
+    };
+    source[payload].lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#')
+    })
+}
+
+/// The anchor the addressed property declares that another property aliases,
+/// if there is one.
+///
+/// `base: &shared` … `user: *shared` is the shape. `vault-core` resolves the
+/// alias before this module sees the value, so a re-serialization or a delete
+/// of `base` emits a document in which `*shared` points at nothing — and the
+/// *whole* frontmatter then fails to parse, including properties the caller
+/// never named. See [`MutationError::AnchoredProperty`].
+///
+/// The scan is deliberately narrow: a sigil counts only where a YAML token
+/// could begin — at the start of the region, or after whitespace — so
+/// `team: R&D` declares no anchor and a body's `*emphasis*` is no alias. The
+/// alias half is confined to the frontmatter payload for that second reason.
+/// A false positive costs one refusal; a false negative costs the document.
+fn aliased_anchor(source: &str, payload: Range<usize>, entry: Range<usize>) -> Option<String> {
+    let declared = sigil_tokens(source, payload.clone(), '&');
+    if declared.is_empty() {
+        return None;
+    }
+    // Everything in the payload that is not this property's own lines.
+    let before = payload.start..entry.start.clamp(payload.start, payload.end);
+    let after = entry.end.clamp(payload.start, payload.end)..payload.end;
+    let mine = sigil_tokens(source, entry, '&');
+    let mut used = sigil_tokens(source, before, '*');
+    used.extend(sigil_tokens(source, after, '*'));
+    mine.into_iter().find(|anchor| used.contains(anchor))
+}
+
+/// The `&name` or `*name` tokens in `region`, counting a sigil only where a
+/// token could start.
+fn sigil_tokens(source: &str, region: Range<usize>, sigil: char) -> Vec<String> {
+    if region.start >= region.end {
+        return Vec::new();
+    }
+    let text = &source[region];
+    let mut found = Vec::new();
+    let mut previous: Option<char> = None;
+    for (offset, character) in text.char_indices() {
+        if character == sigil && previous.is_none_or(char::is_whitespace) {
+            let name: String = text[offset + sigil.len_utf8()..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+                .collect();
+            if !name.is_empty() {
+                found.push(name);
+            }
+        }
+        previous = Some(character);
+    }
+    found
+}
+
+/// The line terminator the document predominantly uses.
+///
+/// An emitted line has to match its neighbours: mixing terminators parses
+/// fine and churns every diff, which is the opposite of what a module built
+/// for byte fidelity is for. Deletion already handled CRLF, because
+/// [`line_end`] takes the whole `\r\n`; only the emitter needed telling.
+fn dominant_newline(source: &str) -> &'static str {
+    let crlf = source.matches("\r\n").count();
+    let lf = source.matches('\n').count() - crlf;
+    if crlf > lf { "\r\n" } else { "\n" }
+}
+
+/// The payload weight of `edits`: roughly the bytes a client spent describing
+/// them.
+///
+/// The *result* of a patch is deliberately uncapped — see
+/// `MutationEngine::patch_frontmatter` — so that a note already over the cap
+/// stays patchable by the only interface that could shrink it. The **edits**
+/// are a different thing: they are a payload the client hands the daemon, and
+/// `DEFAULT_MAX_FILE_BYTES`'s own rule applies to those. Without this, a
+/// client that cannot `write_note` a 100 MB note can patch one key to a
+/// 100 MB string and get the same file.
+///
+/// An approximation is the right instrument: what matters is that a huge
+/// string weighs huge, not that the count matches the JSON byte for byte.
+pub(crate) fn patch_weight(edits: &[FrontmatterEdit]) -> u64 {
+    edits
+        .iter()
+        .map(|edit| {
+            let path: u64 = edit
+                .key_path
+                .iter()
+                .map(|segment| segment.len() as u64 + 1)
+                .sum();
+            path + edit.value.as_ref().map_or(0, value_weight)
+        })
+        .sum()
+}
+
+fn value_weight(value: &PatchValue) -> u64 {
+    match value {
+        PatchValue::Boolean(_) | PatchValue::Integer(_) | PatchValue::Float(_) => 8,
+        PatchValue::String(text) => text.len() as u64,
+        PatchValue::Sequence(items) => {
+            items.iter().map(value_weight).sum::<u64>() + items.len() as u64
+        }
+        PatchValue::Mapping(entries) => entries
+            .iter()
+            .map(|(key, value)| key.len() as u64 + value_weight(value) + 2)
+            .sum(),
+    }
+}
+
 /// Serialize `value` exactly as it appears after its key's `:` — the
 /// separator included, so a scalar gets one space and a block collection gets
 /// a newline instead of a dangling space. The reference vault's dominant
 /// obsidian-linter style: block sequences and mappings indented two spaces
 /// past their key, scalars inline.
-fn after_key(value: &Yaml, indent: usize) -> String {
+fn after_key(value: &Yaml, indent: usize, newline: &str) -> String {
     match value {
         // A bare `key:` — the linter's empty-value style, and what a document
         // that already held one round-trips back to.
@@ -472,7 +731,7 @@ fn after_key(value: &Yaml, indent: usize) -> String {
             let pad = " ".repeat(indent + 2);
             let mut text = String::new();
             for item in items {
-                text.push('\n');
+                text.push_str(newline);
                 text.push_str(&pad);
                 text.push_str("- ");
                 text.push_str(&one_line(item, Style::Block));
@@ -484,7 +743,7 @@ fn after_key(value: &Yaml, indent: usize) -> String {
             let pad = " ".repeat(indent + 2);
             let mut text = String::new();
             for (key, value) in entries {
-                text.push('\n');
+                text.push_str(newline);
                 text.push_str(&pad);
                 // A key is a scalar and gets a scalar's quoting. A key path
                 // segment is whatever the caller sent, so `on` or `1.5` can
@@ -493,7 +752,7 @@ fn after_key(value: &Yaml, indent: usize) -> String {
                 // all.
                 text.push_str(&scalar(key));
                 text.push(':');
-                text.push_str(&after_key(value, indent + 2));
+                text.push_str(&after_key(value, indent + 2, newline));
             }
             text
         }
@@ -576,12 +835,43 @@ fn scalar(text: &str) -> String {
             text.to_lowercase().as_str(),
             "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
         )
-        || text.parse::<f64>().is_ok();
+        || reads_as_a_number(text);
     if needs_quotes {
         quote(text)
     } else {
         text.to_string()
     }
+}
+
+/// Whether YAML would read `text` as a number rather than as the string it
+/// is.
+///
+/// **Not** `parse::<f64>()`, which is *Rust's* number grammar. The two differ
+/// in both directions, and one direction is a silent type change:
+///
+/// | spelling | Rust `parse::<f64>` | YAML |
+/// | --- | --- | --- |
+/// | `.inf`, `.nan` | rejects | float — **must** be quoted |
+/// | `0x1A`, `0o17` | rejects | integer — **must** be quoted |
+/// | `inf`, `nan`, `infinity` | accepts | plain string — over-quoting, harmless |
+///
+/// The first two rows were live bugs a reviewer found by round-tripping a
+/// hostile matrix: a caller setting the string `"0x1A"` got a note that read
+/// back as the integer 26. Over-quoting in the third row costs nothing and is
+/// Obsidian-compat prudence, so `parse::<f64>` stays as the decimal case.
+fn reads_as_a_number(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let lowercase = unsigned.to_ascii_lowercase();
+    if matches!(lowercase.as_str(), ".inf" | ".nan") {
+        return true;
+    }
+    if let Some(digits) = lowercase.strip_prefix("0x") {
+        return !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    if let Some(digits) = lowercase.strip_prefix("0o") {
+        return !digits.is_empty() && digits.bytes().all(|byte| matches!(byte, b'0'..=b'7'));
+    }
+    text.parse::<f64>().is_ok()
 }
 
 /// [`scalar`] inside a flow collection, where `,`, `[`, `]`, `{`, `}` and `:`

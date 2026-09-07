@@ -395,6 +395,7 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
                 | MutationError::InvalidPrecondition { .. }
                 | MutationError::UnaddressablePatch { .. }
                 | MutationError::MalformedFrontmatter { .. }
+                | MutationError::AnchoredProperty { .. }
                 | MutationError::OverlappingPatch => error.code = ErrorCode::InvalidRequest,
                 MutationError::Io { .. } => error.code = ErrorCode::StorageFailure,
             }

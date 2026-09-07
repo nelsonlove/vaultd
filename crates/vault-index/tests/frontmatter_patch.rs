@@ -1,6 +1,6 @@
 //! `patch_frontmatter`: every byte outside an addressed span survives.
 
-use vault_core::VaultPath;
+use vault_core::{DiagnosticCode, PropertyValue, SourceDocument, VaultPath, parse_note};
 use vault_index::{FrontmatterEdit, MutationError, PatchValue, patch_source};
 
 fn path() -> VaultPath {
@@ -400,6 +400,455 @@ fn deleting_a_nested_leaf_reserializes_its_property_without_it() {
     );
 }
 
+/// The value `key` holds once `vault-core` has read `document` back. This is
+/// the only honest test of the serializer: what matters is not what bytes it
+/// emitted but what the parser makes of them.
+fn read_back(document: &str, key: &str) -> PropertyValue {
+    let note = parse_note(SourceDocument::new(path(), document.to_string()));
+    let structural: Vec<_> = note
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                DiagnosticCode::MalformedFrontmatter
+                    | DiagnosticCode::UnsupportedPropertyShape
+                    | DiagnosticCode::UnterminatedFrontmatter
+            )
+        })
+        .collect();
+    assert!(
+        structural.is_empty(),
+        "re-reading {document:?} produced {structural:?}"
+    );
+    note.properties
+        .iter()
+        .find(|property| property.key.value == key)
+        .unwrap_or_else(|| panic!("no property {key} in {document:?}"))
+        .value
+        .value
+        .clone()
+}
+
+/// A sequence's items as plain strings, so an expectation does not have to
+/// invent the spans `PropertyValue` carries.
+fn sequence_strings(value: &PropertyValue) -> Vec<String> {
+    let PropertyValue::Sequence(items) = value else {
+        panic!("not a sequence: {value:?}");
+    };
+    items
+        .iter()
+        .map(|item| match &item.value {
+            PropertyValue::String(text) => text.clone(),
+            other => panic!("not a string item: {other:?}"),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The shapes a real vault holds that the brief's fixture document does not.
+// Every test below was written from a reviewer's reproduced failure, not from
+// the brief: an empty value, a block scalar, unreadable frontmatter, a YAML
+// anchor, CRLF, and YAML's number grammar.
+// ---------------------------------------------------------------------------
+
+/// `title:` — the linter's own empty-property spelling, and the commonest
+/// shape in the reference vault after a plain scalar. `vault-core` gives it a
+/// zero-width `Null` span sitting *at* the colon, so a splice built from it
+/// naively runs backwards and `replace_range` panics. Nothing above the
+/// engine installs a `catch_unwind`, so that panic takes the coordinator down.
+#[test]
+fn setting_a_key_whose_value_is_empty_does_not_panic() {
+    let source = "---\ntitle:\ncount: 3\n---\n# Body\n";
+    let patched = patch_source(
+        &path(),
+        source,
+        &[edit("title", Some(PatchValue::String("New".into())))],
+    )
+    .expect("an empty value is a value to replace, not a panic");
+    assert_eq!(patched, "---\ntitle: New\ncount: 3\n---\n# Body\n");
+}
+
+/// The same shape with the trailing space a hand-edit leaves behind. The
+/// space belongs to the value, so the replacement takes it rather than
+/// leaving `title:  New`.
+#[test]
+fn setting_a_key_whose_empty_value_has_a_trailing_space_leaves_one_space() {
+    let patched = patch_source(
+        &path(),
+        "---\ntitle: \ncount: 3\n---\n# Body\n",
+        &[edit("title", Some(PatchValue::String("New".into())))],
+    )
+    .expect("a padded empty value is still a value");
+    assert_eq!(patched, "---\ntitle: New\ncount: 3\n---\n# Body\n");
+}
+
+#[test]
+fn deleting_a_key_whose_value_is_empty_removes_exactly_its_line() {
+    let patched = patch_source(
+        &path(),
+        "---\ntitle:\ncount: 3\n---\n# Body\n",
+        &[edit("title", None)],
+    )
+    .expect("delete an empty-valued key");
+    assert_eq!(patched, "---\ncount: 3\n---\n# Body\n");
+}
+
+/// A null holds no value, so descending into it creates the structure rather
+/// than refusing — the `fm.a = fm.a ?? {}` parity that makes a missing
+/// top-level key create its whole path. A *scalar* is still refused, because
+/// that one would discard something the caller never mentioned.
+#[test]
+fn a_nested_create_under_an_empty_valued_key_builds_the_structure() {
+    let patched = patch_source(
+        &path(),
+        "---\nmeta:\ncount: 3\n---\n# Body\n",
+        &[edit(
+            "meta.inner.leaf",
+            Some(PatchValue::String("v".into())),
+        )],
+    )
+    .expect("a null discards nothing, so the path is created");
+    assert_eq!(
+        patched,
+        "---\nmeta:\n  inner:\n    leaf: v\ncount: 3\n---\n# Body\n"
+    );
+}
+
+/// A block scalar's stored value span ends at the first byte of the **next
+/// key**, not at its own last byte — the one value type whose span overshoots
+/// its property. A splice built from it swallows the neighbour, and the
+/// engine commits the wreckage as `Ok`.
+#[test]
+fn setting_a_block_scalar_leaves_the_next_property_byte_identical() {
+    for indicator in ["|", ">", "|-", ">+"] {
+        let source = format!(
+            "---\ntitle: Original\ndesc: {indicator}\n  first line\n  second line\ntail: end\n---\n# Body\n"
+        );
+        let patched = patch_source(
+            &path(),
+            &source,
+            &[edit("desc", Some(PatchValue::String("short".into())))],
+        )
+        .unwrap_or_else(|error| panic!("set a {indicator} block scalar: {error}"));
+        assert_eq!(
+            patched, "---\ntitle: Original\ndesc: short\ntail: end\n---\n# Body\n",
+            "indicator {indicator}"
+        );
+        assert_eq!(
+            outside_property(&patched, "desc"),
+            outside_property(&source, "desc"),
+            "indicator {indicator}: only desc may move"
+        );
+    }
+}
+
+/// The same overrun with nothing after it to swallow but the closing fence —
+/// the note loses its frontmatter entirely.
+#[test]
+fn setting_a_block_scalar_that_is_the_last_property_leaves_the_fence() {
+    for indicator in ["|", ">", "|-", ">+"] {
+        let source =
+            format!("---\ntitle: Original\ndesc: {indicator}\n  first line\n---\n# Body\n");
+        let patched = patch_source(
+            &path(),
+            &source,
+            &[edit("desc", Some(PatchValue::String("short".into())))],
+        )
+        .unwrap_or_else(|error| panic!("set a trailing {indicator} block scalar: {error}"));
+        assert_eq!(
+            patched, "---\ntitle: Original\ndesc: short\n---\n# Body\n",
+            "indicator {indicator}"
+        );
+        assert_eq!(body(&patched), body(&source), "indicator {indicator}");
+    }
+}
+
+#[test]
+fn deleting_a_block_scalar_removes_only_its_own_lines() {
+    for indicator in ["|", ">", "|-", ">+"] {
+        let source = format!(
+            "---\ntitle: Original\ndesc: {indicator}\n  first line\n  second line\ntail: end\n---\n# Body\n"
+        );
+        let patched = patch_source(&path(), &source, &[edit("desc", None)])
+            .unwrap_or_else(|error| panic!("delete a {indicator} block scalar: {error}"));
+        assert_eq!(
+            patched, "---\ntitle: Original\ntail: end\n---\n# Body\n",
+            "indicator {indicator}"
+        );
+    }
+}
+
+/// Frontmatter the parser turned into no properties at all is the state in
+/// which every key looks absent, so a set appends a **duplicate** into a
+/// document nobody can read and reports success. Refuse instead.
+#[test]
+fn frontmatter_that_parsed_into_no_properties_is_refused_rather_than_appended_to() {
+    for source in [
+        // Unparseable YAML.
+        "---\ntitle: [unclosed\ncount: 3\n---\n# Body\n",
+        // Valid YAML, but not a mapping.
+        "---\n- a\n- b\n---\n# Body\n",
+        // A null document.
+        "---\nnull\n---\n# Body\n",
+        // An empty flow mapping: appending a block key after it does not parse.
+        "---\n{}\n---\n# Body\n",
+    ] {
+        let error = patch_source(
+            &path(),
+            source,
+            &[edit("added", Some(PatchValue::String("x".into())))],
+        )
+        .expect_err("appending into frontmatter nobody can read is not success");
+        assert!(
+            matches!(error, MutationError::MalformedFrontmatter { .. }),
+            "expected malformed_frontmatter for {source:?}, got {error:?}"
+        );
+    }
+}
+
+/// The refusal above must not be over-broad. A comment-only or empty
+/// frontmatter block has no properties either, and appending to it is
+/// well-defined and right.
+#[test]
+fn a_comment_only_or_empty_frontmatter_still_accepts_an_addition() {
+    for (source, expected) in [
+        (
+            "---\n# just a comment\n---\n# Body\n",
+            "---\n# just a comment\nadded: x\n---\n# Body\n",
+        ),
+        ("---\n---\n# Body\n", "---\nadded: x\n---\n# Body\n"),
+        ("---\n\n---\n# Body\n", "---\n\nadded: x\n---\n# Body\n"),
+    ] {
+        assert_eq!(
+            patch_source(
+                &path(),
+                source,
+                &[edit("added", Some(PatchValue::String("x".into())))]
+            )
+            .unwrap_or_else(|error| panic!("{source:?}: {error}")),
+            expected
+        );
+    }
+}
+
+/// And it must key off "no properties", not off a diagnostic code:
+/// `UnsupportedPropertyShape` is also raised for a malformed `aliases:`
+/// **value** in a block whose properties all parsed fine.
+#[test]
+fn a_malformed_aliases_value_does_not_block_an_unrelated_patch() {
+    let patched = patch_source(
+        &path(),
+        "---\ntitle: Original\naliases:\n  - nested:\n      bad: shape\n---\n# Body\n",
+        &[edit("title", Some(PatchValue::String("New".into())))],
+    )
+    .expect("the properties parsed; only the alias projection complained");
+    assert!(patched.contains("title: New\n"), "{patched}");
+}
+
+/// `vault-core` resolves a YAML alias before this module sees it, so
+/// re-emitting or deleting the anchored property leaves `*anchor` pointing at
+/// nothing and the **whole** frontmatter stops parsing. That is damage
+/// outside the edited property, which correction #9 forbids absolutely.
+#[test]
+fn editing_a_property_whose_anchor_another_property_aliases_is_refused() {
+    let source = "---\nbase: &shared\n  a: 1\nuser: *shared\n---\n# Body\n";
+    for patch in [
+        vec![edit("base.a", Some(PatchValue::Integer(2)))],
+        vec![edit("base", None)],
+        vec![edit("base", Some(PatchValue::String("x".into())))],
+    ] {
+        let error = patch_source(&path(), source, &patch)
+            .expect_err("orphaning the alias would break a sibling property");
+        match error {
+            MutationError::AnchoredProperty { anchor, .. } => assert_eq!(anchor, "shared"),
+            other => panic!("expected anchored_property, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn an_anchor_that_nothing_aliases_does_not_block_the_patch() {
+    let patched = patch_source(
+        &path(),
+        "---\nbase: &unused\n  a: 1\nother: plain\n---\n# Body\n",
+        &[edit("base.a", Some(PatchValue::Integer(2)))],
+    )
+    .expect("an unused anchor orphans nothing");
+    assert!(patched.contains("a: 2"), "{patched}");
+}
+
+/// `R&D` is not an anchor and `*emphasis*` in the body is not an alias. The
+/// scan counts a sigil only where a YAML token could start, so neither is
+/// mistaken for one.
+#[test]
+fn an_ampersand_inside_a_value_is_not_mistaken_for_an_anchor() {
+    let patched = patch_source(
+        &path(),
+        "---\nteam: R&D\nnested:\n  leaf: old\n---\n*emphasis* and a * star\n",
+        &[edit("nested.leaf", Some(PatchValue::String("new".into())))],
+    )
+    .expect("no anchor is declared anywhere");
+    assert!(patched.contains("leaf: new"), "{patched}");
+}
+
+/// An emitted line takes the document's own terminator. Mixing them parses
+/// fine and churns every diff, which is the opposite of what this module is
+/// for.
+#[test]
+fn an_edit_to_a_crlf_document_emits_crlf() {
+    let source = "---\r\ntitle: Original\r\ntags:\r\n  - one\r\n---\r\n# Body\r\n";
+    let patched = patch_source(
+        &path(),
+        source,
+        &[
+            edit(
+                "tags",
+                Some(PatchValue::Sequence(vec![PatchValue::String("z".into())])),
+            ),
+            edit("added", Some(PatchValue::String("x".into()))),
+        ],
+    )
+    .expect("patch a CRLF document");
+    assert_eq!(
+        patched,
+        "---\r\ntitle: Original\r\ntags:\r\n  - z\r\nadded: x\r\n---\r\n# Body\r\n"
+    );
+    assert!(
+        !patched.contains("\n\n")
+            && patched.matches('\n').count() == patched.matches("\r\n").count(),
+        "no bare LF may be introduced: {patched:?}"
+    );
+}
+
+#[test]
+fn an_edit_to_an_lf_document_still_emits_lf() {
+    let patched = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit("added", Some(PatchValue::String("x".into())))],
+    )
+    .expect("patch an LF document");
+    assert!(!patched.contains('\r'), "{patched:?}");
+}
+
+/// Every spelling here must come back out of `vault-core` as the **string**
+/// it went in as. The first eight are YAML's number grammar, which is not
+/// Rust's: `parse::<f64>()` rejects `.inf`, `.nan`, `0x1A`, and `0o17`, and
+/// YAML reads all four as numbers.
+#[test]
+fn hostile_scalars_round_trip_as_strings_in_every_position() {
+    const HOSTILE: [&str; 32] = [
+        ".inf",
+        "-.inf",
+        "+.inf",
+        ".INF",
+        ".nan",
+        ".NaN",
+        "0x1A",
+        "0o17",
+        "on",
+        "off",
+        "yes",
+        "no",
+        "true",
+        "false",
+        "null",
+        "~",
+        "12",
+        "1.5",
+        "1e3",
+        "007",
+        "+1",
+        "-3",
+        " padded ",
+        "",
+        "a, b",
+        "a: b",
+        "# hash",
+        "---",
+        "...",
+        "one\ntwo",
+        "back\\slash",
+        "[[wiki, link]]",
+    ];
+
+    for sent in HOSTILE {
+        // Top-level scalar.
+        let document = patch_source(
+            &path(),
+            "body\n",
+            &[edit("v", Some(PatchValue::String(sent.into())))],
+        )
+        .unwrap_or_else(|error| panic!("{sent:?}: {error}"));
+        assert_eq!(
+            read_back(&document, "v"),
+            PropertyValue::String(sent.to_string()),
+            "top-level scalar {sent:?} emitted as {document:?}"
+        );
+
+        // Block sequence item, then a flow item nested one level deeper.
+        let document = patch_source(
+            &path(),
+            "body\n",
+            &[
+                edit(
+                    "block",
+                    Some(PatchValue::Sequence(vec![PatchValue::String(sent.into())])),
+                ),
+                edit(
+                    "flow",
+                    Some(PatchValue::Sequence(vec![PatchValue::Sequence(vec![
+                        PatchValue::String(sent.into()),
+                    ])])),
+                ),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{sent:?}: {error}"));
+        assert_eq!(
+            sequence_strings(&read_back(&document, "block")),
+            vec![sent.to_string()],
+            "block item {sent:?} emitted as {document:?}"
+        );
+        let PropertyValue::Sequence(outer) = read_back(&document, "flow") else {
+            panic!("flow item {sent:?}: not a sequence in {document:?}");
+        };
+        assert_eq!(outer.len(), 1, "flow item {sent:?} in {document:?}");
+        assert_eq!(
+            sequence_strings(&outer[0].value),
+            vec![sent.to_string()],
+            "flow item {sent:?} emitted as {document:?}"
+        );
+    }
+
+    // Mapping-key position, for every spelling that is a legal path segment.
+    for sent in HOSTILE {
+        if sent.is_empty() || sent.contains('.') || sent.contains('\n') {
+            continue;
+        }
+        let document = patch_source(
+            &path(),
+            "body\n",
+            &[edit(
+                &format!("outer.{sent}"),
+                Some(PatchValue::String("v".into())),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("key {sent:?}: {error}"));
+        let PropertyValue::Mapping(entries) = read_back(&document, "outer") else {
+            panic!("key {sent:?}: outer is not a mapping in {document:?}");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(key, _)| key.value.clone())
+                .collect::<Vec<_>>(),
+            vec![sent.to_string()],
+            "mapping key {sent:?} emitted as {document:?}"
+        );
+    }
+}
+
 #[test]
 fn two_edits_to_the_same_key_are_refused_rather_than_silently_ordered() {
     let error = patch_source(
@@ -424,12 +873,30 @@ fn an_empty_patch_is_byte_identical() {
 
 use proptest::prelude::*;
 
+/// A title the serializer will spell exactly the way the document does.
+///
+/// `[a-z]{1,8}` alone draws `on`, `no`, `yes`, `off`, `y`, `n`, `true`,
+/// `false`, `null`, `inf`, `nan`, and `infinity` — every one of which YAML
+/// reads as something other than a string, so `scalar()` rightly quotes it
+/// and `title: on` becomes `title: "on"`. That made
+/// `re_setting_an_identical_scalar_is_byte_identical` fail on roughly one
+/// draw in forty: the *serializer* was right and the property's expectation
+/// was wrong. Ending every title in `x` excludes the whole class without a
+/// hand-maintained word list that could drift out of step with the quoting
+/// rules. The excluded case is not lost: it is pinned deterministically by
+/// `a_title_yaml_would_read_as_a_bool_is_re_quoted`, and covered generally
+/// by `re_applying_the_same_edit_is_byte_identical`, which needs no
+/// restriction at all.
+fn plain_title() -> impl Strategy<Value = String> {
+    "[a-z]{0,7}x"
+}
+
 /// A document whose frontmatter holds the four keys the strategy edits, plus
 /// arbitrary body prose. The body is the property's whole subject: no
 /// frontmatter edit may move one of its bytes.
 fn document() -> impl Strategy<Value = String> {
     (
-        "[a-z]{1,8}",
+        plain_title(),
         0i64..1000,
         prop::collection::vec("[a-z]{1,6}", 0..4),
         "(?s)[a-zA-Z0-9 \n#\\[\\]-]{0,200}",
@@ -466,8 +933,24 @@ fn any_edit() -> impl Strategy<Value = FrontmatterEdit> {
     ]
 }
 
+/// 256 cases by default, and `PROPTEST_CASES` honoured when it is set.
+///
+/// `ProptestConfig::with_cases(256)` would look equivalent and is not: it
+/// builds `Config::default()` — which *has* already read `PROPTEST_CASES` —
+/// and then overwrites the field with the literal. So the environment
+/// variable silently did nothing, and "run it at 2000 cases to prove it is
+/// stable" quietly ran 256. That is exactly the check a flaky property needs
+/// to be provable against, so the override has to survive.
+fn cases() -> ProptestConfig {
+    let mut config = ProptestConfig::default();
+    if std::env::var_os("PROPTEST_CASES").is_none() {
+        config.cases = 256;
+    }
+    config
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(cases())]
 
     /// The body survives every patch, byte for byte.
     #[test]
@@ -480,7 +963,14 @@ proptest! {
         prop_assert_eq!(body(&patched), body(&original));
     }
 
-    /// The keys a patch does not address keep their exact source lines.
+    /// The keys a patch does not address keep their exact source lines, in
+    /// their exact order.
+    ///
+    /// A line *vector* comparison, not `patched.contains(line)`: containment
+    /// is satisfied by a reordered or duplicated line and is vacuously true
+    /// for the empty lines the body strategy generates, so it was weaker than
+    /// the test's own name. `title` is a top-level key and takes the span
+    /// surgery path, so every other line must survive byte for byte.
     #[test]
     fn a_patch_never_moves_an_unaddressed_key(
         original in document(),
@@ -488,19 +978,20 @@ proptest! {
     ) {
         let patched = patch_source(&path(), &original, &[edit("title", Some(PatchValue::String(value)))])
             .map_err(|error| TestCaseError::fail(format!("patch failed: {error}")))?;
-        for line in original.lines() {
-            if line.starts_with("title:") {
-                continue;
-            }
-            prop_assert!(
-                patched.contains(line),
-                "line {line:?} vanished from {patched:?}"
-            );
-        }
+        let without_title = |text: &str| {
+            text.lines()
+                .filter(|line| !line.starts_with("title:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        prop_assert_eq!(without_title(&patched), without_title(&original));
     }
 
     /// Re-applying the value a key already holds is byte-identical, so a
-    /// no-op patch never manufactures a generation.
+    /// no-op patch never manufactures a generation. The title strategy is
+    /// restricted to spellings the serializer does not re-quote — see
+    /// `plain_title` for why that is the property's honesty and not its
+    /// weakening.
     #[test]
     fn re_setting_an_identical_scalar_is_byte_identical(original in document()) {
         let current = original
@@ -512,6 +1003,43 @@ proptest! {
             .map_err(|error| TestCaseError::fail(format!("patch failed: {error}")))?;
         prop_assert_eq!(patched, original);
     }
+
+    /// Patching is idempotent: whatever the serializer chose the first time,
+    /// applying the same edit again changes nothing. This is the no-op claim
+    /// in the form that holds for **every** value, including the bool-ish
+    /// spellings the property above excludes — it compares the serializer
+    /// against itself rather than against the author's spelling.
+    #[test]
+    fn re_applying_the_same_edit_is_byte_identical(
+        original in document(),
+        value in "[a-z]{1,8}",
+    ) {
+        let once = patch_source(&path(), &original, &[edit("title", Some(PatchValue::String(value.clone())))])
+            .map_err(|error| TestCaseError::fail(format!("first patch failed: {error}")))?;
+        let twice = patch_source(&path(), &once, &[edit("title", Some(PatchValue::String(value)))])
+            .map_err(|error| TestCaseError::fail(format!("second patch failed: {error}")))?;
+        prop_assert_eq!(twice, once);
+    }
+}
+
+/// The case `plain_title` excludes, pinned deterministically: the document
+/// spells it bare, YAML reads that as a boolean, so re-setting it as a string
+/// *must* change the bytes. The serializer is right and a byte-identity
+/// expectation would be wrong.
+#[test]
+fn a_title_yaml_would_read_as_a_bool_is_re_quoted() {
+    let patched = patch_source(
+        &path(),
+        "---\ntitle: on\n---\n# Body\n",
+        &[edit("title", Some(PatchValue::String("on".into())))],
+    )
+    .expect("re-set a bool-ish title");
+    assert_eq!(patched, "---\ntitle: \"on\"\n---\n# Body\n");
+    assert_eq!(
+        read_back(&patched, "title"),
+        PropertyValue::String("on".into()),
+        "and now it reads back as the string it was set to"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +1339,65 @@ fn a_directory_at_the_target_name_is_refused_as_an_occupied_name() {
         "expected target_exists, got {error:?}"
     );
     assert!(fixture.root.join("Folder.md").is_dir());
+}
+
+/// The *result* of a patch is deliberately uncapped, so an already-oversized
+/// note stays patchable. The **edits** are a payload the client hands the
+/// daemon, and the cap's own rule applies to those — otherwise a client that
+/// cannot `write_note` a huge note can patch one key to a huge string and get
+/// the same file.
+#[test]
+fn an_oversized_edit_payload_is_refused_before_anything_is_read() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    std::fs::write(root.join("One.md"), NOTE).expect("write One");
+    let engine = MutationEngine::new(&root).with_max_file_bytes(64);
+
+    let error = engine
+        .apply(&patch(
+            "One.md",
+            vec![edit(
+                "title",
+                Some(PatchValue::String("x".repeat(65).to_string())),
+            )],
+            Precondition::Any,
+        ))
+        .expect_err("the edits exceed the payload cap");
+    match error {
+        MutationError::TooLarge { limit, actual } => {
+            assert_eq!(limit, 64);
+            assert!(actual > 64, "actual {actual}");
+        }
+        other => panic!("expected too_large, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("One.md")).expect("read back"),
+        NOTE
+    );
+}
+
+/// An oversized *note* stays patchable by a small edit — the ruling the cap
+/// above must not quietly overturn.
+#[test]
+fn a_note_larger_than_the_cap_is_still_patchable_by_a_small_edit() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    let big = format!("---\ntitle: Original\n---\n{}\n", "padding ".repeat(64));
+    std::fs::write(root.join("One.md"), &big).expect("write One");
+    let engine = MutationEngine::new(&root).with_max_file_bytes(64);
+
+    engine
+        .apply(&patch(
+            "One.md",
+            vec![edit("title", Some(PatchValue::String("New".into())))],
+            Precondition::Any,
+        ))
+        .expect("a small edit to an over-cap note is exactly what the ruling protects");
+    assert!(
+        std::fs::read_to_string(root.join("One.md"))
+            .expect("read back")
+            .contains("title: New\n")
+    );
 }
 
 /// The patcher's own refusals reach the caller unchanged, and nothing is
