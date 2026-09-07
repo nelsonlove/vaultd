@@ -18,11 +18,15 @@
 //!
 //! Nothing here knows about protocol types, the coordinator, or generations.
 
+pub mod frontmatter;
+
 use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use vault_core::VaultPath;
+
+pub use frontmatter::{FrontmatterEdit, PatchValue, patch_source};
 
 /// The largest single raw payload a mutation accepts, in bytes.
 ///
@@ -568,6 +572,11 @@ pub enum Mutation {
         to: VaultPath,
         rewrite_links: bool,
     },
+    PatchFrontmatter {
+        path: VaultPath,
+        patch: Vec<FrontmatterEdit>,
+        expected: Precondition,
+    },
 }
 
 /// What `copy_file` does when its destination already exists.
@@ -855,6 +864,11 @@ impl MutationEngine {
                 to,
                 rewrite_links: _,
             } => self.rename_folder(from, to),
+            Mutation::PatchFrontmatter {
+                path,
+                patch,
+                expected,
+            } => self.patch_frontmatter(path, patch, expected),
         }
     }
 
@@ -997,6 +1011,93 @@ impl MutationEngine {
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
             revision: Some(revision_of(bytes)),
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            semantic: true,
+        })
+    }
+
+    /// Edit a note's frontmatter in place, changing only the addressed keys'
+    /// bytes.
+    ///
+    /// The guards are `write_note`'s, for `write_note`'s reasons: this writes
+    /// a note through the same atomic rename, so the same paths must be
+    /// unreachable. It carries no size cap, and that is deliberate. The cap
+    /// governs a payload a client hands the daemon, and a patch's payload is
+    /// its edits, not a file; capping the *result* would make a note that is
+    /// already over the cap permanently unpatchable — a refusal with no
+    /// remedy, since the only interface that could shrink it is the one
+    /// refusing. That is the same reasoning [`DEFAULT_MAX_FILE_BYTES`] gives
+    /// for an uncapped delete.
+    fn patch_frontmatter(
+        &self,
+        path: &VaultPath,
+        edits: &[FrontmatterEdit],
+        expected: &Precondition,
+    ) -> Result<MutationOutcome, MutationError> {
+        // Once on the caller's spelling, so an obviously refused path is
+        // refused even when its parent does not exist and `resolve` would
+        // answer `parent_not_found` instead.
+        if is_unindexable(path) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        if !path.is_markdown() {
+            return Err(MutationError::NotANote { path: path.clone() });
+        }
+        // A patch edits a document that must already be there, so `absent`
+        // cannot be satisfied by anything this operation could then do.
+        if expected == &Precondition::Absent {
+            return Err(MutationError::InvalidPrecondition {
+                expected: expected.clone(),
+            });
+        }
+        let resolved = self.resolve(path)?;
+        // And again on the path the write would actually reach: a
+        // case-insensitive filesystem folds `.OBSIDIAN` onto the real zone,
+        // and a symlink with an innocuous name can have a hidden parent once
+        // resolved.
+        let stored = self.stored_path(path, &resolved)?;
+        if is_unindexable(&stored) {
+            return Err(MutationError::ZoneViolation { path: path.clone() });
+        }
+        // Case before the precondition, for `write_note`'s reason: on a
+        // case-insensitive filesystem `check` folds the spelling, so a patch
+        // of `one.md` would read and then rewrite the stored `One.md` — a
+        // file the caller never addressed.
+        if let Some(existing) = self.case_collision_at(&resolved)? {
+            return Err(MutationError::CaseCollision {
+                path: path.clone(),
+                existing,
+            });
+        }
+        // `check_resolved` refuses a non-regular occupant as `TargetExists`
+        // before reading, and answers `None` only for a genuinely absent
+        // target under an unconditional precondition.
+        let Some(bytes) = self.check_resolved(path, &resolved, expected)? else {
+            return Err(MutationError::NotFound { path: path.clone() });
+        };
+        let text = String::from_utf8(bytes).map_err(|_| MutationError::Io {
+            message: format!("{} is not valid UTF-8", path.as_str()),
+        })?;
+        let patched = frontmatter::patch_source(path, &text, edits)?;
+        if patched == text {
+            // Byte-identical: do not rewrite the file, do not move its mtime,
+            // and name no changed path — a no-op patch must not manufacture a
+            // generation. `semantic` stays `true` regardless: it states
+            // whether this is an operation over the indexed Markdown half,
+            // not whether this call happened to move a byte.
+            return Ok(MutationOutcome {
+                changed_paths: BTreeSet::new(),
+                revision: Some(revision_of(text.as_bytes())),
+                links_rewritten: 0,
+                link_rewrite_failures: Vec::new(),
+                semantic: true,
+            });
+        }
+        write_atomically(&resolved, patched.as_bytes())?;
+        Ok(MutationOutcome {
+            changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
+            revision: Some(revision_of(patched.as_bytes())),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
             semantic: true,
