@@ -524,14 +524,16 @@ fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
     }
 }
 
-/// The other half of `storage_failure`, and the one a client can act on
-/// wrongly. `MutationError::Io` means **nothing landed** — retry is safe. A
-/// reconciliation that fails *after* the engine's rename means **the bytes are
-/// on disk** and only the index is behind — a retry under
-/// `expected: {"absent": true}` will now meet `target_exists`, and one under
-/// the old revision will meet `revision_conflict`. Same code, opposite next
-/// move, so the two are told apart by the payload the protocol already
-/// carries: `current_revision` names the revision the write put on disk.
+/// The bytes a landed-but-unpublished write puts on disk.
+const LANDED: &[u8] = b"# One changed\n";
+
+/// Drive one `write_note` whose engine write lands and whose publication then
+/// fails, and hand back the vault it wrote into and the error a client sees.
+///
+/// `fault` is a factory rather than a value because `IndexError` is not
+/// `Clone` and the retryable shapes are injected on *every* attempt: a fault
+/// that fired once would be retried straight into a success and never reach
+/// the failure path under test.
 ///
 /// Driven in-process rather than through a spawned daemon on purpose. The
 /// failure has to happen *inside* the coordinator, after the engine's rename
@@ -542,8 +544,9 @@ fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
 /// request still travels the real `Server::handle` dispatch arm and the real
 /// `convert::mutation_failure` conversion — everything the wire shape depends
 /// on.
-#[test]
-fn a_write_that_landed_but_could_not_publish_names_the_revision_on_disk() {
+fn a_write_that_lands_but_cannot_publish(
+    fault: impl Fn() -> IndexError + Send + Sync + 'static,
+) -> (TempDir, vault_protocol::ProtocolError) {
     let vault = TempDir::new().expect("vault tempdir");
     let index = TempDir::new().expect("index tempdir");
     std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
@@ -553,23 +556,20 @@ fn a_write_that_landed_but_could_not_publish_names_the_revision_on_disk() {
 
     // Stage 0 is disarmed. The test moves it to 1 immediately before the
     // write; the next call into the `IndexService` is the engine's own, which
-    // must succeed, and the one after it is the reconciliation — the one that
-    // fails. Counting from the arming point rather than from process start
-    // keeps this immune to a retry renumbering the startup catch-up.
+    // must succeed, and every call after it fails. Counting from the arming
+    // point rather than from process start keeps this immune to a retry
+    // renumbering the startup catch-up.
     let stage = Arc::new(AtomicUsize::new(0));
     let hooks = RuntimeTestHooks {
         mutation_fault: Some(Arc::new({
             let stage = Arc::clone(&stage);
             move |_| match stage.load(Ordering::Acquire) {
+                0 => None,
                 1 => {
                     stage.store(2, Ordering::Release);
                     None
                 }
-                2 => {
-                    stage.store(3, Ordering::Release);
-                    Some(IndexError::Storage("injected publication failure".into()))
-                }
-                _ => None,
+                _ => Some(fault()),
             }
         })),
         ..RuntimeTestHooks::default()
@@ -592,7 +592,7 @@ fn a_write_that_landed_but_could_not_publish_names_the_revision_on_disk() {
             id: "w".into(),
             request: Request::WriteNote(WriteNoteParams {
                 path: "One.md".into(),
-                content: "# One changed\n".into(),
+                content: String::from_utf8(LANDED.to_vec()).expect("utf-8 fixture"),
                 expected: Some(ExpectedDto {
                     revision: None,
                     absent: None,
@@ -609,16 +609,150 @@ fn a_write_that_landed_but_could_not_publish_names_the_revision_on_disk() {
             panic!("the reconciliation failed, so the write must not report success: {other:?}")
         }
     };
+    assert_eq!(
+        std::fs::read(vault.path().join("One.md")).expect("read back"),
+        LANDED,
+        "the point of the whole distinction: the bytes really are on disk"
+    );
+    (vault, error)
+}
+
+/// The other half of `storage_failure`, and the one a client can act on
+/// wrongly. `MutationError::Io` means **nothing landed** — retry is safe. A
+/// reconciliation that fails *after* the engine's rename means **the bytes are
+/// on disk** and only the index is behind — a retry under
+/// `expected: {"absent": true}` will now meet `target_exists`, and one under
+/// the old revision will meet `revision_conflict`. Same code, opposite next
+/// move, so the two are told apart by the payload the protocol already
+/// carries: `current_revision` names the revision the write put on disk.
+#[test]
+fn a_write_that_landed_but_could_not_publish_names_the_revision_on_disk() {
+    let (_vault, error) = a_write_that_lands_but_cannot_publish(|| {
+        IndexError::Storage("injected publication failure".into())
+    });
     assert_eq!(error.code, ErrorCode::StorageFailure);
     assert_eq!(
         error.current_revision.as_deref(),
-        Some(revision_of(b"# One changed\n").as_str()),
+        Some(revision_of(LANDED).as_str()),
         "a write that reached disk must name the revision it wrote, so the client \
          knows not to retry blindly: {error:?}"
     );
+}
+
+/// **One code for one situation.** A landed-but-unpublished write must reach
+/// the client as `storage_failure` *whatever* the reconciliation happened to
+/// fail with — because the code is what a client branches on, and the two
+/// facts it needs are "the index is behind" and "your bytes are there".
+///
+/// `vault_changed_during_refresh` is the shape that proves the point. Its own
+/// documented meaning is "nothing was published", which is true of a refresh
+/// and false of this: the write *did* land. Letting that code through here
+/// would tell a client the exact opposite of what happened and recreate the
+/// blind-retry hazard one code over from where it was fixed. So the mapping is
+/// unconditional, and `current_revision` — present here, absent for a
+/// pre-write `Io` failure — stays the only thing a client reads to tell the
+/// two states apart.
+#[test]
+fn a_landed_write_reports_storage_failure_whatever_the_reconciliation_failed_with() {
+    let (_vault, error) =
+        a_write_that_lands_but_cannot_publish(|| IndexError::VaultChangedDuringRefresh);
     assert_eq!(
-        std::fs::read(vault.path().join("One.md")).expect("read back"),
-        b"# One changed\n",
-        "the point of the distinction: the bytes really are on disk"
+        error.code,
+        ErrorCode::StorageFailure,
+        "vault_changed_during_refresh means nothing was published; this write was: {error:?}"
     );
+    assert_eq!(
+        error.current_revision.as_deref(),
+        Some(revision_of(LANDED).as_str()),
+        "the proof the bytes landed must survive the normalisation: {error:?}"
+    );
+}
+
+/// **TRIPWIRE — Task 12 must flip this test, not delete it.** The
+/// `rename_folder` twin of the one above.
+///
+/// A folder rename moves every note under it at once, so it is the shape with
+/// the most inbound references to repair and the most to break by not
+/// repairing them. The design says `rename_folder` "repairs inbound references
+/// for every contained note", `rewrite_links` defaults `true`, and the engine
+/// destructures it to `_` — so today a client that spells nothing renames a
+/// folder, is told `links_rewritten: 0` with no failures, and every path-form
+/// reference into that folder is silently dead.
+///
+/// This test pins the break with a before/after pair: the reference resolves
+/// while the folder is where it was, and is `unresolved` afterwards. When Task
+/// 12 lands, `links_rewritten` becomes 1, `Two.md` reads `[[Renamed/One]]`,
+/// and the second resolution assertion goes back to `Resolved`.
+#[test]
+fn task_12_must_flip_this_folder_rename_still_breaks_inbound_links() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index = TempDir::new().expect("index tempdir");
+    std::fs::create_dir(vault.path().join("Folder")).expect("create Folder");
+    std::fs::write(vault.path().join("Folder/One.md"), "# One\n").expect("write One");
+    // The path form, not `[[One]]`: a bare basename would still resolve after
+    // the folder moved, since the file keeps its name, and the test would
+    // prove nothing.
+    std::fs::write(vault.path().join("Two.md"), "# Two\n[[Folder/One]]\n").expect("write Two");
+    let mut daemon = Daemon::for_vault(&vault, &index);
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+
+    let before = daemon.call(
+        r#"{"version":1,"id":"b","request":{"method":"get_note","params":{"path":"Two.md"}}}"#,
+    );
+    match before.outcome {
+        ResponseOutcome::Ok(Response::GetNote(response)) => assert!(
+            matches!(
+                response.note.outgoing[0].resolution,
+                vault_protocol::ResolutionDto::Resolved { .. }
+            ),
+            "the fixture must start with a reference that actually resolves, or the \
+             after-assertion proves nothing: {:?}",
+            response.note.outgoing[0].resolution
+        ),
+        other => panic!("get_note failed: {other:?}"),
+    }
+
+    // `rewrite_links` deliberately unspelled: the wire default is `true`.
+    let renamed = daemon.call(
+        r#"{"version":1,"id":"n","request":{"method":"rename_folder","params":{"from":"Folder","to":"Renamed"}}}"#,
+    );
+    match renamed.outcome {
+        ResponseOutcome::Ok(Response::RenameFolder(response)) => {
+            assert_eq!(
+                response.links_rewritten, 0,
+                "TASK 12: this must become 1 when link repair lands"
+            );
+            assert!(
+                response.link_rewrite_failures.is_empty(),
+                "TASK 12: nothing is even attempted yet, so nothing can fail"
+            );
+            assert!(
+                response.revision.is_none(),
+                "a folder has no bytes to hash, so it reports no revision at all"
+            );
+        }
+        other => panic!("rename_folder did not reach the engine: {other:?}"),
+    }
+
+    assert!(vault.path().join("Renamed/One.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(vault.path().join("Two.md")).expect("read Two back"),
+        "# Two\n[[Folder/One]]\n",
+        "TASK 12: this must become \"# Two\\n[[Renamed/One]]\\n\" when link repair lands"
+    );
+
+    let after = daemon.call(
+        r#"{"version":1,"id":"g","request":{"method":"get_note","params":{"path":"Two.md"}}}"#,
+    );
+    match after.outcome {
+        ResponseOutcome::Ok(Response::GetNote(response)) => {
+            assert_eq!(response.note.outgoing.len(), 1);
+            assert_eq!(
+                response.note.outgoing[0].resolution,
+                vault_protocol::ResolutionDto::Unresolved,
+                "TASK 12: this must stay resolved, at Renamed/One.md, when link repair lands"
+            );
+        }
+        other => panic!("get_note failed: {other:?}"),
+    }
 }

@@ -1297,36 +1297,31 @@ impl Coordinator {
         &mut self,
         paths: BTreeSet<VaultPath>,
     ) -> Result<LiveRefreshReport, IndexError> {
-        for attempt in 0..MAX_MUTATION_ATTEMPTS {
-            let final_attempt = attempt + 1 == MAX_MUTATION_ATTEMPTS;
+        // The retry loop below covers all but the last attempt, and the last
+        // one is the tail expression: whatever it produces is the answer.
+        // Written that way so there is no unreachable fallback to keep honest
+        // — the shape enforces "three attempts, then report" rather than a
+        // comment claiming it.
+        const _: () = assert!(
+            MAX_MUTATION_ATTEMPTS > 0,
+            "reconcile_mutation makes MAX_MUTATION_ATTEMPTS - 1 retries plus one final attempt"
+        );
+        for _ in 0..MAX_MUTATION_ATTEMPTS - 1 {
             let batch = paths.clone();
             match self.mutation(|index| index.refresh_paths(batch, ChangeCause::Mutation)) {
                 Ok(report) => return Ok(report),
-                Err(error) => {
-                    let retryable = matches!(
-                        error,
-                        IndexError::Busy(_)
-                            | IndexError::LiveStateStale(_)
-                            | IndexError::VaultChangedDuringRefresh
-                    );
-                    // The final attempt returns whatever it got, so the loop
-                    // never falls through and there is no post-loop fallback
-                    // to get wrong. Keeping a "last error" here would be a
-                    // value nothing can ever read.
-                    if !retryable || final_attempt {
-                        return Err(error);
-                    }
-                    match &error {
-                        IndexError::Busy(_) => std::thread::sleep(BUSY_BACKOFF),
-                        IndexError::LiveStateStale(_) => {
-                            self.mutation(IndexService::resync_published)?;
-                        }
-                        _ => {}
-                    }
+                // Only the three that are retryable by construction get
+                // another attempt; anything else is reported as it stands,
+                // because nothing this loop does would change the answer.
+                Err(IndexError::Busy(_)) => std::thread::sleep(BUSY_BACKOFF),
+                Err(IndexError::LiveStateStale(_)) => {
+                    self.mutation(IndexService::resync_published)?;
                 }
+                Err(IndexError::VaultChangedDuringRefresh) => {}
+                Err(error) => return Err(error),
             }
         }
-        unreachable!("MAX_MUTATION_ATTEMPTS is non-zero and its final attempt always returns")
+        self.mutation(|index| index.refresh_paths(paths, ChangeCause::Mutation))
     }
 
     /// Put a batch back for another attempt, or give up on being incremental

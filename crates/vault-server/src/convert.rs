@@ -426,22 +426,31 @@ pub(crate) fn mutation_error(value: vault_index::MutationError) -> ProtocolError
 
 /// A mutation that produced no report.
 ///
-/// `Unpublished` is why this is not just [`index_error`]. Its `IndexError` is
-/// an ordinary storage failure and maps to `storage_failure` like any other —
-/// but the write it belongs to *reached disk*, and a client's next move
-/// differs completely between "nothing happened, retry" and "it happened, the
-/// index is behind". Rather than invent a code for a state that is still a
+/// `Unpublished` is why this is not just [`index_error`]. The write it belongs
+/// to *reached disk* and only its generation is missing, and a client's next
+/// move differs completely between "nothing happened, retry" and "it happened,
+/// the index is behind". Rather than invent a code for a state that is still a
 /// storage failure, the difference is carried in the payload the protocol
 /// already has: `current_revision` names the revision now on disk. Present
 /// means the bytes landed; absent means they did not. `docs/protocol.md`'s
 /// `storage_failure` row states the same rule to clients.
+///
+/// The mapping is **unconditional** — the inner `IndexError` chooses nothing.
+/// It describes why the *reconciliation* failed, and every one of its codes
+/// would say something false about the mutation: `vault_changed_during_refresh`
+/// is documented as "nothing was published", which is true of a refresh and
+/// exactly backwards here, and passing it through would recreate the
+/// blind-retry hazard one code over from where it was fixed. One situation,
+/// one code, with the revision as the proof.
 pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
     match value {
-        MutationFailure::Unpublished { error, revision } => {
-            let mut error = index_error(error);
-            error.current_revision = revision;
-            error
-        }
+        MutationFailure::Unpublished { revision, .. } => ProtocolError {
+            code: ErrorCode::StorageFailure,
+            message: "the write reached the vault but its generation was not published".into(),
+            supported_version: None,
+            current_generation: None,
+            current_revision: revision,
+        },
         MutationFailure::Overloaded => ProtocolError {
             code: ErrorCode::RuntimeOverloaded,
             message: "the runtime is saturated; retry this mutation".into(),
