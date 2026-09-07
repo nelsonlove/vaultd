@@ -199,6 +199,33 @@ fn io(error: std::io::Error) -> MutationError {
     }
 }
 
+/// The engine's NUL gate, in one place because every verb must answer it the
+/// same way.
+///
+/// A NUL byte never reaches the filesystem — std refuses the C-string
+/// conversion — and *which* component holds it decides which syscall fails
+/// first, so classifying by the resulting `io::Error` answers two different
+/// ways for one malformed input (and `Ok` for one of them, since a final
+/// `canonicalize` failing is indistinguishable from an absent target). Left to
+/// the io mapping it reaches a client as `storage_failure`: a claim the daemon
+/// is broken and that a write was attempted, when neither is true, and an
+/// invitation to retry a request that can never succeed.
+///
+/// [`MutationEngine::resolve`] calls this for every verb that resolves a
+/// target. `create_folder` walks its own segments — a folder chain need not
+/// have an existing parent, so it cannot resolve — and therefore calls it
+/// directly rather than inheriting the gate. That is the whole reason this is
+/// a function and not four lines inside `resolve`.
+///
+/// `VaultPath::new` is string-level and does not reject a NUL; tightening that
+/// constructor is a `vault-core` change this crate does not own.
+fn refuse_nul(path: &VaultPath) -> Result<(), MutationError> {
+    if path.as_str().contains('\0') {
+        return Err(MutationError::ZoneViolation { path: path.clone() });
+    }
+    Ok(())
+}
+
 /// The one writer into the vault.
 #[derive(Clone, Debug)]
 pub struct MutationEngine {
@@ -256,17 +283,7 @@ impl MutationEngine {
     /// an absent target: the name is occupied by something this check cannot
     /// vouch for.
     pub fn resolve(&self, path: &VaultPath) -> Result<PathBuf, MutationError> {
-        // A NUL byte never reaches the filesystem — std refuses the C-string
-        // conversion — and *which* component holds it decides which syscall
-        // fails first, so classifying by the resulting `io::Error` answers
-        // two different ways for one malformed input (and `Ok` for one of
-        // them, since the final `canonicalize` failing is indistinguishable
-        // from an absent target). Refused once, here, for every spelling.
-        // `VaultPath::new` is string-level and does not reject it; tightening
-        // that constructor is a `vault-core` change this task does not own.
-        if path.as_str().contains('\0') {
-            return Err(MutationError::ZoneViolation { path: path.clone() });
-        }
+        refuse_nul(path)?;
         let absolute = self.canonical_root.join(path.as_str());
         let parent = absolute
             .parent()
@@ -1169,13 +1186,40 @@ impl MutationEngine {
         if is_unindexable_folder(path) {
             return Err(MutationError::ZoneViolation { path: path.clone() });
         }
+        // Called here rather than inherited from `resolve`, which this verb
+        // never reaches: see [`refuse_nul`].
+        refuse_nul(path)?;
         // `resolve` requires an existing parent, which a folder chain need
         // not have. Walk the segments instead, checking containment at every
         // level that already exists, and creating the rest.
         let mut created = BTreeSet::new();
         let mut current = self.canonical_root.clone();
-        for segment in path.as_str().split('/') {
+        let segments: Vec<&str> = path.as_str().split('/').collect();
+        let last = segments.len() - 1;
+        for (index, segment) in segments.into_iter().enumerate() {
             current = current.join(segment);
+            // The final segment is this call's target, and it gets the guard
+            // every other verb applies to its own: a stored name that differs
+            // only in case, with no file stored under the caller's spelling.
+            // On a case-folding volume the create would otherwise be a silent
+            // success on a folder the caller did not name; on a case-sensitive
+            // one it creates the twin directory that folds into its sibling —
+            // and whose contents then collide — the moment the vault reaches a
+            // default macOS filesystem, which is Ruling 4's strictness applied
+            // to the verb that makes the twin.
+            //
+            // Ancestors are deliberately exempt, per the ancestor-fold
+            // doctrine the phase already ratified: a folded ancestor names a
+            // folder that exists, the platform reaches it, and every other
+            // verb serves it the same way.
+            if index == last {
+                if let Some(existing) = self.case_collision_at(&current)? {
+                    return Err(MutationError::CaseCollision {
+                        path: path.clone(),
+                        existing,
+                    });
+                }
+            }
             match current.canonicalize() {
                 Ok(canonical) => {
                     if !canonical.starts_with(&self.canonical_root) {

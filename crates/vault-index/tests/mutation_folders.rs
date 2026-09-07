@@ -150,6 +150,71 @@ fn creating_a_hidden_or_zone_folder_is_refused() {
     assert!(fixture.root.join(".obsidian/app.json").is_file());
 }
 
+/// A NUL byte never reaches the filesystem, and which syscall notices first
+/// depends on where in the path it sits — so the engine refuses it once, in
+/// one typed way, for every verb. `create_folder` walks segments itself
+/// instead of calling `resolve`, so it is the one verb that can miss the gate
+/// and answer `storage_failure`: a claim the daemon is broken and that a write
+/// was attempted, when neither is true.
+#[test]
+fn creating_a_folder_with_a_nul_byte_is_refused() {
+    let fixture = fixture();
+    for spelling in ["bad\0name/Deep", "A/bad\0name"] {
+        let error = fixture
+            .engine
+            .apply(&Mutation::CreateFolder {
+                path: path(spelling),
+            })
+            .expect_err("a NUL byte is refused, not attempted");
+        assert!(
+            matches!(error, MutationError::ZoneViolation { .. }),
+            "expected zone_violation for {spelling:?}, got {error:?}"
+        );
+    }
+    assert!(
+        !fixture.root.join("A").exists(),
+        "the refusal must come before any segment is created"
+    );
+}
+
+/// The last segment gets the guard every other verb applies to its target. On
+/// a case-folding volume the create would otherwise be a silent success on a
+/// folder the caller did not name; on a case-sensitive one it would create the
+/// twin directory that folds into its sibling — and their contents collide —
+/// the moment the vault reached a default macOS filesystem. Ancestor folds
+/// stay served, per the ratified ancestor-fold doctrine.
+#[test]
+fn creating_a_folder_that_only_differs_in_case_is_refused() {
+    let fixture = fixture();
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path("folder"),
+        })
+        .expect_err("a case variant of a stored folder is not a folder to create");
+    assert!(
+        matches!(&error, MutationError::CaseCollision { existing, .. } if existing == "Folder"),
+        "expected case_collision naming the stored spelling, got {error:?}"
+    );
+    assert!(fixture.root.join("Folder/Two.md").is_file());
+
+    // The ancestor half, which must keep working: only the final segment is
+    // the caller's target, and on a folding volume a folded ancestor names a
+    // folder that exists. (On a case-sensitive volume `folder/` is simply a
+    // different folder and the create legitimately makes both, so there is
+    // nothing to assert there.)
+    if !folds_case(&fixture) {
+        return;
+    }
+    fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path("folder/New"),
+        })
+        .expect("a folded ancestor still reaches the stored folder");
+    assert!(fixture.root.join("Folder/New").is_dir());
+}
+
 /// The stored-spelling half of the folder guard, which nothing lexical can
 /// stand in for: `Link` carries no dot and names no zone, and only resolving
 /// it reveals that the folder the caller addressed *is* the configuration
