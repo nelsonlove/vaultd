@@ -51,13 +51,13 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
     // shape the `Err` arm already produces keeps the note indexable — its
     // frontmatter is parsed before this point and survives — and records the
     // loss of body semantics as a diagnostic rather than swallowing it.
-    // `AssertUnwindSafe` is honest here: nothing is mutated across the
-    // boundary, `to_mdast` gets a `&str` and a fresh options value, and a
-    // panic leaves no partial state behind because the tree is the only
-    // output and it is discarded.
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        to_mdast(body, &parse_options())
-    }));
+    // No `AssertUnwindSafe`: the closure captures only `&str`, which is
+    // `UnwindSafe` on its own, so the compiler proves the invariant. If a
+    // future edit captures something mutable here, the build fails instead
+    // of silently defeating this boundary. NOTE this containment depends on
+    // panic = "unwind" (the workspace default, left implicit; a profile
+    // switch to "abort" would reopen the process-kill this guards against).
+    let parsed = std::panic::catch_unwind(|| to_mdast(body, &parse_options()));
 
     let tree = match parsed {
         Ok(Ok(tree)) => tree,
