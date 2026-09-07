@@ -549,6 +549,34 @@ pub enum Mutation {
         mode: Option<DeleteMode>,
         recursive: bool,
     },
+    CopyFile {
+        from: VaultPath,
+        to: VaultPath,
+        expected_source: Precondition,
+        if_exists: CopyConflict,
+    },
+    RenameNote {
+        from: VaultPath,
+        to: VaultPath,
+        expected: Precondition,
+        /// Consumed by `IndexService::apply_mutation`, which owns the link
+        /// repair burst; the engine below only ever moves the file.
+        rewrite_links: bool,
+    },
+    RenameFolder {
+        from: VaultPath,
+        to: VaultPath,
+        rewrite_links: bool,
+    },
+}
+
+/// What `copy_file` does when its destination already exists.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CopyConflict {
+    #[default]
+    Error,
+    /// Obsidian's auto-numbering behaviour, for `getAvailablePath` parity.
+    Suffix,
 }
 
 /// How a delete disposes of its target.
@@ -810,6 +838,23 @@ impl MutationEngine {
                 mode,
                 recursive,
             } => self.delete_folder(path, *mode, *recursive),
+            Mutation::CopyFile {
+                from,
+                to,
+                expected_source,
+                if_exists,
+            } => self.copy_file(from, to, expected_source, *if_exists),
+            Mutation::RenameNote {
+                from,
+                to,
+                expected,
+                rewrite_links: _,
+            } => self.rename_note(from, to, expected),
+            Mutation::RenameFolder {
+                from,
+                to,
+                rewrite_links: _,
+            } => self.rename_folder(from, to),
         }
     }
 
@@ -1095,37 +1140,7 @@ impl MutationEngine {
         // Deletion is never idempotent-silent: a caller deleting something
         // that is already gone had a wrong model of the vault and should
         // hear so.
-        let present = match expected {
-            // Hashed in bounded chunks rather than read whole: the revision is
-            // the only thing this branch wants, and a delete that materialised
-            // a multi-gigabyte attachment to compare one string would spend
-            // the memory the M3 decision refuses to cap.
-            Precondition::Revision(wanted) => match self.streamed_revision(path, &resolved)? {
-                None => return Err(MutationError::NotFound { path: path.clone() }),
-                Some(actual) if &actual == wanted => true,
-                Some(actual) => {
-                    return Err(MutationError::RevisionConflict {
-                        path: path.clone(),
-                        current: Some(actual),
-                    });
-                }
-            },
-            // Existence is the whole question, so it is answered with a stat
-            // and not with a read of a file the daemon has no use for: see
-            // [`DEFAULT_MAX_FILE_BYTES`].
-            Precondition::Any => self.regular_file_exists(path, &resolved)?,
-            // Unreachable — refused above — and answered rather than panicked
-            // on, because a future variant reaching here must not take the
-            // daemon down with it.
-            Precondition::Absent => {
-                return Err(MutationError::InvalidPrecondition {
-                    expected: expected.clone(),
-                });
-            }
-        };
-        if !present {
-            return Err(MutationError::NotFound { path: path.clone() });
-        }
+        self.require_regular_file(path, &resolved, expected)?;
         self.dispose(
             &resolved,
             mode.unwrap_or_else(|| self.configured_delete_mode()),
@@ -1225,6 +1240,53 @@ impl MutationEngine {
         })
     }
 
+    /// Require a regular file at `resolved` that satisfies `expected`, reading
+    /// no more of it than the precondition actually asks for.
+    ///
+    /// Shared by the two operations that *move or remove* an existing file —
+    /// `delete_note` and `rename_note` — because they ask the filesystem the
+    /// same three questions in the same order, and a second copy of this would
+    /// be a second place for the M3 reasoning to drift. A `revision`
+    /// precondition is hashed in bounded chunks rather than read whole (see
+    /// [`DEFAULT_MAX_FILE_BYTES`]); an `any` precondition is answered with a
+    /// stat, because existence is the only fact it asks for; and `absent` is a
+    /// contradiction its callers refuse before they get here, answered rather
+    /// than panicked on so a future variant reaching it cannot take the daemon
+    /// down.
+    ///
+    /// An absent target is never a silent success: a caller moving or deleting
+    /// something that is already gone had a wrong model of the vault and should
+    /// hear so.
+    fn require_regular_file(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+        expected: &Precondition,
+    ) -> Result<(), MutationError> {
+        let present = match expected {
+            Precondition::Revision(wanted) => match self.streamed_revision(path, resolved)? {
+                None => return Err(MutationError::NotFound { path: path.clone() }),
+                Some(actual) if &actual == wanted => true,
+                Some(actual) => {
+                    return Err(MutationError::RevisionConflict {
+                        path: path.clone(),
+                        current: Some(actual),
+                    });
+                }
+            },
+            Precondition::Any => self.regular_file_exists(path, resolved)?,
+            Precondition::Absent => {
+                return Err(MutationError::InvalidPrecondition {
+                    expected: expected.clone(),
+                });
+            }
+        };
+        if !present {
+            return Err(MutationError::NotFound { path: path.clone() });
+        }
+        Ok(())
+    }
+
     /// The on-disk revision of a regular file at `resolved`, hashed in bounded
     /// chunks, or `None` when nothing is there.
     ///
@@ -1306,6 +1368,549 @@ impl MutationEngine {
             }
         }
     }
+
+    /// Whether anything the filesystem would reach under this name is already
+    /// there — the name itself, or a stored name that folds onto it.
+    ///
+    /// Both halves are needed and neither subsumes the other. `exists` answers
+    /// through the platform's own folding, so on APFS it already reports
+    /// `Two.md` when asked about `two.md`; the case scan answers from the
+    /// parent's *stored names*, which is the only thing that sees the collision
+    /// on a case-sensitive volume where both spellings could legally coexist.
+    /// Used by the suffix policy, where a folded name is not a refusal but
+    /// simply not free.
+    fn is_occupied(&self, resolved: &Path) -> Result<bool, MutationError> {
+        if resolved.exists() {
+            return Ok(true);
+        }
+        Ok(self.case_scan(resolved)?.variant.is_some())
+    }
+
+    /// Copy one vault file — a note or an attachment — to a new path.
+    ///
+    /// Never overwrites. `CopyConflict::Error` refuses an occupied
+    /// destination; `CopyConflict::Suffix` numbers past it the way Obsidian's
+    /// `getAvailablePath` does.
+    ///
+    /// **The payload cap does not govern a copy**, for the reason it does not
+    /// govern a delete (see [`DEFAULT_MAX_FILE_BYTES`]): none of these bytes
+    /// cross the wire, so there is no line-delimited reader to strain, and a
+    /// cap here would make an attachment larger than it permanently uncopyable
+    /// through vaultd — a refusal with no remedy. The bytes are streamed
+    /// through a bounded buffer instead, so nothing is refused for its size and
+    /// nothing larger than the buffer is ever held.
+    fn copy_file(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        expected_source: &Precondition,
+        if_exists: CopyConflict,
+    ) -> Result<MutationOutcome, MutationError> {
+        // Both ends, on the caller's own spelling, before the filesystem is
+        // touched: a path the scan never lists is a path this operation cannot
+        // address in either direction, and `.trash/Gone.md` must be refused as
+        // a zone violation rather than reported as merely absent.
+        if is_unindexable(from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        if is_unindexable(to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        // An `absent` precondition on the *source* of a copy is a
+        // contradiction: it asks for nothing to be there, and there would then
+        // be nothing to copy. The spec's validity table says the same —
+        // `copy_file` (source) accepts `revision` or `any`, never `absent`.
+        if expected_source == &Precondition::Absent {
+            return Err(MutationError::InvalidPrecondition {
+                expected: expected_source.clone(),
+            });
+        }
+        let source = self.resolve(from)?;
+        let stored_from = self.stored_path(from, &source)?;
+        if is_unindexable(&stored_from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        // The same guard the other verbs carry, in the same position: on a
+        // case-folding filesystem a folded source spelling reads a file the
+        // caller never named, and the copy would then reproduce *that* file
+        // under a name the caller chose for a different one.
+        if let Some(existing) = self.case_collision_at(&source)? {
+            return Err(MutationError::CaseCollision {
+                path: from.clone(),
+                existing,
+            });
+        }
+        // A directory is refused here as `TargetExists` — "something else
+        // occupies this name" — rather than reaching an `EISDIR` from the read,
+        // which would tell a client the daemon is broken and invite a retry
+        // that can never succeed.
+        if !self.regular_file_exists(from, &source)? {
+            return Err(MutationError::NotFound { path: from.clone() });
+        }
+
+        let mut destination_path = to.clone();
+        let mut destination = self.resolve(&destination_path)?;
+        match if_exists {
+            CopyConflict::Error => {
+                // The case check comes before the existence check, and the
+                // order is load-bearing. On a case-folding filesystem
+                // `two.md` "exists" because `Two.md` does, so `target_exists`
+                // would name a path this vault does not store while the real
+                // hazard — a write landing on `Two.md` — went unnamed.
+                if let Some(existing) = self.case_collision_at(&destination)? {
+                    return Err(MutationError::CaseCollision {
+                        path: to.clone(),
+                        existing,
+                    });
+                }
+                if destination.exists() {
+                    return Err(MutationError::TargetExists { path: to.clone() });
+                }
+            }
+            CopyConflict::Suffix => {
+                if self.is_occupied(&destination)? {
+                    destination_path = available_sibling(to, |candidate| {
+                        let resolved = self.resolve(candidate)?;
+                        self.is_occupied(&resolved)
+                    })?;
+                    destination = self.resolve(&destination_path)?;
+                }
+            }
+        }
+        // And the stored half of the destination guard, which nothing lexical
+        // can stand in for: a symlink named `Link` pointing at `.obsidian`
+        // carries no dot and names no zone until it is resolved.
+        let stored_to = self.stored_path(&destination_path, &destination)?;
+        if is_unindexable(&stored_to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+
+        let revision = self.stream_copy(&source, &destination, expected_source, from)?;
+        let written = self.written_path(&destination_path, &destination, stored_to);
+        let semantic = written.is_markdown();
+        Ok(MutationOutcome {
+            // Ruling B4: the destination is a new tree row whatever its
+            // extension, and a created path the outcome does not name is a row
+            // that never lands. `semantic` is the independent fact — read off
+            // the destination, per the `MutationOutcome::semantic` table.
+            changed_paths: BTreeSet::from([written]),
+            revision: Some(revision),
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            semantic,
+        })
+    }
+
+    /// Stream `source`'s bytes into a temporary beside `destination`, hashing
+    /// them on the way, and rename it over `destination` once the precondition
+    /// has been checked against what was actually read.
+    ///
+    /// One pass, not two, and the reason is correctness rather than speed: a
+    /// separate verify-then-copy would hash bytes the copy did not necessarily
+    /// carry, so the revision handed back could describe a file that changed in
+    /// between. Here the revision returned is the hash of exactly the bytes
+    /// that landed.
+    ///
+    /// A failed precondition drops the temporary unpersisted, so the refusal
+    /// leaves the vault byte-identical: the temporary is never the destination
+    /// until `persist` makes it so, which is the same atomicity
+    /// [`write_atomically`] provides, and it carries the same `.vaultd-` prefix
+    /// with no extension so the scanner can never mistake it for a note.
+    fn stream_copy(
+        &self,
+        source: &Path,
+        destination: &Path,
+        expected: &Precondition,
+        from: &VaultPath,
+    ) -> Result<String, MutationError> {
+        let directory = destination.parent().ok_or_else(|| MutationError::Io {
+            message: format!("{} has no parent directory", destination.display()),
+        })?;
+        let mut reader = match std::fs::File::open(source) {
+            Ok(file) => file,
+            // Removed between the stat above and this open: still absence, and
+            // the caller hears the same `not_found` either way.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(MutationError::NotFound { path: from.clone() });
+            }
+            Err(error) => return Err(io(error)),
+        };
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".vaultd-")
+            .tempfile_in(directory)
+            .map_err(io)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer).map_err(io)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            temporary.write_all(&buffer[..read]).map_err(io)?;
+        }
+        // The same spelling `revision_of` produces, so a streamed revision and
+        // a buffered one are comparable strings.
+        let revision = format!("blake3:{}", hasher.finalize());
+        match expected {
+            Precondition::Revision(wanted) if wanted != &revision => {
+                return Err(MutationError::RevisionConflict {
+                    path: from.clone(),
+                    current: Some(revision),
+                });
+            }
+            _ => {}
+        }
+        // The destination does not exist — every branch above refused an
+        // occupied one — so this takes the containing folder's implied mode
+        // rather than `tempfile`'s owner-only default.
+        adopt_permissions(destination, temporary.as_file())?;
+        temporary.as_file().sync_all().map_err(io)?;
+        temporary
+            .persist(destination)
+            .map_err(|error| MutationError::Io {
+                message: error.error.to_string(),
+            })?;
+        Ok(revision)
+    }
+
+    /// Move one file — a note or an attachment — under a precondition.
+    ///
+    /// The engine half of `rename_note`: it moves bytes and reports what moved.
+    /// Link repair is the coordinator's, and `rewrite_links` never reaches
+    /// here.
+    fn rename_note(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        expected: &Precondition,
+    ) -> Result<MutationOutcome, MutationError> {
+        if is_unindexable(from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        if is_unindexable(to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        // Per the spec's validity table: `rename_note` accepts `revision` or
+        // `any`, never `absent` — a precondition asking for the source not to
+        // exist cannot guard a move of it.
+        if expected == &Precondition::Absent {
+            return Err(MutationError::InvalidPrecondition {
+                expected: expected.clone(),
+            });
+        }
+        let resolved = self.resolve(from)?;
+        // Before the precondition, because on a case-folding filesystem the
+        // precondition itself folds: a `revision` naming `One.md`'s bytes would
+        // *pass* for a caller who spelled `one.md`, and the move would then
+        // take a file the caller never addressed.
+        self.guard_source_case(from, to, &resolved)?;
+        // `regular_file_exists` inside refuses a directory as `TargetExists`,
+        // which is what keeps the note verb off a folder: the same
+        // `std::fs::rename` would happily move one, and the outcome would then
+        // report a revision for something that has no bytes.
+        self.require_regular_file(from, &resolved, expected)?;
+
+        let changed_paths = self.rename_paths(from, to)?;
+        let semantic = changed_paths.iter().any(VaultPath::is_markdown);
+        // Read after the move, from the file that is now there. Any failure is
+        // swallowed rather than propagated, for `written_path`'s reason: the
+        // move already landed, and a mutation that succeeded must never be
+        // reported to the caller as a failure. The revision is informational;
+        // the move is the operation.
+        let revision = self
+            .resolve(to)
+            .and_then(|destination| self.streamed_revision(to, &destination))
+            .ok()
+            .flatten();
+        Ok(MutationOutcome {
+            changed_paths,
+            revision,
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            semantic,
+        })
+    }
+
+    /// Move a folder and everything under it.
+    ///
+    /// Guarded like `delete_folder`, and for the same reason turned around:
+    /// without the folder-shaped guard a rename becomes the way to *create*
+    /// and to *reach* exactly what `create_folder` and `delete_folder` refuse
+    /// — `.git`, `.trash`, the configuration zone.
+    fn rename_folder(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+    ) -> Result<MutationOutcome, MutationError> {
+        if is_unindexable_folder(from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        if is_unindexable_folder(to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        let resolved = self.resolve(from)?;
+        // The same three-way answer `delete_folder` gives, for the same
+        // reasons: a symlink is not the folder it points at, and a file is not
+        // a folder at all.
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(MutationError::TargetExists { path: from.clone() });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(MutationError::NotFound { path: from.clone() });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(MutationError::NotFound { path: from.clone() });
+            }
+            Err(error) => return Err(io(error)),
+        }
+        let changed_paths = self.rename_paths(from, to)?;
+        Ok(MutationOutcome {
+            // Read off the Markdown subset, not off `changed_paths`, per the
+            // `MutationOutcome::semantic` table: a folder of attachments moves
+            // every tree row under it and no semantic row at all.
+            semantic: changed_paths.iter().any(VaultPath::is_markdown),
+            changed_paths,
+            // A folder has no bytes to hash, so it reports no revision — never
+            // an empty string. The wire's `RenameResponse.revision` is optional
+            // for exactly this.
+            revision: None,
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+        })
+    }
+
+    /// The case guard a rename applies to its **source**, with the one
+    /// exemption a case-only rename needs.
+    ///
+    /// Ordinarily a folded source spelling is refused exactly as it is for a
+    /// delete: `one.md` beside a stored `One.md` names a file this vault does
+    /// not hold, and moving the stored one instead would move a file the caller
+    /// never addressed. A case-only rename is the deliberate exception. There
+    /// the fold *is* the operation — the caller is asking for `One.md` to
+    /// become `ONE.md`, and on a case-insensitive filesystem the source and the
+    /// destination are the same file — so refusing the fold would refuse the
+    /// only spelling in which the request can be made.
+    fn guard_source_case(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        resolved: &Path,
+    ) -> Result<(), MutationError> {
+        if is_case_only_rename(from, to) {
+            return Ok(());
+        }
+        match self.case_collision_at(resolved)? {
+            Some(existing) => Err(MutationError::CaseCollision {
+                path: from.clone(),
+                existing,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Move `from` to `to` and report **every** path whose state moved: the
+    /// vacated spellings and the occupied ones, of every kind. Works for a file
+    /// or a folder — the only difference is how many paths come back.
+    ///
+    /// This is the movement primitive Task 12 calls after it has rewritten the
+    /// referrers, so it carries its own guards rather than trusting the arm
+    /// above it: a direct caller gets the same refusals. Nothing here knows
+    /// about links.
+    ///
+    /// Refuses an existing destination outright: there is no
+    /// overwrite-on-rename, and a mover who means replace must delete first,
+    /// visibly. A case-only rename (`One.md` to `ONE.md`) is the one exception,
+    /// and goes through a temporary name because on a case-insensitive
+    /// filesystem the source and destination are the same file.
+    ///
+    /// Every path it reports is spelled the way the filesystem stores it, per
+    /// `MutationOutcome::changed_paths`. The source side is captured *before*
+    /// the move, because afterwards there is nothing left to canonicalize and
+    /// the caller's own spelling would reach the index as a key the scanner
+    /// never emits.
+    pub fn rename_paths(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+    ) -> Result<BTreeSet<VaultPath>, MutationError> {
+        if self.read_only {
+            return Err(MutationError::ReadOnly);
+        }
+        if is_unindexable(from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        if is_unindexable(to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        let source = self.resolve(from)?;
+        // A symlink is not the thing it points at. `std::fs::rename` moves the
+        // link while `paths_under` walks the link's *target*, so a rename
+        // through one would report the target's notes as moved while every one
+        // of them stayed exactly where it was — a hint that lies in the most
+        // expensive direction. Refused, so the caller says what it means.
+        let metadata = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(MutationError::TargetExists { path: from.clone() });
+            }
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(MutationError::NotFound { path: from.clone() });
+            }
+            Err(error) => return Err(io(error)),
+        };
+        let source_is_dir = metadata.is_dir();
+        // The folder-shaped half of the guard, which `is_unindexable` cannot
+        // give: `VaultPath::is_hidden` never judges the last component, because
+        // nothing lexical tells a hidden *file* from a hidden *directory*. A
+        // rename that knows its target is a directory applies it itself, or a
+        // rename becomes the way to create `.git` and to move `.trash` out into
+        // the open.
+        if source_is_dir && is_unindexable_folder(from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        if source_is_dir && is_unindexable_folder(to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+
+        let case_only = is_case_only_rename(from, to);
+        if !case_only {
+            if let Some(existing) = self.case_collision_at(&source)? {
+                return Err(MutationError::CaseCollision {
+                    path: from.clone(),
+                    existing,
+                });
+            }
+        }
+        // The case-only exemption is the one place in the engine where a folded
+        // caller spelling gets this far, so it is worth stating why that is
+        // safe: `captured_path` canonicalizes, `canonicalize` is `realpath(3)`,
+        // and on APFS that returns the *stored* case of every component. A
+        // caller who spelled `one.md` therefore still has `One.md` reported as
+        // the vacated path, which is the spelling the scanner emits.
+        let stored_from = self.captured_path(from, &source)?;
+        if is_unindexable(&stored_from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+        if source_is_dir && is_unindexable_folder(&stored_from) {
+            return Err(MutationError::ZoneViolation { path: from.clone() });
+        }
+
+        let destination = self.resolve(to)?;
+        let stored_to = self.stored_path(to, &destination)?;
+        if is_unindexable(&stored_to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        if source_is_dir && is_unindexable_folder(&stored_to) {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        // A folder cannot become its own descendant. The kernel refuses that
+        // rename with `EINVAL`, which would reach a client as
+        // `storage_failure` — a claim the daemon is broken and an invitation to
+        // retry a request that can never succeed. Refused as an invalid target
+        // for this operation instead, which is what the message says.
+        if stored_to
+            .as_str()
+            .starts_with(&format!("{}/", stored_from.as_str()))
+        {
+            return Err(MutationError::ZoneViolation { path: to.clone() });
+        }
+        if !case_only {
+            // Case before existence, for the reason `copy_file` gives: on a
+            // case-folding filesystem `two.md` "exists" because `Two.md` does,
+            // and `target_exists` would name a path this vault does not store.
+            if let Some(existing) = self.case_collision_at(&destination)? {
+                return Err(MutationError::CaseCollision {
+                    path: to.clone(),
+                    existing,
+                });
+            }
+            if destination.exists() {
+                return Err(MutationError::TargetExists { path: to.clone() });
+            }
+        }
+
+        // Enumerated *before* the move, under the stored spelling, per Ruling
+        // B4: every path that leaves its old location has to reach
+        // reconciliation, or its rows describe a path that is no longer there.
+        // Attachments and subfolders included — the index has held a row per
+        // tree entry since the tree pre-task.
+        let mut changed: BTreeSet<VaultPath> = BTreeSet::new();
+        if source_is_dir {
+            changed.extend(paths_under(&self.canonical_root, &stored_from)?);
+        }
+        changed.insert(stored_from);
+
+        if case_only {
+            // On a case-insensitive filesystem the source and the destination
+            // are the same file, so a direct rename is either a no-op or
+            // refused. A staging directory beside the destination gives the
+            // file a name that folds onto neither. `.vaultd-` with no extension
+            // again, so the scanner can never see it as a note, and the
+            // `TempDir` removes it on drop however this returns.
+            let parent = destination.parent().ok_or_else(|| MutationError::Io {
+                message: format!("{} has no parent directory", destination.display()),
+            })?;
+            let staging = tempfile::Builder::new()
+                .prefix(".vaultd-")
+                .tempdir_in(parent)
+                .map_err(io)?;
+            let intermediate = staging.path().join("staged");
+            std::fs::rename(&source, &intermediate).map_err(io)?;
+            std::fs::rename(&intermediate, &destination).map_err(io)?;
+        } else {
+            std::fs::rename(&source, &destination).map_err(io)?;
+        }
+
+        // And the occupied side, canonicalized *after* the move for the reason
+        // `written_path` gives: a Unicode normalization difference survives
+        // every check before the write, and only a full canonicalize settles
+        // it.
+        let written_to = self.written_path(to, &destination, stored_to);
+        if source_is_dir {
+            changed.extend(paths_under(&self.canonical_root, &written_to)?);
+        }
+        changed.insert(written_to);
+        Ok(changed)
+    }
+}
+
+/// Whether these two spellings differ only in case, which is the one rename a
+/// case-insensitive filesystem cannot serve directly.
+fn is_case_only_rename(from: &VaultPath, to: &VaultPath) -> bool {
+    from.as_str() != to.as_str() && from.as_str().to_lowercase() == to.as_str().to_lowercase()
+}
+
+/// The first `name N.ext` spelling beside `path` that `occupied` says is free,
+/// matching Obsidian's `getAvailablePath` numbering.
+///
+/// The number goes on the **file name**, never on the path: a dot in a folder
+/// segment (`v1.0/Note`) is not an extension separator, and splitting the whole
+/// string on its last dot would produce `v1 1.0/Note`. A leading dot is not one
+/// either — `.env` numbers as `.env 1`, not as ` 1.env`.
+fn available_sibling(
+    path: &VaultPath,
+    occupied: impl Fn(&VaultPath) -> Result<bool, MutationError>,
+) -> Result<VaultPath, MutationError> {
+    let text = path.as_str();
+    let (folder, name) = match text.rsplit_once('/') {
+        Some((folder, name)) => (format!("{folder}/"), name),
+        None => (String::new(), text),
+    };
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    for suffix in 1u32..10_000 {
+        let candidate = VaultPath::new(format!("{folder}{stem} {suffix}{extension}"))
+            .map_err(|_| MutationError::ZoneViolation { path: path.clone() })?;
+        if !occupied(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(MutationError::TargetExists { path: path.clone() })
 }
 
 /// Every path under `folder`, of every kind — notes, attachments, and the
