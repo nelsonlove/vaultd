@@ -455,24 +455,19 @@ fn an_io_refusal_never_leaks_a_filesystem_path_on_the_wire() {
     );
 }
 
-/// **TRIPWIRE — Task 12 must flip this test, not delete it.**
+/// The Task 12 tripwire, flipped — it was
+/// `task_12_must_flip_this_rename_still_breaks_inbound_links` while link
+/// repair was unbuilt, and it pinned the honest-but-broken shape so the gap
+/// stayed visible in the suite rather than only in a plan document.
 ///
-/// `rename_note` accepts `rewrite_links` (wire default `true`) and the engine
-/// destructures it to `_`. Nothing repairs an inbound reference yet, so today
-/// a rename breaks every link into the renamed note while answering
-/// `links_rewritten: 0` with an empty `link_rewrite_failures` — which is an
-/// affirmative statement that nothing failed. That is a contract violation:
-/// the design says `rewrite_links` defaults true and repairs inbound
-/// references, and a client that spells nothing gets silent link rot.
-///
-/// This test pins the honest-but-broken shape on purpose, so the gap is
-/// visible in the suite rather than only in a plan document. It is not an
-/// endorsement. When Task 12 lands the link-repair burst, these assertions
-/// invert: `links_rewritten` becomes 1 and the referrer's bytes become
-/// `[[Renamed]]`. A descoped Task 12 leaves behind a test that documents the
-/// hazard instead of a green suite that hides it.
+/// What it pins now is the promise itself: `rewrite_links` defaults `true` on
+/// the wire, so a client that spells nothing gets its inbound links repaired.
+/// `links_rewritten` counts them, `link_rewrite_failures` stays empty because
+/// nothing was skipped, the referrer's bytes name the new path, and the index
+/// agrees the reference still resolves — the honest reading of those bytes,
+/// not a stale row.
 #[test]
-fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
+fn a_rename_repairs_every_inbound_link_by_default() {
     let vault = TempDir::new().expect("vault tempdir");
     let index = TempDir::new().expect("index tempdir");
     std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
@@ -487,13 +482,11 @@ fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
     );
     match renamed.outcome {
         ResponseOutcome::Ok(Response::RenameNote(response)) => {
-            assert_eq!(
-                response.links_rewritten, 0,
-                "TASK 12: this must become 1 when link repair lands"
-            );
+            assert_eq!(response.links_rewritten, 1);
             assert!(
                 response.link_rewrite_failures.is_empty(),
-                "TASK 12: nothing is even attempted yet, so nothing can fail"
+                "nothing was skipped, so nothing may be reported as skipped: {:?}",
+                response.link_rewrite_failures
             );
         }
         other => panic!("rename_note did not reach the engine: {other:?}"),
@@ -502,11 +495,10 @@ fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
     assert!(vault.path().join("Renamed.md").is_file());
     assert_eq!(
         std::fs::read_to_string(vault.path().join("Two.md")).expect("read Two back"),
-        "# Two\n[[One]]\n",
-        "TASK 12: this must become \"# Two\\n[[Renamed]]\\n\" when link repair lands"
+        "# Two\n[[Renamed]]\n",
     );
 
-    // And the index agrees the link is now broken — the honest reading of the
+    // And the index agrees the link still resolves — the honest reading of the
     // bytes above, not a stale row.
     let read_back = daemon.call(
         r#"{"version":1,"id":"g","request":{"method":"get_note","params":{"path":"Two.md"}}}"#,
@@ -514,10 +506,14 @@ fn task_12_must_flip_this_rename_still_breaks_inbound_links() {
     match read_back.outcome {
         ResponseOutcome::Ok(Response::GetNote(response)) => {
             assert_eq!(response.note.outgoing.len(), 1);
-            assert_eq!(
-                response.note.outgoing[0].resolution,
-                vault_protocol::ResolutionDto::Unresolved,
-                "TASK 12: this must resolve to Renamed.md when link repair lands"
+            assert!(
+                matches!(
+                    &response.note.outgoing[0].resolution,
+                    vault_protocol::ResolutionDto::Resolved { target, .. }
+                        if target == "Renamed.md"
+                ),
+                "the repaired reference must resolve at the new path: {:?}",
+                response.note.outgoing[0].resolution
             );
         }
         other => panic!("get_note failed: {other:?}"),
@@ -668,23 +664,22 @@ fn a_landed_write_reports_storage_failure_whatever_the_reconciliation_failed_wit
     );
 }
 
-/// **TRIPWIRE — Task 12 must flip this test, not delete it.** The
-/// `rename_folder` twin of the one above.
+/// The Task 12 tripwire's folder twin, flipped — it was
+/// `task_12_must_flip_this_folder_rename_still_breaks_inbound_links` while
+/// link repair was unbuilt.
 ///
 /// A folder rename moves every note under it at once, so it is the shape with
 /// the most inbound references to repair and the most to break by not
 /// repairing them. The design says `rename_folder` "repairs inbound references
-/// for every contained note", `rewrite_links` defaults `true`, and the engine
-/// destructures it to `_` — so today a client that spells nothing renames a
-/// folder, is told `links_rewritten: 0` with no failures, and every path-form
-/// reference into that folder is silently dead.
+/// for every contained note", and `rewrite_links` defaults `true`.
 ///
-/// This test pins the break with a before/after pair: the reference resolves
-/// while the folder is where it was, and is `unresolved` afterwards. When Task
-/// 12 lands, `links_rewritten` becomes 1, `Two.md` reads `[[Renamed/One]]`,
-/// and the second resolution assertion goes back to `Resolved`.
+/// The claim is pinned with a before/after pair: the reference resolves while
+/// the folder is where it was, and still resolves — at the new path — once it
+/// has moved. The path form is what makes that mean something, and the
+/// spelling stays a path form: shortening `[[Renamed/One]]` to `[[One]]`
+/// would resolve too, and would be a rewrite the author never asked for.
 #[test]
-fn task_12_must_flip_this_folder_rename_still_breaks_inbound_links() {
+fn a_folder_rename_repairs_every_inbound_link_by_default() {
     let vault = TempDir::new().expect("vault tempdir");
     let index = TempDir::new().expect("index tempdir");
     std::fs::create_dir(vault.path().join("Folder")).expect("create Folder");
@@ -718,13 +713,11 @@ fn task_12_must_flip_this_folder_rename_still_breaks_inbound_links() {
     );
     match renamed.outcome {
         ResponseOutcome::Ok(Response::RenameFolder(response)) => {
-            assert_eq!(
-                response.links_rewritten, 0,
-                "TASK 12: this must become 1 when link repair lands"
-            );
+            assert_eq!(response.links_rewritten, 1);
             assert!(
                 response.link_rewrite_failures.is_empty(),
-                "TASK 12: nothing is even attempted yet, so nothing can fail"
+                "nothing was skipped, so nothing may be reported as skipped: {:?}",
+                response.link_rewrite_failures
             );
             assert!(
                 response.revision.is_none(),
@@ -737,8 +730,7 @@ fn task_12_must_flip_this_folder_rename_still_breaks_inbound_links() {
     assert!(vault.path().join("Renamed/One.md").is_file());
     assert_eq!(
         std::fs::read_to_string(vault.path().join("Two.md")).expect("read Two back"),
-        "# Two\n[[Folder/One]]\n",
-        "TASK 12: this must become \"# Two\\n[[Renamed/One]]\\n\" when link repair lands"
+        "# Two\n[[Renamed/One]]\n",
     );
 
     let after = daemon.call(
@@ -747,10 +739,14 @@ fn task_12_must_flip_this_folder_rename_still_breaks_inbound_links() {
     match after.outcome {
         ResponseOutcome::Ok(Response::GetNote(response)) => {
             assert_eq!(response.note.outgoing.len(), 1);
-            assert_eq!(
-                response.note.outgoing[0].resolution,
-                vault_protocol::ResolutionDto::Unresolved,
-                "TASK 12: this must stay resolved, at Renamed/One.md, when link repair lands"
+            assert!(
+                matches!(
+                    &response.note.outgoing[0].resolution,
+                    vault_protocol::ResolutionDto::Resolved { target, .. }
+                        if target == "Renamed/One.md"
+                ),
+                "the repaired reference must resolve at the new path: {:?}",
+                response.note.outgoing[0].resolution
             );
         }
         other => panic!("get_note failed: {other:?}"),

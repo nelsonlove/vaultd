@@ -133,6 +133,13 @@ fn revision_changes(before: &State, after: &State) -> BTreeSet<String> {
 #[derive(Clone, Copy, Debug)]
 enum Expect {
     Lands,
+    /// Lands **and** repairs at least one inbound link. The rename steps carry
+    /// this: `rewrite_links` is honoured by the coordinator, so a rename that
+    /// answered `links_rewritten: 0` would be claiming nothing pointed at what
+    /// it moved — which the fixture below makes false on purpose. The three
+    /// axes then check that the referrers the burst rewrote reached a
+    /// generation, which is the half a bare `Lands` cannot see.
+    LandsRepairingLinks,
     /// Refused because the verb is not wired yet. A refusal is still checked
     /// on all three axes: nothing moved, so no generation may appear.
     RefusedUntilTask16,
@@ -404,9 +411,13 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
     // a root `Zeta.md` would keep `[[Zeta]]` unambiguous however many nested
     // namesakes existed.
     let steps: Vec<(&str, String, Expect)> = vec![
+        // `[[Nested/Gamma]]` is written before its note exists and in **path
+        // form** on purpose: it is what gives the two rename steps below
+        // something to repair, and a path form is the shape a rename really
+        // breaks — a bare stem would keep resolving wherever the note landed.
         (
             "write_note",
-            r##"{"path":"Beta.md","content":"# Beta\n[[Alpha#Heading]]\n[[Alpha#Missing]]\n","expected":{"absent":true}}"##.to_string(),
+            r##"{"path":"Beta.md","content":"# Beta\n[[Alpha#Heading]]\n[[Alpha#Missing]]\n[[Nested/Gamma]]\n","expected":{"absent":true}}"##.to_string(),
             Expect::Lands,
         ),
         ("create_folder", r#"{"path":"Nested"}"#.to_string(), Expect::Lands),
@@ -456,31 +467,28 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
             r#"{"from":"Nested/Zeta.md","to":"Other/Zeta.md","expected_source":{"any":true},"if_exists":"error"}"#.to_string(),
             Expect::Lands,
         ),
-        // TRIPWIRE — Task 12 must flip this step, not delete it
-        // (`task_12_must_flip_rename_note_link_repair`). `rewrite_links` is
-        // honoured by the engine's caller, and link repair lands in Task 12;
-        // until then the flag is a no-op and the three axes hold trivially.
-        // Once repair lands, this step also moves every *referencing* note,
-        // and axis 3 starts checking that the repair burst names them.
+        // The Task 12 tripwire step, flipped. `rewrite_links` is honoured by
+        // the coordinator, so this step now also moves `Beta.md` — the
+        // referrer whose `[[Nested/Gamma]]` has to become `[[Nested/Delta]]`
+        // — and axis 3 checks that the repair burst named it.
         (
             "rename_note",
             r#"{"from":"Nested/Gamma.md","to":"Nested/Delta.md","expected":{"any":true},"rewrite_links":true}"#.to_string(),
-            Expect::Lands,
+            Expect::LandsRepairingLinks,
         ),
         (
             "delete_note",
             r#"{"path":"Other/Zeta.md","mode":"permanent","expected":{"any":true}}"#.to_string(),
             Expect::Lands,
         ),
-        // TRIPWIRE — Task 12 must flip this step, not delete it
-        // (`task_12_must_flip_rename_folder_link_repair`). Same reasoning as
-        // the note rename above, one level up: today the flag changes
-        // nothing, and after Task 12 the moved folder's referencing notes
-        // join the change set this step checks.
+        // The folder half of that tripwire step, flipped. Same reasoning one
+        // level up: the moved folder's referencing notes join the change set
+        // this step checks, and `[[Nested/Delta]]` in `Beta.md` — a path form,
+        // so the move genuinely breaks it — becomes `[[Moved/Delta]]`.
         (
             "rename_folder",
             r#"{"from":"Nested","to":"Moved","rewrite_links":true}"#.to_string(),
-            Expect::Lands,
+            Expect::LandsRepairingLinks,
         ),
         (
             "delete_folder",
@@ -498,6 +506,25 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                 "{method} {params} failed: {:?}",
                 response.outcome
             ),
+            Expect::LandsRepairingLinks => {
+                let (rewritten, failures) = match &response.outcome {
+                    ResponseOutcome::Ok(Response::RenameNote(rename)) => {
+                        (rename.links_rewritten, &rename.link_rewrite_failures)
+                    }
+                    ResponseOutcome::Ok(Response::RenameFolder(rename)) => {
+                        (rename.links_rewritten, &rename.link_rewrite_failures)
+                    }
+                    other => panic!("{method} {params} failed: {other:?}"),
+                };
+                assert!(
+                    rewritten >= 1,
+                    "{method} {params} repaired nothing, but the fixture points at what it moved"
+                );
+                assert!(
+                    failures.is_empty(),
+                    "{method} {params} skipped a referrer it should have rewritten: {failures:?}"
+                );
+            }
             Expect::RefusedUntilTask16 => match &response.outcome {
                 ResponseOutcome::Err(error) => assert_eq!(
                     error.code,

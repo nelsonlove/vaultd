@@ -38,6 +38,11 @@ pub enum HookPoint {
     /// would — is what makes the compare-and-swap's re-check deterministic
     /// instead of a matter of timing.
     AfterMutationPrecondition,
+    /// Every referencing note has been rewritten and the renamed file has not
+    /// moved yet. Aborting from here produces exactly the crash the ordering
+    /// guarantee is about, so the convergence claim can be asserted rather
+    /// than argued.
+    BeforeRenameMove,
 }
 
 /// A test's callback into the engine. `Send + Sync` because the writer may

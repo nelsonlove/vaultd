@@ -152,11 +152,188 @@ impl IndexService {
 
     /// Apply one mutation to the vault. Filesystem-only: publishing what it
     /// changed is the caller's next step, through `refresh_paths`.
+    ///
+    /// Everything except a link-repairing rename is pure filesystem work and
+    /// goes straight to the engine. A repairing rename is the one operation
+    /// that needs the index — the live graph to know *which* references point
+    /// at the moved note, the durable rows to know *how* to rewrite them — so
+    /// it runs here, as one burst, serialized against every other mutation by
+    /// the coordinator that owns this service.
     pub fn apply_mutation(
         &mut self,
         mutation: &crate::mutate::Mutation,
     ) -> Result<crate::mutate::MutationOutcome, IndexError> {
-        Ok(self.engine.apply(mutation)?)
+        // Read-only is checked **first**, above every other consideration.
+        // `MutationEngine::apply` checks it too, but a repairing rename does
+        // work before it reaches `apply`: it enumerates a folder's notes and
+        // reads the index, so on a read-only daemon a rename of a folder that
+        // does not exist would fail with a filesystem error — surfacing as
+        // `storage_failure` — instead of the dedicated `read_only` code the
+        // flag exists to produce. Refuse here, before any path is touched.
+        if self.engine.is_read_only() {
+            return Err(crate::mutate::MutationError::ReadOnly.into());
+        }
+        match mutation {
+            crate::mutate::Mutation::RenameNote {
+                from,
+                to,
+                expected,
+                rewrite_links: true,
+            } => self.rename_with_repair(from, to, Some(expected)),
+            crate::mutate::Mutation::RenameFolder {
+                from,
+                to,
+                rewrite_links: true,
+            } => self.rename_with_repair(from, to, None),
+            other => Ok(self.engine.apply(other)?),
+        }
+    }
+
+    /// Rewrite every referencing note, then move the file — in that order,
+    /// and never the reverse.
+    ///
+    /// A crash between the two leaves references pointing at a path the note
+    /// has not reached yet: visible as unresolved references, convergent when
+    /// the client retries, and never the failure mode the other order would
+    /// produce — a moved note with stale inbound links that look resolved and
+    /// are not.
+    ///
+    /// `expected` present means the note shape, absent the folder one. The
+    /// movement itself goes back through `MutationEngine::apply`, so the
+    /// repairing and non-repairing renames move bytes through exactly the same
+    /// code — the same `rename_paths` primitive, the same guards, the same
+    /// `MutationOutcome`. Only `changed_paths`, `links_rewritten`, and
+    /// `link_rewrite_failures` are this function's own; `revision` and
+    /// `semantic` are read off that outcome rather than restated here, because
+    /// restating them is how a folder rename ends up claiming a revision it
+    /// has no bytes to hash. Routing the movement back through the engine also
+    /// means the precondition is re-evaluated with nothing between it and the
+    /// move — `rename_note`'s own re-check — which is the window the referrer
+    /// rewrites open and the first check cannot cover.
+    fn rename_with_repair(
+        &mut self,
+        from: &VaultPath,
+        to: &VaultPath,
+        expected: Option<&crate::mutate::Precondition>,
+    ) -> Result<crate::mutate::MutationOutcome, IndexError> {
+        // Every refusal first: a rename that will fail must not have edited a
+        // single referrer on its way to failing. This is `rename_paths`'s own
+        // guard set, run for its refusals only.
+        self.engine.preflight_rename(from, to)?;
+        if let Some(expected) = expected {
+            self.engine.check_rename_source(from, expected)?;
+        }
+
+        let moves = self.repair_moves(from, to, expected.is_some())?;
+        let mut changed_paths: BTreeSet<VaultPath> = BTreeSet::new();
+        let mut links_rewritten = 0u64;
+        let mut failures: Vec<crate::mutate::LinkRewriteFailure> = Vec::new();
+
+        match self.store.current_generation()? {
+            Some(generation) => {
+                self.republish_current(generation)?;
+                // The graph handle is released at the end of this block, before
+                // anything publishes: a live clone would force the next delta
+                // install to copy the whole graph.
+                let repair = {
+                    let graph = self.published_graph(generation)?;
+                    crate::mutate::rename::plan_repair(&graph, &self.store, &self.engine, &moves)?
+                };
+                failures = repair.failures;
+                for rewrite in repair.rewrites {
+                    let resolved = self.engine.resolve(&rewrite.path)?;
+                    match crate::mutate::write_atomically(&resolved, rewrite.patched.as_bytes()) {
+                        Ok(()) => {
+                            links_rewritten += rewrite.links;
+                            changed_paths.insert(rewrite.path);
+                        }
+                        Err(error) => failures.push(crate::mutate::LinkRewriteFailure {
+                            path: rewrite.path,
+                            reason: error.to_string(),
+                        }),
+                    }
+                }
+            }
+            // Nothing has ever been published, so there is no graph to ask
+            // which references point here. The move still happens — refusing
+            // it would make an unbuilt index block a filesystem operation —
+            // but the answer says so, because `links_rewritten: 0` with no
+            // failures is an affirmative claim that nothing needed repair.
+            None => failures.push(crate::mutate::LinkRewriteFailure {
+                path: from.clone(),
+                reason: "index_unavailable".into(),
+            }),
+        }
+
+        self.reach(crate::HookPoint::BeforeRenameMove);
+        let moved = self.engine.apply(&match expected {
+            Some(expected) => crate::mutate::Mutation::RenameNote {
+                from: from.clone(),
+                to: to.clone(),
+                expected: expected.clone(),
+                rewrite_links: false,
+            },
+            None => crate::mutate::Mutation::RenameFolder {
+                from: from.clone(),
+                to: to.clone(),
+                rewrite_links: false,
+            },
+        })?;
+        changed_paths.extend(moved.changed_paths);
+
+        Ok(crate::mutate::MutationOutcome {
+            changed_paths,
+            revision: moved.revision,
+            links_rewritten,
+            link_rewrite_failures: failures,
+            // A rewritten referrer is a note by construction, so a burst that
+            // repaired anything moved the semantic layer even in the shape
+            // where the thing that *moved* was not itself a note.
+            semantic: moved.semantic || links_rewritten > 0,
+        })
+    }
+
+    /// The `from -> to` map link repair works from: one entry for a note
+    /// rename, one per contained **note** for a folder rename.
+    ///
+    /// `paths_under` reports every kind — attachments and subfolders included,
+    /// because the file tree needs them — and this map deliberately keeps only
+    /// the Markdown ones. The rewriter's job is wikilinks between notes; the
+    /// live graph holds no attachment identity to select references against,
+    /// so feeding it the wider set would widen the walk (a `load_note` and a
+    /// candidate-key sweep per attachment) to answer nothing.
+    ///
+    /// Keyed by the **stored** spelling on both sides, because that is what
+    /// the index and the graph are keyed by: a caller's `nested/` against a
+    /// stored `Nested/` would produce a map that matches no note at all.
+    fn repair_moves(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        is_note: bool,
+    ) -> Result<std::collections::BTreeMap<VaultPath, VaultPath>, IndexError> {
+        let mut moves = std::collections::BTreeMap::new();
+        let stored_from = self.engine.stored_spelling(from)?;
+        if is_note {
+            moves.insert(stored_from, to.clone());
+            return Ok(moves);
+        }
+        for path in crate::mutate::paths_under(&self.config.canonical_vault_root, &stored_from)? {
+            if !path.is_markdown() {
+                continue;
+            }
+            let Some(suffix) = path
+                .as_str()
+                .strip_prefix(stored_from.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+            else {
+                continue;
+            };
+            let destination = VaultPath::new(format!("{}/{suffix}", to.as_str()))
+                .map_err(|error| IndexError::InvalidPath(error.to_string()))?;
+            moves.insert(path, destination);
+        }
+        Ok(moves)
     }
 
     /// Refuse every mutation. Reads, snapshots, and reconciliation are

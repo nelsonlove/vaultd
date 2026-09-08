@@ -19,6 +19,7 @@
 //! Nothing here knows about protocol types, the coordinator, or generations.
 
 pub mod frontmatter;
+pub(crate) mod rename;
 
 use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
@@ -2046,6 +2047,12 @@ impl MutationEngine {
         // `std::fs::rename` would happily move one, and the outcome would then
         // report a revision for something that has no bytes.
         self.require_regular_file(from, &resolved, expected)?;
+        // And again with nothing between the guard and the movement, the way
+        // `write_note` and `delete_note` take theirs. A rename is destructive
+        // at the source: a caller that lost the race in between would move a
+        // file whose bytes it never verified, and the loser would be left with
+        // neither its content at the old path nor a revision to retry against.
+        self.recheck_present(from, &resolved, expected)?;
 
         let changed_paths = self.rename_paths(from, to)?;
         let semantic = changed_paths.iter().any(VaultPath::is_markdown);
@@ -2151,10 +2158,17 @@ impl MutationEngine {
     /// vacated spellings and the occupied ones, of every kind. Works for a file
     /// or a folder — the only difference is how many paths come back.
     ///
-    /// This is the movement primitive Task 12 calls after it has rewritten the
-    /// referrers, so it carries its own guards rather than trusting the arm
-    /// above it: a direct caller gets the same refusals. Nothing here knows
-    /// about links.
+    /// This is the movement primitive underneath every rename verb, including
+    /// the link-repairing ones, so it carries its own guards rather than
+    /// trusting the arm above it: a direct caller gets the same refusals.
+    /// Nothing here knows about links.
+    ///
+    /// Those guards are also available on their own, as
+    /// [`MutationEngine::preflight_rename`], because link repair rewrites the
+    /// referrers *before* the move and a refusal discovered at move time would
+    /// leave the vault edited for a rename that never happened. Both go
+    /// through the same `plan_rename`, so the preflight can never let through
+    /// what the movement then refuses.
     ///
     /// Refuses an existing destination outright: there is no
     /// overwrite-on-rename, and a mover who means replace must delete first,
@@ -2172,6 +2186,86 @@ impl MutationEngine {
         from: &VaultPath,
         to: &VaultPath,
     ) -> Result<BTreeSet<VaultPath>, MutationError> {
+        let plan = self.plan_rename(from, to)?;
+
+        // Enumerated *before* the move, under the stored spelling, per Ruling
+        // B4: every path that leaves its old location has to reach
+        // reconciliation, or its rows describe a path that is no longer there.
+        // Attachments and subfolders included — the index has held a row per
+        // tree entry since the tree pre-task.
+        let mut changed: BTreeSet<VaultPath> = BTreeSet::new();
+        if plan.source_is_dir {
+            changed.extend(paths_under(&self.canonical_root, &plan.stored_from)?);
+        }
+        changed.insert(plan.stored_from);
+
+        if plan.case_only {
+            staged_rename(&plan.source, &plan.destination, |from, to| {
+                std::fs::rename(from, to)
+            })?;
+        } else {
+            std::fs::rename(&plan.source, &plan.destination).map_err(io)?;
+        }
+
+        // And the occupied side, canonicalized *after* the move for the reason
+        // `written_path` gives: a Unicode normalization difference survives
+        // every check before the write, and only a full canonicalize settles
+        // it.
+        let written_to = self.written_path(to, &plan.destination, plan.stored_to);
+        if plan.source_is_dir {
+            changed.extend(paths_under(&self.canonical_root, &written_to)?);
+        }
+        changed.insert(written_to);
+        Ok(changed)
+    }
+
+    /// Every reason a rename will be refused, checked before anything is
+    /// written and before anything is enumerated.
+    ///
+    /// Link repair rewrites referencing notes *before* the move, so a refusal
+    /// discovered at move time would leave the vault edited for a rename that
+    /// never happened. This is the whole guard set [`MutationEngine::rename_paths`]
+    /// applies — the same function, called for its refusals and not for its
+    /// answer — so the two can never drift apart into a preflight that lets
+    /// through what the movement then refuses.
+    pub fn preflight_rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), MutationError> {
+        self.plan_rename(from, to).map(|_| ())
+    }
+
+    /// The stored spelling of an existing path: the one the filesystem holds
+    /// and the scanner emits, not the one a caller sent.
+    ///
+    /// A caller that keys anything by a path — index rows, a link-repair move
+    /// map — needs this rather than its own spelling, for
+    /// [`MutationEngine::stored_path`]'s reason: on a case-folding filesystem
+    /// `folder/note.md` reaches a stored `Folder/Note.md`, and a map keyed by
+    /// the caller's spelling matches nothing the index knows.
+    pub fn stored_spelling(&self, path: &VaultPath) -> Result<VaultPath, MutationError> {
+        let resolved = self.resolve(path)?;
+        self.captured_path(path, &resolved)
+    }
+
+    /// Evaluate `expected` against the file a rename is about to move,
+    /// **without reading its payload**.
+    ///
+    /// The repairing-rename coordinator needs this before it rewrites a single
+    /// referrer, so a rename that will be refused has edited nothing on its
+    /// way to failing. [`MutationEngine::check`] would answer the same
+    /// question and hand back the bytes, which is the wrong trade here: a
+    /// rename's source can be a multi-gigabyte attachment, and nothing in this
+    /// path wants its content. The re-check with nothing between it and the
+    /// movement is `rename_note`'s own, further down.
+    pub fn check_rename_source(
+        &self,
+        path: &VaultPath,
+        expected: &Precondition,
+    ) -> Result<(), MutationError> {
+        let resolved = self.resolve(path)?;
+        self.require_regular_file(path, &resolved, expected)
+    }
+
+    /// Everything `rename_paths` decides before it touches the filesystem.
+    fn plan_rename(&self, from: &VaultPath, to: &VaultPath) -> Result<RenamePlan, MutationError> {
         if self.read_only {
             return Err(MutationError::ReadOnly);
         }
@@ -2278,34 +2372,26 @@ impl MutationEngine {
             }
         }
 
-        // Enumerated *before* the move, under the stored spelling, per Ruling
-        // B4: every path that leaves its old location has to reach
-        // reconciliation, or its rows describe a path that is no longer there.
-        // Attachments and subfolders included — the index has held a row per
-        // tree entry since the tree pre-task.
-        let mut changed: BTreeSet<VaultPath> = BTreeSet::new();
-        if source_is_dir {
-            changed.extend(paths_under(&self.canonical_root, &stored_from)?);
-        }
-        changed.insert(stored_from);
-
-        if case_only {
-            staged_rename(&source, &destination, |from, to| std::fs::rename(from, to))?;
-        } else {
-            std::fs::rename(&source, &destination).map_err(io)?;
-        }
-
-        // And the occupied side, canonicalized *after* the move for the reason
-        // `written_path` gives: a Unicode normalization difference survives
-        // every check before the write, and only a full canonicalize settles
-        // it.
-        let written_to = self.written_path(to, &destination, stored_to);
-        if source_is_dir {
-            changed.extend(paths_under(&self.canonical_root, &written_to)?);
-        }
-        changed.insert(written_to);
-        Ok(changed)
+        Ok(RenamePlan {
+            source,
+            destination,
+            stored_from,
+            stored_to,
+            source_is_dir,
+            case_only,
+        })
     }
+}
+
+/// A validated rename: everything [`MutationEngine::plan_rename`] resolved and
+/// refused on, handed to the movement so nothing is resolved twice.
+struct RenamePlan {
+    source: PathBuf,
+    destination: PathBuf,
+    stored_from: VaultPath,
+    stored_to: VaultPath,
+    source_is_dir: bool,
+    case_only: bool,
 }
 
 /// Whether these two spellings differ only in case, which is the one rename a
