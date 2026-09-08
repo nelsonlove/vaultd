@@ -15,14 +15,45 @@
 //! The daemon runs with no watcher and no periodic tick, so nothing but the
 //! scripted mutations can move the index: a divergence here is the mutation
 //! path's, never a background cycle's.
+//!
+//! Three axes are checked after every step, because the note axis alone
+//! leaves the folder verbs proving almost nothing — four of the steps exist
+//! mainly to move tree rows, and `list_notes` cannot see one:
+//!
+//! 1. **Note equivalence** — `list_notes` + `get_note` equal a fresh
+//!    `scan_vault`, reference resolutions included.
+//! 2. **Generation exactness** — the published generation advances exactly
+//!    once when a fresh *walk* or a fresh scan moved, and exactly zero times
+//!    when neither did. This is the axis a folder verb lives on: a
+//!    `create_folder` whose outcome names nothing puts a folder on disk that
+//!    no generation ever carries, and nothing in axis 1 can see it.
+//! 3. **Tree honesty** — every path the walk says moved appears in the
+//!    generation's own published change set. Over-naming is free (the engine
+//!    documents conservative invalidation as the safe direction);
+//!    under-naming is the bug, so the relation asserted is superset, not
+//!    equality.
+//!
+//! Axis 3 reads the daemon's `generation_committed` events, which is the
+//! **only** surface on which this daemon says anything about non-note paths
+//! today. TRIPWIRE — Tasks 13-15 wire `open_snapshot`/`snapshot_tree`; when
+//! they land, axis 3 should compare `snapshot_tree`'s rows against
+//! `FileSystemVaultSource::scan()` directly (path, kind, size — the walk
+//! vocabulary `vault-index`'s `tests/live_oracle.rs` already uses) instead of
+//! inferring the tree from a change set. Strengthen this test then; do not
+//! delete it.
 
 mod daemon;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tempfile::TempDir;
-use vault_core::{FileSystemVaultSource, Resolution, Subpath, VaultPath, scan_vault};
-use vault_protocol::{ResolutionDto, Response, ResponseEnvelope, ResponseOutcome, SubpathDto};
+use vault_core::{
+    FileSystemVaultSource, Resolution, Subpath, TreeEntryKind, VaultPath, scan_vault,
+};
+use vault_protocol::{
+    ChangeSetDto, ErrorCode, ResolutionDto, Response, ResponseEnvelope, ResponseOutcome,
+    RuntimeEventDto, SubpathDto,
+};
 
 use daemon::Daemon;
 
@@ -30,6 +61,82 @@ use daemon::Daemon;
 /// of its outgoing references — the shape a fresh scan can be compared against
 /// without re-deriving spans.
 type State = Vec<(String, String, Vec<String>)>;
+
+/// The file tree as the pre-task's walk reports it: path, kind, and size.
+///
+/// Timestamps are deliberately absent, exactly as in `vault-index`'s
+/// `tests/live_oracle.rs`: a folder's timestamps move whenever anything
+/// inside it is created or removed, nothing reads them, and letting them
+/// count as "changed" would make every step look generational.
+type Tree = BTreeMap<String, (TreeEntryKind, Option<u64>)>;
+
+/// What a fresh walk says the tree is.
+fn scanned_tree(root: &std::path::Path) -> Tree {
+    let source = FileSystemVaultSource::new(root).expect("tree scan source");
+    source
+        .scan()
+        .expect("scan vault tree")
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.as_str().to_string(), (entry.kind, entry.size)))
+        .collect()
+}
+
+/// Every path whose walk row appeared, vanished, or changed between two
+/// walks — the ground truth a generation's published change set must cover.
+fn tree_changes(before: &Tree, after: &Tree) -> BTreeSet<String> {
+    let mut changed = BTreeSet::new();
+    for (path, row) in after {
+        if before.get(path) != Some(row) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    changed
+}
+
+/// Notes whose revision appeared, vanished, or moved between two scans.
+///
+/// The tree walk catches most of this already — a rewritten note almost
+/// always changes size — but not all of it: a same-length rewrite moves a
+/// revision while leaving the walk row identical, and that path still has to
+/// reach a client. Resolution-only changes are deliberately **not** included:
+/// a note whose answers moved because some *other* note moved is a different
+/// claim, and axis 1 already pins it.
+fn revision_changes(before: &State, after: &State) -> BTreeSet<String> {
+    let revisions = |state: &State| -> BTreeMap<String, String> {
+        state
+            .iter()
+            .map(|(path, revision, _)| (path.clone(), revision.clone()))
+            .collect()
+    };
+    let (before, after) = (revisions(before), revisions(after));
+    let mut changed = BTreeSet::new();
+    for (path, revision) in &after {
+        if before.get(path) != Some(revision) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    changed
+}
+
+/// Whether a step is expected to land today.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    Lands,
+    /// Refused because the verb is not wired yet. A refusal is still checked
+    /// on all three axes: nothing moved, so no generation may appear.
+    RefusedUntilTask16,
+}
 
 /// A daemon plus the request-id bookkeeping this suite needs. Ids are unique
 /// per request so a stale line can never be mistaken for the answer in hand.
@@ -54,6 +161,73 @@ impl Client {
         ));
         assert_eq!(envelope.id, id, "answered the wrong request: {envelope:?}");
         envelope
+    }
+
+    /// Subscribe, so the tree axis has a surface to read. Returns nothing:
+    /// the events are matched by generation, not by subscription id, and one
+    /// subscription is all this walk opens.
+    fn subscribe(&mut self) {
+        let response = self.call("subscribe_events", "{}");
+        assert!(
+            matches!(
+                response.outcome,
+                ResponseOutcome::Ok(Response::SubscribeEvents(_))
+            ),
+            "subscribe_events failed: {:?}",
+            response.outcome
+        );
+    }
+
+    /// The generation the daemon currently serves.
+    ///
+    /// `get_vault_info` is a unit variant on the wire — it takes no `params`
+    /// key at all, and sending an empty object is an `invalid_request`.
+    fn generation(&mut self) -> u64 {
+        self.next_id += 1;
+        let id = format!("id-{}", self.next_id);
+        let response = self.daemon.call(&format!(
+            r#"{{"version":1,"id":"{id}","request":{{"method":"get_vault_info"}}}}"#
+        ));
+        assert_eq!(response.id, id, "answered the wrong request: {response:?}");
+        match response.outcome {
+            ResponseOutcome::Ok(Response::GetVaultInfo(info)) => info.generation,
+            other => panic!("get_vault_info failed: {other:?}"),
+        }
+    }
+
+    /// Every path the daemon published for `generation`, from its own
+    /// `generation_committed` event.
+    ///
+    /// The cause is asserted here rather than at the call site because it is
+    /// a property of the same event: a mutation this daemon applied must be
+    /// attributed to `mutation`, never to the watcher — which is off.
+    fn published_paths(&mut self, generation: u64) -> BTreeSet<String> {
+        let event = self.daemon.wait_for_event(|event| match &event.event {
+            RuntimeEventDto::GenerationCommitted(committed) => committed.generation == generation,
+            _ => false,
+        });
+        let committed = match event.event {
+            RuntimeEventDto::GenerationCommitted(committed) => committed,
+            other => panic!("matched a non-generation event: {other:?}"),
+        };
+        assert_eq!(
+            committed.cause,
+            vault_protocol::GenerationCauseDto::Mutation,
+            "a generation this walk caused must be attributed to the mutation path"
+        );
+        match committed.changes {
+            ChangeSetDto::Detailed {
+                created,
+                modified,
+                deleted,
+            } => created.into_iter().chain(modified).chain(deleted).collect(),
+            // Every step here moves a handful of paths; a counts-only change
+            // set would mean the detail limit moved, and this axis would be
+            // silently unable to check anything.
+            ChangeSetDto::CountsOnly { .. } => {
+                panic!("the change set for generation {generation} lost its per-path detail")
+            }
+        }
     }
 }
 
@@ -191,16 +365,28 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
     // Wikilinks rather than bare names, because a bare name is not a
     // reference: a bare-text fixture would compare empty outgoing lists on
     // both sides and pass for the wrong reason.
-    std::fs::write(root.join("Seed.md"), "# Seed\n[[Alpha]]\n[[Nowhere]]\n").expect("write Seed");
+    // The external link and the missing block subpath are here so the
+    // comparison vocabulary is fully exercised rather than merely defined:
+    // without them `non-vault` and a block-flavoured `missing-subpath` are
+    // arms no step ever produces.
+    std::fs::write(
+        root.join("Seed.md"),
+        "# Seed\n[[Alpha]]\n[[Nowhere]]\n[[Alpha#^missing]]\n[site](https://example.com)\n",
+    )
+    .expect("write Seed");
     std::fs::write(root.join("Alpha.md"), "# Heading\n\ntext ^block\n").expect("write Alpha");
 
     let mut client = Client::new(&vault, &index);
     client.call("refresh_index", "{}");
+    client.subscribe();
     assert_eq!(
         daemon_state(&mut client),
         scanned_state(&root),
         "the cold build already diverged, so nothing below would mean anything"
     );
+    let mut generation = client.generation();
+    let mut tree = scanned_tree(&root);
+    let mut state = scanned_state(&root);
 
     // Every operation in the mutation surface, in an order that walks a note
     // through creation, reference, patching, folder moves, copying, and
@@ -214,66 +400,146 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
     // spellings and no root one, because an exact vault path wins outright —
     // a root `Zeta.md` would keep `[[Zeta]]` unambiguous however many nested
     // namesakes existed.
-    let steps: Vec<(&str, String)> = vec![
+    let steps: Vec<(&str, String, Expect)> = vec![
         (
             "write_note",
             r##"{"path":"Beta.md","content":"# Beta\n[[Alpha#Heading]]\n[[Alpha#Missing]]\n","expected":{"absent":true}}"##.to_string(),
+            Expect::Lands,
         ),
-        ("create_folder", r#"{"path":"Nested"}"#.to_string()),
+        ("create_folder", r#"{"path":"Nested"}"#.to_string(), Expect::Lands),
+        // The ninth mutation verb, and the one whose only visible effect is a
+        // non-note tree row — which is exactly why it belongs in a walk that
+        // checks the tree. It is refused today because raw file operations
+        // are wired in Task 16, and a refusal is still a claim worth
+        // checking: nothing moved, so no generation may appear.
+        //
+        // TRIPWIRE — Task 16 must flip this step, not delete it. When
+        // `write_file` lands, change `Expect::RefusedUntilTask16` to
+        // `Expect::Lands`; the three axes then check the attachment's tree
+        // row for free, and the note axis must stay unmoved because an
+        // attachment is not a note.
+        (
+            "write_file",
+            r#"{"path":"Nested/note.txt","content_base64":"aGVsbG8=","expected":{"absent":true}}"#.to_string(),
+            Expect::RefusedUntilTask16,
+        ),
         (
             "write_note",
             r##"{"path":"Nested/Gamma.md","content":"# Gamma\n[[Beta]]\n[[Alpha#^block]]\n[[Zeta]]\n","expected":{"absent":true}}"##.to_string(),
+            Expect::Lands,
         ),
         (
             "patch_frontmatter",
             r#"{"path":"Beta.md","patch":[{"key_path":"title","value":"Titled"}],"expected":{"any":true}}"#.to_string(),
+            Expect::Lands,
         ),
         (
             "write_note",
             r##"{"path":"Nested/Zeta.md","content":"# Zeta\n","expected":{"absent":true}}"##.to_string(),
+            Expect::Lands,
         ),
-        ("create_folder", r#"{"path":"Other"}"#.to_string()),
+        ("create_folder", r#"{"path":"Other"}"#.to_string(), Expect::Lands),
         (
             "copy_file",
             r#"{"from":"Nested/Zeta.md","to":"Other/Zeta.md","expected_source":{"any":true},"if_exists":"error"}"#.to_string(),
+            Expect::Lands,
         ),
+        // TRIPWIRE — Task 12 must flip this step, not delete it
+        // (`task_12_must_flip_rename_note_link_repair`). `rewrite_links` is
+        // honoured by the engine's caller, and link repair lands in Task 12;
+        // until then the flag is a no-op and the three axes hold trivially.
+        // Once repair lands, this step also moves every *referencing* note,
+        // and axis 3 starts checking that the repair burst names them.
         (
             "rename_note",
             r#"{"from":"Nested/Gamma.md","to":"Nested/Delta.md","expected":{"any":true},"rewrite_links":true}"#.to_string(),
+            Expect::Lands,
         ),
         (
             "delete_note",
             r#"{"path":"Other/Zeta.md","mode":"permanent","expected":{"any":true}}"#.to_string(),
+            Expect::Lands,
         ),
+        // TRIPWIRE — Task 12 must flip this step, not delete it
+        // (`task_12_must_flip_rename_folder_link_repair`). Same reasoning as
+        // the note rename above, one level up: today the flag changes
+        // nothing, and after Task 12 the moved folder's referencing notes
+        // join the change set this step checks.
         (
             "rename_folder",
             r#"{"from":"Nested","to":"Moved","rewrite_links":true}"#.to_string(),
+            Expect::Lands,
         ),
         (
             "delete_folder",
             r#"{"path":"Moved","mode":"permanent","recursive":true}"#.to_string(),
+            Expect::Lands,
         ),
     ];
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for (method, params) in steps {
+    for (method, params, expect) in steps {
         let response = client.call(method, &params);
-        assert!(
-            matches!(response.outcome, ResponseOutcome::Ok(_)),
-            "{method} {params} failed: {:?}",
-            response.outcome
-        );
+        match expect {
+            Expect::Lands => assert!(
+                matches!(response.outcome, ResponseOutcome::Ok(_)),
+                "{method} {params} failed: {:?}",
+                response.outcome
+            ),
+            Expect::RefusedUntilTask16 => match &response.outcome {
+                ResponseOutcome::Err(error) => assert_eq!(
+                    error.code,
+                    ErrorCode::RuntimeNotReady,
+                    "{method} was refused for the wrong reason"
+                ),
+                other => panic!(
+                    "TRIPWIRE — Task 16 wired `{method}`: flip this step to `Expect::Lands` \
+                     rather than deleting it, so the tree axis starts checking the row it \
+                     writes. Answer was {other:?}"
+                ),
+            },
+        }
+
+        // Axis 1: the note answers equal a fresh scan.
         let answered = daemon_state(&mut client);
         seen.extend(
             answered
                 .iter()
                 .flat_map(|(_, _, targets)| targets.iter().cloned()),
         );
+        let scanned = scanned_state(&root);
         assert_eq!(
-            answered,
-            scanned_state(&root),
+            answered, scanned,
             "the daemon diverged from a fresh scan after {method} {params}"
         );
+
+        // Axes 2 and 3, against the walk this step actually produced.
+        let walked = scanned_tree(&root);
+        let mut moved = tree_changes(&tree, &walked);
+        moved.extend(revision_changes(&state, &scanned));
+        let changed = !moved.is_empty();
+        let published = client.generation();
+        assert_eq!(
+            published,
+            generation + u64::from(changed),
+            "the generation must advance exactly once iff the vault moved \
+             (moved = {moved:?}) after {method} {params}"
+        );
+        if changed {
+            let announced = client.published_paths(published);
+            let unannounced: Vec<&String> = moved
+                .iter()
+                .filter(|path| !announced.contains(*path))
+                .collect();
+            assert!(
+                unannounced.is_empty(),
+                "generation {published} never named {unannounced:?}, which the walk says \
+                 moved, after {method} {params}; it named {announced:?}"
+            );
+        }
+        generation = published;
+        tree = walked;
+        state = scanned;
     }
 
     // The scenario's own reachability claim. Comparing two answers that are
@@ -284,7 +550,9 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
         "resolved Alpha.md #heading Heading",
         "resolved Alpha.md #block block",
         "missing-subpath Alpha.md #heading Missing",
+        "missing-subpath Alpha.md #block missing",
         "unresolved",
+        "non-vault",
         "ambiguous Nested/Zeta.md|Other/Zeta.md",
     ] {
         assert!(

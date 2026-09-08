@@ -167,6 +167,43 @@ enum Operation {
         path: String,
         value: Option<String>,
     },
+    /// A write through the engine at a case-folded spelling of a root slot.
+    /// The engine refuses it while the stored spelling exists — a caller who
+    /// spells `alpha.md` beside a stored `Alpha.md` is naming a file this
+    /// vault does not hold. The refusal is part of the equivalence claim:
+    /// both sides then have to agree that nothing changed at all.
+    MutateWriteCaseVariant {
+        path: String,
+        body: String,
+    },
+    /// A write through the engine at a hidden path, which is unindexable and
+    /// always refused. Same claim: a refused mutation moves nothing, and the
+    /// batch still reconciles to a scan-equivalent state with no generation.
+    MutateWriteHidden {
+        path: String,
+        body: String,
+    },
+}
+
+/// What the mutation engine answered, for the operations that ask it
+/// anything. `None` is a `std::fs` arm, which asks it nothing.
+///
+/// This exists because the reachability test cannot infer "the engine ran"
+/// from the bytes on disk: `Write` and `MutateWrite` draw from the same slot
+/// and body space, so a refused `MutateWrite` very often returns to a file
+/// that already holds exactly the bytes it meant to write. Recording the
+/// engine's own answer is the only signal another arm cannot forge.
+#[derive(Clone, Debug)]
+enum MutationAnswer {
+    Accepted,
+    Refused(vault_index::MutationError),
+}
+
+/// What one applied operation did: the paths a perfect watcher would have
+/// hinted, and what the engine answered if the operation asked it anything.
+struct Applied {
+    touched: BTreeSet<VaultPath>,
+    answer: Option<MutationAnswer>,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,22 +265,29 @@ fn write_preserving_fingerprint(root: &Path, name: &str, body: &str) {
 }
 
 /// Apply one operation and report every path whose state a perfect watcher
-/// would have hinted.
+/// would have hinted, plus whatever the mutation engine answered.
 ///
 /// The mutation arms hint the same paths their `std::fs` twins do, on purpose:
 /// this oracle's claim is about reconciliation, so the hint set is the test's
 /// own, never the engine's `changed_paths`. What an outcome reports is the
 /// coordinator's business, and `vault-server`'s `tests/mutation_oracle.rs`
-/// checks it where it is actually consumed.
-fn apply(
-    root: &Path,
-    engine: &vault_index::MutationEngine,
-    operation: &Operation,
-) -> BTreeSet<VaultPath> {
+/// checks it where it is actually consumed. The engine's *answer* is carried
+/// out for the reachability test alone — see [`MutationAnswer`] for why the
+/// bytes on disk cannot stand in for it.
+fn apply(root: &Path, engine: &vault_index::MutationEngine, operation: &Operation) -> Applied {
     fn touch(name: &str, touched: &mut BTreeSet<VaultPath>) {
         touched.insert(VaultPath::new(name).expect("valid vault path"));
     }
+    fn answer(
+        outcome: Result<vault_index::MutationOutcome, vault_index::MutationError>,
+    ) -> Option<MutationAnswer> {
+        Some(match outcome {
+            Ok(_) => MutationAnswer::Accepted,
+            Err(error) => MutationAnswer::Refused(error),
+        })
+    }
     let mut touched = BTreeSet::new();
+    let mut engine_answer = None;
     match operation {
         Operation::Write { path, body } => {
             write_file(root, path, body);
@@ -289,28 +333,29 @@ fn apply(
         }
         Operation::MutateWrite { path, body } => {
             let vault_path = VaultPath::new(path).expect("valid vault path");
-            // The generator picks freely, so a create into a folder that does
-            // not exist yet is expected and is not a failure: the refusal
-            // leaves the vault untouched, and the batch still has to
-            // reconcile to a scan-equivalent state.
+            // The parent is created first so this arm is a *write* test rather
+            // than a parent-existence test: with the folder in place and an
+            // unconditional precondition, the engine has no refusal left to
+            // give here, and every draw lands. The two refusal cells below are
+            // where a refused mutation is the point.
             if let Some(parent) = std::path::Path::new(path).parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(root.join(parent)).expect("create parent directory");
                 }
             }
-            let _ = engine.apply(&vault_index::Mutation::WriteNote {
+            engine_answer = answer(engine.apply(&vault_index::Mutation::WriteNote {
                 path: vault_path,
                 content: body.clone(),
                 expected: vault_index::Precondition::Any,
-            });
+            }));
             touch(path, &mut touched);
         }
         Operation::MutateDelete { path } => {
-            let _ = engine.apply(&vault_index::Mutation::DeleteNote {
+            engine_answer = answer(engine.apply(&vault_index::Mutation::DeleteNote {
                 path: VaultPath::new(path).expect("valid vault path"),
                 mode: Some(vault_index::DeleteMode::Permanent),
                 expected: vault_index::Precondition::Any,
-            });
+            }));
             touch(path, &mut touched);
         }
         Operation::MutateRename { from, to } => {
@@ -321,7 +366,7 @@ fn apply(
                             .expect("create parent directory");
                     }
                 }
-                let _ = engine.apply(&vault_index::Mutation::RenameNote {
+                engine_answer = answer(engine.apply(&vault_index::Mutation::RenameNote {
                     from: VaultPath::new(from).expect("valid vault path"),
                     to: VaultPath::new(to).expect("valid vault path"),
                     expected: vault_index::Precondition::Any,
@@ -329,24 +374,51 @@ fn apply(
                     // the claim is that a moved file reconciles exactly like
                     // an externally moved one.
                     rewrite_links: false,
-                });
+                }));
             }
             touch(from, &mut touched);
             touch(to, &mut touched);
         }
         Operation::MutatePatch { path, value } => {
-            let _ = engine.apply(&vault_index::Mutation::PatchFrontmatter {
+            engine_answer = answer(engine.apply(&vault_index::Mutation::PatchFrontmatter {
                 path: VaultPath::new(path).expect("valid vault path"),
                 patch: vec![vault_index::FrontmatterEdit {
                     key_path: vec!["title".to_string()],
                     value: value.clone().map(vault_index::PatchValue::String),
                 }],
                 expected: vault_index::Precondition::Any,
-            });
+            }));
             touch(path, &mut touched);
         }
+        // The two refusal cells. Neither creates its parent and neither is
+        // expected to land: what they exercise is that a refusal really is
+        // inert — the vault stays byte-identical (claim 4) and no generation
+        // appears (claim 3, in its zero direction).
+        //
+        // **They hint nothing, and that is the honest hint.** A refused
+        // mutation writes nothing, so a perfect watcher sees no filesystem
+        // event and emits no path. Hinting the caller's spelling instead
+        // would be out of contract in a way that matters: every real hint is
+        // a *stored* spelling — the watcher reads them off the filesystem and
+        // `MutationOutcome::changed_paths` documents at length why it reports
+        // the stored spelling rather than the caller's — while `seed.md` is
+        // precisely a spelling this vault does not store. Feeding one in
+        // manufactures a generation for a vault that did not change, which is
+        // an out-of-contract input producing an out-of-contract answer, not a
+        // defect these cells are entitled to report.
+        Operation::MutateWriteCaseVariant { path, body }
+        | Operation::MutateWriteHidden { path, body } => {
+            engine_answer = answer(engine.apply(&vault_index::Mutation::WriteNote {
+                path: VaultPath::new(path).expect("valid vault path"),
+                content: body.clone(),
+                expected: vault_index::Precondition::Any,
+            }));
+        }
     }
-    touched
+    Applied {
+        touched,
+        answer: engine_answer,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +509,7 @@ impl Oracle {
     fn run_batch(&mut self, batch: &[Operation]) -> Result<(), TestCaseError> {
         let mut touched: BTreeSet<VaultPath> = BTreeSet::new();
         for operation in batch {
-            touched.extend(apply(&self.root, &self.engine, operation));
+            touched.extend(apply(&self.root, &self.engine, operation).touched);
         }
         let vault_after_operations = common::digest_tree(&self.root);
 
@@ -456,6 +528,8 @@ impl Oracle {
                     | Operation::MutateDelete { .. }
                     | Operation::MutateRename { .. }
                     | Operation::MutatePatch { .. }
+                    | Operation::MutateWriteCaseVariant { .. }
+                    | Operation::MutateWriteHidden { .. }
             )
         }) {
             ChangeCause::Mutation
@@ -636,7 +710,42 @@ fn operation() -> impl Strategy<Value = Operation> {
         1 => (slot(), slot()).prop_map(|(from, to)| Operation::MutateRename { from, to }),
         1 => (slot(), prop::option::of("[a-z]{1,6}"))
             .prop_map(|(path, value)| Operation::MutatePatch { path, value }),
+        1 => (case_variant_slot(), body())
+            .prop_map(|(path, body)| Operation::MutateWriteCaseVariant { path, body }),
+        1 => (hidden_slot(), body())
+            .prop_map(|(path, body)| Operation::MutateWriteHidden { path, body }),
     ]
+}
+
+/// Case variants of `Seed.md`, and only of `Seed.md`.
+///
+/// Two properties make this the one safe spelling to fold. It is the note no
+/// generated operation ever names, so it always exists and the cell is a
+/// guaranteed collision on every draw rather than one that depends on what
+/// the run has deleted so far. And it is at the root, so the parent always
+/// exists — a folded nested spelling (`nested/deep/gamma.md`) would be
+/// refused for its missing parent long before the case rule was consulted,
+/// and the cell would prove only that a missing folder is a missing folder.
+///
+/// Folding a slot instead would sometimes *land*, creating a second stored
+/// spelling on a case-insensitive filesystem and dragging case-only
+/// reconciliation — a real gap, deliberately left to its own task — into a
+/// cell that is meant to check one refusal.
+fn case_variant_slot() -> impl Strategy<Value = String> {
+    const VARIANTS: &[&str] = &["seed.md", "SEED.md", "sEeD.md"];
+    (0usize..VARIANTS.len()).prop_map(|index| VARIANTS[index].to_string())
+}
+
+/// Paths with a hidden component, which the scan excludes and the engine
+/// refuses to write into. `.obsidian` is the configuration zone the engine
+/// guards by name; the other two are ordinary dot-directories.
+fn hidden_slot() -> impl Strategy<Value = String> {
+    const HIDDEN: &[&str] = &[
+        ".obsidian/Alpha.md",
+        ".hidden/Alpha.md",
+        ".trash/Nested/Alpha.md",
+    ];
+    (0usize..HIDDEN.len()).prop_map(|index| HIDDEN[index].to_string())
 }
 
 /// Batches of one to three operations, so bursts — several changes landing
@@ -768,6 +877,18 @@ fn regression_scenario() -> Vec<Vec<Operation>> {
                 path: "Alpha.md".into(),
             },
         ],
+        // Two refused mutations, scripted so the inert case is pinned rather
+        // than left to the draw: a case-variant spelling of a note this vault
+        // stores under another case, and a write into a hidden zone. Both
+        // must leave the vault byte-identical and the generation still.
+        vec![Operation::MutateWriteCaseVariant {
+            path: "seed.md".into(),
+            body: "# Heading\n\ntext ^block\n".into(),
+        }],
+        vec![Operation::MutateWriteHidden {
+            path: ".obsidian/Alpha.md".into(),
+            body: "# Heading\n\ntext ^block\n".into(),
+        }],
     ]
 }
 
@@ -913,8 +1034,45 @@ const INTERESTING_STATES: &[&str] = &[
     "a resolved reference becomes unresolved without its own note changing",
     "a note is written through the mutation engine",
     "a note is deleted through the mutation engine",
+    "a note is renamed through the mutation engine",
     "frontmatter is patched through the mutation engine",
+    "the mutation engine refuses a case-variant spelling",
+    "the mutation engine refuses a hidden path",
 ];
+
+/// The interesting state one mutation operation reached, judged from the
+/// engine's own answer rather than from the vault's bytes.
+///
+/// The refusal cells name the refusal they exist for, so a cell that starts
+/// being refused for some *other* reason — a missing parent, a read-only
+/// engine, a size limit — stops counting rather than quietly standing in for
+/// the rule it was written to exercise.
+fn mutation_state(operation: &Operation, answer: Option<&MutationAnswer>) -> Option<&'static str> {
+    use vault_index::MutationError;
+    match (operation, answer?) {
+        (Operation::MutateWrite { .. }, MutationAnswer::Accepted) => {
+            Some("a note is written through the mutation engine")
+        }
+        (Operation::MutateDelete { .. }, MutationAnswer::Accepted) => {
+            Some("a note is deleted through the mutation engine")
+        }
+        (Operation::MutateRename { .. }, MutationAnswer::Accepted) => {
+            Some("a note is renamed through the mutation engine")
+        }
+        (Operation::MutatePatch { .. }, MutationAnswer::Accepted) => {
+            Some("frontmatter is patched through the mutation engine")
+        }
+        (
+            Operation::MutateWriteCaseVariant { .. },
+            MutationAnswer::Refused(MutationError::CaseCollision { .. }),
+        ) => Some("the mutation engine refuses a case-variant spelling"),
+        (
+            Operation::MutateWriteHidden { .. },
+            MutationAnswer::Refused(MutationError::ZoneViolation { .. }),
+        ) => Some("the mutation engine refuses a hidden path"),
+        _ => None,
+    }
+}
 
 /// Whether any reference belonging to a note that did **not** itself change
 /// flipped its resolution answer. Restricting to unchanged notes is what
@@ -1005,30 +1163,25 @@ fn the_generators_reach_every_interesting_state() {
                         reached.insert("content moves while the fingerprint does not");
                     }
                 }
-                // The three mutation states are recorded from what the vault
-                // holds *afterwards*, not from the draw. A mutation the
-                // engine refuses is a legitimate draw, and counting it as
-                // reached would let the alphabet decay into refusals while
-                // this test kept reporting full coverage.
-                Operation::MutateWrite { path, body } => {
-                    apply(&root, &engine, operation);
-                    if std::fs::read(root.join(path)).ok().as_deref() == Some(body.as_bytes()) {
-                        reached.insert("a note is written through the mutation engine");
-                    }
-                }
-                Operation::MutateDelete { path } => {
-                    let existed = root.join(path).is_file();
-                    apply(&root, &engine, operation);
-                    if existed && !root.join(path).exists() {
-                        reached.insert("a note is deleted through the mutation engine");
-                    }
-                }
-                Operation::MutatePatch { path, .. } => {
-                    let before_bytes = std::fs::read(root.join(path)).ok();
-                    apply(&root, &engine, operation);
-                    if before_bytes.is_some() && before_bytes != std::fs::read(root.join(path)).ok()
-                    {
-                        reached.insert("frontmatter is patched through the mutation engine");
+                // Every mutation state is recorded from the engine's own
+                // answer, never from the vault's bytes. Bytes cannot carry
+                // this claim: `Write` and `MutateWrite` draw from the same
+                // slot and body space, so a file very often already holds
+                // exactly what a *refused* `MutateWrite` meant to write, and
+                // an engine that refused everything would still be reported
+                // as reached. Reading the `Ok`/`Err` the engine returned is
+                // the one signal no other arm can forge — so an arm that
+                // decays into refusals fails this test, which is the whole
+                // reason the states exist.
+                Operation::MutateWrite { .. }
+                | Operation::MutateDelete { .. }
+                | Operation::MutateRename { .. }
+                | Operation::MutatePatch { .. }
+                | Operation::MutateWriteCaseVariant { .. }
+                | Operation::MutateWriteHidden { .. } => {
+                    let applied = apply(&root, &engine, operation);
+                    if let Some(state) = mutation_state(operation, applied.answer.as_ref()) {
+                        reached.insert(state);
                     }
                 }
                 _ => {
