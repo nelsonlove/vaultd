@@ -321,3 +321,69 @@ fn an_include_less_page_carries_identities_and_a_misspelled_facet_is_refused() {
         r#"{{"version":1,"id":"c","request":{{"method":"close_snapshot","params":{{"snapshot_id":"{snapshot_id}"}}}}}}"#
     ));
 }
+
+/// Task 15 review finding I-2: crossing `sections` and `list_items` inside
+/// `convert::note_facets` left this whole suite green, because the hydration
+/// test asks for all six names and checks presence only. A host that asks for
+/// one name must get that one facet and no other — so each name is requested
+/// alone and the other five asserted absent.
+#[test]
+fn each_wire_facet_name_selects_exactly_its_own_facet() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index = TempDir::new().expect("index tempdir");
+    std::fs::write(
+        vault.path().join("One.md"),
+        "---\ntitle: One\n---\n# One\n[[Two]]\n\n- [ ] a task\n",
+    )
+    .expect("write One");
+    std::fs::write(vault.path().join("Two.md"), "# Two\n[[One]]\n").expect("write Two");
+
+    let mut daemon = daemon(&vault, &index);
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    let opened =
+        daemon.call(r#"{"version":1,"id":"o","request":{"method":"open_snapshot","params":{}}}"#);
+    let snapshot_id = match opened.outcome {
+        ResponseOutcome::Ok(Response::OpenSnapshot(response)) => response.snapshot_id,
+        other => panic!("open_snapshot failed: {other:?}"),
+    };
+
+    for name in [
+        "metadata",
+        "references",
+        "resolutions",
+        "backlinks",
+        "sections",
+        "list_items",
+    ] {
+        let page = daemon.call(&format!(
+            r#"{{"version":1,"id":"f","request":{{"method":"snapshot_notes","params":{{"snapshot_id":"{snapshot_id}","include":["{name}"]}}}}}}"#
+        ));
+        match page.outcome {
+            ResponseOutcome::Ok(Response::SnapshotNotes(response)) => {
+                assert_eq!(response.notes.len(), 2);
+                for note in &response.notes {
+                    let present = [
+                        ("metadata", note.metadata.is_some()),
+                        ("references", note.references.is_some()),
+                        ("resolutions", note.resolutions.is_some()),
+                        ("backlinks", note.backlinks.is_some()),
+                        ("sections", note.sections.is_some()),
+                        ("list_items", note.list_items.is_some()),
+                    ];
+                    for (facet, is_present) in present {
+                        assert_eq!(
+                            is_present,
+                            facet == name,
+                            "asked for {name:?}, so {facet:?} presence is wrong: {note:?}"
+                        );
+                    }
+                }
+            }
+            other => panic!("snapshot_notes for {name:?} failed: {other:?}"),
+        }
+    }
+
+    daemon.call(&format!(
+        r#"{{"version":1,"id":"c","request":{{"method":"close_snapshot","params":{{"snapshot_id":"{snapshot_id}"}}}}}}"#
+    ));
+}

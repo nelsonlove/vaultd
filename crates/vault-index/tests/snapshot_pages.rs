@@ -563,7 +563,9 @@ fn unpin_and_move_the_writer(
     fixture.service.refresh(false).expect("publish past it");
 }
 
-fn assert_pin_lost(error: IndexError, id: &str, pinned: u64) {
+/// The refusal, with the generation it says the connection now reads handed
+/// back so a caller can say *why* the refusal had to be direct.
+fn assert_pin_lost(error: IndexError, id: &str, pinned: u64) -> u64 {
     match error {
         IndexError::SnapshotPinLost {
             snapshot,
@@ -572,10 +574,7 @@ fn assert_pin_lost(error: IndexError, id: &str, pinned: u64) {
         } => {
             assert_eq!(snapshot, id);
             assert_eq!(claimed, pinned);
-            assert!(
-                observed > pinned,
-                "the refusal names what the transaction now reads: {observed} vs {pinned}"
-            );
+            observed
         }
         other => panic!("expected a lost-pin refusal, got {other:?}"),
     }
@@ -595,7 +594,11 @@ fn a_tree_page_refuses_when_its_own_transaction_no_longer_holds_the_pin() {
     let error = sessions
         .tree_page(&opened.snapshot_id, None, Some(100))
         .expect_err("a page whose pin is gone must refuse, not serve");
-    assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+    let observed = assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+    assert!(
+        observed > opened.generation.get(),
+        "the refusal names what the transaction now reads: {observed}"
+    );
 }
 
 #[test]
@@ -608,5 +611,232 @@ fn a_notes_page_refuses_when_its_own_transaction_no_longer_holds_the_pin() {
     let error = sessions
         .notes_page(&opened.snapshot_id, None, Some(100), NoteFacets::default())
         .expect_err("a page whose pin is gone must refuse, not serve");
-    assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+    let observed = assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+    assert!(
+        observed > opened.generation.get(),
+        "the refusal names what the transaction now reads: {observed}"
+    );
+}
+
+/// End the pin, then make the writer commit *without* moving the generation:
+/// rewriting a note with its own bytes changes its mtime, so reconciliation
+/// takes `IndexStore::touch`, which commits `tree_entries` metadata and note
+/// fingerprints and stamps `refreshed_at_unix_ms` — and never bumps the
+/// generation.
+fn unpin_and_touch_without_moving_the_generation(
+    fixture: &mut Fixture,
+    sessions: &mut SnapshotSessions,
+    id: &str,
+) {
+    sessions
+        .end_pinned_transaction_for_test(id)
+        .expect("end the pinned transaction under the session");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(fixture.root.join("Alpha.md"), "# Alpha\n").expect("rewrite Alpha's own bytes");
+    fixture.service.refresh(false).expect("reconcile the touch");
+}
+
+/// Task 15 review finding I-3, demonstrated by the reviewer: a generation
+/// re-read cannot see this. `touch` commits a moved `mtime_unix_ms` under the
+/// same generation, so an unpinned tree page passed the generation check and
+/// served the new stat — the number a host builds `TFile.stat` from. The pin
+/// is therefore detected **directly**: a rolled-back deferred transaction
+/// leaves the connection in autocommit, which is evidence about the pin
+/// itself rather than about the world the pin was meant to freeze.
+#[test]
+fn a_tree_page_refuses_a_lost_pin_even_when_the_generation_never_moved() {
+    let mut fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    unpin_and_touch_without_moving_the_generation(&mut fixture, &mut sessions, &opened.snapshot_id);
+
+    let error = sessions
+        .tree_page(&opened.snapshot_id, None, Some(100))
+        .expect_err("an unpinned page must refuse even at an unchanged generation");
+    let observed = assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+    assert_eq!(
+        observed,
+        opened.generation.get(),
+        "the generation never moved, so only direct evidence of the lost pin could refuse this"
+    );
+}
+
+/// The notes half serves nothing `touch` writes, so no row could tear here —
+/// but a session that cannot prove it holds its pin has nothing to serve a
+/// page from, and both pagers answer that the same way.
+#[test]
+fn a_notes_page_refuses_a_lost_pin_even_when_the_generation_never_moved() {
+    let mut fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    unpin_and_touch_without_moving_the_generation(&mut fixture, &mut sessions, &opened.snapshot_id);
+
+    let error = sessions
+        .notes_page(&opened.snapshot_id, None, Some(100), NoteFacets::default())
+        .expect_err("an unpinned page must refuse even at an unchanged generation");
+    let observed = assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+    assert_eq!(observed, opened.generation.get());
+}
+
+/// Exactly the facets that were asked for are present, and every other one is
+/// absent — asserted field by field rather than by spot check.
+fn assert_row_matches_facets(note: &vault_index::SnapshotNoteRow, facets: NoteFacets) {
+    assert_eq!(
+        note.metadata.is_some(),
+        facets.metadata,
+        "metadata presence disagrees with {facets:?}: {note:?}"
+    );
+    assert_eq!(
+        note.references.is_some(),
+        facets.references,
+        "references presence disagrees with {facets:?}: {note:?}"
+    );
+    assert_eq!(
+        note.resolutions.is_some(),
+        facets.resolutions,
+        "resolutions presence disagrees with {facets:?}: {note:?}"
+    );
+    assert_eq!(
+        note.backlinks.is_some(),
+        facets.backlinks,
+        "backlinks presence disagrees with {facets:?}: {note:?}"
+    );
+    assert_eq!(
+        note.sections.is_some(),
+        facets.sections,
+        "sections presence disagrees with {facets:?}: {note:?}"
+    );
+    assert_eq!(
+        note.list_items.is_some(),
+        facets.list_items,
+        "list items presence disagrees with {facets:?}: {note:?}"
+    );
+}
+
+/// Task 15 review finding I-1: every earlier test that asked for
+/// `resolutions` also asked for `references`, so serving `references`
+/// unconditionally whenever `outgoing` was loaded passed the whole suite. The
+/// leak that hides there is the expensive one — `resolutions` exists so a
+/// client can have the answers *without* the spans and spellings, and a leak
+/// ships exactly the payload it asked not to receive. Each facet is therefore
+/// requested alone, and every other facet asserted absent.
+#[test]
+fn each_facet_requested_alone_carries_itself_and_nothing_else() {
+    let fixture = fixture();
+    std::fs::write(fixture.root.join("Pointer.md"), "[[Alpha]]\n- [ ] task\n")
+        .expect("write Pointer");
+    let mut service = fixture.service;
+    service.refresh(false).expect("index the pointer");
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+
+    let singles = [
+        NoteFacets {
+            metadata: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            references: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            resolutions: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            backlinks: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            sections: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            list_items: true,
+            ..NoteFacets::default()
+        },
+    ];
+    // The pairs that share a query or a loader, where a leak is likeliest.
+    let combinations = [
+        NoteFacets {
+            references: true,
+            resolutions: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            metadata: true,
+            sections: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            resolutions: true,
+            backlinks: true,
+            ..NoteFacets::default()
+        },
+        NoteFacets {
+            metadata: true,
+            references: true,
+            resolutions: true,
+            backlinks: true,
+            sections: true,
+            list_items: true,
+        },
+    ];
+
+    for facets in singles.into_iter().chain(combinations) {
+        let page = sessions
+            .notes_page(&opened.snapshot_id, None, Some(100), facets)
+            .expect("a notes page");
+        assert_eq!(page.notes.len() as u64, opened.note_count);
+        for note in &page.notes {
+            assert_row_matches_facets(note, facets);
+        }
+    }
+}
+
+/// Task 15 review finding L-1: `load_note_with` routes the stored `task`
+/// column through `codec::decode_task`, which admits exactly one character.
+/// The page loader must apply the same rule — the DTO promises a
+/// one-character string on the wire, and two loaders holding one rule between
+/// them is the hazard the parent-column decoding already avoids. Our writer
+/// cannot store this row; the refusal is what proves the rule is applied.
+#[test]
+fn a_stored_task_marker_that_is_not_one_character_is_refused_rather_than_served() {
+    let fixture = fixture();
+    std::fs::write(fixture.root.join("List.md"), "- [x] done\n").expect("write List");
+    let mut service = fixture.service;
+    service.refresh(false).expect("index the list");
+    drop(service);
+
+    let connection =
+        vault_index::open_index_for_test(&fixture.config).expect("open the index for writing");
+    let changed = connection
+        .execute(
+            "UPDATE list_items SET task = 'xy' WHERE note_path = 'List.md'",
+            [],
+        )
+        .expect("corrupt one task marker");
+    assert_eq!(changed, 1, "the fixture must have written one list item");
+    drop(connection);
+
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    let error = sessions
+        .notes_page(
+            &opened.snapshot_id,
+            None,
+            Some(100),
+            NoteFacets {
+                list_items: true,
+                ..NoteFacets::default()
+            },
+        )
+        .expect_err("a two-character task marker is not a task marker");
+    match error {
+        IndexError::IncompatibleIndex(message) => assert!(
+            message.contains("task"),
+            "the refusal must name what it found: {message:?}"
+        ),
+        other => panic!("expected incompatible_index, got {other:?}"),
+    }
 }

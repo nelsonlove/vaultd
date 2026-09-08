@@ -700,34 +700,59 @@ fn load_list_items(
                 )?,
                 list_start_line,
                 parent_start_line,
-                task,
+                // Through the codec for the same reason the parent columns
+                // are: `load_note_with` reads this column through
+                // `decode_task`, which admits exactly one character, and a
+                // page that skipped it would be the second loader holding one
+                // rule between them. Re-encoding is what the wire wants — a
+                // one-character string — so the round trip is the validation
+                // rather than a conversion for its own sake.
+                task: crate::codec::encode_task(crate::codec::decode_task(task)?),
             })
         })
         .collect()
 }
 
-/// The generation the session's transaction reads **now**, refused when it is
-/// not the one the session claims to be pinned at.
+/// Proof that this session still holds its pin, and the generation it is
+/// pinned at — refused when either half fails.
 ///
-/// Task 14 review finding M-a, demonstrated with a probe that ended a live
-/// session's transaction: every page reported `session.generation` — a struct
-/// field, written once at `open` — while serving whatever rows the connection
-/// could currently see. Three post-snapshot notes went out under
-/// `Generation(1)`, with no error and no signal. A struct field cannot
-/// evidence a pin; only a read inside the transaction can, and it costs one
-/// indexed row per page.
+/// **Two checks, in order, and the first one is about the pin itself.** A
+/// deferred transaction that has ended returns its connection to autocommit,
+/// so `is_autocommit()` is direct evidence: it answers "am I still inside the
+/// transaction that froze these frames", which is the actual question, and it
+/// cannot be fooled by what the writer did or did not do meanwhile. The
+/// generation re-read stays behind it as defence in depth, and names the
+/// number a client needs in the refusal.
 ///
-/// A pin that ended while the writer happened not to move is not detectable
-/// this way and does not need to be: generation determines the rows, so such
-/// a page is content-identical to the pinned one.
+/// Task 14 review finding M-a is why either check exists: every page used to
+/// report `session.generation` — a struct field, written once at `open` —
+/// while serving whatever rows the connection could currently see, so a probe
+/// that ended the transaction got three post-snapshot notes under
+/// `Generation(1)` with no error and no signal.
+///
+/// Task 15 review finding I-3 is why the generation re-read is not enough on
+/// its own. [`crate::IndexStore::touch`] commits `tree_entries` metadata (a
+/// moved `mtime_unix_ms`, `size`, `ctime_unix_ms`) and note fingerprints
+/// **without bumping the generation**, so an unpinned `tree_page` passed the
+/// generation check and served a touched stat — the numbers a host builds
+/// `TFile.stat` from — under the pinned generation number. The notes half
+/// serves nothing `touch` writes and could not tear that way, but "the
+/// generation determines the rows" is false for the tree, so the pin is
+/// detected directly rather than inferred.
 fn pinned_generation(session: &Session, id: &str) -> Result<Generation, IndexError> {
+    let lost = |observed: Generation| IndexError::SnapshotPinLost {
+        snapshot: id.to_string(),
+        pinned: session.generation.get(),
+        observed: observed.get(),
+    };
+    if session.connection.is_autocommit() {
+        // The pin is provably gone; the generation is read only so the
+        // refusal can say what this connection would have answered from.
+        return Err(lost(stored_generation(&session.connection)?));
+    }
     let observed = stored_generation(&session.connection)?;
     if observed != session.generation {
-        return Err(IndexError::SnapshotPinLost {
-            snapshot: id.to_string(),
-            pinned: session.generation.get(),
-            observed: observed.get(),
-        });
+        return Err(lost(observed));
     }
     Ok(observed)
 }
