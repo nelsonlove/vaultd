@@ -911,6 +911,144 @@ fn renaming_a_folder_repairs_references_to_every_note_it_carried() {
     assert!(outcome.semantic, "notes moved, so the semantic layer moved");
 }
 
+/// A folder somebody else left at the destination is a **squatter**, not this
+/// burst's reservation — even when it is empty. The spec says `rename_folder`
+/// refuses if `to` exists, and the two `rewrite_links` shapes of one verb must
+/// not disagree about what "exists" means.
+#[test]
+fn a_pre_existing_empty_destination_folder_is_refused_in_both_shapes() {
+    for rewrite_links in [true, false] {
+        let mut fixture = fixture();
+        std::fs::create_dir(fixture.root.join("Moved")).expect("a user's own empty folder");
+
+        let error = fixture
+            .service
+            .apply_mutation(&Mutation::RenameFolder {
+                from: path("Nested"),
+                to: path("Moved"),
+                rewrite_links,
+            })
+            .expect_err("the destination is occupied");
+        assert!(
+            matches!(
+                error,
+                vault_index::IndexError::Mutation(MutationError::TargetExists { .. })
+            ),
+            "expected target_exists for rewrite_links={rewrite_links}, got {error:?}"
+        );
+        assert!(
+            fixture.root.join("Moved").is_dir() && fixture.root.join("Nested").is_dir(),
+            "a refused rename moves nothing and consumes nothing"
+        );
+        assert!(
+            std::fs::read_dir(fixture.root.join("Moved"))
+                .expect("read the squatter")
+                .next()
+                .is_none(),
+            "the squatting folder is left exactly as it was, still empty"
+        );
+    }
+}
+
+/// The other side of the same coin: a folder reservation **this burst** left
+/// behind is still adopted, so a crash between the rewrites and the move
+/// converges on a retry exactly as the note shape does. What distinguishes the
+/// two is an ownership marker inside the reserved folder, checked byte-exact.
+#[test]
+fn a_leftover_folder_reservation_is_still_adopted_on_a_retry() {
+    let mut fixture = fixture();
+    std::fs::write(fixture.root.join("Nested/Inner.md"), "# Inner\n").expect("write Inner");
+    std::fs::write(fixture.root.join("Pointer.md"), "[[Nested/Inner]]\n").expect("write Pointer");
+    fixture.service.refresh(false).expect("index the new notes");
+
+    fixture
+        .service
+        .install_test_hook(once_at(HookPoint::BeforeRenameMove, || {
+            panic!("simulated crash between the rewrites and the move");
+        }));
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = fixture.service.apply_mutation(&Mutation::RenameFolder {
+            from: path("Nested"),
+            to: path("Moved"),
+            rewrite_links: true,
+        });
+    }));
+    assert!(crashed.is_err(), "the hook must have aborted the burst");
+    assert_eq!(read(&fixture, "Pointer.md"), "[[Moved/Inner]]\n");
+    assert!(
+        fixture.root.join("Moved").is_dir(),
+        "the reservation is what the repaired links point at"
+    );
+
+    // The hook fires once, so the retry adopts its own leftover and completes.
+    fixture
+        .service
+        .apply_mutation(&Mutation::RenameFolder {
+            from: path("Nested"),
+            to: path("Moved"),
+            rewrite_links: true,
+        })
+        .expect("the retry converges");
+    assert!(fixture.root.join("Moved/Inner.md").is_file());
+    assert!(!fixture.root.join("Nested").exists());
+}
+
+/// The marker is consumed by the move it guards: a completed folder rename
+/// leaves nothing of the reservation behind, in either the source or the
+/// destination tree.
+#[test]
+fn a_completed_folder_rename_leaves_no_reservation_marker() {
+    let mut fixture = fixture();
+    std::fs::write(fixture.root.join("Nested/Inner.md"), "# Inner\n").expect("write Inner");
+    std::fs::write(fixture.root.join("Pointer.md"), "[[Nested/Inner]]\n").expect("write Pointer");
+    fixture.service.refresh(false).expect("index the new notes");
+
+    fixture
+        .service
+        .apply_mutation(&Mutation::RenameFolder {
+            from: path("Nested"),
+            to: path("Moved"),
+            rewrite_links: true,
+        })
+        .expect("rename a folder with repair");
+
+    let mut leftovers = Vec::new();
+    for entry in walk(&fixture.root) {
+        if entry
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".vaultd-"))
+        {
+            leftovers.push(entry.display().to_string());
+        }
+    }
+    assert!(
+        leftovers.is_empty(),
+        "the reservation marker must not survive the move: {leftovers:?}"
+    );
+    assert!(fixture.root.join("Moved/Inner.md").is_file());
+    assert_eq!(read(&fixture, "Pointer.md"), "[[Moved/Inner]]\n");
+}
+
+/// Every path under `root`, so a test can assert on residue the vault scan
+/// would not list.
+fn walk(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found
+}
+
 #[test]
 fn rewrite_links_false_moves_the_file_and_leaves_every_referrer_alone() {
     let mut fixture = fixture();

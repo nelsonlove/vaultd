@@ -2358,6 +2358,13 @@ impl MutationEngine {
         }
         changed.insert(plan.stored_from);
 
+        // The reserved folder's marker, consumed with nothing between it and
+        // the move. A foreign writer who fills the directory in that instant
+        // makes the rename fail with `ENOTEMPTY` rather than clobber anything,
+        // which is the refusal they are owed.
+        if let Some(marker) = &plan.consume {
+            std::fs::remove_file(marker).map_err(io)?;
+        }
         if plan.case_only {
             staged_rename(&plan.source, &plan.destination, |from, to| {
                 std::fs::rename(from, to)
@@ -2462,15 +2469,28 @@ impl MutationEngine {
         let destination = self.resolve(to)?;
         if folder {
             return match std::fs::create_dir(&destination) {
-                Ok(()) => Ok(Reservation::Folder),
+                Ok(()) => {
+                    match create_atomically(
+                        &destination.join(RENAME_RESERVATION_MARKER),
+                        RENAME_RESERVATION,
+                    ) {
+                        Ok(_) => Ok(Reservation::Folder),
+                        // The directory is ours and the marker is not: undo
+                        // the claim rather than hold one nothing can prove.
+                        Err(error) => {
+                            let _ = std::fs::remove_dir(&destination);
+                            Err(error)
+                        }
+                    }
+                }
+                // Adopted **only** when it holds this burst's own marker and
+                // nothing else. An ordinary empty folder is a squatter, not a
+                // reservation: the spec refuses a rename whose destination
+                // exists, and consuming a user's folder because it happened to
+                // be empty would make the two `rewrite_links` shapes of one
+                // verb disagree about what "exists" means.
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Adopted only when it is an *empty* directory: a rename
-                    // over a non-empty one fails `ENOTEMPTY` anyway, so
-                    // adopting one would only move the refusal later.
-                    let empty = std::fs::read_dir(&destination)
-                        .map(|mut entries| entries.next().is_none())
-                        .unwrap_or(false);
-                    if empty {
+                    if folder_holds_reservation(&destination) {
                         Ok(Reservation::Folder)
                     } else {
                         Err(MutationError::TargetExists { path: to.clone() })
@@ -2505,9 +2525,13 @@ impl MutationEngine {
         match reservation {
             Reservation::None => {}
             Reservation::Folder => {
-                // `remove_dir` refuses a non-empty directory, which is the
-                // guard: anything created inside it since is not ours.
-                let _ = std::fs::remove_dir(&destination);
+                // Only while it still holds nothing but this burst's marker.
+                // `remove_dir` then refuses a directory anything else was put
+                // into, which is the second half of the same guard.
+                if folder_holds_reservation(&destination) {
+                    let _ = std::fs::remove_file(destination.join(RENAME_RESERVATION_MARKER));
+                    let _ = std::fs::remove_dir(&destination);
+                }
             }
             Reservation::File => {
                 if matches!(
@@ -2529,10 +2553,7 @@ impl MutationEngine {
     ) -> Result<bool, MutationError> {
         Ok(match reservation {
             Reservation::None => false,
-            Reservation::Folder => match std::fs::read_dir(destination) {
-                Ok(mut entries) => entries.next().is_none(),
-                Err(_) => false,
-            },
+            Reservation::Folder => folder_holds_reservation(destination),
             Reservation::File => {
                 matches!(self.read_regular_file(to, destination)?, Some(bytes) if bytes == RENAME_RESERVATION)
             }
@@ -2720,6 +2741,12 @@ impl MutationEngine {
         }
 
         Ok(RenamePlan {
+            // A reserved *folder* must be empty at the instant of the
+            // `rename(2)`, so its marker is removed there rather than here:
+            // held until the last moment, it keeps proving ownership for as
+            // long as ownership can still be questioned.
+            consume: (reserved && matches!(reservation, Some(Reservation::Folder)))
+                .then(|| destination.join(RENAME_RESERVATION_MARKER)),
             source,
             destination,
             stored_from,
@@ -2739,6 +2766,26 @@ impl MutationEngine {
 /// a crash ever leaves one behind.
 pub(crate) const RENAME_RESERVATION: &[u8] =
     b"<!-- vaultd: rename in progress; this placeholder is replaced when the rename completes -->\n";
+
+/// The name of the file a reserved *folder* holds to prove the reservation is
+/// this burst's own.
+///
+/// A folder has no bytes of its own to mark, and an empty directory is
+/// something a user plausibly created — so without this a pre-existing empty
+/// folder at the destination would be indistinguishable from a leftover
+/// reservation, and the repairing shape would silently consume it while the
+/// non-repairing shape refused the same rename. The marker makes ownership a
+/// byte-exact question, exactly as [`RENAME_RESERVATION`] does for a note.
+///
+/// It is **consumed by the move it guards**: POSIX renames a directory over an
+/// existing one only while that one is empty, so the marker is removed in the
+/// instant before the `rename(2)` and never survives a completed rename. A
+/// foreign writer that fills the directory in that instant makes the rename
+/// fail rather than clobber, which is the refusal it owes them.
+///
+/// Dot-prefixed and extensionless for [`write_atomically`]'s reason: the vault
+/// scan enumerates only `*.md` as notes, so it is never mistaken for one.
+pub(crate) const RENAME_RESERVATION_MARKER: &str = ".vaultd-rename-reservation";
 
 /// A claim on a rename's destination, held while the referrers are rewritten.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2761,6 +2808,31 @@ struct RenamePlan {
     stored_to: VaultPath,
     source_is_dir: bool,
     case_only: bool,
+    /// A reserved folder's ownership marker, removed immediately before the
+    /// move so the directory the rename replaces is empty.
+    consume: Option<PathBuf>,
+}
+
+/// Whether `directory` holds a rename reservation this daemon made: exactly
+/// one entry, named [`RENAME_RESERVATION_MARKER`], holding
+/// [`RENAME_RESERVATION`] byte for byte.
+///
+/// Everything else — an empty folder, a folder with a user's files in it, a
+/// folder with a same-named file whose bytes differ — is somebody else's, and
+/// a rename onto it is refused.
+fn folder_holds_reservation(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for entry in entries.flatten() {
+        names.push(entry.file_name());
+    }
+    if names.len() != 1 || names[0] != std::ffi::OsStr::new(RENAME_RESERVATION_MARKER) {
+        return false;
+    }
+    std::fs::read(directory.join(RENAME_RESERVATION_MARKER))
+        .is_ok_and(|bytes| bytes == RENAME_RESERVATION)
 }
 
 /// Whether these two spellings differ only in case, which is the one rename a

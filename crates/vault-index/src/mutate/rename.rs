@@ -132,9 +132,12 @@ fn at_path(note: &ResolutionNote, destination: &VaultPath) -> ResolutionNote {
 /// with both spans spliced.
 ///
 /// Runs **before** the movement, against the index's pre-move rows and the
-/// pre-move bytes on disk, and records each rewrite's post-move write target.
-/// The coordinator moves first and writes second, so a movement that is
-/// refused has cost nothing but this plan.
+/// pre-move bytes on disk. The coordinator rewrites first and moves last —
+/// with the destination reserved before either, so a squatter is refused while
+/// the vault is still byte-identical — and each rewrite is written at the
+/// referrer's *current* path, which is where it still is. A referrer that is
+/// itself inside a renamed folder travels to its new location with the move
+/// that follows; only its **spellings** are judged from where it will land.
 pub(crate) fn plan_repair(
     graph: &LiveGraph,
     store: &IndexStore,

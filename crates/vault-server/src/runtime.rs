@@ -1234,12 +1234,32 @@ impl Coordinator {
     fn apply_mutation(&mut self, mutation: Mutation) -> Result<MutationReport, MutationFailure> {
         self.flush();
         // Every failure up to and including this call leaves the vault
-        // byte-identical: the engine refuses before it writes, and its own
-        // write is temp-then-rename. A link-repairing rename keeps that
-        // property by moving the file **first** and rewriting the referrers
-        // after — so an `Err` here still means nothing changed, and a repair
-        // that could not land is reported inside the `Ok` outcome's
-        // `link_rewrite_failures` rather than by failing the mutation.
+        // byte-identical — for every mutation **except** a link-repairing
+        // rename, where the engine refuses before it writes and its own write
+        // is temp-then-rename.
+        //
+        // A repairing rename rewrites the referrers before it moves the file,
+        // so the guarantee splits at that point and an `Err` here means one of
+        // two things:
+        //
+        // * refused **before** the rewrites — the ordinary case, and the one
+        //   every squatter produces, because the destination is reserved
+        //   first: nothing changed, and the reservation is given back;
+        // * refused **after** them — a source that vanished or whose revision
+        //   moved in that window: the referrers are rewritten and the
+        //   reservation is deliberately *kept*, so those references name a
+        //   placeholder this daemon owns rather than a same-basename note
+        //   elsewhere in the vault. The client's retry adopts the placeholder
+        //   and completes.
+        //
+        // In that second case `changed_paths` is lost with the `Err`, so the
+        // rewritten referrers reach a generation through the watcher's own
+        // hint or the next complete reconciliation rather than through this
+        // call. Recorded as Task 12's residue 2, not an oversight.
+        //
+        // A repair that could not land while the rename itself *succeeded* is
+        // reported inside the `Ok` outcome's `link_rewrite_failures`, never by
+        // failing the mutation.
         let outcome = self
             .mutation(|index| index.apply_mutation(&mutation))
             .map_err(MutationFailure::Failed)?;
