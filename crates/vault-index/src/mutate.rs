@@ -999,9 +999,10 @@ pub struct MutationOutcome {
     /// inside the indexed vault", which is what the wire's
     /// `WriteFileResponse::semantic` answers. That one is `!is_unindexable` —
     /// the configuration zone *and* every hidden folder, since the scan lists
-    /// neither — the server computes it from the path, and conflating the two
-    /// is what made an attachment write claim to be semantic in the first
-    /// draft. Nor is it the same question as `changed_paths`: an attachment
+    /// neither — and the server computes it from `written`, the landed stored
+    /// spelling, never from the caller's request path (an alias or case fold
+    /// must answer for where it landed). Conflating the two questions is what
+    /// made an attachment write claim to be semantic in the first draft. Nor is it the same question as `changed_paths`: an attachment
     /// write names its path (the tree moved) while reporting `false` here.
     pub semantic: bool,
 }
