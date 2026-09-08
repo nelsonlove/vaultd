@@ -939,6 +939,13 @@ impl IndexService {
         //     recovery, a checkpointer holding read marks) are bounded by
         //     `busy_timeout(5s)`: they can stall a publication, never wedge
         //     it.
+        //
+        // A snapshot session (`snapshot.rs`) is the one reader that takes no
+        // barrier at all, deliberately: it serves SQL rows only, never the
+        // live graph, so the commit below is its authoritative publish and it
+        // may see a generation a hair before that generation's install
+        // finishes. Taking no lock only strengthens (a) — such a reader can
+        // never be the thread this commit waits on.
         let mut published = write_published(&self.published)?;
         let (generation, publish_metrics) = pending.commit()?;
         if let Some(hook) = &self.publication_pause {

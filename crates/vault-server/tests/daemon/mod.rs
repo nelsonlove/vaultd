@@ -175,9 +175,10 @@ impl Daemon {
     /// Close stdin and wait. The daemon must exit rather than hang.
     ///
     /// Allowed dead because this module is compiled into each test binary
-    /// separately and no current consumer calls it; Tasks 14/16/17 are its
-    /// intended callers. The allow is on this one item rather than the file,
-    /// so anything else that goes dead here still shows up.
+    /// separately: `tests/snapshots.rs` calls it — a client that disconnects
+    /// with a session open is the one release path a unit test cannot reach —
+    /// and the other binaries do not. The allow is on this one item rather
+    /// than the file, so anything else that goes dead here still shows up.
     #[allow(dead_code)]
     pub fn disconnect(&mut self) -> std::process::ExitStatus {
         drop(self.stdin.take());

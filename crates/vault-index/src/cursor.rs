@@ -22,6 +22,12 @@ pub(crate) enum CursorPosition {
         end: u64,
         id: i64,
     },
+    /// The last tree row a `snapshot_tree` page served. The path alone is the
+    /// whole key: `tree_entries.path` is the table's primary key, so it is
+    /// both unique and the order the page walks.
+    TreeEntry {
+        path: String,
+    },
     Diagnostic {
         path: Option<String>,
         start: Option<u64>,

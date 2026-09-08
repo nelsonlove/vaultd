@@ -261,6 +261,11 @@ fn dispatch(
                 if !drain(&mut subscriptions, outputs) {
                     return Ok(());
                 }
+                // Idle snapshot sessions are reclaimed here rather than by a
+                // timer: this loop already runs on every request, and a
+                // session that nobody asks about otherwise holds its WAL
+                // frames for as long as the client stays connected.
+                server.sweep_snapshots();
                 let response = respond(server, &mut subscriptions, *raw);
                 if outputs
                     .send(OutputEnvelope::Response(Box::new(response)))

@@ -11,7 +11,8 @@ use vault_protocol::{
     FrontmatterEditDto, GetVaultInfoResponse, HeadingDto, IndexStateDto, LinkRewriteFailureDto,
     LiveStateDto, NoteDto, NoteSummaryDto, PatchValueDto, PropertyDto, PropertyMappingEntryDto,
     PropertyValueDto, ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto,
-    ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto,
+    ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto, TreeEntryDto,
+    TreeEntryKindDto,
 };
 
 use crate::runtime::{MutationFailure, RefreshFailure};
@@ -563,6 +564,28 @@ pub(crate) fn frontmatter_edits(
         });
     }
     Ok(converted)
+}
+
+/// One tree row, as a `snapshot_tree` page puts it on the wire.
+///
+/// `TreeEntryKindDto::Unknown` has no source here on purpose: this server
+/// only ever produces the three kinds the index's own `CHECK` constraint
+/// admits. That variant exists so a *client* built against an older protocol
+/// can survive a kind a later server adds, which is the direction the
+/// openness is for.
+pub(crate) fn tree_entry(value: &vault_index::TreeEntryRow) -> TreeEntryDto {
+    TreeEntryDto {
+        path: value.path.as_str().to_string(),
+        kind: match value.kind {
+            vault_index::TreeEntryKind::Folder => TreeEntryKindDto::Folder,
+            vault_index::TreeEntryKind::Note => TreeEntryKindDto::Note,
+            vault_index::TreeEntryKind::File => TreeEntryKindDto::File,
+        },
+        size: value.size,
+        ctime_unix_ms: value.ctime_unix_ms,
+        mtime_unix_ms: value.mtime_unix_ms,
+        revision: value.revision.clone(),
+    }
 }
 
 pub(crate) fn link_rewrite_failures(

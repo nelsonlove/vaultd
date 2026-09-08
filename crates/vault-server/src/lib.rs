@@ -9,9 +9,10 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexReader, LiveState, ReferenceStatus};
 use vault_protocol::{
-    ErrorCode, GenerationResponse, MutationResponse, PageResponse, ProtocolError,
-    ReferenceStatusFilter, RefreshIndexResponse, RenameResponse, Request, RequestEnvelope,
-    ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto, validate_version,
+    CloseSnapshotResponse, ErrorCode, GenerationResponse, MutationResponse, OpenSnapshotResponse,
+    PageResponse, ProtocolError, ReferenceStatusFilter, RefreshIndexResponse, RenameResponse,
+    Request, RequestEnvelope, ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto,
+    SnapshotTreeResponse, validate_version,
 };
 
 use crate::runtime::{MutationReport, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
@@ -31,6 +32,16 @@ const NOTICE_CAPACITY: usize = 256;
 /// reads need no coordination at all.
 pub struct Server {
     live: Option<Live>,
+    /// Snapshot sessions, behind a mutex so reads answer from the dispatcher
+    /// thread without ever touching the coordinator. `rusqlite::Connection`
+    /// is `Send` but not `Sync`, which is exactly what a `Mutex` is for.
+    ///
+    /// `None` in health-only mode. A registry needs an `IndexConfig` to open
+    /// reader connections against, and health-only has no vault and therefore
+    /// no config — so the absence is modelled rather than faked with an empty
+    /// registry that would answer `snapshot_not_found` where it should answer
+    /// `index_unavailable`.
+    snapshots: Option<std::sync::Mutex<vault_index::SnapshotSessions>>,
 }
 
 struct Live {
@@ -100,7 +111,10 @@ impl Server {
     /// refuses. Allocation-light on purpose — no watcher, no lease, no
     /// graph, no timer, and no threads at all.
     pub fn health_only() -> Self {
-        Self { live: None }
+        Self {
+            live: None,
+            snapshots: None,
+        }
     }
 
     /// Serve an already-running runtime. The caller owns the notice
@@ -108,8 +122,10 @@ impl Server {
     /// deliver events.
     pub fn for_runtime(handle: RuntimeHandle) -> Self {
         let reader = handle.reader();
+        let snapshots = std::sync::Mutex::new(vault_index::SnapshotSessions::new(&handle.config()));
         Self {
             live: Some(Live { handle, reader }),
+            snapshots: Some(snapshots),
         }
     }
 
@@ -135,8 +151,34 @@ impl Server {
     /// Stop the runtime and join every thread it owns. Idempotent, and
     /// implied by dropping the server.
     pub fn shutdown(&self) {
+        // Sessions first: each one pins WAL frames until its transaction is
+        // rolled back, and a disconnect is what reaches this on the ordinary
+        // path — the daemon is single-peer, so end of input means every
+        // session that client held is abandoned.
+        if let Some(sessions) = self.snapshots.as_ref() {
+            sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .close_all();
+        }
         if let Some(live) = &self.live {
             live.handle.shutdown();
+        }
+    }
+
+    /// Reclaim snapshot sessions that have gone idle.
+    ///
+    /// Called by the transport on every request it takes, of any kind. The
+    /// registry otherwise only reaps inside a call *about* a session, so a
+    /// client that opens one and then does other work would hold its WAL
+    /// frames for as long as it stayed connected. This bounds residency to
+    /// one idle timeout after the last request, with no thread and no timer.
+    pub fn sweep_snapshots(&self) {
+        if let Some(sessions) = self.snapshots.as_ref() {
+            sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .sweep();
         }
     }
 
@@ -618,12 +660,66 @@ impl Server {
                 id,
                 runtime_not_ready("raw file operations are not wired yet"),
             ),
-            // Snapshot sessions land in Tasks 13-15.
-            Request::OpenSnapshot(_)
-            | Request::SnapshotTree(_)
-            | Request::SnapshotNotes(_)
-            | Request::CloseSnapshot(_) => {
-                ResponseEnvelope::error(id, runtime_not_ready("snapshots are not wired yet"))
+            Request::OpenSnapshot(_) => match self.snapshots.as_ref() {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(sessions) => {
+                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+                    match sessions.open() {
+                        Ok(opened) => ResponseEnvelope::success(
+                            id,
+                            Response::OpenSnapshot(OpenSnapshotResponse {
+                                snapshot_id: opened.snapshot_id,
+                                generation: opened.generation.get(),
+                                note_count: opened.note_count,
+                                entry_count: opened.entry_count,
+                            }),
+                        ),
+                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                    }
+                }
+            },
+            Request::SnapshotTree(params) => match self.snapshots.as_ref() {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(sessions) => {
+                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+                    match sessions.tree_page(
+                        &params.snapshot_id,
+                        params.cursor.as_deref(),
+                        params.limit,
+                    ) {
+                        Ok(page) => ResponseEnvelope::success(
+                            id,
+                            Response::SnapshotTree(SnapshotTreeResponse {
+                                snapshot_id: params.snapshot_id,
+                                generation: page.generation.get(),
+                                entries: page.entries.iter().map(convert::tree_entry).collect(),
+                                next_cursor: page.next_cursor,
+                            }),
+                        ),
+                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                    }
+                }
+            },
+            Request::CloseSnapshot(params) => match self.snapshots.as_ref() {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(sessions) => {
+                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+                    match sessions.close(&params.snapshot_id) {
+                        Ok(()) => ResponseEnvelope::success(
+                            id,
+                            Response::CloseSnapshot(CloseSnapshotResponse {
+                                snapshot_id: params.snapshot_id,
+                            }),
+                        ),
+                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                    }
+                }
+            },
+            // The semantic half of a session lands in Task 15. It refuses
+            // rather than answering an empty page, which a client would
+            // read as "this snapshot has no notes".
+            Request::SnapshotNotes(_) => {
+                ResponseEnvelope::error(id, runtime_not_ready("snapshot_notes is not wired yet"))
             }
         }
     }

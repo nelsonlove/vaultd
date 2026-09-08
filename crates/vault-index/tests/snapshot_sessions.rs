@@ -162,6 +162,58 @@ fn closing_a_session_releases_it_and_closing_it_twice_is_typed() {
     }
 }
 
+/// The one branch of `open` that returns without a session. Its own comment
+/// makes a claim a test can check — that the connection it already opened
+/// does not survive as a pin — so the assertion is "no session", not merely
+/// "an error".
+#[test]
+fn opening_before_anything_is_published_is_refused_rather_than_pinning_an_empty_index() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index = TempDir::new().expect("index tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    std::fs::write(root.join("One.md"), "# One\n").expect("write One");
+    let config =
+        IndexConfig::explicit(&root, index.path().join("index.sqlite3")).expect("snapshot config");
+    // Opened, never refreshed: the schema exists and no generation is
+    // committed, so there is no snapshot to pin.
+    let _service = IndexService::open(config.clone()).expect("snapshot service");
+
+    let mut sessions = SnapshotSessions::new(&config);
+    let error = sessions
+        .open()
+        .expect_err("an index with no committed generation has nothing to pin");
+    assert!(
+        matches!(error, IndexError::IndexUnavailable),
+        "expected index_unavailable, got {error:?}"
+    );
+    assert!(
+        sessions.is_empty(),
+        "a refused open must leave no session behind, and therefore no WAL pin"
+    );
+}
+
+/// Residency, closed out. `reap` otherwise runs only inside a call about a
+/// session, so a client that opens one and goes quiet holds its frames for as
+/// long as it stays connected; the dispatcher calls `sweep` on every request
+/// of any kind.
+#[test]
+fn a_sweep_reclaims_an_idle_session_nobody_has_asked_about() {
+    let fixture = fixture(|config| config.snapshot_idle_timeout = Duration::from_millis(50));
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    sessions.open().expect("open a snapshot");
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(
+        sessions.len(),
+        1,
+        "nothing has touched the registry, so nothing has been reaped yet"
+    );
+    sessions.sweep();
+    assert!(
+        sessions.is_empty(),
+        "a sweep reclaims an idle session without a call about that session"
+    );
+}
+
 #[test]
 fn closing_every_session_is_what_a_disconnect_does() {
     let fixture = fixture(|_| {});

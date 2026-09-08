@@ -359,6 +359,7 @@ impl Runtime {
 
         Ok(RuntimeHandle {
             inner: Arc::new(RuntimeInner {
+                config,
                 commands,
                 overflow,
                 running,
@@ -675,6 +676,11 @@ impl Drop for CoordinatorAlive {
 
 /// The shared, clonable half of a running runtime.
 struct RuntimeInner {
+    /// The configuration this runtime was started with. Kept so a server can
+    /// build reader-side machinery — snapshot sessions open their own
+    /// connections — against the same vault and index the coordinator is
+    /// writing, without a second source of truth for either path.
+    config: IndexConfig,
     commands: SyncSender<RuntimeCommand>,
     overflow: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -754,6 +760,14 @@ impl RuntimeHandle {
     /// the coordinator thread.
     pub fn reader(&self) -> Arc<IndexReader> {
         Arc::clone(&self.inner.reader)
+    }
+
+    /// The configuration this runtime is serving. A clone rather than a
+    /// borrow: `IndexConfig` is a handful of owned paths, and handing out a
+    /// reference would tie a caller's snapshot registry to the lifetime of a
+    /// handle it does not otherwise need to keep.
+    pub fn config(&self) -> IndexConfig {
+        self.inner.config.clone()
     }
 
     /// Queue one command, without ever blocking. A full mailbox sets the

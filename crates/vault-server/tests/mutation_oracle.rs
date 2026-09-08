@@ -27,26 +27,24 @@
 //!    when neither did. This is the axis a folder verb lives on: a
 //!    `create_folder` whose outcome names nothing puts a folder on disk that
 //!    no generation ever carries, and nothing in axis 1 can see it.
-//! 3. **Tree honesty** — every path the walk says moved appears in the
-//!    generation's own published change set. Over-naming is free (the engine
-//!    documents conservative invalidation as the safe direction);
-//!    under-naming is the bug, so the relation asserted is superset, not
-//!    equality.
+//! 3. **Tree honesty**, in two halves:
+//!    - The tree the daemon *serves* equals a fresh walk. Every step pages a
+//!      whole `snapshot_tree` out of a session it opens and closes, and
+//!      compares it to `FileSystemVaultSource::scan()` row for row (path,
+//!      kind, size — the walk vocabulary `vault-index`'s
+//!      `tests/live_oracle.rs` already uses).
+//!    - Every path the walk says moved appears in the generation's own
+//!      published change set. Over-naming is free (the engine documents
+//!      conservative invalidation as the safe direction); under-naming is the
+//!      bug, so the relation asserted is superset, not equality.
 //!
-//! Axis 3 reads the daemon's `generation_committed` events, which is the
-//! **only** surface on which this daemon says anything about non-note paths
-//! today. TRIPWIRE — Task 14 wires the `open_snapshot`/`snapshot_tree`
-//! dispatch arms; when they land, axis 3 should compare `snapshot_tree`'s
-//! rows against `FileSystemVaultSource::scan()` directly (path, kind, size —
-//! the walk vocabulary `vault-index`'s `tests/live_oracle.rs` already uses)
-//! instead of inferring the tree from a change set. Strengthen this test
-//! then; do not delete it.
-//!
-//! Task 13 landed the session registry itself (`vault_index::SnapshotSessions`
-//! — its own connection, its own pinned deferred transaction), but no
-//! dispatch arm reaches it yet: the daemon still answers `runtime_not_ready`
-//! to every snapshot verb, so the step below stays a refusal for one more
-//! task rather than being flipped early on a verb that does not answer.
+//! Until Task 14 the first half did not exist: `generation_committed` events
+//! were the only surface on which this daemon said anything about non-note
+//! paths, so the tree could only be *inferred* from a change set. The
+//! `snapshot_tree` arm makes it directly observable, and both halves are kept
+//! because they fail differently — the row comparison catches a tree the
+//! daemon serves wrongly, the change-set half catches a tree it serves
+//! correctly but never announced.
 
 mod daemon;
 
@@ -153,11 +151,6 @@ enum Expect {
     /// Refused because the verb is not wired yet. A refusal is still checked
     /// on all three axes: nothing moved, so no generation may appear.
     RefusedUntilTask16,
-    /// Refused because no dispatch arm reaches the snapshot sessions yet.
-    /// Same contract as [`Expect::RefusedUntilTask16`], different owner:
-    /// Task 14, which wires `open_snapshot` and `snapshot_tree` onto the
-    /// registry Task 13 built.
-    RefusedUntilTask14,
 }
 
 /// A daemon plus the request-id bookkeeping this suite needs. Ids are unique
@@ -217,6 +210,60 @@ impl Client {
         }
     }
 
+    /// The file tree as the daemon serves it: a snapshot opened, paged to
+    /// completion, and closed.
+    ///
+    /// A small page limit on purpose — the fixture never holds many entries,
+    /// and paging is only exercised if more than one page is needed. The
+    /// session is closed rather than left to the idle timeout, so the number
+    /// of live sessions this walk holds stays at the one the scripted
+    /// `open_snapshot` step deliberately abandons.
+    fn snapshot_tree(&mut self) -> Tree {
+        let opened = self.call("open_snapshot", "{}");
+        let snapshot_id = match opened.outcome {
+            ResponseOutcome::Ok(Response::OpenSnapshot(response)) => response.snapshot_id,
+            other => panic!("open_snapshot failed: {other:?}"),
+        };
+
+        let mut tree = Tree::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = match &cursor {
+                Some(cursor) => {
+                    format!(r#"{{"snapshot_id":"{snapshot_id}","cursor":"{cursor}","limit":3}}"#)
+                }
+                None => format!(r#"{{"snapshot_id":"{snapshot_id}","limit":3}}"#),
+            };
+            let page = match self.call("snapshot_tree", &params).outcome {
+                ResponseOutcome::Ok(Response::SnapshotTree(page)) => page,
+                other => panic!("snapshot_tree failed: {other:?}"),
+            };
+            for entry in page.entries {
+                let previous = tree.insert(entry.path.clone(), (dto_kind(entry.kind), entry.size));
+                assert!(
+                    previous.is_none(),
+                    "{} was served twice, so the keyset paging repeats rows",
+                    entry.path
+                );
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let closed = self.call(
+            "close_snapshot",
+            &format!(r#"{{"snapshot_id":"{snapshot_id}"}}"#),
+        );
+        assert!(
+            matches!(closed.outcome, ResponseOutcome::Ok(_)),
+            "close_snapshot failed: {:?}",
+            closed.outcome
+        );
+        tree
+    }
+
     /// Every path the daemon published for `generation`, from its own
     /// `generation_committed` event.
     ///
@@ -249,6 +296,21 @@ impl Client {
             ChangeSetDto::CountsOnly { .. } => {
                 panic!("the change set for generation {generation} lost its per-path detail")
             }
+        }
+    }
+}
+
+/// The wire kind in the walk's own vocabulary. `Unknown` is unreachable from
+/// this server — it exists so an older client survives a kind a later server
+/// adds — and a panic is the honest answer if it ever arrives, because the
+/// comparison below would otherwise have to invent a kind to compare against.
+fn dto_kind(kind: vault_protocol::TreeEntryKindDto) -> TreeEntryKind {
+    match kind {
+        vault_protocol::TreeEntryKindDto::Folder => TreeEntryKind::Folder,
+        vault_protocol::TreeEntryKindDto::Note => TreeEntryKind::Note,
+        vault_protocol::TreeEntryKindDto::File => TreeEntryKind::File,
+        vault_protocol::TreeEntryKindDto::Unknown => {
+            panic!("this server produces only the three kinds the index's CHECK admits")
         }
     }
 }
@@ -454,17 +516,12 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
             r##"{"path":"Nested/Gamma.md","content":"# Gamma\n[[Beta]]\n[[Alpha#^block]]\n[[Zeta]]\n","expected":{"absent":true}}"##.to_string(),
             Expect::Lands,
         ),
-        // TRIPWIRE — Task 14 must flip this step, not delete it. Task 13
-        // landed `SnapshotSessions` but wired no dispatch arm to it, so the
-        // verb still refuses; when Task 14's `open_snapshot` arm lands,
-        // change `Expect::RefusedUntilTask14` to `Expect::Lands` and upgrade
-        // axis 3 (see the module header) into a real snapshot_tree row
-        // comparison.
-        (
-            "open_snapshot",
-            r#"{}"#.to_string(),
-            Expect::RefusedUntilTask14,
-        ),
+        // The Task 14 tripwire step, flipped: `open_snapshot` now reaches the
+        // registry and lands. It is deliberately never closed, so the rest of
+        // the walk runs with a session pinned at this generation — which is
+        // the claim worth having here: a pinned reader must not stop the
+        // writer, and every step below still publishes with it open.
+        ("open_snapshot", r#"{}"#.to_string(), Expect::Lands),
         (
             "patch_frontmatter",
             r#"{"path":"Beta.md","patch":[{"key_path":"title","value":"Titled"}],"expected":{"any":true}}"#.to_string(),
@@ -552,18 +609,6 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                      writes. Answer was {other:?}"
                 ),
             },
-            Expect::RefusedUntilTask14 => match &response.outcome {
-                ResponseOutcome::Err(error) => assert_eq!(
-                    error.code,
-                    ErrorCode::RuntimeNotReady,
-                    "{method} was refused for the wrong reason"
-                ),
-                other => panic!(
-                    "TRIPWIRE — Task 14 wired `{method}`: flip this step to \
-                     `Expect::Lands` and upgrade axis 3 into a real snapshot_tree row \
-                     comparison per the module header. Answer was {other:?}"
-                ),
-            },
         }
 
         // Axis 1: the note answers equal a fresh scan.
@@ -581,6 +626,17 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
 
         // Axes 2 and 3, against the walk this step actually produced.
         let walked = scanned_tree(&root);
+
+        // Axis 3, first half: the tree the daemon *serves* is the tree on
+        // disk. Read before the generation is asked for, so a snapshot that
+        // somehow moved the index would show up here rather than as a
+        // surprise generation.
+        assert_eq!(
+            client.snapshot_tree(),
+            walked,
+            "the tree the daemon pages out diverged from a fresh walk after {method} {params}"
+        );
+
         let mut moved = tree_changes(&tree, &walked);
         moved.extend(revision_changes(&state, &scanned));
         let changed = !moved.is_empty();
@@ -591,6 +647,7 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
             "the generation must advance exactly once iff the vault moved \
              (moved = {moved:?}) after {method} {params}"
         );
+        // Axis 3, second half: what moved was also announced.
         if changed {
             let announced = client.published_paths(published);
             let unannounced: Vec<&String> = moved
