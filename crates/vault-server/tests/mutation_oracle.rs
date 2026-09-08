@@ -35,12 +35,18 @@
 //!
 //! Axis 3 reads the daemon's `generation_committed` events, which is the
 //! **only** surface on which this daemon says anything about non-note paths
-//! today. TRIPWIRE — Tasks 13-15 wire `open_snapshot`/`snapshot_tree`; when
-//! they land, axis 3 should compare `snapshot_tree`'s rows against
-//! `FileSystemVaultSource::scan()` directly (path, kind, size — the walk
-//! vocabulary `vault-index`'s `tests/live_oracle.rs` already uses) instead of
-//! inferring the tree from a change set. Strengthen this test then; do not
-//! delete it.
+//! today. TRIPWIRE — Task 14 wires the `open_snapshot`/`snapshot_tree`
+//! dispatch arms; when they land, axis 3 should compare `snapshot_tree`'s
+//! rows against `FileSystemVaultSource::scan()` directly (path, kind, size —
+//! the walk vocabulary `vault-index`'s `tests/live_oracle.rs` already uses)
+//! instead of inferring the tree from a change set. Strengthen this test
+//! then; do not delete it.
+//!
+//! Task 13 landed the session registry itself (`vault_index::SnapshotSessions`
+//! — its own connection, its own pinned deferred transaction), but no
+//! dispatch arm reaches it yet: the daemon still answers `runtime_not_ready`
+//! to every snapshot verb, so the step below stays a refusal for one more
+//! task rather than being flipped early on a verb that does not answer.
 
 mod daemon;
 
@@ -147,9 +153,11 @@ enum Expect {
     /// Refused because the verb is not wired yet. A refusal is still checked
     /// on all three axes: nothing moved, so no generation may appear.
     RefusedUntilTask16,
-    /// Refused because snapshot sessions are not wired yet. Same contract as
-    /// [`Expect::RefusedUntilTask16`], different owner: Tasks 13-15.
-    RefusedUntilTask13,
+    /// Refused because no dispatch arm reaches the snapshot sessions yet.
+    /// Same contract as [`Expect::RefusedUntilTask16`], different owner:
+    /// Task 14, which wires `open_snapshot` and `snapshot_tree` onto the
+    /// registry Task 13 built.
+    RefusedUntilTask14,
 }
 
 /// A daemon plus the request-id bookkeeping this suite needs. Ids are unique
@@ -446,14 +454,16 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
             r##"{"path":"Nested/Gamma.md","content":"# Gamma\n[[Beta]]\n[[Alpha#^block]]\n[[Zeta]]\n","expected":{"absent":true}}"##.to_string(),
             Expect::Lands,
         ),
-        // TRIPWIRE — Tasks 13-15 must flip this step, not delete it. When
-        // `open_snapshot` lands, change `Expect::RefusedUntilTask13` to
-        // `Expect::Lands` and upgrade axis 3 (see the module header) into a
-        // real snapshot_tree row comparison.
+        // TRIPWIRE — Task 14 must flip this step, not delete it. Task 13
+        // landed `SnapshotSessions` but wired no dispatch arm to it, so the
+        // verb still refuses; when Task 14's `open_snapshot` arm lands,
+        // change `Expect::RefusedUntilTask14` to `Expect::Lands` and upgrade
+        // axis 3 (see the module header) into a real snapshot_tree row
+        // comparison.
         (
             "open_snapshot",
             r#"{}"#.to_string(),
-            Expect::RefusedUntilTask13,
+            Expect::RefusedUntilTask14,
         ),
         (
             "patch_frontmatter",
@@ -542,14 +552,14 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                      writes. Answer was {other:?}"
                 ),
             },
-            Expect::RefusedUntilTask13 => match &response.outcome {
+            Expect::RefusedUntilTask14 => match &response.outcome {
                 ResponseOutcome::Err(error) => assert_eq!(
                     error.code,
                     ErrorCode::RuntimeNotReady,
                     "{method} was refused for the wrong reason"
                 ),
                 other => panic!(
-                    "TRIPWIRE — Tasks 13-15 wired `{method}`: flip this step to \
+                    "TRIPWIRE — Task 14 wired `{method}`: flip this step to \
                      `Expect::Lands` and upgrade axis 3 into a real snapshot_tree row \
                      comparison per the module header. Answer was {other:?}"
                 ),

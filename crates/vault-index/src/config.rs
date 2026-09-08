@@ -14,6 +14,16 @@ pub struct IndexConfig {
     pub vault_identity: String,
     pub index_path: PathBuf,
     pub location: IndexLocation,
+    /// How long a snapshot session may sit unused before it is reclaimed.
+    /// An open snapshot pins WAL frames and defers checkpoint truncation, so
+    /// an abandoned one is a real cost rather than an inert handle.
+    pub snapshot_idle_timeout: std::time::Duration,
+    /// How many snapshot sessions may be open at once, for the same reason.
+    pub max_concurrent_snapshots: usize,
+    /// The page size a client gets when it does not ask for one.
+    pub snapshot_page_size: u32,
+    /// The largest page size a client may ask for.
+    pub max_snapshot_page_size: u32,
 }
 
 impl IndexConfig {
@@ -33,6 +43,10 @@ impl IndexConfig {
             vault_identity,
             index_path: resolved_index_path,
             location: IndexLocation::Derived,
+            snapshot_idle_timeout: std::time::Duration::from_secs(60),
+            max_concurrent_snapshots: 4,
+            snapshot_page_size: 500,
+            max_snapshot_page_size: 2_000,
         })
     }
 
@@ -63,6 +77,10 @@ impl IndexConfig {
             vault_identity,
             index_path: resolved_index_path,
             location: IndexLocation::Explicit,
+            snapshot_idle_timeout: std::time::Duration::from_secs(60),
+            max_concurrent_snapshots: 4,
+            snapshot_page_size: 500,
+            max_snapshot_page_size: 2_000,
         })
     }
 

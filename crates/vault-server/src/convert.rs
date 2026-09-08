@@ -362,6 +362,14 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::IndexInUse;
             error.message = "the index is held by another writer".into();
         }
+        IndexError::SnapshotNotFound(id) => {
+            error.code = ErrorCode::SnapshotNotFound;
+            error.message = format!("no such snapshot session: {id}");
+        }
+        IndexError::TooManySnapshots { limit } => {
+            error.code = ErrorCode::TooManySnapshots;
+            error.message = format!("at most {limit} snapshot sessions may be open at once");
+        }
         // One mapping, one place. The dispatch path calls `mutation_error`
         // directly for the refusals it produces itself, and this arm routes
         // the ones that arrive wrapped in an `IndexError` to exactly the same

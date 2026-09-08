@@ -13,6 +13,7 @@ mod query;
 mod reader;
 mod reconcile;
 mod schema;
+mod snapshot;
 mod store;
 mod test_hook;
 
@@ -44,6 +45,7 @@ pub use reader::IndexReader;
 pub use reader::PauseHook;
 pub use reconcile::{IndexService, RefreshReport};
 pub use schema::{SEMANTIC_FORMAT_VERSION, SQL_SCHEMA_VERSION};
+pub use snapshot::{OpenSnapshot, SnapshotSessions, TreeEntryKind};
 pub use store::{
     DeltaPublication, DeltaPublishOutcome, DeltaPublishTimings, DeltaWriteCounts, IndexStore,
     NoteReplacement, ResolutionReplacement, StoredTreeEntry, TreeDelta,

@@ -45,6 +45,15 @@ pub enum IndexError {
     /// construction.
     #[error("index storage is already in use by another writer")]
     IndexInUse,
+    /// No session with this identifier is open — it was closed, reclaimed
+    /// after its idle timeout, or never issued by this process.
+    #[error("no such snapshot session: {0}")]
+    SnapshotNotFound(String),
+    /// The daemon already holds its maximum number of open snapshots. Each
+    /// one pins WAL frames, so the cap is a resource bound rather than a
+    /// policy.
+    #[error("at most {limit} snapshot sessions may be open at once")]
+    TooManySnapshots { limit: usize },
     /// A mutation was refused by its own preconditions, by path validation,
     /// or by a zone rule. Never damage, and never retryable by this process:
     /// the caller's model of the vault was wrong and should hear so.
