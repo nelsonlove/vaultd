@@ -136,6 +136,9 @@ enum Expect {
     /// Refused because the verb is not wired yet. A refusal is still checked
     /// on all three axes: nothing moved, so no generation may appear.
     RefusedUntilTask16,
+    /// Refused because snapshot sessions are not wired yet. Same contract as
+    /// [`Expect::RefusedUntilTask16`], different owner: Tasks 13-15.
+    RefusedUntilTask13,
 }
 
 /// A daemon plus the request-id bookkeeping this suite needs. Ids are unique
@@ -428,6 +431,15 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
             r##"{"path":"Nested/Gamma.md","content":"# Gamma\n[[Beta]]\n[[Alpha#^block]]\n[[Zeta]]\n","expected":{"absent":true}}"##.to_string(),
             Expect::Lands,
         ),
+        // TRIPWIRE — Tasks 13-15 must flip this step, not delete it. When
+        // `open_snapshot` lands, change `Expect::RefusedUntilTask13` to
+        // `Expect::Lands` and upgrade axis 3 (see the module header) into a
+        // real snapshot_tree row comparison.
+        (
+            "open_snapshot",
+            r#"{}"#.to_string(),
+            Expect::RefusedUntilTask13,
+        ),
         (
             "patch_frontmatter",
             r#"{"path":"Beta.md","patch":[{"key_path":"title","value":"Titled"}],"expected":{"any":true}}"#.to_string(),
@@ -496,6 +508,18 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                     "TRIPWIRE — Task 16 wired `{method}`: flip this step to `Expect::Lands` \
                      rather than deleting it, so the tree axis starts checking the row it \
                      writes. Answer was {other:?}"
+                ),
+            },
+            Expect::RefusedUntilTask13 => match &response.outcome {
+                ResponseOutcome::Err(error) => assert_eq!(
+                    error.code,
+                    ErrorCode::RuntimeNotReady,
+                    "{method} was refused for the wrong reason"
+                ),
+                other => panic!(
+                    "TRIPWIRE — Tasks 13-15 wired `{method}`: flip this step to \
+                     `Expect::Lands` and upgrade axis 3 into a real snapshot_tree row \
+                     comparison per the module header. Answer was {other:?}"
                 ),
             },
         }
