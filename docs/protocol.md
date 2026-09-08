@@ -291,10 +291,10 @@ Each entry is `{ "path": ..., "reason": ... }`. `path` is *the path the failure 
 - `unwritable_spelling` — no link syntax available at that reference can spell the destination's name. A wikilink's file target cannot carry a `#` (it starts the subpath) or a `|` (it starts the display text), and cannot contain the `]]` that would close the link early; a frontmatter reference carries wikilinks and nothing else, so it has no other syntax to fall back to. Rename the destination, or edit the reference by hand.
 - `context_conflict` — the replacement is a valid link on its own and changes how the *surrounding document* parses, so writing it would destroy or redirect a reference. The referring note is left exactly as it was. Edit that reference by hand.
 - `ambiguous_target` — the reference was already ambiguous: its spelling matched more than one note before the rename, so there is no single target to preserve, and the rename changes which note it lands on. Spell that reference explicitly and retry.
-
-A reference that resolved nowhere before the rename is **not** reported: it was already broken, the rename did not break it, and listing it would bury the real failures.
 - `write_failed` — the rewrite was planned and validated and the filesystem write failed.
 - `index_unavailable` — **burst-scoped**, not per-reference: no generation has ever been published, so there was no graph to ask which references point at the moved path. `path` names the rename's own subject. The move happened; nothing was repaired. Refresh the index and rename back and forth, or fix the references by hand.
+
+A reference that resolved **nowhere** before the rename is not reported at all: it was already broken, the rename did not break it, and listing it would bury the real failures under links the rename never touched.
 
 Per the evolution rule below, a client MUST treat a `reason` it does not recognise as unknown rather than as a protocol error.
 

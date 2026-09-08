@@ -201,7 +201,7 @@ fn a_destination_a_wikilink_cannot_spell_becomes_a_markdown_link() {
 
     assert_eq!(
         read(&fixture, "Short.md"),
-        "before [A|B](A%7CB) after\n",
+        "before [A\\|B](A%7CB) after\n",
         "[[A|B]] would name A.md; the Markdown form spells the real name"
     );
     assert_eq!(
@@ -604,12 +604,63 @@ fn a_crash_before_the_move_never_lets_a_repaired_link_reach_a_shadowed_namesake(
     );
 }
 
-/// A refusal reached *after* the destination was claimed must not leave the
-/// claim behind: the vault would be left holding a placeholder note nobody
-/// asked for.
+/// A refusal reached after the destination was claimed but **before any
+/// referrer was rewritten** must not leave the claim behind: nothing points at
+/// it, so the vault would just be holding a placeholder nobody asked for.
 #[test]
-fn a_refusal_after_the_reservation_leaves_no_placeholder_behind() {
+fn a_refusal_before_any_rewrite_leaves_no_placeholder_behind() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let index = TempDir::new().expect("index tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    // Nothing references `Alpha.md`, so the burst rewrites nothing and the
+    // reservation is safe to give back.
+    std::fs::write(root.join("Alpha.md"), "# Alpha\n").expect("write Alpha");
+    let config = IndexConfig::explicit(&root, index.path().join("index.sqlite3")).expect("config");
+    let mut service = IndexService::open(config).expect("service");
+    service.refresh(false).expect("cold build");
+
+    let source = root.join("Alpha.md");
+    service.install_test_hook(once_at(HookPoint::BeforeRenameMove, move || {
+        std::fs::remove_file(&source).expect("delete the source from the hook");
+    }));
+
+    let error = service
+        .apply_mutation(&Mutation::RenameNote {
+            from: path("Alpha.md"),
+            to: path("Renamed.md"),
+            expected: Precondition::Any,
+            rewrite_links: true,
+        })
+        .expect_err("the source vanished under us");
+    assert!(
+        matches!(
+            error,
+            vault_index::IndexError::Mutation(MutationError::NotFound { .. })
+        ),
+        "expected not_found, got {error:?}"
+    );
+    assert!(
+        !root.join("Renamed.md").exists(),
+        "nothing pointed at the reservation, so it is given back"
+    );
+}
+
+/// The mirror case, and the one that matters. Once a referrer has been
+/// rewritten it *points at* the reserved name — so releasing the reservation
+/// on a later refusal is the same corruption the reservation exists to
+/// prevent: with a shadowing namesake the repaired link stops resolving at the
+/// placeholder and starts resolving at a **different note**.
+///
+/// So the placeholder stays. It is self-describing, the retry adopts it, and
+/// the state is visibly incomplete rather than quietly wrong.
+#[test]
+fn a_refusal_after_the_rewrites_keeps_the_placeholder_the_links_point_at() {
     let mut fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join("Archive")).expect("create Archive");
+    std::fs::write(fixture.root.join("Archive/Renamed.md"), "# shadow\n")
+        .expect("write the shadowing namesake");
+    fixture.service.refresh(false).expect("index the shadow");
+
     let source = fixture.root.join("Alpha.md");
     fixture
         .service
@@ -633,9 +684,82 @@ fn a_refusal_after_the_reservation_leaves_no_placeholder_behind() {
         ),
         "expected not_found, got {error:?}"
     );
+    assert_eq!(read(&fixture, "Short.md"), "before [[Renamed]] after\n");
     assert!(
-        !fixture.root.join("Renamed.md").exists(),
-        "a refused rename leaves no reservation residue"
+        fixture.root.join("Renamed.md").is_file(),
+        "the referrers point at the reservation, so it must not be released"
+    );
+
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(path("Alpha.md"));
+    changed.insert(path("Renamed.md"));
+    changed.insert(path("Short.md"));
+    assert_eq!(
+        resolution_after(&mut fixture, changed, "Short.md"),
+        vec![vault_core::Resolution::Resolved {
+            target: path("Renamed.md"),
+            subpath: None
+        }],
+        "releasing the reservation here would point the repaired link at Archive/Renamed.md"
+    );
+}
+
+/// The destination scanner ends a Markdown link at **any** whitespace, not at
+/// a space — so a tab in a filename truncates the destination unless it is
+/// escaped. Legal on APFS, and the encoder's own doc comment claims to cover
+/// it, so the claim has to be true.
+#[test]
+fn a_whitespace_character_a_space_is_not_still_gets_escaped() {
+    let mut fixture = fixture();
+    let outcome = rename(&mut fixture, "Alpha.md", "Tab\tNote.md");
+
+    assert_eq!(
+        read(&fixture, "Markdown.md"),
+        "[shown](Tab%09Note.md)\n",
+        "an unescaped tab would end the destination at `Tab`"
+    );
+    assert_eq!(
+        read(&fixture, "Short.md"),
+        "before [[Tab\tNote]] after\n",
+        "a wikilink target is literal, so the tab needs no escape there"
+    );
+    assert!(outcome.link_rewrite_failures.is_empty());
+}
+
+/// A table cell ends at `|`, so a display text carrying one splits the row and
+/// the link is gone. Escaped, the same rename repairs the cell instead of
+/// declining it.
+#[test]
+fn a_display_text_carrying_a_pipe_does_not_split_its_table_row() {
+    let mut fixture = fixture();
+    std::fs::write(
+        fixture.root.join("Table.md"),
+        "| a | b |\n| --- | --- |\n| [[Alpha]] | x |\n",
+    )
+    .expect("write Table");
+    fixture.service.refresh(false).expect("index Table");
+
+    let outcome = rename(&mut fixture, "Alpha.md", "A|B.md");
+
+    assert_eq!(
+        read(&fixture, "Table.md"),
+        "| a | b |\n| --- | --- |\n| [A\\|B](A%7CB) | x |\n",
+        "the pipe in the display text is escaped, so the row still has two cells"
+    );
+    assert!(
+        outcome.link_rewrite_failures.is_empty(),
+        "this cell is repairable, so it must be repaired: {:?}",
+        outcome.link_rewrite_failures
+    );
+
+    let mut changed = outcome.changed_paths.clone();
+    changed.insert(path("Table.md"));
+    assert_eq!(
+        resolution_after(&mut fixture, changed, "Table.md"),
+        vec![vault_core::Resolution::Resolved {
+            target: path("A|B.md"),
+            subpath: None
+        }]
     );
 }
 
@@ -644,8 +768,8 @@ fn a_refusal_after_the_reservation_leaves_no_placeholder_behind() {
 /// rather than the reference.
 ///
 /// `[x][[Alpha]]` is legal prose: `[x]` is literal and the wikilink is a
-/// reference. Rewrite that wikilink into `[a|b](a%7Cb)` and CommonMark reads
-/// `[x][a|b]` as a full reference link — which the definition at the bottom of
+/// reference. Rewrite that wikilink into `[a#b](a%23b)` and CommonMark reads
+/// `[x][a#b]` as a full reference link — which the definition at the bottom of
 /// the file *defines* — so the whole construct becomes one link to
 /// `example.com` and the vault reference is **gone**. One reference in, zero
 /// out, reported as repaired.
@@ -656,15 +780,15 @@ fn a_refusal_after_the_reservation_leaves_no_placeholder_behind() {
 #[test]
 fn a_replacement_that_would_change_how_the_document_parses_is_refused() {
     let mut fixture = fixture();
-    let before = "go [x][[Alpha]] end\n\nsafe ![[Alpha]] here\n\n[a|b]: http://example.com\n";
+    let before = "go [x][[Alpha]] end\n\nsafe ![[Alpha]] here\n\n[a#b]: http://example.com\n";
     std::fs::write(fixture.root.join("Edges.md"), before).expect("write Edges");
     fixture.service.refresh(false).expect("index Edges");
 
-    let outcome = rename(&mut fixture, "Alpha.md", "a|b.md");
+    let outcome = rename(&mut fixture, "Alpha.md", "a#b.md");
 
     assert_eq!(
         read(&fixture, "Edges.md"),
-        "go [x][[Alpha]] end\n\nsafe ![a|b](a%7Cb) here\n\n[a|b]: http://example.com\n",
+        "go [x][[Alpha]] end\n\nsafe ![a#b](a%23b) here\n\n[a#b]: http://example.com\n",
         "the reference whose rewrite would be swallowed is left alone; the safe one is repaired"
     );
     assert_eq!(

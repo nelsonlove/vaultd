@@ -240,31 +240,50 @@ impl IndexService {
             self.engine.check_rename_source(from, expected)?;
         }
 
-        // Claimed before anything is rewritten. From here on every exit runs
-        // through `finish`, which gives the claim back on failure.
+        // Claimed before anything is rewritten.
         let reservation = self
             .engine
             .reserve_rename_destination(to, from, expected.is_none())?;
-        let outcome = self.repair_then_move(from, to, expected, &reservation);
-        if outcome.is_err() {
+        let mut rewritten = 0u64;
+        let outcome = self.repair_then_move(from, to, expected, &reservation, &mut rewritten);
+
+        // The claim is given back on failure **only while nothing points at
+        // it**. Once a referrer has been rewritten it names the reserved path,
+        // and removing the placeholder is then the exact corruption the
+        // reservation exists to prevent: with a same-basename note elsewhere
+        // in the vault, `[[Renamed]]` stops resolving at the placeholder and
+        // starts resolving at `Archive/Renamed.md` — a different note, and
+        // resolved, which is the one state this ordering forbids.
+        //
+        // So a refusal that arrives after the rewrites leaves the placeholder
+        // standing. It carries a line saying what it is, the repaired links
+        // point at it rather than at a namesake, and the client's retry adopts
+        // it and completes. Visibly incomplete beats quietly wrong.
+        if outcome.is_err() && rewritten == 0 {
             self.engine.release_rename_destination(to, &reservation);
         }
         outcome
     }
 
     /// The body of a repairing rename, from a held reservation to a completed
-    /// move. Split out so its caller can return the reservation on every
-    /// failure without an exit path forgetting to.
+    /// move. Split out so its caller can decide the reservation's fate on
+    /// every failure without an exit path forgetting to.
+    ///
+    /// `rewritten` is an out-parameter rather than part of the return value
+    /// because the caller needs it **on the error path**, where there is no
+    /// outcome to read it off: whether any referrer already points at the
+    /// reserved name is exactly what decides whether the reservation may be
+    /// released.
     fn repair_then_move(
         &mut self,
         from: &VaultPath,
         to: &VaultPath,
         expected: Option<&crate::mutate::Precondition>,
         reservation: &crate::mutate::Reservation,
+        rewritten: &mut u64,
     ) -> Result<crate::mutate::MutationOutcome, IndexError> {
         let moves = self.repair_moves(from, to, expected.is_some())?;
         let mut changed_paths: BTreeSet<VaultPath> = BTreeSet::new();
-        let mut links_rewritten = 0u64;
         let mut failures: Vec<crate::mutate::LinkRewriteFailure> = Vec::new();
 
         // Planned against the index's pre-move rows and the pre-move bytes on
@@ -323,7 +342,7 @@ impl IndexService {
             let resolved = self.engine.resolve(&rewrite.path)?;
             match crate::mutate::write_atomically(&resolved, rewrite.patched.as_bytes()) {
                 Ok(()) => {
-                    links_rewritten += rewrite.links;
+                    *rewritten += rewrite.links;
                     changed_paths.insert(rewrite.path);
                 }
                 Err(error) => failures.push(crate::mutate::LinkRewriteFailure {
@@ -360,12 +379,12 @@ impl IndexService {
         Ok(crate::mutate::MutationOutcome {
             changed_paths,
             revision: moved.revision,
-            links_rewritten,
+            links_rewritten: *rewritten,
             link_rewrite_failures: failures,
             // A rewritten referrer is a note by construction, so a burst that
             // repaired anything moved the semantic layer even in the shape
             // where the thing that *moved* was not itself a note.
-            semantic: moved.semantic || links_rewritten > 0,
+            semantic: moved.semantic || *rewritten > 0,
         })
     }
 

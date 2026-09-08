@@ -33,7 +33,7 @@
 //! **And the check is the whole document, not the reference.** A replacement
 //! can be correct in isolation and still change how the bytes around it parse:
 //! `[x][[Alpha]]` is legal prose, and rewriting that wikilink into
-//! `[a|b](a%7Cb)` turns the pair into a reference-style link whose label the
+//! `[a#b](a%23b)` turns the pair into a reference-style link whose label the
 //! document may define — one vault reference in, zero out. So the patched body
 //! is re-parsed and its whole reference list compared against the intended
 //! one, and a splice that does not survive that is reported rather than
@@ -301,25 +301,12 @@ pub(crate) fn plan_repair(
                 existing,
                 ordinal,
             ) {
-                Emitted::Unchanged => {
-                    eprintln!(
-                        "DBG unchanged src={:?} ord={ordinal} existing={existing:?} dest={:?}",
-                        source.as_str(),
-                        destination.as_str()
-                    );
-                }
+                Emitted::Unchanged => {}
                 Emitted::Splice(splice) => splices.push(*splice),
-                Emitted::Impossible => {
-                    eprintln!(
-                        "DBG impossible src={:?} ord={ordinal} existing={existing:?} dest={:?}",
-                        source.as_str(),
-                        destination.as_str()
-                    );
-                    failures.push(LinkRewriteFailure {
-                        path: source.clone(),
-                        reason: LinkRewriteReason::UnwritableSpelling,
-                    })
-                }
+                Emitted::Impossible => failures.push(LinkRewriteFailure {
+                    path: source.clone(),
+                    reason: LinkRewriteReason::UnwritableSpelling,
+                }),
             }
         }
         if splices.is_empty() {
@@ -643,7 +630,7 @@ struct PlannedSplice {
 fn in_place(emission: &Emission<'_>, candidate: &str) -> Option<Replacement> {
     Some(Replacement {
         range: emission.file_range.clone(),
-        bytes: encode_for(emission.reference.reference.kind, candidate).clone(),
+        bytes: encode_for(emission.reference.reference.kind, candidate),
         intended_file: candidate.to_string(),
         intended_display: emission.reference.reference.display.clone(),
         intended_raw: format!(
@@ -896,13 +883,24 @@ fn encode_for(kind: ReferenceKind, spelling: &str) -> String {
     for character in spelling.chars() {
         match character {
             '%' => encoded.push_str("%25"),
-            ' ' => encoded.push_str("%20"),
             '(' => encoded.push_str("%28"),
             ')' => encoded.push_str("%29"),
             '#' => encoded.push_str("%23"),
             '|' => encoded.push_str("%7C"),
             '<' => encoded.push_str("%3C"),
             '>' => encoded.push_str("%3E"),
+            // **Every** whitespace character, not the space alone: the
+            // destination scanner ends the link at any of them, so a tab in a
+            // filename would silently truncate the destination to its first
+            // word. Encoded byte by byte, because a non-ASCII whitespace
+            // character is more than one byte and a percent escape names a
+            // byte.
+            other if other.is_whitespace() => {
+                let mut buffer = [0u8; 4];
+                for byte in other.encode_utf8(&mut buffer).as_bytes() {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+            }
             other => encoded.push(other),
         }
     }
@@ -910,11 +908,16 @@ fn encode_for(kind: ReferenceKind, spelling: &str) -> String {
 }
 
 /// Display text, escaped so the closing `]` of a Markdown link is the one this
-/// code wrote.
+/// code wrote — and so the link survives a table row.
+///
+/// `|` is escaped for the same reason the destination's is encoded: a GFM
+/// table cell ends at an unescaped pipe, so a display text carrying one splits
+/// the row and takes the link with it. Escaping it here is what turns a cell
+/// the burst would otherwise have to decline into one it repairs.
 fn escape_display(display: &str) -> String {
     let mut escaped = String::with_capacity(display.len());
     for character in display.chars() {
-        if matches!(character, '\\' | '[' | ']') {
+        if matches!(character, '\\' | '[' | ']' | '|') {
             escaped.push('\\');
         }
         escaped.push(character);
@@ -991,8 +994,27 @@ mod tests {
     }
 
     #[test]
-    fn display_text_cannot_close_the_link_early() {
+    fn every_whitespace_character_is_escaped_not_only_the_space() {
+        assert_eq!(
+            encode_for(ReferenceKind::MarkdownLink, "Tab\tNote.md"),
+            "Tab%09Note.md",
+            "the destination scanner ends the link at any whitespace, not at a space"
+        );
+        assert_eq!(
+            encode_for(ReferenceKind::MarkdownLink, "Nbsp\u{a0}Note.md"),
+            "Nbsp%C2%A0Note.md",
+            "a non-ASCII whitespace character is encoded byte by byte"
+        );
+    }
+
+    #[test]
+    fn display_text_cannot_close_the_link_early_or_split_a_table_row() {
         assert_eq!(escape_display("a [b] c"), "a \\[b\\] c");
+        assert_eq!(
+            escape_display("a|b"),
+            "a\\|b",
+            "an unescaped pipe ends a table cell and takes the link with it"
+        );
     }
 
     #[test]
