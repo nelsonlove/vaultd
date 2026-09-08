@@ -275,6 +275,25 @@ Stable version 1 codes and when each occurs:
 
 Errors never contain raw SQL, internal cache paths, or backtraces.
 
+## Link repair failure reasons
+
+`rename_note` and `rename_folder` repair inbound references when `rewrite_links` is true (the default). A rename that moves the file but cannot retarget some reference still succeeds: it reports `links_rewritten` and, separately, one `link_rewrite_failures` entry **per unrepaired reference**. Silence means nothing was declined, so a client may treat an empty list as an affirmative "every inbound reference now points at the new path".
+
+Each entry is `{ "path": ..., "reason": ... }`. `path` is *the path the failure is about* — the referring note for every per-reference reason, and the rename's own subject for the one burst-scoped reason. A client must read `reason` before it reads `path`.
+
+`reason` is a closed set of stable codes:
+
+- `revision_conflict` — the referring note's bytes moved between the plan and the write. Its content is intact and the reference was not retargeted; re-read it and retry.
+- `source_absent` — the referring note was deleted before its rewrite landed. Deliberately not recreated.
+- `not_indexed` — the referring note has no indexed row, so there were no spans to rewrite against. The index is behind the vault for that path; a refresh and a retry will repair it.
+- `reference_missing` — the reference has no stored row under its ordinal. An index invariant is broken; a complete reconciliation repairs it.
+- `span_mismatch` — the stored target span and the stored bytes disagree, so splicing would rewrite the wrong bytes.
+- `unwritable_spelling` — no link syntax available at that reference can spell the destination's name. A wikilink cannot express `#`, `|`, `[` or `]` in a file target, and a frontmatter reference has no other syntax to fall back to. Rename the destination, or edit the reference by hand.
+- `write_failed` — the rewrite was planned and validated and the filesystem write failed.
+- `index_unavailable` — **burst-scoped**, not per-reference: no generation has ever been published, so there was no graph to ask which references point at the moved path. `path` names the rename's own subject. The move happened; nothing was repaired. Refresh the index and rename back and forth, or fix the references by hand.
+
+Per the evolution rule below, a client MUST treat a `reason` it does not recognise as unknown rather than as a protocol error.
+
 ## Reserved operation families
 
 These names document intended boundaries and are not accepted by the version 1 request enum:

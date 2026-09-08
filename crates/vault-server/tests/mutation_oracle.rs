@@ -133,13 +133,17 @@ fn revision_changes(before: &State, after: &State) -> BTreeSet<String> {
 #[derive(Clone, Copy, Debug)]
 enum Expect {
     Lands,
-    /// Lands **and** repairs at least one inbound link. The rename steps carry
-    /// this: `rewrite_links` is honoured by the coordinator, so a rename that
-    /// answered `links_rewritten: 0` would be claiming nothing pointed at what
-    /// it moved — which the fixture below makes false on purpose. The three
-    /// axes then check that the referrers the burst rewrote reached a
+    /// Lands **and** repairs exactly this many inbound links. The rename steps
+    /// carry this: `rewrite_links` is honoured by the coordinator, so a rename
+    /// that answered `links_rewritten: 0` would be claiming nothing pointed at
+    /// what it moved — which the fixture below makes false on purpose. The
+    /// three axes then check that the referrers the burst rewrote reached a
     /// generation, which is the half a bare `Lands` cannot see.
-    LandsRepairingLinks,
+    ///
+    /// The count is exact rather than a floor: the fixture pins which
+    /// references each step has to repair, so a change that starts repairing
+    /// three where one was meant is a change worth failing on.
+    LandsRepairing(u64),
     /// Refused because the verb is not wired yet. A refusal is still checked
     /// on all three axes: nothing moved, so no generation may appear.
     RefusedUntilTask16,
@@ -474,7 +478,7 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
         (
             "rename_note",
             r#"{"from":"Nested/Gamma.md","to":"Nested/Delta.md","expected":{"any":true},"rewrite_links":true}"#.to_string(),
-            Expect::LandsRepairingLinks,
+            Expect::LandsRepairing(1),
         ),
         (
             "delete_note",
@@ -488,7 +492,7 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
         (
             "rename_folder",
             r#"{"from":"Nested","to":"Moved","rewrite_links":true}"#.to_string(),
-            Expect::LandsRepairingLinks,
+            Expect::LandsRepairing(1),
         ),
         (
             "delete_folder",
@@ -506,7 +510,7 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                 "{method} {params} failed: {:?}",
                 response.outcome
             ),
-            Expect::LandsRepairingLinks => {
+            Expect::LandsRepairing(expected) => {
                 let (rewritten, failures) = match &response.outcome {
                     ResponseOutcome::Ok(Response::RenameNote(rename)) => {
                         (rename.links_rewritten, &rename.link_rewrite_failures)
@@ -516,9 +520,10 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                     }
                     other => panic!("{method} {params} failed: {other:?}"),
                 };
-                assert!(
-                    rewritten >= 1,
-                    "{method} {params} repaired nothing, but the fixture points at what it moved"
+                assert_eq!(
+                    rewritten, expected,
+                    "{method} {params} repaired {rewritten} links, not the {expected} the \
+                     fixture pins"
                 );
                 assert!(
                     failures.is_empty(),

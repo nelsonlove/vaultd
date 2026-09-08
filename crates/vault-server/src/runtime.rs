@@ -1235,7 +1235,11 @@ impl Coordinator {
         self.flush();
         // Every failure up to and including this call leaves the vault
         // byte-identical: the engine refuses before it writes, and its own
-        // write is temp-then-rename.
+        // write is temp-then-rename. A link-repairing rename keeps that
+        // property by moving the file **first** and rewriting the referrers
+        // after — so an `Err` here still means nothing changed, and a repair
+        // that could not land is reported inside the `Ok` outcome's
+        // `link_rewrite_failures` rather than by failing the mutation.
         let outcome = self
             .mutation(|index| index.apply_mutation(&mutation))
             .map_err(MutationFailure::Failed)?;

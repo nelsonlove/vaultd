@@ -32,8 +32,8 @@ pub use model::{
 };
 pub use mutate::{
     CONFIG_ZONE, CopyConflict, DEFAULT_MAX_FILE_BYTES, DeleteMode, FrontmatterEdit, LOCAL_TRASH,
-    LinkRewriteFailure, Mutation, MutationEngine, MutationError, MutationOutcome, PatchValue,
-    Precondition, in_config_zone, patch_source, revision_of,
+    LinkRewriteFailure, LinkRewriteReason, Mutation, MutationEngine, MutationError,
+    MutationOutcome, PatchValue, Precondition, in_config_zone, patch_source, revision_of,
 };
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus, VaultInfo,

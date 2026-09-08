@@ -564,7 +564,7 @@ pub(crate) fn link_rewrite_failures(
         .into_iter()
         .map(|failure| LinkRewriteFailureDto {
             path: failure.path.as_str().to_string(),
-            reason: failure.reason,
+            reason: failure.reason.as_str().to_string(),
         })
         .collect()
 }

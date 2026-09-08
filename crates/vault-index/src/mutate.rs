@@ -763,12 +763,78 @@ struct AppJson {
     trash_option: Option<String>,
 }
 
-/// One referencing note a rename could not rewrite, and why. Populated only
-/// by rename link repair; every other mutation leaves it empty.
+/// Why one reference a rename should have repaired was left alone.
+///
+/// A **closed set of stable codes**, not prose: this reaches a client verbatim
+/// as `LinkRewriteFailureDto::reason`, and a client has to be able to branch on
+/// it. `docs/protocol.md` documents the same list. Adding a variant is
+/// additive — the protocol's own evolution rule tells clients to treat a code
+/// they do not recognise as unknown rather than as an error — but changing a
+/// spelling is not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkRewriteReason {
+    /// The referrer's bytes moved between the plan and the write. Its content
+    /// is intact; the reference was not retargeted.
+    RevisionConflict,
+    /// The referrer was deleted before its rewrite landed. Deliberately not
+    /// recreated: [`MutationEngine::resolve`] answers `Ok` for an absent path,
+    /// so writing here would resurrect a note somebody removed.
+    SourceAbsent,
+    /// The referrer has no stored row, so there are no spans to splice
+    /// against. The index is behind the vault for that path.
+    NotIndexed,
+    /// The selected reference has no stored row under its ordinal — an index
+    /// invariant broken, never a reference to skip quietly.
+    ReferenceMissing,
+    /// The stored target span does not sit on a character boundary of the
+    /// stored body: spans and bytes disagree, and splicing on a guess would
+    /// rewrite the wrong bytes.
+    SpanMismatch,
+    /// No link syntax available at this reference can spell the destination's
+    /// name. A wikilink cannot express `#`, `|`, `[` or `]` in a file target,
+    /// and a frontmatter reference has no other syntax to fall back to.
+    UnwritableSpelling,
+    /// The rewrite was planned and validated and the filesystem write failed.
+    WriteFailed,
+    /// **Burst-scoped, not per-referrer.** No generation has ever been
+    /// published, so there was no graph to ask which references point at the
+    /// moved path. `LinkRewriteFailure::path` names the rename's own subject
+    /// here, because no referrer could be identified to name instead.
+    IndexUnavailable,
+}
+
+impl LinkRewriteReason {
+    /// The wire spelling. Stable: a client branches on this string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RevisionConflict => "revision_conflict",
+            Self::SourceAbsent => "source_absent",
+            Self::NotIndexed => "not_indexed",
+            Self::ReferenceMissing => "reference_missing",
+            Self::SpanMismatch => "span_mismatch",
+            Self::UnwritableSpelling => "unwritable_spelling",
+            Self::WriteFailed => "write_failed",
+            Self::IndexUnavailable => "index_unavailable",
+        }
+    }
+}
+
+/// One reference a rename could not repair, and why. Populated only by rename
+/// link repair; every other mutation leaves it empty.
+///
+/// `path` is **the path the failure is about**, which is the referring note for
+/// every per-reference code and the rename's own subject for the one
+/// burst-scoped code ([`LinkRewriteReason::IndexUnavailable`]). It is not
+/// unconditionally a referrer, and a client must read `reason` before it reads
+/// `path`.
+///
+/// One entry per *reference*, not per file: a note with two references to a
+/// moved path that both decline produces two entries, so a count of entries is
+/// a count of unrepaired references.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkRewriteFailure {
     pub path: VaultPath,
-    pub reason: String,
+    pub reason: LinkRewriteReason,
 }
 
 /// What one applied mutation did on disk.
