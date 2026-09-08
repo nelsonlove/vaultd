@@ -49,6 +49,21 @@ pub enum IndexError {
     /// after its idle timeout, or never issued by this process.
     #[error("no such snapshot session: {0}")]
     SnapshotNotFound(String),
+    /// A snapshot session's own read transaction no longer reads the
+    /// generation the session is pinned at, so the frames that made every
+    /// page's promise true are gone. Refused rather than served: a page whose
+    /// pin has ended would carry post-snapshot rows under the pinned
+    /// generation number, silently, which is the one failure snapshot
+    /// sessions exist to prevent. A client's move is to reopen the snapshot —
+    /// which is why this maps to the same wire code a stale cursor gets.
+    #[error(
+        "snapshot {snapshot} is pinned at generation {pinned} but its transaction reads {observed}"
+    )]
+    SnapshotPinLost {
+        snapshot: String,
+        pinned: u64,
+        observed: u64,
+    },
     /// The daemon already holds its maximum number of open snapshots. Each
     /// one pins WAL frames, so the cap is a resource bound rather than a
     /// policy.

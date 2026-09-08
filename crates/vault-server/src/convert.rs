@@ -9,9 +9,10 @@ use vault_index::{
 use vault_protocol::{
     AliasDto, BlockDto, CopyConflictDto, DeleteModeDto, DiagnosticDto, ErrorCode, ExpectedDto,
     FrontmatterEditDto, GetVaultInfoResponse, HeadingDto, IndexStateDto, LinkRewriteFailureDto,
-    LiveStateDto, NoteDto, NoteSummaryDto, PatchValueDto, PropertyDto, PropertyMappingEntryDto,
-    PropertyValueDto, ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto,
-    ResolutionDto, SeverityDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto, TreeEntryDto,
+    ListItemDto, LiveStateDto, NoteDto, NoteFacetDto, NoteMetadataDto, NoteSummaryDto,
+    PatchValueDto, PropertyDto, PropertyMappingEntryDto, PropertyValueDto, ProtocolError,
+    ReferenceDto, ReferenceKindDto, ReferenceOriginDto, ResolutionDto, SectionDto, SeverityDto,
+    SnapshotNoteDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto, TreeEntryDto,
     TreeEntryKindDto,
 };
 
@@ -367,6 +368,26 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
             error.code = ErrorCode::SnapshotNotFound;
             error.message = format!("no such snapshot session: {id}");
         }
+        // A session whose pinned transaction no longer reads the generation it
+        // claims. `generation_mismatch` rather than a code of its own: the
+        // situation is the one that code already names — the paging context a
+        // client holds is stale and its move is to start over — and
+        // `current_generation` is exactly the number it needs to see that the
+        // world moved. The session still exists, so `snapshot_not_found` would
+        // be a lie, and nothing is damaged, so `incompatible_index` would be a
+        // worse one.
+        IndexError::SnapshotPinLost {
+            snapshot,
+            pinned,
+            observed,
+        } => {
+            error.code = ErrorCode::GenerationMismatch;
+            error.message = format!(
+                "snapshot {snapshot} is pinned at generation {pinned} but its read transaction \
+                 now sees generation {observed}; reopen the snapshot"
+            );
+            error.current_generation = Some(observed);
+        }
         IndexError::TooManySnapshots { limit } => {
             error.code = ErrorCode::TooManySnapshots;
             error.message = format!("at most {limit} snapshot sessions may be open at once");
@@ -585,6 +606,124 @@ pub(crate) fn tree_entry(value: &vault_index::TreeEntryRow) -> TreeEntryDto {
         ctime_unix_ms: value.ctime_unix_ms,
         mtime_unix_ms: value.mtime_unix_ms,
         revision: value.revision.clone(),
+    }
+}
+
+/// Which facets a `snapshot_notes` request asked for.
+///
+/// A name this build does not know never arrives: `NoteFacetDto` has no
+/// unknown variant, so a misspelling fails the request's own deserialization
+/// and is answered `invalid_request` — the same strictness the mutation params
+/// get. An empty list is the documented default and stays legal: it pages
+/// identities, which is what a client resuming a mirror asks for.
+pub(crate) fn note_facets(include: &[NoteFacetDto]) -> vault_index::NoteFacets {
+    let mut facets = vault_index::NoteFacets::default();
+    for facet in include {
+        match facet {
+            NoteFacetDto::Metadata => facets.metadata = true,
+            NoteFacetDto::References => facets.references = true,
+            NoteFacetDto::Resolutions => facets.resolutions = true,
+            NoteFacetDto::Backlinks => facets.backlinks = true,
+            NoteFacetDto::Sections => facets.sections = true,
+            NoteFacetDto::ListItems => facets.list_items = true,
+        }
+    }
+    facets
+}
+
+/// One note's facets, as a `snapshot_notes` page puts them on the wire.
+///
+/// `sections` and `list_items` are siblings of `metadata` here exactly as
+/// they are in the row and in the request's `include`: a client asks for them
+/// by name or does not get them, and neither is ever nested inside metadata.
+pub(crate) fn snapshot_note(value: &vault_index::SnapshotNoteRow) -> SnapshotNoteDto {
+    SnapshotNoteDto {
+        path: value.path.as_str().to_string(),
+        revision: value.revision.clone(),
+        metadata: value.metadata.as_ref().map(|metadata| NoteMetadataDto {
+            properties: metadata
+                .properties
+                .iter()
+                .map(|property| PropertyDto {
+                    key: property.key.value.clone(),
+                    value: property_value(&property.value.value),
+                    span: span(property.span),
+                    key_span: span(property.key.span),
+                    value_span: span(property.value.span),
+                })
+                .collect(),
+            aliases: metadata
+                .aliases
+                .iter()
+                .map(|alias| AliasDto {
+                    value: alias.value.clone(),
+                    span: span(alias.span),
+                })
+                .collect(),
+            headings: metadata
+                .headings
+                .iter()
+                .map(|heading| HeadingDto {
+                    level: heading.level,
+                    text: heading.text.clone(),
+                    span: span(heading.span),
+                })
+                .collect(),
+            blocks: metadata
+                .blocks
+                .iter()
+                .map(|block| BlockDto {
+                    value: block.value.clone(),
+                    span: span(block.span),
+                })
+                .collect(),
+            tags: metadata
+                .tags
+                .iter()
+                .map(|tag| TagDto {
+                    value: tag.value.clone(),
+                    comparison_key: tag.comparison_key.clone(),
+                    span: span(tag.span),
+                })
+                .collect(),
+            diagnostics: metadata.diagnostics.iter().map(diagnostic).collect(),
+        }),
+        references: value
+            .references
+            .as_ref()
+            .map(|references| references.iter().map(reference).collect()),
+        resolutions: value
+            .resolutions
+            .as_ref()
+            .map(|resolutions| resolutions.iter().map(resolution).collect()),
+        backlinks: value
+            .backlinks
+            .as_ref()
+            .map(|backlinks| backlinks.iter().map(reference).collect()),
+        sections: value.sections.as_ref().map(|sections| {
+            sections
+                .iter()
+                .map(|section| SectionDto {
+                    kind: section.kind.clone(),
+                    span: span(section.span),
+                    block_id: section.block_id.clone(),
+                })
+                .collect()
+        }),
+        list_items: value.list_items.as_ref().map(|items| {
+            items
+                .iter()
+                .map(|item| ListItemDto {
+                    span: span(item.span),
+                    // Both carried through unchanged: the wire mirrors the
+                    // stored line-number model, and a host does its own
+                    // negation to reach Obsidian's single `parent` number.
+                    list_start_line: item.list_start_line,
+                    parent_start_line: item.parent_start_line,
+                    task: item.task.clone(),
+                })
+                .collect()
+        }),
     }
 }
 

@@ -1,12 +1,14 @@
-//! Paging a snapshot's tree: complete, ordered, and stable across a write
-//! storm.
+//! Paging a snapshot's tree and its per-note semantics: complete, ordered,
+//! and stable across a write storm — and refused outright when the pin that
+//! makes those claims true is no longer held.
 
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 use vault_core::VaultPath;
 use vault_index::{
-    IndexConfig, IndexError, IndexService, Mutation, Precondition, SnapshotSessions, TreeEntryKind,
+    IndexConfig, IndexError, IndexService, Mutation, NoteFacets, Precondition, SnapshotSessions,
+    TreeEntryKind,
 };
 
 struct Fixture {
@@ -222,4 +224,389 @@ fn paging_a_closed_session_is_typed_rather_than_a_panic() {
         .tree_page(&opened.snapshot_id, None, Some(10))
         .expect_err("a closed session cannot be paged");
     assert!(matches!(error, IndexError::SnapshotNotFound(_)));
+}
+
+#[test]
+fn a_notes_page_carries_only_the_facets_that_were_asked_for() {
+    let fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    let page = sessions
+        .notes_page(
+            &opened.snapshot_id,
+            None,
+            Some(100),
+            NoteFacets {
+                metadata: true,
+                references: false,
+                resolutions: false,
+                backlinks: false,
+                sections: false,
+                list_items: false,
+            },
+        )
+        .expect("a notes page");
+    assert_eq!(page.notes.len(), 3);
+    let alpha = &page.notes[0];
+    assert_eq!(alpha.path.as_str(), "Alpha.md");
+    assert_eq!(
+        alpha.revision,
+        vault_index::revision_of(b"# Alpha\n"),
+        "the page reports the snapshot's revision, not the file's current one"
+    );
+    assert!(alpha.metadata.is_some());
+    assert!(
+        alpha.references.is_none()
+            && alpha.resolutions.is_none()
+            && alpha.backlinks.is_none()
+            && alpha.sections.is_none()
+            && alpha.list_items.is_none(),
+        "an unrequested facet is not read at all"
+    );
+    assert_eq!(
+        alpha
+            .metadata
+            .as_ref()
+            .expect("metadata was requested")
+            .headings
+            .len(),
+        1
+    );
+}
+
+/// The documented default for an absent `include`: a page of identities.
+/// Every facet is absent, which is the honest answer to "you asked for none"
+/// — and distinguishable on the wire from "this note has none", because the
+/// field is missing rather than an empty array.
+#[test]
+fn asking_for_no_facet_at_all_still_pages_every_notes_path_and_revision() {
+    let fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    let page = sessions
+        .notes_page(&opened.snapshot_id, None, Some(100), NoteFacets::default())
+        .expect("a notes page");
+    assert_eq!(page.notes.len() as u64, opened.note_count);
+    assert!(
+        page.notes.iter().all(|note| note.metadata.is_none()
+            && note.references.is_none()
+            && note.resolutions.is_none()
+            && note.backlinks.is_none()
+            && note.sections.is_none()
+            && note.list_items.is_none()),
+        "no facet was asked for, so none is read: {:?}",
+        page.notes
+    );
+    assert!(page.notes.iter().all(|note| !note.revision.is_empty()));
+}
+
+#[test]
+fn references_resolutions_and_backlinks_agree_with_each_other() {
+    let fixture = fixture();
+    // Checkpoint-1 ruling B1: a reference is a `[[wikilink]]`. The brief's
+    // bare `Alpha` is prose — it parses as no reference at all, so the
+    // backlink this test is about would never exist.
+    std::fs::write(fixture.root.join("Pointer.md"), "[[Alpha]]\n").expect("write Pointer");
+    let mut service = fixture.service;
+    service.refresh(false).expect("index the pointer");
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    let page = sessions
+        .notes_page(
+            &opened.snapshot_id,
+            None,
+            Some(100),
+            NoteFacets {
+                metadata: false,
+                references: true,
+                resolutions: true,
+                backlinks: true,
+                sections: false,
+                list_items: false,
+            },
+        )
+        .expect("a notes page");
+
+    let alpha = page
+        .notes
+        .iter()
+        .find(|note| note.path.as_str() == "Alpha.md")
+        .expect("Alpha is in the page");
+    let backlinks = alpha.backlinks.as_ref().expect("backlinks were requested");
+    assert_eq!(backlinks.len(), 1);
+    assert_eq!(backlinks[0].source.as_str(), "Pointer.md");
+
+    let pointer = page
+        .notes
+        .iter()
+        .find(|note| note.path.as_str() == "Pointer.md")
+        .expect("Pointer is in the page");
+    let references = pointer
+        .references
+        .as_ref()
+        .expect("references were requested");
+    let resolutions = pointer
+        .resolutions
+        .as_ref()
+        .expect("resolutions were requested");
+    assert_eq!(references.len(), resolutions.len());
+    assert_eq!(references[0].resolution, resolutions[0]);
+}
+
+/// `sections` and `list_items` are siblings of `metadata`, served straight
+/// from the pinned schema-v3 rows: the spans as stored (UTF-16 code units,
+/// never re-derived), `block_id` carried through, and the line-number parent
+/// model with exactly one of its two columns set.
+#[test]
+fn sections_and_list_items_come_out_of_the_stored_rows_unchanged() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.root.join("List.md"),
+        "---\ntitle: List\n---\n# List\n\n- top\n    - nested\n- [x] done\n\nAnchored. ^anchor\n",
+    )
+    .expect("write List");
+    let mut service = fixture.service;
+    service.refresh(false).expect("index the list");
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    let page = sessions
+        .notes_page(
+            &opened.snapshot_id,
+            None,
+            Some(100),
+            NoteFacets {
+                metadata: false,
+                references: false,
+                resolutions: false,
+                backlinks: false,
+                sections: true,
+                list_items: true,
+            },
+        )
+        .expect("a notes page");
+    let list = page
+        .notes
+        .iter()
+        .find(|note| note.path.as_str() == "List.md")
+        .expect("List is in the page");
+
+    let sections = list.sections.as_ref().expect("sections were requested");
+    assert_eq!(
+        sections.first().map(|section| section.kind.as_str()),
+        Some("yaml"),
+        "the frontmatter block is the first section: {sections:?}"
+    );
+    assert!(
+        sections
+            .iter()
+            .any(|section| section.block_id.as_deref() == Some("anchor")),
+        "a trailing ^id is carried through every read path: {sections:?}"
+    );
+
+    let items = list.list_items.as_ref().expect("list items were requested");
+    assert_eq!(items.len(), 3);
+    assert!(
+        items
+            .iter()
+            .all(|item| item.list_start_line.is_some() != item.parent_start_line.is_some()),
+        "exactly one parent column is ever set: {items:?}"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.parent_start_line.is_some())
+            .count(),
+        1,
+        "one nested item, naming its parent item's start line: {items:?}"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter_map(|item| item.task.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["x"],
+        "a task carries the raw character inside the brackets: {items:?}"
+    );
+    // Spans are stored UTF-16 code-unit offsets and are served as stored.
+    assert!(
+        items.iter().all(|item| item.span.end() > item.span.start()),
+        "{items:?}"
+    );
+}
+
+#[test]
+fn a_notes_page_stays_at_its_generation_and_pages_by_path() {
+    let mut fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+
+    fixture
+        .service
+        .apply_mutation(&Mutation::WriteNote {
+            path: VaultPath::new("Zulu.md").expect("valid vault path"),
+            content: "# Zulu\n".into(),
+            expected: Precondition::Absent,
+        })
+        .expect("write during the snapshot");
+    fixture.service.refresh(false).expect("publish the write");
+
+    let facets = NoteFacets::default();
+    let mut paths = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = sessions
+            .notes_page(&opened.snapshot_id, cursor.as_deref(), Some(2), facets)
+            .expect("a notes page");
+        assert_eq!(page.generation, opened.generation);
+        paths.extend(page.notes.iter().map(|note| note.path.as_str().to_string()));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        paths,
+        vec![
+            "Alpha.md".to_string(),
+            "Folder/Beta.md".to_string(),
+            "Folder/Deep/Gamma.md".to_string()
+        ],
+        "a note written after the snapshot opened must never appear in it"
+    );
+    assert_eq!(paths.len() as u64, opened.note_count);
+}
+
+#[test]
+fn a_notes_cursor_from_another_session_is_refused() {
+    let fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let first = sessions.open().expect("first snapshot");
+    let second = sessions.open().expect("second snapshot");
+    let page = sessions
+        .notes_page(&first.snapshot_id, None, Some(1), NoteFacets::default())
+        .expect("first page");
+    let cursor = page.next_cursor.expect("more pages");
+    let error = sessions
+        .notes_page(
+            &second.snapshot_id,
+            Some(&cursor),
+            Some(1),
+            NoteFacets::default(),
+        )
+        .expect_err("a cursor belongs to the session that issued it");
+    assert!(
+        matches!(error, IndexError::InvalidCursor(_)),
+        "expected invalid_cursor, got {error:?}"
+    );
+}
+
+/// A `snapshot_tree` cursor is not a `snapshot_notes` cursor even inside one
+/// session: the two pagers walk different tables, and `tree_entries` holds
+/// folders a notes page has no row for.
+#[test]
+fn a_tree_cursor_does_not_page_the_notes_listing() {
+    let fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    let cursor = sessions
+        .tree_page(&opened.snapshot_id, None, Some(1))
+        .expect("a tree page")
+        .next_cursor
+        .expect("more tree pages");
+    let error = sessions
+        .notes_page(
+            &opened.snapshot_id,
+            Some(&cursor),
+            Some(1),
+            NoteFacets::default(),
+        )
+        .expect_err("the two listings do not share cursors");
+    assert!(
+        matches!(error, IndexError::InvalidCursor(_)),
+        "expected invalid_cursor, got {error:?}"
+    );
+}
+
+#[test]
+fn paging_the_notes_of_a_closed_session_is_typed_rather_than_a_panic() {
+    let fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    sessions.close(&opened.snapshot_id).expect("close it");
+    let error = sessions
+        .notes_page(&opened.snapshot_id, None, Some(10), NoteFacets::default())
+        .expect_err("a closed session cannot be paged");
+    assert!(matches!(error, IndexError::SnapshotNotFound(_)));
+}
+
+/// End the session's pinned transaction the way the Task 14 reviewer's probe
+/// did, then move the writer past it. Both pagers must refuse: a page whose
+/// pin is gone would serve post-snapshot rows under the pinned generation
+/// number, which is the one failure this whole module exists to prevent.
+fn unpin_and_move_the_writer(
+    fixture: &mut Fixture,
+    sessions: &mut SnapshotSessions,
+    id: &str,
+    marker: &str,
+) {
+    sessions
+        .end_pinned_transaction_for_test(id)
+        .expect("end the pinned transaction under the session");
+    fixture
+        .service
+        .apply_mutation(&Mutation::WriteNote {
+            path: VaultPath::new(marker).expect("valid vault path"),
+            content: format!("# {marker}\n"),
+            expected: Precondition::Absent,
+        })
+        .expect("write past the snapshot");
+    fixture.service.refresh(false).expect("publish past it");
+}
+
+fn assert_pin_lost(error: IndexError, id: &str, pinned: u64) {
+    match error {
+        IndexError::SnapshotPinLost {
+            snapshot,
+            pinned: claimed,
+            observed,
+        } => {
+            assert_eq!(snapshot, id);
+            assert_eq!(claimed, pinned);
+            assert!(
+                observed > pinned,
+                "the refusal names what the transaction now reads: {observed} vs {pinned}"
+            );
+        }
+        other => panic!("expected a lost-pin refusal, got {other:?}"),
+    }
+}
+
+/// Task 14 review finding M-a, demonstrated rather than hypothesised: with the
+/// pinned transaction ended under it, `tree_page` used to serve post-snapshot
+/// rows while still reporting `Generation(1)` from a struct field. The
+/// generation is now re-read inside the page's own transaction.
+#[test]
+fn a_tree_page_refuses_when_its_own_transaction_no_longer_holds_the_pin() {
+    let mut fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    unpin_and_move_the_writer(&mut fixture, &mut sessions, &opened.snapshot_id, "Later.md");
+
+    let error = sessions
+        .tree_page(&opened.snapshot_id, None, Some(100))
+        .expect_err("a page whose pin is gone must refuse, not serve");
+    assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
+}
+
+#[test]
+fn a_notes_page_refuses_when_its_own_transaction_no_longer_holds_the_pin() {
+    let mut fixture = fixture();
+    let mut sessions = SnapshotSessions::new(&fixture.config);
+    let opened = sessions.open().expect("open a snapshot");
+    unpin_and_move_the_writer(&mut fixture, &mut sessions, &opened.snapshot_id, "Later.md");
+
+    let error = sessions
+        .notes_page(&opened.snapshot_id, None, Some(100), NoteFacets::default())
+        .expect_err("a page whose pin is gone must refuse, not serve");
+    assert_pin_lost(error, &opened.snapshot_id, opened.generation.get());
 }

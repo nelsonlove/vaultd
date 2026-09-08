@@ -1025,31 +1025,35 @@ pub(crate) fn resolved_reference_from_row_with(
     })
 }
 
-pub(crate) fn load_note_with(
+/// One note's parsed metadata **without** its source bytes: everything a
+/// bulk reader wants, and none of what a body costs. `load_note_with` reads
+/// the same rows through this, so the two can never drift apart.
+pub(crate) struct NoteMetadata {
+    pub(crate) properties: Vec<vault_core::Property>,
+    pub(crate) aliases: Vec<Alias>,
+    pub(crate) headings: Vec<Heading>,
+    pub(crate) blocks: Vec<BlockId>,
+    pub(crate) tags: Vec<Tag>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
+}
+
+/// Every statement below is the one `load_note_with` used to run, moved
+/// verbatim: identical SQL, identical `query_map` closures, identical
+/// decoding. Two loaders reading the same tables through different SQL would
+/// be free to disagree about what a note holds, which is the whole reason the
+/// bulk pager borrows this rather than growing its own.
+pub(crate) fn load_metadata_with(
     connection: &Connection,
     path: &VaultPath,
-) -> Result<Option<ParsedNote>, IndexError> {
-    let row: Option<(Vec<u8>, String)> = connection
-        .query_row(
-            "SELECT source_bytes, content_revision FROM notes WHERE path = ?1",
-            params![path.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((bytes, stored_revision)) = row else {
-        return Ok(None);
+) -> Result<NoteMetadata, IndexError> {
+    let mut metadata = NoteMetadata {
+        properties: Vec::new(),
+        aliases: Vec::new(),
+        headings: Vec::new(),
+        blocks: Vec::new(),
+        tags: Vec::new(),
+        diagnostics: Vec::new(),
     };
-    let text = String::from_utf8(bytes)
-        .map_err(|_| IndexError::IncompatibleIndex("stored source is not UTF-8".into()))?;
-    let source = SourceDocument::new(path.clone(), text);
-    if source.revision().as_str() != stored_revision {
-        return Err(IndexError::IncompatibleIndex(format!(
-            "stored revision for {} does not match its source bytes",
-            path.as_str()
-        )));
-    }
-
-    let mut note = ParsedNote::empty(source);
 
     let mut statement = connection.prepare(
         "SELECT key_text, value_json, span_start, span_end, key_span_start, key_span_end, \
@@ -1073,7 +1077,7 @@ pub(crate) fn load_note_with(
     for (key, value_json, span_start, span_end, key_start, key_end, value_start, value_end) in
         property_rows
     {
-        note.properties.push(vault_core::Property {
+        metadata.properties.push(vault_core::Property {
             key: vault_core::Spanned::new(
                 key,
                 codec::decode_span(
@@ -1108,7 +1112,7 @@ pub(crate) fn load_note_with(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for (value, start, end) in alias_rows {
-        note.aliases.push(Alias {
+        metadata.aliases.push(Alias {
             value,
             span: codec::decode_span(
                 i64_to_usize(start, "alias span start")?,
@@ -1134,7 +1138,7 @@ pub(crate) fn load_note_with(
     for (level, text, start, end) in heading_rows {
         let level = u8::try_from(level)
             .map_err(|_| IndexError::IncompatibleIndex("heading level out of range".into()))?;
-        note.headings.push(Heading {
+        metadata.headings.push(Heading {
             level,
             text,
             span: codec::decode_span(
@@ -1158,7 +1162,7 @@ pub(crate) fn load_note_with(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for (value, start, end) in block_rows {
-        note.blocks.push(BlockId {
+        metadata.blocks.push(BlockId {
             value,
             span: codec::decode_span(
                 i64_to_usize(start, "block span start")?,
@@ -1182,7 +1186,7 @@ pub(crate) fn load_note_with(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for (value, comparison_key, start, end) in tag_rows {
-        note.tags.push(Tag {
+        metadata.tags.push(Tag {
             value,
             comparison_key,
             span: codec::decode_span(
@@ -1191,6 +1195,70 @@ pub(crate) fn load_note_with(
             )?,
         });
     }
+
+    let mut statement = connection.prepare(
+        "SELECT code, severity, message, path, span_start, span_end \
+         FROM note_diagnostics WHERE note_path = ?1 ORDER BY ordinal",
+    )?;
+    let diagnostic_rows = statement
+        .query_map(params![path.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (code, severity, message, diagnostic_path, start, end) in diagnostic_rows {
+        metadata.diagnostics.push(codec::diagnostic_from_row(
+            &code,
+            &severity,
+            message,
+            diagnostic_path.as_deref(),
+            start,
+            end,
+        )?);
+    }
+
+    Ok(metadata)
+}
+
+pub(crate) fn load_note_with(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Option<ParsedNote>, IndexError> {
+    let row: Option<(Vec<u8>, String)> = connection
+        .query_row(
+            "SELECT source_bytes, content_revision FROM notes WHERE path = ?1",
+            params![path.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((bytes, stored_revision)) = row else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| IndexError::IncompatibleIndex("stored source is not UTF-8".into()))?;
+    let source = SourceDocument::new(path.clone(), text);
+    if source.revision().as_str() != stored_revision {
+        return Err(IndexError::IncompatibleIndex(format!(
+            "stored revision for {} does not match its source bytes",
+            path.as_str()
+        )));
+    }
+
+    let mut note = ParsedNote::empty(source);
+
+    let metadata = load_metadata_with(connection, path)?;
+    note.properties = metadata.properties;
+    note.aliases = metadata.aliases;
+    note.headings = metadata.headings;
+    note.blocks = metadata.blocks;
+    note.tags = metadata.tags;
+    note.diagnostics = metadata.diagnostics;
 
     let mut statement = connection.prepare(
         "SELECT kind, origin, raw_target, file_target, subpath_kind, subpath_value, display, \
@@ -1272,33 +1340,6 @@ pub(crate) fn load_note_with(
             parent: codec::decode_list_item_parent(list_start_line, parent_start_line)?,
             task: codec::decode_task(task)?,
         });
-    }
-
-    let mut statement = connection.prepare(
-        "SELECT code, severity, message, path, span_start, span_end \
-         FROM note_diagnostics WHERE note_path = ?1 ORDER BY ordinal",
-    )?;
-    let diagnostic_rows = statement
-        .query_map(params![path.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (code, severity, message, diagnostic_path, start, end) in diagnostic_rows {
-        note.diagnostics.push(codec::diagnostic_from_row(
-            &code,
-            &severity,
-            message,
-            diagnostic_path.as_deref(),
-            start,
-            end,
-        )?);
     }
 
     Ok(Some(note))

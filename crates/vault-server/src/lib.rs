@@ -12,7 +12,7 @@ use vault_protocol::{
     CloseSnapshotResponse, ErrorCode, GenerationResponse, MutationResponse, OpenSnapshotResponse,
     PageResponse, ProtocolError, ReferenceStatusFilter, RefreshIndexResponse, RenameResponse,
     Request, RequestEnvelope, ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto,
-    SnapshotTreeResponse, validate_version,
+    SnapshotNotesResponse, SnapshotTreeResponse, validate_version,
 };
 
 use crate::runtime::{MutationReport, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
@@ -737,12 +737,29 @@ impl Server {
                     }
                 }
             },
-            // The semantic half of a session lands in Task 15. It refuses
-            // rather than answering an empty page, which a client would
-            // read as "this snapshot has no notes".
-            Request::SnapshotNotes(_) => {
-                ResponseEnvelope::error(id, runtime_not_ready("snapshot_notes is not wired yet"))
-            }
+            Request::SnapshotNotes(params) => match self.snapshots.as_ref() {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(sessions) => {
+                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+                    match sessions.notes_page(
+                        &params.snapshot_id,
+                        params.cursor.as_deref(),
+                        params.limit,
+                        convert::note_facets(&params.include),
+                    ) {
+                        Ok(page) => ResponseEnvelope::success(
+                            id,
+                            Response::SnapshotNotes(SnapshotNotesResponse {
+                                snapshot_id: params.snapshot_id,
+                                generation: page.generation.get(),
+                                notes: page.notes.iter().map(convert::snapshot_note).collect(),
+                                next_cursor: page.next_cursor,
+                            }),
+                        ),
+                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                    }
+                }
+            },
         }
     }
 }

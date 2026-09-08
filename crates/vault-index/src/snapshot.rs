@@ -18,6 +18,15 @@
 //! file, or observes anything outside the transaction — a session that did
 //! would be exactly as stale as whatever moment it happened to look.
 //!
+//! **A page proves its own pin rather than asserting it.** Both pagers
+//! re-read the committed generation *inside the page's own transaction* and
+//! refuse ([`IndexError::SnapshotPinLost`]) when it disagrees with the
+//! generation the session was opened at. The bookkeeping field alone cannot
+//! evidence anything: a session whose transaction had ended would keep
+//! reporting it while serving whatever rows the connection could currently
+//! see, which is precisely the silent staleness this module exists to
+//! prevent.
+//!
 //! **A session takes no publication barrier, deliberately.** Every other read
 //! path acquires the barrier before touching its connection (see the lock
 //! order note in `reconcile.rs`); a session reads SQLite directly, so it may
@@ -38,7 +47,9 @@ use crate::config::IndexConfig;
 use crate::cursor::{CursorPosition, decode_cursor, encode_cursor};
 use crate::error::IndexError;
 use crate::model::Generation;
-use vault_core::VaultPath;
+use vault_core::{
+    Diagnostic, ListItemParent, Resolution, ResolvedReference, SourceSpan, VaultPath,
+};
 
 /// What one tree entry is, mirroring `tree_entries.kind`.
 ///
@@ -132,6 +143,21 @@ impl SnapshotSessions {
     /// The generation `id` is pinned at, refreshing its idle deadline.
     pub fn generation_of(&mut self, id: &str) -> Result<Generation, IndexError> {
         Ok(self.session(id)?.generation)
+    }
+
+    /// End one session's pinned transaction without closing the session.
+    ///
+    /// The Task 14 reviewer's probe, kept as production-visible test surface
+    /// rather than reconstructed per test: nothing in a query-only deferred
+    /// transaction ends it on its own (SQLite's automatic-rollback cases are
+    /// I/O-error class), which is exactly why a page that trusted its own
+    /// bookkeeping failed silently. This is the only way to reach the state
+    /// [`IndexError::SnapshotPinLost`] describes.
+    #[doc(hidden)]
+    pub fn end_pinned_transaction_for_test(&mut self, id: &str) -> Result<(), IndexError> {
+        let session = self.session(id)?;
+        session.connection.execute_batch("ROLLBACK")?;
+        Ok(())
     }
 
     /// What the session's own pinned transaction says the committed
@@ -272,6 +298,10 @@ impl SnapshotSessions {
     /// The cursor is bound to both the pinned generation and this session's
     /// own query fingerprint, so a cursor issued by another session is
     /// `invalid_cursor` rather than a page of somebody else's listing.
+    ///
+    /// The generation this page reports is re-read from the transaction
+    /// serving it, never taken on trust from the session record — see
+    /// [`pinned_generation`].
     pub fn tree_page(
         &mut self,
         id: &str,
@@ -280,7 +310,7 @@ impl SnapshotSessions {
     ) -> Result<TreePage, IndexError> {
         let page_size = self.page_size(limit);
         let session = self.session(id)?;
-        let generation = session.generation;
+        let generation = pinned_generation(session, id)?;
         let query = format!("snapshot_tree:{id}");
         let after = match cursor {
             None => String::new(),
@@ -354,14 +384,357 @@ impl SnapshotSessions {
     }
 }
 
-/// The generation, note count, and tree entry count one connection currently
-/// reads — inside whatever transaction it already holds.
+/// Which per-note row-sets a page carries. A facet that is `false` is not
+/// queried, not allocated, and absent from the row.
 ///
-/// The tree count comes from the same pinned transaction as the note count,
-/// so the number a client is told up front is the number it will actually
-/// page out. `tree_entries` holds folders, notes, and non-Markdown files
-/// alike, so it is always at least the note count.
-fn pinned_counts(connection: &Connection) -> Result<(Generation, u64, u64), IndexError> {
+/// `Default` is every facet off, which is the documented answer to a request
+/// that names no facet: a page of identities — path and revision — rather
+/// than an error or a silent full hydration. A facet name this build does not
+/// know never reaches here at all: the wire enum has no unknown variant, so a
+/// misspelling is `invalid_request` at parse time, the same strictness every
+/// other params struct gets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoteFacets {
+    pub metadata: bool,
+    pub references: bool,
+    pub resolutions: bool,
+    pub backlinks: bool,
+    pub sections: bool,
+    pub list_items: bool,
+}
+
+/// One parsed section, from the schema-v3 `sections` rows.
+///
+/// `kind` is the stored string, carried through rather than decoded and
+/// re-encoded: the column is written from `codec::encode_section_kind`, whose
+/// `Other(s)` case stores `s` literally, so a round trip through the enum
+/// could only lose the open end of that set. `block_id` is the trailing `^id`
+/// anchor where the block carries one, present on every read path exactly as
+/// the pre-task's DDL requires.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SectionRow {
+    pub kind: String,
+    pub span: SourceSpan,
+    pub block_id: Option<String>,
+}
+
+/// One parsed list item, from the schema-v3 `list_items` rows.
+///
+/// The parent is a **line number**. A top-level item names the start line of
+/// the list containing it; a nested item names its parent item's own start
+/// line. Exactly one of the two is set — the stored `CHECK` constraint
+/// enforces it, and this type mirrors that rather than flattening the pair
+/// into one signed number. Obsidian's own `listItems[].parent` is that
+/// flattening (negated for the top level), and reconstructing it is the
+/// host's arithmetic, not this layer's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListItemRow {
+    pub span: SourceSpan,
+    pub list_start_line: Option<u32>,
+    pub parent_start_line: Option<u32>,
+    /// The raw character inside the brackets, `None` for a non-task item.
+    /// One character wide by construction.
+    pub task: Option<String>,
+}
+
+/// One note's requested facets.
+#[derive(Clone, Debug)]
+pub struct SnapshotNoteRow {
+    pub path: VaultPath,
+    pub revision: String,
+    pub metadata: Option<SnapshotMetadata>,
+    pub references: Option<Vec<ResolvedReference>>,
+    pub resolutions: Option<Vec<Resolution>>,
+    pub backlinks: Option<Vec<ResolvedReference>>,
+    pub sections: Option<Vec<SectionRow>>,
+    pub list_items: Option<Vec<ListItemRow>>,
+}
+
+/// The metadata facet, body-free.
+#[derive(Clone, Debug)]
+pub struct SnapshotMetadata {
+    pub properties: Vec<vault_core::Property>,
+    pub aliases: Vec<vault_core::Alias>,
+    pub headings: Vec<vault_core::Heading>,
+    pub blocks: Vec<vault_core::BlockId>,
+    pub tags: Vec<vault_core::Tag>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NotesPage {
+    pub generation: Generation,
+    pub notes: Vec<SnapshotNoteRow>,
+    pub next_cursor: Option<String>,
+}
+
+impl SnapshotSessions {
+    /// One page of per-note semantic row-sets, in path order, at the
+    /// session's pinned generation.
+    ///
+    /// Bodies stay per-note through `get_note`: the metadata facet never
+    /// selects `notes.source_bytes`, because a bulk hydration that dragged
+    /// every body through it would defeat the point of paging facets at all.
+    ///
+    /// Like `tree_page`, this re-reads the pinned generation inside the
+    /// page's own transaction before serving anything — see
+    /// [`pinned_generation`].
+    pub fn notes_page(
+        &mut self,
+        id: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        facets: NoteFacets,
+    ) -> Result<NotesPage, IndexError> {
+        let page_size = self.page_size(limit);
+        let session = self.session(id)?;
+        let generation = pinned_generation(session, id)?;
+        let query = format!("snapshot_notes:{id}");
+        let after = match cursor {
+            None => String::new(),
+            Some(cursor) => match decode_cursor(cursor, generation, &query)? {
+                CursorPosition::SnapshotNote { path } => path,
+                _ => {
+                    return Err(IndexError::InvalidCursor(
+                        "cursor position does not fit a note listing".into(),
+                    ));
+                }
+            },
+        };
+
+        // One extra row, so "is there another page" needs no second query.
+        let wanted = i64::from(page_size) + 1;
+        let mut rows: Vec<(String, String)> = {
+            let mut statement = session.connection.prepare(
+                "SELECT path, content_revision FROM notes WHERE path > ?1 ORDER BY path LIMIT ?2",
+            )?;
+            statement
+                .query_map(rusqlite::params![after.as_str(), wanted], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let wanted_rows = usize::try_from(page_size).unwrap_or(usize::MAX);
+        let has_more = rows.len() > wanted_rows;
+        rows.truncate(wanted_rows);
+
+        let mut notes = Vec::with_capacity(rows.len());
+        for (path, revision) in rows {
+            let path = crate::codec::decode_path(&path)?;
+            let metadata = if facets.metadata {
+                let loaded = crate::store::load_metadata_with(&session.connection, &path)?;
+                Some(SnapshotMetadata {
+                    properties: loaded.properties,
+                    aliases: loaded.aliases,
+                    headings: loaded.headings,
+                    blocks: loaded.blocks,
+                    tags: loaded.tags,
+                    diagnostics: loaded.diagnostics,
+                })
+            } else {
+                None
+            };
+            // Loaded once when either facet is asked for: the two are the
+            // same query, and `resolutions` is the answers-only projection of
+            // it for a client that wants no spans or spellings.
+            let outgoing = if facets.references || facets.resolutions {
+                Some(crate::store::load_outgoing_with(
+                    &session.connection,
+                    &path,
+                )?)
+            } else {
+                None
+            };
+            let resolutions = if facets.resolutions {
+                outgoing.as_ref().map(|outgoing| {
+                    outgoing
+                        .iter()
+                        .map(|resolved| resolved.resolution.clone())
+                        .collect()
+                })
+            } else {
+                None
+            };
+            let references = if facets.references { outgoing } else { None };
+            let backlinks = if facets.backlinks {
+                Some(load_backlinks(&session.connection, &path)?)
+            } else {
+                None
+            };
+            let sections = if facets.sections {
+                Some(load_sections(&session.connection, &path)?)
+            } else {
+                None
+            };
+            let list_items = if facets.list_items {
+                Some(load_list_items(&session.connection, &path)?)
+            } else {
+                None
+            };
+            notes.push(SnapshotNoteRow {
+                path,
+                revision,
+                metadata,
+                references,
+                resolutions,
+                backlinks,
+                sections,
+                list_items,
+            });
+        }
+
+        let next_cursor = match (has_more, notes.last()) {
+            (true, Some(last)) => Some(encode_cursor(
+                generation,
+                &query,
+                CursorPosition::SnapshotNote {
+                    path: last.path.as_str().to_string(),
+                },
+            )?),
+            _ => None,
+        };
+        Ok(NotesPage {
+            generation,
+            notes,
+            next_cursor,
+        })
+    }
+}
+
+/// Every reference that resolves to `path`, in the same stable order
+/// `IndexReader::get_backlinks` uses.
+fn load_backlinks(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Vec<ResolvedReference>, IndexError> {
+    let mut statement = connection.prepare(
+        "SELECT r.id, r.kind, r.origin, r.raw_target, r.file_target, r.subpath_kind, \
+                r.subpath_value, r.display, r.span_start, r.span_end, \
+                r.target_span_start, r.target_span_end, \
+                s.kind, s.target_path, s.subpath_kind, s.subpath_value, r.note_path \
+         FROM resolutions s JOIN note_references r ON r.id = s.reference_id \
+         WHERE s.target_path = ?1 AND s.kind IN ('resolved', 'missing_subpath') \
+         ORDER BY r.note_path, r.span_start, r.span_end, r.id",
+    )?;
+    let rows = statement
+        .query_map(rusqlite::params![path.as_str()], |row| {
+            Ok((
+                crate::store::reference_row_prefix(row)?,
+                row.get::<_, String>(16)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(row, source)| {
+            let source = crate::codec::decode_path(&source)?;
+            crate::store::resolved_reference_from_row_with(connection, source, row)
+        })
+        .collect()
+}
+
+fn load_sections(connection: &Connection, path: &VaultPath) -> Result<Vec<SectionRow>, IndexError> {
+    let mut statement = connection.prepare(
+        "SELECT kind, span_start, span_end, block_id FROM sections \
+         WHERE note_path = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map(rusqlite::params![path.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(kind, start, end, block_id)| {
+            Ok(SectionRow {
+                kind,
+                span: crate::codec::decode_span(
+                    crate::store::i64_to_usize(start, "section span start")?,
+                    crate::store::i64_to_usize(end, "section span end")?,
+                )?,
+                block_id,
+            })
+        })
+        .collect()
+}
+
+fn load_list_items(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Vec<ListItemRow>, IndexError> {
+    let mut statement = connection.prepare(
+        "SELECT span_start, span_end, list_start_line, parent_start_line, task \
+         FROM list_items WHERE note_path = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map(rusqlite::params![path.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(start, end, list_start_line, parent_start_line, task)| {
+            // The stored `CHECK` already guarantees exactly one parent column
+            // is set, and a negative line number is not a sentinel in this
+            // model. Both refusals belong to `codec::decode_list_item_parent`,
+            // which is what the writer and `load_note_with` already use — a
+            // second copy of that rule here would be free to disagree with
+            // the one the rows were written under.
+            let (list_start_line, parent_start_line) =
+                match crate::codec::decode_list_item_parent(list_start_line, parent_start_line)? {
+                    ListItemParent::Root { list_start_line } => (Some(list_start_line), None),
+                    ListItemParent::Item { parent_start_line } => (None, Some(parent_start_line)),
+                };
+            Ok(ListItemRow {
+                span: crate::codec::decode_span(
+                    crate::store::i64_to_usize(start, "list item span start")?,
+                    crate::store::i64_to_usize(end, "list item span end")?,
+                )?,
+                list_start_line,
+                parent_start_line,
+                task,
+            })
+        })
+        .collect()
+}
+
+/// The generation the session's transaction reads **now**, refused when it is
+/// not the one the session claims to be pinned at.
+///
+/// Task 14 review finding M-a, demonstrated with a probe that ended a live
+/// session's transaction: every page reported `session.generation` — a struct
+/// field, written once at `open` — while serving whatever rows the connection
+/// could currently see. Three post-snapshot notes went out under
+/// `Generation(1)`, with no error and no signal. A struct field cannot
+/// evidence a pin; only a read inside the transaction can, and it costs one
+/// indexed row per page.
+///
+/// A pin that ended while the writer happened not to move is not detectable
+/// this way and does not need to be: generation determines the rows, so such
+/// a page is content-identical to the pinned one.
+fn pinned_generation(session: &Session, id: &str) -> Result<Generation, IndexError> {
+    let observed = stored_generation(&session.connection)?;
+    if observed != session.generation {
+        return Err(IndexError::SnapshotPinLost {
+            snapshot: id.to_string(),
+            pinned: session.generation.get(),
+            observed: observed.get(),
+        });
+    }
+    Ok(observed)
+}
+
+/// The committed generation one connection reads, inside whatever transaction
+/// it already holds. `IndexUnavailable` when nothing has been committed.
+fn stored_generation(connection: &Connection) -> Result<Generation, IndexError> {
     let stored: Option<i64> = connection.query_row(
         "SELECT generation FROM index_metadata WHERE singleton = 1",
         [],
@@ -374,7 +747,18 @@ fn pinned_counts(connection: &Connection) -> Result<(Generation, u64, u64), Inde
         // closing it here is what ends the transaction.
         return Err(IndexError::IndexUnavailable);
     };
-    let generation = Generation::from_db(stored)?;
+    Generation::from_db(stored)
+}
+
+/// The generation, note count, and tree entry count one connection currently
+/// reads — inside whatever transaction it already holds.
+///
+/// The tree count comes from the same pinned transaction as the note count,
+/// so the number a client is told up front is the number it will actually
+/// page out. `tree_entries` holds folders, notes, and non-Markdown files
+/// alike, so it is always at least the note count.
+fn pinned_counts(connection: &Connection) -> Result<(Generation, u64, u64), IndexError> {
+    let generation = stored_generation(connection)?;
     let note_count = count(connection, "SELECT COUNT(*) FROM notes", "note count")?;
     let entry_count = count(
         connection,

@@ -28,6 +28,14 @@ pub(crate) enum CursorPosition {
     TreeEntry {
         path: String,
     },
+    /// The last note a `snapshot_notes` page served. `notes.path` is that
+    /// table's primary key, so — as with `TreeEntry` — the path alone is both
+    /// unique and the order the page walks. A distinct variant from
+    /// `TreeEntry` because the two pagers walk different tables: a tree cursor
+    /// can name a folder, which the notes listing has no row for.
+    SnapshotNote {
+        path: String,
+    },
     Diagnostic {
         path: Option<String>,
         start: Option<u64>,
