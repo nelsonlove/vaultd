@@ -10,7 +10,11 @@ use vault_protocol::{ErrorCode, Response, ResponseOutcome};
 /// `Daemon::for_vault`'s arguments plus the flag under test. Spelled out
 /// rather than derived from it, because the flag's position in the list is
 /// part of what this test exercises: `--read-only` carries `requires =
-/// "vault"`, so a daemon started without `--vault` must reject it outright.
+/// "vault"`, so a daemon started without `--vault` must reject it outright —
+/// verified directly: `vaultd --read-only` alone exits 2 with "the following
+/// required arguments were not provided". Not re-asserted as a test of its
+/// own here, because every daemon this suite starts already has a vault; the
+/// argument's position in this list is what stands in for that check.
 fn read_only_daemon(vault: &TempDir, index: &TempDir) -> Daemon {
     Daemon::start(&[
         "--vault",
@@ -50,6 +54,14 @@ fn every_mutating_operation_is_refused_with_the_read_only_code() {
         r#"{"version":1,"id":"8","request":{"method":"patch_frontmatter","params":{"path":"One.md","patch":[{"key_path":"a","value":"b"}],"expected":{"any":true}}}}"#,
         r#"{"version":1,"id":"9","request":{"method":"write_file","params":{"path":"raw.bin","content_base64":"AAEC","expected":{"absent":true}}}}"#,
         r#"{"version":1,"id":"10","request":{"method":"write_file","params":{"path":".obsidian/app.json","content_base64":"e30=","expected":{"any":true}}}}"#,
+        // The two trash delete modes, not just `permanent`: a local trash is
+        // a move *inside* the vault rather than a write to a caller-named
+        // path, so it is the one shape a filesystem-boundary-only guard could
+        // miss. Both refuse above the mode `match` in `MutationEngine::apply`
+        // (mode selection is never reached), but that structural fact is
+        // worth a witness here too, not just at the engine layer.
+        r#"{"version":1,"id":"11","request":{"method":"delete_note","params":{"path":"One.md","mode":"trash_local","expected":{"any":true}}}}"#,
+        r#"{"version":1,"id":"12","request":{"method":"delete_note","params":{"path":"One.md","mode":"trash_system","expected":{"any":true}}}}"#,
     ];
     for attempt in attempts {
         let response = daemon.call(attempt);
@@ -74,6 +86,10 @@ fn every_mutating_operation_is_refused_with_the_read_only_code() {
         b"{}",
         "a zone write is a mutating operation too"
     );
+    assert!(
+        !vault.path().join(".trash").exists(),
+        "a trash move is a mutating operation too"
+    );
 }
 
 #[test]
@@ -83,7 +99,12 @@ fn reads_and_snapshots_are_unaffected_by_read_only() {
     std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
 
     let mut daemon = read_only_daemon(&vault, &index);
-    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    let refreshed =
+        daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    assert!(
+        matches!(refreshed.outcome, ResponseOutcome::Ok(_)),
+        "reconciliation is a read-only daemon's job: {refreshed:?}"
+    );
 
     let note = daemon.call(
         r#"{"version":1,"id":"g","request":{"method":"get_note","params":{"path":"One.md"}}}"#,

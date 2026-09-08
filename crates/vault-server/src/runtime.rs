@@ -380,6 +380,7 @@ impl Runtime {
                 stopped: AtomicBool::new(false),
                 watch_alive,
                 coordinator_alive,
+                read_only: options.read_only,
             }),
         })
     }
@@ -712,6 +713,13 @@ struct RuntimeInner {
     /// Whether the coordinator thread is still inside `run`. Cleared by
     /// [`CoordinatorAlive`] on unwind as well as on a clean exit.
     coordinator_alive: Arc<AtomicBool>,
+    /// A copy of the flag the coordinator's `IndexService` was opened with.
+    /// `RuntimeOptions` is consumed by `start_with_hooks` and never reaches
+    /// this struct otherwise, so without this a caller building a second
+    /// handle on the vault's write rules — a raw-read helper, say — would
+    /// have no way to ask whether the runtime it serves is read-only, and
+    /// could build one that silently is not.
+    read_only: bool,
 }
 
 impl RuntimeInner {
@@ -867,6 +875,16 @@ impl RuntimeHandle {
     pub fn is_stopped(&self) -> bool {
         self.inner.stopped.load(Ordering::Acquire)
             || !self.inner.coordinator_alive.load(Ordering::Acquire)
+    }
+
+    /// Whether this runtime refuses every mutation. Construction-time fixed —
+    /// there is no command that changes it after `start` — so a caller that
+    /// builds a second handle on the vault's write rules (a raw read or
+    /// write helper that bypasses the coordinator) can ask once and inherit
+    /// the answer, rather than defaulting to write-capable and relying on a
+    /// comment to never be used that way.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.read_only
     }
 
     /// Whether a filesystem watcher is installed *and* its forwarder thread

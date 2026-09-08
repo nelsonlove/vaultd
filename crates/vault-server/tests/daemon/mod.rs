@@ -70,6 +70,14 @@ impl Daemon {
 
     /// A daemon over `vault` with its index in `index`, watcher and periodic
     /// tick off, so every generation in a test is one the test caused.
+    ///
+    /// Allowed dead for the same reason as [`Daemon::wait_for_event`] above:
+    /// this module compiles into each test binary separately, and
+    /// `tests/read_only.rs` needs its daemon to carry an extra flag
+    /// (`--read-only`), so it spells its own argument list out with
+    /// [`Daemon::start`] rather than calling this. Most binaries that declare
+    /// `mod daemon;` do call it — unlike `wait_for_event`, this helper is not
+    /// dead everywhere, only in that one binary's own compilation.
     #[allow(dead_code)]
     pub fn for_vault(vault: &TempDir, index: &TempDir) -> Self {
         Self::start(&[

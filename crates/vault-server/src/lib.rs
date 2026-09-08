@@ -48,9 +48,15 @@ pub struct Server {
     /// nothing, so routing it through the coordinator would queue a pure
     /// filesystem read behind whatever write is in flight for no benefit. The
     /// engine is `Clone` and holds only the canonical root, so this is a
-    /// second handle on the same rules rather than a second writer — and it is
-    /// never used to mutate: every write still goes through
-    /// [`Server::mutate`].
+    /// second handle on the same rules rather than a second writer — and
+    /// today nothing uses it to mutate: every write still goes through
+    /// [`Server::mutate`]. That is no longer only a convention this comment
+    /// asserts: [`Server::for_runtime`] builds this engine with
+    /// `.with_read_only(handle.is_read_only())`, so a future helper that did
+    /// call `.apply` (or `.rename_paths`, or `.reserve_rename_destination` —
+    /// all `pub`) straight through this handle would refuse under
+    /// `--read-only` exactly as the coordinator path does, rather than
+    /// silently bypassing it.
     engine: Option<vault_index::MutationEngine>,
 }
 
@@ -170,8 +176,13 @@ impl Server {
         let config = handle.config();
         let snapshots = std::sync::Mutex::new(vault_index::SnapshotSessions::new(&config));
         // The same canonical root the runtime's own engine was built from, so
-        // a raw read resolves and contains a path exactly as a write does.
-        let engine = vault_index::MutationEngine::new(&config.canonical_vault_root);
+        // a raw read resolves and contains a path exactly as a write does —
+        // and the same read-only flag, so a write attempted straight through
+        // this handle refuses exactly as `Server::mutate`'s coordinator path
+        // does, rather than resting on the fact that nothing calls `.apply`
+        // on it today.
+        let engine = vault_index::MutationEngine::new(&config.canonical_vault_root)
+            .with_read_only(handle.is_read_only());
         Self {
             live: Some(Live { handle, reader }),
             snapshots: Some(snapshots),
@@ -967,5 +978,56 @@ mod tests {
             Server::mutation_revision(&report(Some("blake3:abc"))).expect("a revision is present"),
             "blake3:abc"
         );
+    }
+
+    /// `Server::engine` is a second, dispatcher-side handle on the vault's
+    /// write rules — held only so `read_file` can resolve and contain a path
+    /// without going through the coordinator. Nothing today calls `.apply`,
+    /// `.rename_paths`, or `.reserve_rename_destination` on it, but every one
+    /// of those is `pub`, and a future raw-write helper reaching for "skip the
+    /// coordinator, `read_file` already does" would inherit a write-capable
+    /// engine with no read-only guard of its own unless this engine is built
+    /// read-only whenever the runtime is. This test is that guard's witness:
+    /// it proves the engine the server actually holds refuses a write, not
+    /// just that a flag reads true.
+    #[test]
+    fn the_raw_engine_a_read_only_server_holds_refuses_a_write_too() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
+            .expect("valid config");
+        let options = RuntimeOptions {
+            watch: false,
+            reconcile_interval: None,
+            read_only: true,
+            ..RuntimeOptions::default()
+        };
+        let (server, notices) = Server::start(config, options).expect("start a read-only runtime");
+        // The coordinator only ever `try_send`s notices; a dropped receiver
+        // costs a dropped notice and never blocks it.
+        drop(notices);
+
+        let engine = server
+            .engine
+            .as_ref()
+            .expect("a configured server always has a raw engine");
+        assert!(
+            engine.is_read_only(),
+            "the server's raw engine must inherit read-only from the runtime it serves"
+        );
+        let outcome = engine.apply(&vault_index::Mutation::CreateFolder {
+            path: VaultPath::new("Folder").expect("valid path"),
+        });
+        assert!(
+            matches!(outcome, Err(vault_index::MutationError::ReadOnly)),
+            "a write attempted straight through this handle must refuse, exactly as \
+             Server::mutate's coordinator path already does: {outcome:?}"
+        );
+        assert!(
+            !vault.path().join("Folder").exists(),
+            "the refused write must leave the vault untouched"
+        );
+
+        server.shutdown();
     }
 }
