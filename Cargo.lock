@@ -1080,6 +1080,7 @@ dependencies = [
 name = "vault-server"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "libc",
  "serde",

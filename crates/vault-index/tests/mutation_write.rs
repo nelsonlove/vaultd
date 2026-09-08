@@ -588,3 +588,135 @@ fn replacing_a_note_keeps_the_permissions_it_had() {
         "a replace must not narrow a note's permissions"
     );
 }
+
+/// The pair rule, stated once: a `.md` path goes through `write_note`,
+/// everything else through `write_file`, and neither crosses into the other's
+/// half.
+#[test]
+fn a_raw_write_refuses_a_markdown_path_and_write_note_refuses_everything_else() {
+    let fixture = fixture();
+    let raw_note = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path("Folder/Raw.md"),
+            content: b"# Raw\n".to_vec(),
+            expected: Precondition::Absent,
+        })
+        .expect_err("write_file must not reach a note");
+    assert!(
+        matches!(raw_note, MutationError::IsANote { .. }),
+        "expected is_a_note, got {raw_note:?}"
+    );
+    assert!(!fixture.root.join("Folder/Raw.md").exists());
+
+    // The mirror image, already covered by `a_non_markdown_path_is_not_a_note`
+    // above, restated here so the pair reads as one rule: `.md` goes through
+    // `write_note`, everything else through `write_file`, and neither crosses.
+    let raw_attachment = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path("Folder/data.bin"),
+            content: vec![1, 2, 3],
+            expected: Precondition::Absent,
+        })
+        .expect("an attachment is exactly what write_file is for");
+    assert!(
+        !raw_attachment.semantic,
+        "an attachment carries no semantics the index reads"
+    );
+    // But it *is* a tree row, and the change set is what the tree is
+    // reconciled from. Naming nothing here would leave `snapshot_tree` serving
+    // a tree missing the daemon's own attachment — the under-naming hazard
+    // `MutationOutcome::changed_paths` documents.
+    assert_eq!(
+        raw_attachment.changed_paths,
+        BTreeSet::from([path("Folder/data.bin")]),
+        "a raw write inside the indexed vault must name the path it moved"
+    );
+}
+
+#[test]
+fn a_zone_write_reaches_the_zone_and_stays_out_of_the_change_set() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".obsidian")).expect("create the zone");
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path(".obsidian/app.json"),
+            content: br#"{"trashOption":"local"}"#.to_vec(),
+            expected: Precondition::Any,
+        })
+        .expect("the zone is writable through the raw pair");
+    assert!(!outcome.semantic);
+    assert!(
+        outcome.changed_paths.is_empty(),
+        "the scan never lists the zone, so naming a path there would ask for a \
+         reconciliation that can only ever find nothing"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join(".obsidian/app.json")).expect("read back"),
+        br#"{"trashOption":"local"}"#.to_vec()
+    );
+}
+
+/// A hidden folder is not the configuration zone, and the raw pair reaches it
+/// for the same reason: the scan never lists it, so nothing there can join a
+/// generation. It is the second half of the predicate the wire's `semantic`
+/// field answers with.
+#[test]
+fn a_hidden_path_is_written_raw_and_stays_out_of_the_change_set() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".hidden")).expect("create a hidden folder");
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path(".hidden/data.bin"),
+            content: vec![7, 8, 9],
+            expected: Precondition::Absent,
+        })
+        .expect("a hidden attachment is raw-writable");
+    assert!(!outcome.semantic);
+    assert!(outcome.changed_paths.is_empty());
+    assert_eq!(
+        std::fs::read(fixture.root.join(".hidden/data.bin")).expect("read back"),
+        [7, 8, 9]
+    );
+}
+
+/// A read is the only verb that answers about a path without judging it: a
+/// note, an attachment, and the zone all come back as bytes plus the revision
+/// a later `write_file` compares against. An absent path is `not_found`, never
+/// an empty answer.
+#[test]
+fn a_raw_read_answers_for_every_kind_of_path_and_refuses_an_absent_one() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".obsidian")).expect("create the zone");
+    std::fs::write(fixture.root.join(".obsidian/app.json"), b"{}").expect("write app.json");
+    std::fs::write(fixture.root.join("Folder/data.bin"), [1u8, 2, 3]).expect("write an attachment");
+
+    for (spelling, expected) in [
+        ("One.md", b"# One\n".to_vec()),
+        ("Folder/data.bin", vec![1, 2, 3]),
+        (".obsidian/app.json", b"{}".to_vec()),
+    ] {
+        let (bytes, revision) = fixture
+            .engine
+            .read_file(&path(spelling))
+            .unwrap_or_else(|error| panic!("read {spelling}: {error:?}"));
+        assert_eq!(bytes, expected, "wrong bytes for {spelling}");
+        assert_eq!(
+            revision,
+            revision_of(&expected),
+            "wrong revision for {spelling}"
+        );
+    }
+
+    let error = fixture
+        .engine
+        .read_file(&path("Folder/Gone.bin"))
+        .expect_err("an absent path has no bytes");
+    assert!(
+        matches!(error, MutationError::NotFound { .. }),
+        "expected not_found, got {error:?}"
+    );
+}

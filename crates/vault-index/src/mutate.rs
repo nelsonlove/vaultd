@@ -728,6 +728,14 @@ pub enum Mutation {
         patch: Vec<FrontmatterEdit>,
         expected: Precondition,
     },
+    /// Raw bytes to any vault file except a note: an attachment, the
+    /// configuration zone, a hidden folder. The one verb that carries bytes
+    /// the daemon does not interpret.
+    WriteFile {
+        path: VaultPath,
+        content: Vec<u8>,
+        expected: Precondition,
+    },
 }
 
 /// What `copy_file` does when its destination already exists.
@@ -942,15 +950,18 @@ pub struct MutationOutcome {
     /// | `copy_file` | `true` iff the **destination** is Markdown |
     /// | `rename_note` / `rename_folder` | `true` iff any Markdown path moved |
     /// | `patch_frontmatter` | `true` |
-    /// | `write_file` | **always `false`** — the zone is not indexed, an
-    ///   attachment is not indexed, and a `.md` path is refused with
-    ///   [`MutationError::IsANote`] rather than written raw |
+    /// | `write_file` | **always `false`** — the zone holds no semantics, an
+    ///   attachment holds none, and a `.md` path outside the zone is refused
+    ///   with [`MutationError::IsANote`] rather than written raw |
     ///
     /// It is deliberately **not** the same question as "does this write live
     /// inside the indexed vault", which is what the wire's
-    /// `WriteFileResponse::semantic` answers. That one is `!in_config_zone`,
-    /// the server computes it from the path, and conflating the two is what
-    /// made an attachment write claim to be semantic in the first draft.
+    /// `WriteFileResponse::semantic` answers. That one is `!is_unindexable` —
+    /// the configuration zone *and* every hidden folder, since the scan lists
+    /// neither — the server computes it from the path, and conflating the two
+    /// is what made an attachment write claim to be semantic in the first
+    /// draft. Nor is it the same question as `changed_paths`: an attachment
+    /// write names its path (the tree moved) while reporting `false` here.
     pub semantic: bool,
 }
 
@@ -982,7 +993,14 @@ pub fn in_config_zone(path: &VaultPath) -> bool {
 /// [`VaultPath::is_hidden`] is the index's own predicate, used here so the two
 /// cannot drift; it subsumes `.trash`, `.git`, and every nested spelling of
 /// the zone, and `in_config_zone` catches the zone folder named by itself.
-fn is_unindexable(path: &VaultPath) -> bool {
+///
+/// Public because it is also the **wire's** predicate. `write_file` is the one
+/// verb that reaches these paths at all, and its response's `semantic` field
+/// answers "is this path inside the indexed universe" — which is exactly the
+/// negation of this. The server computes it from the path before the mutation
+/// consumes it, and computing it from `in_config_zone` alone would claim a
+/// hidden-folder write joined a generation that will never contain it.
+pub fn is_unindexable(path: &VaultPath) -> bool {
     in_config_zone(path) || path.is_hidden()
 }
 
@@ -1191,6 +1209,11 @@ impl MutationEngine {
                 patch,
                 expected,
             } => self.patch_frontmatter(path, patch, expected),
+            Mutation::WriteFile {
+                path,
+                content,
+                expected,
+            } => self.write_file(path, content, expected),
         }
     }
 
@@ -1354,6 +1377,123 @@ impl MutationEngine {
             link_rewrite_failures: Vec::new(),
             semantic: true,
         })
+    }
+
+    /// Raw bytes to any vault file **except a note**, the configuration zone
+    /// included.
+    ///
+    /// A note is refused with [`MutationError::IsANote`], the mirror of
+    /// `write_note`'s refusal of a non-`.md` path and for the mirrored reason:
+    /// a raw write is not parsed, so a note written this way would land bytes
+    /// whose semantics no generation describes. `write_note` serves that path
+    /// and gives the caller read-your-writes.
+    ///
+    /// The consequence is that **every** raw write reports `semantic: false`:
+    /// the zone is not indexed, an attachment holds no semantics, and a note
+    /// cannot arrive here. That is what keeps raw I/O entirely out of the
+    /// *semantic* layer.
+    ///
+    /// It does **not** keep raw I/O out of the generation model, and the
+    /// difference matters. Since the tree pre-task the index holds a row for
+    /// every file, attachments included, so a write the scan would list has to
+    /// name its path in `changed_paths` or `snapshot_tree` would serve a tree
+    /// missing the daemon's own writes — the under-naming hazard
+    /// [`MutationOutcome::changed_paths`] documents. A write the scan would
+    /// *not* list — the zone, a hidden folder — names nothing, because a
+    /// reconciliation of such a path can only ever find nothing there.
+    /// [`is_unindexable`] is the single predicate for that split, and the same
+    /// one the wire's `WriteFileResponse::semantic` reports.
+    fn write_file(
+        &self,
+        path: &VaultPath,
+        content: &[u8],
+        expected: &Precondition,
+    ) -> Result<MutationOutcome, MutationError> {
+        // Once on the caller's spelling, so a note is refused even when its
+        // parent does not exist and `resolve` would answer `parent_not_found`
+        // instead. The zone is exempt: a `.md` file under `.obsidian/` is a
+        // plugin's data, never a note the index would read, and refusing it
+        // would leave it writable by nothing at all.
+        if !in_config_zone(path) && path.is_markdown() {
+            return Err(MutationError::IsANote { path: path.clone() });
+        }
+        let actual = content.len() as u64;
+        if actual > self.max_file_bytes {
+            return Err(MutationError::TooLarge {
+                limit: self.max_file_bytes,
+                actual,
+            });
+        }
+        let resolved = self.resolve(path)?;
+        // And again on the path the write would actually reach. The zone
+        // exemption above is granted on a string, and `in_config_zone` is
+        // exact-case on purpose, so a caller can only *lose* the exemption by
+        // resolving — never gain a way to write a note raw. What this second
+        // check catches is the other direction: a `.obsidian` that is a
+        // symlink out of the zone, whose resolved target is an ordinary note.
+        let stored = self.stored_path(path, &resolved)?;
+        if !in_config_zone(&stored) && stored.is_markdown() {
+            return Err(MutationError::IsANote { path: path.clone() });
+        }
+        // The case check comes before the precondition, for `write_note`'s
+        // reason: on a case-insensitive filesystem `check` folds the spelling
+        // and would answer about a file the caller never addressed.
+        if let Some(existing) = self.case_collision_at(&resolved)? {
+            return Err(MutationError::CaseCollision {
+                path: path.clone(),
+                existing,
+            });
+        }
+        self.check_resolved(path, &resolved, expected)?;
+        self.recheck(path, &resolved, expected)?;
+        // A create claims the name; every other write replaces it — the same
+        // split, and the same window-closing reason, as `write_note`.
+        if expected == &Precondition::Absent {
+            if create_atomically(&resolved, content)? == Claimed::Taken {
+                return Err(MutationError::RevisionConflict {
+                    path: path.clone(),
+                    current: self.streamed_revision(path, &resolved)?,
+                });
+            }
+        } else {
+            write_atomically(&resolved, content)?;
+        }
+        let written = self.written_path(path, &resolved, stored);
+        let changed_paths = if is_unindexable(&written) {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([written])
+        };
+        Ok(MutationOutcome {
+            changed_paths,
+            revision: Some(revision_of(content)),
+            links_rewritten: 0,
+            link_rewrite_failures: Vec::new(),
+            // Nothing a raw write can reach carries semantics the index reads,
+            // so by the invariant on `MutationOutcome` this is unconditional.
+            semantic: false,
+        })
+    }
+
+    /// Raw bytes from any vault file, the configuration zone included, with
+    /// the revision a later `write_file` would compare against. A note read
+    /// this way is byte-identical to `get_note`'s source, without the
+    /// semantics.
+    ///
+    /// Not gated on `read_only`: a read writes nothing, and a read-only daemon
+    /// exists to serve reads.
+    pub fn read_file(&self, path: &VaultPath) -> Result<(Vec<u8>, String), MutationError> {
+        let resolved = self.resolve(path)?;
+        match std::fs::read(&resolved) {
+            Ok(bytes) => {
+                let revision = revision_of(&bytes);
+                Ok((bytes, revision))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(MutationError::NotFound { path: path.clone() })
+            }
+            Err(error) => Err(io(error)),
+        }
     }
 
     /// Edit a note's frontmatter in place, changing only the addressed keys'

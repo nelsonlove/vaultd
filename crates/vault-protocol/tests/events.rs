@@ -1,8 +1,8 @@
 use vault_protocol::{
-    ChangeSetDto, EventEnvelope, GenerationCauseDto, GenerationCommittedEventDto, LiveStateDto,
-    Request, RequestEnvelope, ResyncReasonDto, ResyncRequiredEventDto, RuntimeEventDto,
-    RuntimeStateChangedEventDto, SubscribeEventsParams, SubscribeEventsResponse, UnsubscribeParams,
-    UnsubscribeResponse,
+    ChangeSetDto, ConfigChangedEventDto, EventEnvelope, GenerationCauseDto,
+    GenerationCommittedEventDto, LiveStateDto, Request, RequestEnvelope, ResyncReasonDto,
+    ResyncRequiredEventDto, RuntimeEventDto, RuntimeStateChangedEventDto, SubscribeEventsParams,
+    SubscribeEventsResponse, UnsubscribeParams, UnsubscribeResponse,
 };
 
 #[test]
@@ -289,4 +289,37 @@ fn event_envelope_has_no_id_or_outcome_fields() {
     assert!(!json.contains("\"id\""));
     assert!(!json.contains("\"outcome\""));
     assert!(json.starts_with(r#"{"version":1,"subscription_id":"sub-1","event":"#));
+}
+
+/// The zone's own event, and the reason it is a separate kind rather than a
+/// `generation_committed` with an odd payload: it carries **no generation**,
+/// because nothing in the configuration zone is indexed and therefore no
+/// generation contains it.
+#[test]
+fn config_changed_event_round_trips_as_exact_json() {
+    let envelope = EventEnvelope::new(
+        "sub-1",
+        RuntimeEventDto::ConfigChanged(ConfigChangedEventDto {
+            path: ".obsidian/app.json".into(),
+        }),
+    );
+    let json = serde_json::to_string(&envelope).expect("serialize event");
+    assert_eq!(
+        json,
+        r#"{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed","value":{"path":".obsidian/app.json"}}}"#
+    );
+
+    let decoded: EventEnvelope = serde_json::from_str(&json).expect("deserialize event");
+    assert_eq!(decoded, envelope);
+}
+
+/// A *known* event kind whose payload is missing still fails. Tolerance is
+/// for variants this build has never heard of, not for lines it should have
+/// understood — and a new arm in the visitor has to join that list or a
+/// truncated `config_changed` would silently decode as `Unknown`.
+#[test]
+fn a_config_changed_event_with_no_value_is_a_decode_failure() {
+    let line = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed"}}"#;
+    serde_json::from_str::<EventEnvelope>(line)
+        .expect_err("a known type with no payload is malformed, not unknown");
 }

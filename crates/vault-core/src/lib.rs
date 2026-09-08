@@ -19,6 +19,7 @@ pub use dependency::{
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use domain::{DomainError, NoteId, NoteRef, Revision, SourceSpan, VaultPath};
 pub use graph::{ScanReport, SemanticGraph, build_graph, scan_vault};
+pub use markdown::in_contained_markdown_parse;
 pub use parse::{parse_note, parse_properties};
 pub use property::{Property, PropertyValue};
 pub use resolver::{

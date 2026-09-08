@@ -55,8 +55,8 @@ use vault_core::{
     FileSystemVaultSource, Resolution, Subpath, TreeEntryKind, VaultPath, scan_vault,
 };
 use vault_protocol::{
-    ChangeSetDto, ErrorCode, ResolutionDto, Response, ResponseEnvelope, ResponseOutcome,
-    RuntimeEventDto, SubpathDto,
+    ChangeSetDto, ResolutionDto, Response, ResponseEnvelope, ResponseOutcome, RuntimeEventDto,
+    SubpathDto,
 };
 
 use daemon::Daemon;
@@ -148,9 +148,6 @@ enum Expect {
     /// references each step has to repair, so a change that starts repairing
     /// three where one was meant is a change worth failing on.
     LandsRepairing(u64),
-    /// Refused because the verb is not wired yet. A refusal is still checked
-    /// on all three axes: nothing moved, so no generation may appear.
-    RefusedUntilTask16,
 }
 
 /// A daemon plus the request-id bookkeeping this suite needs. Ids are unique
@@ -497,19 +494,16 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
         ("create_folder", r#"{"path":"Nested"}"#.to_string(), Expect::Lands),
         // The ninth mutation verb, and the one whose only visible effect is a
         // non-note tree row — which is exactly why it belongs in a walk that
-        // checks the tree. It is refused today because raw file operations
-        // are wired in Task 16, and a refusal is still a claim worth
-        // checking: nothing moved, so no generation may appear.
+        // checks the tree.
         //
-        // TRIPWIRE — Task 16 must flip this step, not delete it. When
-        // `write_file` lands, change `Expect::RefusedUntilTask16` to
-        // `Expect::Lands`; the three axes then check the attachment's tree
-        // row for free, and the note axis must stay unmoved because an
-        // attachment is not a note.
+        // The Task 16 tripwire step, flipped: `write_file` is wired, so the
+        // three axes now check the attachment's tree row for free — and the
+        // note axis stays unmoved on this step, because an attachment is not
+        // a note however much of a generation it earns.
         (
             "write_file",
             r#"{"path":"Nested/note.txt","content_base64":"aGVsbG8=","expected":{"absent":true}}"#.to_string(),
-            Expect::RefusedUntilTask16,
+            Expect::Lands,
         ),
         (
             "write_note",
@@ -597,18 +591,6 @@ fn every_protocol_mutation_leaves_the_daemon_equivalent_to_a_fresh_scan() {
                     "{method} {params} skipped a referrer it should have rewritten: {failures:?}"
                 );
             }
-            Expect::RefusedUntilTask16 => match &response.outcome {
-                ResponseOutcome::Err(error) => assert_eq!(
-                    error.code,
-                    ErrorCode::RuntimeNotReady,
-                    "{method} was refused for the wrong reason"
-                ),
-                other => panic!(
-                    "TRIPWIRE — Task 16 wired `{method}`: flip this step to `Expect::Lands` \
-                     rather than deleting it, so the tree axis starts checking the row it \
-                     writes. Answer was {other:?}"
-                ),
-            },
         }
 
         // Axis 1: the note answers equal a fresh scan.

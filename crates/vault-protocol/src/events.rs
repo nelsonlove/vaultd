@@ -200,6 +200,13 @@ pub struct ResyncRequiredEventDto {
     pub reason: ResyncReasonDto,
 }
 
+/// A file under `.obsidian/` changed. Carries no generation: nothing in the
+/// configuration zone is indexed, so no generation contains it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConfigChangedEventDto {
+    pub path: String,
+}
+
 /// One event delivered to a subscription.
 ///
 /// Open-ended on its own tag: an event kind a later `vaultd` introduces
@@ -211,6 +218,7 @@ pub enum RuntimeEventDto {
     GenerationCommitted(GenerationCommittedEventDto),
     RuntimeStateChanged(RuntimeStateChangedEventDto),
     ResyncRequired(ResyncRequiredEventDto),
+    ConfigChanged(ConfigChangedEventDto),
     /// An event kind this build does not know. Never produced by this server.
     Unknown,
 }
@@ -268,6 +276,7 @@ impl<'de> serde::de::Visitor<'de> for RuntimeEventVisitor {
                             RuntimeEventDto::RuntimeStateChanged(map.next_value()?)
                         }
                         "resync_required" => RuntimeEventDto::ResyncRequired(map.next_value()?),
+                        "config_changed" => RuntimeEventDto::ConfigChanged(map.next_value()?),
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                             RuntimeEventDto::Unknown
@@ -282,9 +291,12 @@ impl<'de> serde::de::Visitor<'de> for RuntimeEventVisitor {
         match event {
             Some(event) => Ok(event),
             None => match kind.as_deref() {
-                Some("generation_committed" | "runtime_state_changed" | "resync_required") => {
-                    Err(serde::de::Error::missing_field("value"))
-                }
+                Some(
+                    "generation_committed"
+                    | "runtime_state_changed"
+                    | "resync_required"
+                    | "config_changed",
+                ) => Err(serde::de::Error::missing_field("value")),
                 Some(_) => Ok(RuntimeEventDto::Unknown),
                 None => Err(serde::de::Error::missing_field("type")),
             },

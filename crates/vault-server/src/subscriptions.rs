@@ -51,9 +51,10 @@ use std::collections::{BTreeMap, VecDeque};
 
 use vault_index::{ChangeCause, LiveRefreshReport, LiveState, PathChanges, PublishedStatus};
 use vault_protocol::{
-    ChangeSetDto, ErrorCode, EventEnvelope, GenerationCauseDto, GenerationCommittedEventDto,
-    LiveStateDto, ProtocolError, ResyncReasonDto, ResyncRequiredEventDto, RuntimeEventDto,
-    RuntimeStateChangedEventDto, SubscribeEventsResponse, UnsubscribeResponse,
+    ChangeSetDto, ConfigChangedEventDto, ErrorCode, EventEnvelope, GenerationCauseDto,
+    GenerationCommittedEventDto, LiveStateDto, ProtocolError, ResyncReasonDto,
+    ResyncRequiredEventDto, RuntimeEventDto, RuntimeStateChangedEventDto, SubscribeEventsResponse,
+    UnsubscribeResponse,
 };
 
 use crate::runtime::{ResyncReason, RuntimeNotice};
@@ -178,6 +179,11 @@ fn events_for(notice: &RuntimeNotice) -> Vec<RuntimeEventDto> {
                 reason: resync_reason(*reason),
             })],
         },
+        RuntimeNotice::ConfigChanged { path } => {
+            vec![RuntimeEventDto::ConfigChanged(ConfigChangedEventDto {
+                path: path.as_str().to_string(),
+            })]
+        }
     }
 }
 
@@ -187,10 +193,13 @@ fn event_generation(event: &RuntimeEventDto) -> Option<u64> {
         RuntimeEventDto::GenerationCommitted(committed) => Some(committed.generation),
         RuntimeEventDto::ResyncRequired(resync) => resync.current_generation,
         // Semantically inert: an event kind this build has never heard of
-        // names no generation. Ruling B2 (task 1): the arm exists here only
-        // to keep this match exhaustive against `RuntimeEventDto::Unknown`;
-        // a later task may give it real meaning.
-        RuntimeEventDto::RuntimeStateChanged(_) | RuntimeEventDto::Unknown => None,
+        // names no generation, and neither does a configuration-zone write —
+        // the zone is not indexed, so no generation contains it. Ruling B2
+        // (task 1): the `Unknown` arm exists here only to keep this match
+        // exhaustive; a later task may give it real meaning.
+        RuntimeEventDto::RuntimeStateChanged(_)
+        | RuntimeEventDto::ConfigChanged(_)
+        | RuntimeEventDto::Unknown => None,
     }
 }
 

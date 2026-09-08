@@ -11,8 +11,9 @@ pub use envelope::{
 };
 pub use error::{ErrorCode, ProtocolError};
 pub use events::{
-    ChangeSetDto, EventEnvelope, GenerationCauseDto, GenerationCommittedEventDto, LiveStateDto,
-    ResyncReasonDto, ResyncRequiredEventDto, RuntimeEventDto, RuntimeStateChangedEventDto,
+    ChangeSetDto, ConfigChangedEventDto, EventEnvelope, GenerationCauseDto,
+    GenerationCommittedEventDto, LiveStateDto, ResyncReasonDto, ResyncRequiredEventDto,
+    RuntimeEventDto, RuntimeStateChangedEventDto,
 };
 pub use mutations::{
     CopyConflictDto, CopyFileParams, DeleteFolderParams, DeleteModeDto, DeleteNoteParams,

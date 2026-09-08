@@ -10,9 +10,9 @@ use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexReader, LiveState, ReferenceStatus};
 use vault_protocol::{
     CloseSnapshotResponse, ErrorCode, GenerationResponse, MutationResponse, OpenSnapshotResponse,
-    PageResponse, ProtocolError, ReferenceStatusFilter, RefreshIndexResponse, RenameResponse,
-    Request, RequestEnvelope, ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto,
-    SnapshotNotesResponse, SnapshotTreeResponse, validate_version,
+    PageResponse, ProtocolError, ReadFileResponse, ReferenceStatusFilter, RefreshIndexResponse,
+    RenameResponse, Request, RequestEnvelope, ResolveLinkResponse, Response, ResponseEnvelope,
+    SeverityDto, SnapshotNotesResponse, SnapshotTreeResponse, WriteFileResponse, validate_version,
 };
 
 use crate::runtime::{MutationReport, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
@@ -42,6 +42,16 @@ pub struct Server {
     /// registry that would answer `snapshot_not_found` where it should answer
     /// `index_unavailable`.
     snapshots: Option<std::sync::Mutex<vault_index::SnapshotSessions>>,
+    /// The engine `read_file` answers from, or `None` in health-only mode.
+    ///
+    /// A raw read touches no index state, takes no lock, and publishes
+    /// nothing, so routing it through the coordinator would queue a pure
+    /// filesystem read behind whatever write is in flight for no benefit. The
+    /// engine is `Clone` and holds only the canonical root, so this is a
+    /// second handle on the same rules rather than a second writer — and it is
+    /// never used to mutate: every write still goes through
+    /// [`Server::mutate`].
+    engine: Option<vault_index::MutationEngine>,
 }
 
 struct Live {
@@ -57,6 +67,40 @@ pub enum ServerStartupError {
     /// missing its coordinator would never reconcile anything.
     #[error("failed to start a runtime thread: {0}")]
     Spawn(#[from] std::io::Error),
+}
+
+/// Report a *contained* parse panic as the warning it is, and every other
+/// panic exactly as before.
+///
+/// `vault-core` catches the upstream markdown parser's unwind and degrades the
+/// note to a diagnostic, so the daemon survives a body that panics
+/// `markdown 1.0.0`. What it cannot do from inside the `catch_unwind` is stop
+/// the panic *hook*, which the runtime already ran on the way out: the default
+/// hook prints `thread … panicked at …` and invites a backtrace. An operator
+/// reading `vaultd`'s stderr then sees a crash report for a daemon that is
+/// still serving — the containment works and the logs say it did not.
+///
+/// So the hook consults [`vault_core::in_contained_markdown_parse`], which is
+/// true only while that one call is on the panicking thread's stack, and
+/// prints one warning line instead. **Every other panic reaches the previous
+/// hook untouched**: a hook that swallowed panics generally would hide the
+/// next real defect, which is a far worse trade than a confusing line.
+///
+/// Installed by the daemon at startup. Idempotent in effect but not in cost —
+/// calling it twice chains two hooks — so `main` calls it once.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if vault_core::in_contained_markdown_parse() {
+            eprintln!(
+                "vaultd: warning: the markdown parser panicked on a note body and was contained; \
+                 that note's frontmatter is indexed, its body semantics are not, and the note \
+                 carries a markdown_parse_error diagnostic. The daemon is unaffected."
+            );
+            return;
+        }
+        previous(info);
+    }));
 }
 
 fn index_unavailable() -> ProtocolError {
@@ -114,6 +158,7 @@ impl Server {
         Self {
             live: None,
             snapshots: None,
+            engine: None,
         }
     }
 
@@ -122,10 +167,15 @@ impl Server {
     /// deliver events.
     pub fn for_runtime(handle: RuntimeHandle) -> Self {
         let reader = handle.reader();
-        let snapshots = std::sync::Mutex::new(vault_index::SnapshotSessions::new(&handle.config()));
+        let config = handle.config();
+        let snapshots = std::sync::Mutex::new(vault_index::SnapshotSessions::new(&config));
+        // The same canonical root the runtime's own engine was built from, so
+        // a raw read resolves and contains a path exactly as a write does.
+        let engine = vault_index::MutationEngine::new(&config.canonical_vault_root);
         Self {
             live: Some(Live { handle, reader }),
             snapshots: Some(snapshots),
+            engine: Some(engine),
         }
     }
 
@@ -233,6 +283,22 @@ impl Server {
         live.handle
             .mutate(mutation)
             .map_err(convert::mutation_failure)
+    }
+
+    /// Read raw bytes out of the vault, off the coordinator thread.
+    ///
+    /// A read is not a mutation: it takes no lease, publishes nothing, and
+    /// cannot fail a precondition, so it needs neither the coordinator's
+    /// serialization nor a generation to be true at. What it does need is the
+    /// engine's containment — `resolve` refuses a NUL, a traversal, and a
+    /// symlink out of the vault — which is why it goes through the engine
+    /// rather than through `std::fs` here.
+    fn read_file(&self, path: &VaultPath) -> Result<(Vec<u8>, String), ProtocolError> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| runtime_not_ready("no vault is configured"))?;
+        engine.read_file(path).map_err(convert::mutation_error)
     }
 
     /// The generation a mutation response reports. `None` means nothing has
@@ -676,12 +742,76 @@ impl Server {
                     }
                 },
             },
-            // The raw pair lands in Task 16; until then it refuses rather
-            // than pretending the zone rules are in place.
-            Request::WriteFile(_) | Request::ReadFile(_) => ResponseEnvelope::error(
-                id,
-                runtime_not_ready("raw file operations are not wired yet"),
-            ),
+            Request::WriteFile(params) => match parse_path(&params.path) {
+                Err(error) => ResponseEnvelope::error(id, error),
+                Ok(path) => match (
+                    convert::precondition(params.expected.as_ref()),
+                    convert::decode_base64(&params.content_base64),
+                ) {
+                    (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                    (Ok(expected), Ok(content)) => {
+                        // The wire's `semantic` answers "is this path inside
+                        // the indexed universe", which is a question about the
+                        // path — *not* `MutationOutcome::semantic`, which
+                        // answers "did indexed rows move" and is always
+                        // `false` for a raw write. The indexed universe is
+                        // what the scan lists, so a hidden path is outside it
+                        // exactly as the configuration zone is. Computed
+                        // before `path` is moved into the mutation.
+                        let indexed = !vault_index::is_unindexable(&path);
+                        match self.mutate(vault_index::Mutation::WriteFile {
+                            path,
+                            content,
+                            expected,
+                        }) {
+                            Err(error) => ResponseEnvelope::error(id, error),
+                            // `mutation_revision` rather than a default: this
+                            // response's `revision` is a bare `String`, and
+                            // `""` would reach a client as a well-formed
+                            // revision it could then compare-and-swap against.
+                            // A raw write always has one, so this is an
+                            // invariant guard, not a shape a caller meets.
+                            Ok(report) => match Self::mutation_revision(&report) {
+                                Err(error) => ResponseEnvelope::error(id, error),
+                                Ok(revision) => ResponseEnvelope::success(
+                                    id,
+                                    Response::WriteFile(WriteFileResponse {
+                                        // Absent for a write the index does
+                                        // not track: no generation contains
+                                        // it, and claiming one would be a lie
+                                        // a client could act on. For an
+                                        // attachment it is the generation the
+                                        // write itself published — the file
+                                        // tree moved, so the client can read
+                                        // its own write back.
+                                        generation: indexed
+                                            .then(|| {
+                                                report.generation.map(vault_index::Generation::get)
+                                            })
+                                            .flatten(),
+                                        revision,
+                                        semantic: indexed,
+                                    }),
+                                ),
+                            },
+                        }
+                    }
+                },
+            },
+            Request::ReadFile(params) => match (self.reader(), parse_path(&params.path)) {
+                (None, _) => ResponseEnvelope::error(id, index_unavailable()),
+                (_, Err(error)) => ResponseEnvelope::error(id, error),
+                (Some(_), Ok(path)) => match self.read_file(&path) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok((bytes, revision)) => ResponseEnvelope::success(
+                        id,
+                        Response::ReadFile(ReadFileResponse {
+                            content_base64: convert::encode_base64(&bytes),
+                            revision,
+                        }),
+                    ),
+                },
+            },
             Request::OpenSnapshot(_) => match self.snapshots.as_ref() {
                 None => ResponseEnvelope::error(id, index_unavailable()),
                 Some(sessions) => {

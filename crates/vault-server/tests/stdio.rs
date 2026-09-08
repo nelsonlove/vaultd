@@ -278,3 +278,67 @@ fn an_unsubscribed_stream_never_carries_an_event() {
     assert_eq!(responses.len(), 3);
     assert_unsubscribed_stream_is_byte_compatible(&output);
 }
+
+/// A contained parse panic must not read as a crash.
+///
+/// `vault-core` catches the upstream markdown parser's unwind on a body it
+/// cannot handle, so the daemon survives and the note keeps its frontmatter.
+/// But the panic runtime ran the process hook *before* the containment took
+/// effect, and the default hook prints a crash report — for a daemon that is
+/// still answering requests. The daemon installs a hook that recognises that
+/// one site and logs a warning instead. Delete the hook and this test goes
+/// red on the `panicked at` line it would print.
+#[test]
+fn a_contained_parse_panic_is_reported_as_a_warning_not_a_crash() {
+    let vault = tempfile::TempDir::new().expect("vault tempdir");
+    let index = tempfile::TempDir::new().expect("index tempdir");
+    // markdown 1.0.0 **panics** on this run of setext-ish underlines
+    // (`to_mdast.rs:193`, "Cannot push to non-parent"); the frontmatter is
+    // there so the note still indexes something after the body is lost.
+    std::fs::write(
+        vault.path().join("Poison.md"),
+        "---\ntitle: x\n---\na\n-\n--\nA\n-\n",
+    )
+    .expect("write the poison note");
+
+    let index_path = index.path().join("index.sqlite3");
+    let arguments = [
+        "--vault",
+        vault.path().to_str().expect("utf-8 vault path"),
+        "--index",
+        index_path.to_str().expect("utf-8 index path"),
+        "--no-watch",
+        "--reconcile-interval-seconds",
+        "0",
+    ];
+    // `refresh_index` rather than `health`, so the parse has demonstrably
+    // happened before stdin closes.
+    let output = run_vaultd(
+        &arguments,
+        &[r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#],
+    );
+
+    assert!(
+        output.status.success(),
+        "the daemon must survive the body: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("vaultd: warning:") && stderr.contains("was contained"),
+        "the contained panic must be reported, not swallowed: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "a contained panic must not print a crash report: {stderr:?}"
+    );
+    // The reachability half: without it this test would pass on a build where
+    // the parser stopped panicking at all, and would then be checking nothing.
+    let responses = parse_responses(&output);
+    assert_eq!(responses.len(), 1, "the refresh must have been answered");
+    assert!(
+        matches!(responses[0].outcome, ResponseOutcome::Ok(_)),
+        "the refresh must succeed despite the body: {:?}",
+        responses[0].outcome
+    );
+}

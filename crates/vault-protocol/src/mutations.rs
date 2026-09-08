@@ -391,11 +391,20 @@ pub struct RenameResponse {
 /// `generation` is absent and `semantic` is `false` for a write into the
 /// `.obsidian` zone: nothing there is indexed, so no generation contains it.
 ///
-/// `semantic` answers **"is this path inside the indexed vault"** — it is
-/// `!` the configuration-zone test and nothing else. It deliberately does not
-/// answer "did this write change indexed rows", which for a raw write is
-/// always `false`: `write_file` reaches only attachments and the zone, and a
-/// `.md` path is refused so a note can never bypass its generation.
+/// `semantic` answers **"is this path inside the indexed universe"** — the
+/// negation of the daemon's unindexable test, which is the configuration zone
+/// **and** every hidden folder, because the vault scan lists neither. So a
+/// write to `.hidden/data.bin` answers `semantic: false` with no `generation`
+/// exactly as a zone write does; the zone is the common case, not the whole
+/// rule. Reporting a generation for either would name one that will never
+/// contain the write, which is a lie a client acts on.
+///
+/// It deliberately does not answer "did this write change indexed rows", which
+/// for a raw write is always `false`: `write_file` reaches only attachments,
+/// the zone, and hidden paths, and a `.md` path outside the zone is refused so
+/// a note can never bypass its generation. An attachment inside the vault is
+/// the case where the two answers differ — `semantic: true` here, no semantic
+/// rows moved, and a real generation because the file tree moved.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WriteFileResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]

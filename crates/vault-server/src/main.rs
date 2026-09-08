@@ -67,6 +67,9 @@ impl Cli {
 type ConfiguredServer = (Server, Option<Receiver<RuntimeNotice>>);
 
 fn main() {
+    // Before anything can parse a note: a contained parse panic must read as a
+    // warning, not as a crash report for a daemon that is still serving.
+    vault_server::install_panic_hook();
     if let Err(error) = run() {
         eprintln!("vaultd: {error}");
         std::process::exit(2);

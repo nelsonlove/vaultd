@@ -349,14 +349,24 @@ fn the_protocol_reaches_the_engine_for_a_write_a_delete_and_a_read() {
     }
     assert!(!vault.path().join("Two.md").exists());
 
-    // The raw pair is still the placeholder until Task 16, and it must refuse
-    // in a typed way rather than pretend the zone rules are in place.
+    // The raw pair is wired, and `read_file` reads a note as bytes without
+    // going anywhere near the semantic layer: same revision, no generation,
+    // no parse. `tests/raw_files.rs` owns the zone half of this contract.
     let raw = daemon.call(
         r#"{"version":1,"id":"f","request":{"method":"read_file","params":{"path":"One.md"}}}"#,
     );
     match raw.outcome {
-        ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::RuntimeNotReady),
-        other => panic!("read_file must refuse until Task 16 wires it: {other:?}"),
+        ResponseOutcome::Ok(Response::ReadFile(response)) => {
+            use base64::Engine as _;
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&response.content_base64)
+                    .expect("valid base64"),
+                b"# One\n"
+            );
+            assert_eq!(response.revision, revision_of(b"# One\n"));
+        }
+        other => panic!("read_file did not reach the engine: {other:?}"),
     }
 }
 

@@ -163,6 +163,9 @@ pub enum RuntimeNotice {
         generation: Option<Generation>,
         reason: ResyncReason,
     },
+    /// A file in the configuration zone was written. Not a generation: the
+    /// zone is not indexed.
+    ConfigChanged { path: VaultPath },
 }
 
 /// How specific a resync reason is, for merging two outstanding escalations.
@@ -1282,6 +1285,17 @@ impl Coordinator {
             // not track: nothing the index holds moved, so report the
             // generation the client can already read at rather than
             // manufacturing one.
+            //
+            // The zone is the one such write anybody can *observe*, and a
+            // plugin host has to: `.obsidian/` is where its own settings live,
+            // and no generation will ever announce them. So it gets its own
+            // notice — deliberately not a generation event, because there is
+            // no generation to name.
+            if let Mutation::WriteFile { path, .. } = &mutation {
+                if vault_index::in_config_zone(path) {
+                    self.emit(RuntimeNotice::ConfigChanged { path: path.clone() });
+                }
+            }
             return Ok(self.report(&outcome, self.committed_generation()));
         }
         let paths = outcome.changed_paths.clone();

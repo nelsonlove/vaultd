@@ -738,3 +738,30 @@ pub(crate) fn link_rewrite_failures(
         })
         .collect()
 }
+
+/// The raw pair's payload encoding. Base64 because JSON has no byte string,
+/// and an attachment is bytes: a `.png` is not valid UTF-8 and would be lost
+/// or mangled by any string-shaped alternative.
+///
+/// A decode failure is `invalid_request`, never `storage_failure`: nothing was
+/// attempted, no retry helps, and the caller has to fix what it sent. The
+/// message names the field so a client with several string fields knows which
+/// one is malformed — and never echoes the payload back, which could be
+/// megabytes.
+pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ProtocolError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|error| ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: format!("content_base64 is not valid base64: {error}"),
+            supported_version: None,
+            current_generation: None,
+            current_revision: None,
+        })
+}
+
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}

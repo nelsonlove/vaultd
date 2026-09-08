@@ -12,6 +12,7 @@ use vault_protocol::{
 const GENERATION_COMMITTED: &str = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"generation_committed","value":{"previous_generation":1,"generation":2,"cause":"watcher","changes":{"kind":"detailed","created":[],"modified":["One.md"],"deleted":[]},"affected_note_count":1,"affected_reference_count":0}}}"#;
 const RUNTIME_STATE_CHANGED: &str = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"runtime_state_changed","value":{"generation":2,"live_state":"watching"}}}"#;
 const RESYNC_REQUIRED: &str = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"resync_required","value":{"current_generation":2,"reason":"runtime_recovered"}}}"#;
+const CONFIG_CHANGED: &str = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed","value":{"path":".obsidian/app.json"}}}"#;
 
 #[test]
 fn todays_event_fixtures_still_parse_unchanged() {
@@ -41,6 +42,15 @@ fn todays_event_fixtures_still_parse_unchanged() {
             assert_eq!(event.reason, ResyncReasonDto::RuntimeRecovered);
         }
         other => panic!("expected resync_required, got {other:?}"),
+    }
+
+    let config: EventEnvelope =
+        serde_json::from_str(CONFIG_CHANGED).expect("today's config_changed line");
+    match config.event {
+        RuntimeEventDto::ConfigChanged(event) => {
+            assert_eq!(event.path, ".obsidian/app.json");
+        }
+        other => panic!("expected config_changed, got {other:?}"),
     }
 }
 

@@ -9,6 +9,27 @@ use crate::{
     ReferenceOrigin, Section, SectionKind, Severity, SourceDocument, SourceSpan, Subpath,
 };
 
+thread_local! {
+    /// Set while the contained `to_mdast` call is on this thread's stack, and
+    /// nowhere else.
+    static CONTAINED_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is currently inside the contained markdown parse — the
+/// one place in the process where a panic is expected, caught, and degraded to
+/// a diagnostic.
+///
+/// For a panic hook, and for nothing else. A hook runs *before* the unwind
+/// reaches `catch_unwind`, so by the time the containment takes effect the
+/// default hook has already printed a crash report for a process that is not
+/// crashing. Consulting this lets a hook tell the one contained site apart
+/// from every genuine panic and report it as a warning instead. Every other
+/// panic must still reach the default hook untouched: silencing panics
+/// generally is how a real defect goes unnoticed.
+pub fn in_contained_markdown_parse() -> bool {
+    CONTAINED_PARSE.with(std::cell::Cell::get)
+}
+
 pub(crate) struct MarkdownParse {
     pub headings: Vec<Heading>,
     pub references: Vec<Reference>,
@@ -57,7 +78,18 @@ pub(crate) fn parse_markdown(document: &SourceDocument, body_start: usize) -> Ma
     // of silently defeating this boundary. NOTE this containment depends on
     // panic = "unwind" (the workspace default, left implicit; a profile
     // switch to "abort" would reopen the process-kill this guards against).
+    //
+    // The flag below is the *cosmetic* half of the same containment. A caught
+    // unwind is contained, but the panic runtime still ran the process-wide
+    // hook on the way out, and the default hook prints `thread … panicked at
+    // …` plus a backtrace invitation. An operator reading `vaultd`'s stderr
+    // sees a crash report for a daemon that is still serving — the loudest
+    // possible way to say the wrong thing. Marking the window lets a hook
+    // recognise this site and report it as the warning it is; see
+    // [`in_contained_markdown_parse`].
+    let restore = CONTAINED_PARSE.with(|flag| flag.replace(true));
     let parsed = std::panic::catch_unwind(|| to_mdast(body, &parse_options()));
+    CONTAINED_PARSE.with(|flag| flag.set(restore));
 
     let tree = match parsed {
         Ok(Ok(tree)) => tree,
