@@ -168,18 +168,40 @@ impl Server {
 
     /// Reclaim snapshot sessions that have gone idle.
     ///
-    /// Called by the transport on every request it takes, of any kind. The
-    /// registry otherwise only reaps inside a call *about* a session, so a
-    /// client that opens one and then does other work would hold its WAL
-    /// frames for as long as it stayed connected. This bounds residency to
-    /// one idle timeout after the last request, with no thread and no timer.
-    pub fn sweep_snapshots(&self) {
+    /// Called by the transport on **every input it takes** — requests and
+    /// runtime notices alike. The registry otherwise only reaps inside a call
+    /// about a session, so a client that opens one and then stops asking
+    /// would pin WAL frames for the life of the connection: opening was a
+    /// request, and after it the client can stay alive on the notice path
+    /// indefinitely. Sweeping on both arms bounds residency to one idle
+    /// timeout after the last *input*, with no thread and no timer.
+    ///
+    /// Crate-visible: the transport is the only caller, and a sweep is not
+    /// something a client can ask for.
+    pub(crate) fn sweep_snapshots(&self) {
         if let Some(sessions) = self.snapshots.as_ref() {
             sessions
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .sweep();
         }
+    }
+
+    /// How many sessions are live, without reaping first.
+    ///
+    /// Test-only, and the only honest instrument for the sweep: every entry
+    /// point a client can reach (`open`, any page, `close`) reaps before it
+    /// answers, so no response distinguishes a swept registry from an unswept
+    /// one. `SnapshotSessions::len` deliberately does not reap either, which
+    /// is what lets a test assert the "not yet" half as well as the "now".
+    #[cfg(test)]
+    pub(crate) fn snapshot_session_count(&self) -> usize {
+        self.snapshots.as_ref().map_or(0, |sessions| {
+            sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len()
+        })
     }
 
     /// The runtime's observational state, with stopped-ness derived from the

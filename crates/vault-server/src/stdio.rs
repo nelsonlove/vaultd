@@ -252,6 +252,12 @@ fn dispatch(
 ) -> Result<(), String> {
     let mut subscriptions = SubscriptionRegistry::new();
     while let Ok(input) = mailbox.recv() {
+        // Idle snapshot sessions are reclaimed here rather than by a timer,
+        // and on **every** input rather than only on requests: a client that
+        // opens a session and then stops asking is still alive on the notice
+        // path, and its session would otherwise pin WAL frames for the life
+        // of the connection. This loop is the one place both arms meet.
+        server.sweep_snapshots();
         match input {
             ServerInput::Request(raw) => {
                 // Pre-drain. For `unsubscribe` this is what fulfils
@@ -261,11 +267,6 @@ fn dispatch(
                 if !drain(&mut subscriptions, outputs) {
                     return Ok(());
                 }
-                // Idle snapshot sessions are reclaimed here rather than by a
-                // timer: this loop already runs on every request, and a
-                // session that nobody asks about otherwise holds its WAL
-                // frames for as long as the client stays connected.
-                server.sweep_snapshots();
                 let response = respond(server, &mut subscriptions, *raw);
                 if outputs
                     .send(OutputEnvelope::Response(Box::new(response)))
@@ -304,4 +305,103 @@ fn drain(subscriptions: &mut SubscriptionRegistry, outputs: &SyncSender<OutputEn
         }
     }
     true
+}
+
+/// The dispatcher is where snapshot residency is actually bounded, and the
+/// sweep has no wire-visible effect — every entry point a client can reach
+/// (`open`, any page, `close`) reaps before it answers, so no response can
+/// distinguish "swept" from "not swept". The registry's own length is
+/// therefore the only honest instrument, and this loop is the only place the
+/// two arms can be told apart.
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use vault_index::{IndexConfig, LiveState};
+    use vault_protocol::{OpenSnapshotParams, RefreshIndexParams};
+
+    use super::*;
+    use crate::runtime::RuntimeOptions;
+
+    fn envelope(id: &str, request: Request) -> RequestEnvelope {
+        RequestEnvelope {
+            version: 1,
+            id: id.to_string(),
+            request,
+        }
+    }
+
+    /// A server over a one-note vault whose sessions go idle in 50 ms, with
+    /// the watcher and the periodic tick off so nothing but this test moves
+    /// the index.
+    fn server(vault: &tempfile::TempDir, index: &tempfile::TempDir) -> Server {
+        std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
+        let mut config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
+            .expect("sweep config");
+        config.snapshot_idle_timeout = Duration::from_millis(50);
+        let (server, notices) = Server::start(
+            config,
+            RuntimeOptions {
+                watch: false,
+                reconcile_interval: None,
+                ..RuntimeOptions::default()
+            },
+        )
+        .expect("start a runtime");
+        // The coordinator only ever `try_send`s notices, so a dropped
+        // receiver costs a dropped notice and never blocks it.
+        drop(notices);
+        server
+    }
+
+    /// A client that opens a session and then stops sending requests is not a
+    /// client that opened no sessions: opening **was** its last request, and
+    /// it can stay alive on the notice path indefinitely — subscribed, or
+    /// simply holding the pipe open while the watcher keeps committing. If
+    /// only the request arm swept, that session would pin WAL frames for the
+    /// life of the connection.
+    #[test]
+    fn a_runtime_notice_reaps_an_idle_session_from_a_client_that_stopped_asking() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let mut subscriptions = SubscriptionRegistry::new();
+
+        server.handle(
+            envelope("r", Request::RefreshIndex(RefreshIndexParams::default())),
+            &mut subscriptions,
+        );
+        server.handle(
+            envelope("o", Request::OpenSnapshot(OpenSnapshotParams::default())),
+            &mut subscriptions,
+        );
+        assert_eq!(server.snapshot_session_count(), 1, "the session opened");
+
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            server.snapshot_session_count(),
+            1,
+            "the registry has not been touched, so nothing has reaped yet"
+        );
+
+        // One notice and nothing else — the arm a quiet client is alive on.
+        let (inputs, mailbox) = sync_channel(4);
+        let (outputs, _pending) = sync_channel(4);
+        inputs
+            .send(ServerInput::Notice(Box::new(RuntimeNotice::State {
+                generation: None,
+                state: LiveState::Watching,
+                error: None,
+            })))
+            .expect("queue one notice");
+        drop(inputs);
+        dispatch(&server, mailbox, &outputs).expect("the loop ends when its mailbox closes");
+
+        assert_eq!(
+            server.snapshot_session_count(),
+            0,
+            "an idle session must be reclaimed on the notice path too, not only on requests"
+        );
+        server.shutdown();
+    }
 }

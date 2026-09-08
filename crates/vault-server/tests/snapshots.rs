@@ -101,6 +101,15 @@ fn a_health_only_daemon_refuses_a_snapshot_as_unavailable_not_as_missing() {
         ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::IndexUnavailable),
         other => panic!("a health-only daemon has no snapshots to open: {other:?}"),
     }
+    // The arm a paging host actually hits, and the one that used to go
+    // unexercised: a page request must refuse the same way its open did.
+    let page = daemon.call(
+        r#"{"version":1,"id":"t","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1"}}}"#,
+    );
+    match page.outcome {
+        ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::IndexUnavailable),
+        other => panic!("a health-only daemon has no snapshot to page: {other:?}"),
+    }
     let closed = daemon.call(
         r#"{"version":1,"id":"c","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}"#,
     );

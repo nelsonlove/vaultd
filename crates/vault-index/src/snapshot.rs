@@ -182,11 +182,12 @@ impl SnapshotSessions {
     ///
     /// `reap` otherwise runs only inside a call *about* a session, so a
     /// client that opens one and then goes quiet holds its WAL frames for as
-    /// long as it stays connected. The dispatcher calls this on every request
-    /// it takes — of any kind — which bounds residency to one idle timeout
-    /// after the last request rather than after the last snapshot call. No
-    /// thread and no timer: the sweep rides on traffic that is already
-    /// happening.
+    /// long as it stays connected — and opening it was itself a request, so
+    /// "quiet" includes a client alive only on an event stream. The
+    /// dispatcher calls this on every **input** it takes, request or runtime
+    /// notice, which bounds residency to one idle timeout after the last
+    /// input rather than after the last snapshot call. No thread and no
+    /// timer: the sweep rides on traffic that is already happening.
     pub fn sweep(&mut self) {
         self.reap(Instant::now());
     }
@@ -319,7 +320,7 @@ impl SnapshotSessions {
                 converted.push(TreeEntryRow {
                     path: crate::codec::decode_path(&path)?,
                     kind: crate::codec::decode_tree_entry_kind(&kind)?,
-                    size: size.and_then(|size| u64::try_from(size).ok()),
+                    size: size.map(decode_size).transpose()?,
                     ctime_unix_ms,
                     mtime_unix_ms,
                     revision,
@@ -328,8 +329,13 @@ impl SnapshotSessions {
             converted
         };
 
-        let has_more = rows.len() > page_size as usize;
-        rows.truncate(page_size as usize);
+        // `u32 -> usize` is lossless on every supported platform; the
+        // saturating fallback keeps the conversion total rather than a cast,
+        // and on a hypothetical 16-bit target it would serve a short page
+        // instead of wrapping to a tiny one.
+        let wanted_rows = usize::try_from(page_size).unwrap_or(usize::MAX);
+        let has_more = rows.len() > wanted_rows;
+        rows.truncate(wanted_rows);
         let next_cursor = match (has_more, rows.last()) {
             (true, Some(last)) => Some(encode_cursor(
                 generation,
@@ -378,6 +384,21 @@ fn pinned_counts(connection: &Connection) -> Result<(Generation, u64, u64), Inde
     Ok((generation, note_count, entry_count))
 }
 
+/// A stored `tree_entries.size`, refused rather than dropped when it is
+/// negative.
+///
+/// The lenient reading (`try_from(...).ok()`) turned a corrupt row into
+/// `size: None`, which is exactly how a **folder** reports itself on the
+/// wire — a client would mirror a file as a directory and never know. Its two
+/// neighbours in the same loop, `decode_path` and `decode_tree_entry_kind`,
+/// both refuse a row they cannot read, and `count` above already refuses a
+/// negative count in precisely this shape. The schema-v3 DDL carries no
+/// `CHECK (size >= 0)` and is pinned, so this decoder is the guard.
+fn decode_size(stored: i64) -> Result<u64, IndexError> {
+    u64::try_from(stored)
+        .map_err(|_| IndexError::IncompatibleIndex(format!("negative tree entry size {stored}")))
+}
+
 fn count(connection: &Connection, sql: &str, what: &str) -> Result<u64, IndexError> {
     let counted: i64 = connection.query_row(sql, [], |row| row.get(0))?;
     u64::try_from(counted).map_err(|_| IndexError::IncompatibleIndex(format!("negative {what}")))
@@ -423,5 +444,114 @@ mod tests {
     fn a_default_larger_than_the_maximum_is_bounded_by_the_maximum_it_advertises() {
         let sessions = sessions(5_000, 100);
         assert_eq!(sessions.page_size(None), 100);
+    }
+
+    /// A built index whose service has been released, so a test may reach the
+    /// database directly. Returns the config and the two temp directories,
+    /// which must outlive it.
+    fn built_index() -> (IndexConfig, tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let root = vault.path().canonicalize().expect("canonical vault root");
+        std::fs::write(root.join("One.md"), "# One\n").expect("write One");
+        let config = IndexConfig::explicit(&root, index.path().join("index.sqlite3"))
+            .expect("decode-test config");
+        let mut service = crate::reconcile::IndexService::open(config.clone()).expect("service");
+        service.refresh(false).expect("cold build");
+        drop(service);
+        (config, vault, index)
+    }
+
+    /// `size` is the one column a page used to decode leniently: a negative
+    /// value became `None`, which on the wire is exactly how a **folder**
+    /// reports itself. Its two neighbours in the same loop (`decode_path`,
+    /// `decode_tree_entry_kind`) both refuse a corrupt row, and a negative
+    /// count already refuses in `count` above, so this is the odd one out
+    /// rather than a new rule. The schema-v3 DDL is pinned and carries no
+    /// `CHECK (size >= 0)`, which makes the decoder the guard.
+    #[test]
+    fn a_negative_stored_size_is_a_decode_error_not_a_row_that_looks_like_a_folder() {
+        let (config, _vault, _index) = built_index();
+        let writer = Connection::open(&config.index_path).expect("open the index for writing");
+        writer
+            .execute(
+                "UPDATE tree_entries SET size = -1 WHERE path = 'One.md'",
+                [],
+            )
+            .expect("corrupt one size");
+        drop(writer);
+
+        let mut sessions = SnapshotSessions::new(&config);
+        let opened = sessions.open().expect("open a snapshot");
+        let error = sessions
+            .tree_page(&opened.snapshot_id, None, Some(10))
+            .expect_err("a negative size is not a size");
+        match error {
+            IndexError::IncompatibleIndex(message) => assert!(
+                message.contains("negative tree entry size"),
+                "the refusal must name what it found: {message:?}"
+            ),
+            other => panic!("expected incompatible_index, got {other:?}"),
+        }
+    }
+
+    /// The other half of the sweep's claim: reaping does not merely forget an
+    /// entry, it releases the WAL frames the session was pinning. Measured
+    /// the only way it can be — a truncating checkpoint from an independent
+    /// connection, which SQLite refuses (`busy = 1`) while any reader still
+    /// holds a mark.
+    #[test]
+    fn sweeping_an_idle_session_releases_the_wal_frames_it_was_pinning() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let root = vault.path().canonicalize().expect("canonical vault root");
+        std::fs::write(root.join("One.md"), "# One\n").expect("write One");
+        let mut config = IndexConfig::explicit(&root, index.path().join("index.sqlite3"))
+            .expect("wal-test config");
+        config.snapshot_idle_timeout = std::time::Duration::from_millis(50);
+        let mut service = crate::reconcile::IndexService::open(config.clone()).expect("service");
+        service.refresh(false).expect("cold build");
+
+        let mut sessions = SnapshotSessions::new(&config);
+        sessions.open().expect("open a snapshot");
+
+        // The writer has to move for there to be frames worth holding: the
+        // reader's mark is what stops the checkpoint from resetting the WAL,
+        // and a WAL with nothing past the mark can be truncated regardless.
+        for index in 0..3 {
+            service
+                .apply_mutation(&crate::mutate::Mutation::WriteNote {
+                    path: vault_core::VaultPath::new(format!("Storm-{index}.md"))
+                        .expect("valid vault path"),
+                    content: format!("# Storm {index}\n"),
+                    expected: crate::mutate::Precondition::Absent,
+                })
+                .expect("write past the snapshot");
+            service.refresh(false).expect("publish past the snapshot");
+        }
+
+        assert_eq!(
+            checkpoint_busy(&config.index_path),
+            1,
+            "the instrument itself: a truncating checkpoint is refused while a session reads"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        sessions.sweep();
+        assert!(sessions.is_empty(), "the idle session was reclaimed");
+        assert_eq!(
+            checkpoint_busy(&config.index_path),
+            0,
+            "the reclaimed session must have released its frames, not merely left the registry"
+        );
+    }
+
+    /// The `busy` column of `PRAGMA wal_checkpoint(TRUNCATE)`: 1 when a
+    /// reader's mark blocks the truncation, 0 when it completes.
+    fn checkpoint_busy(index_path: &std::path::Path) -> i64 {
+        let connection = Connection::open(index_path).expect("open the index");
+        connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .expect("run a truncating checkpoint")
     }
 }
