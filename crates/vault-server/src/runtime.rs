@@ -605,10 +605,19 @@ impl std::error::Error for RefreshFailure {}
 /// own statement about whether the Markdown half of the index moved, never a
 /// fact derived from `generation` — a folder creation moves the generation
 /// through the file tree while nothing semantic happened at all.
+///
+/// `written` carries [`vault_index::MutationOutcome::written`] out to the
+/// dispatcher: the stored spelling a raw write actually landed on. The
+/// dispatcher decides `WriteFileResponse::semantic` and whether to report a
+/// generation from it, and both answers are wrong if taken from the request
+/// path — an alias can resolve into the configuration zone, one inside the
+/// zone can resolve back out of it, and a case-folded zone spelling reaches
+/// the real zone with no symlink at all.
 #[derive(Clone, Debug)]
 pub struct MutationReport {
     pub generation: Option<Generation>,
     pub revision: Option<String>,
+    pub written: Option<VaultPath>,
     pub links_rewritten: u64,
     pub link_rewrite_failures: Vec<LinkRewriteFailure>,
     pub semantic: bool,
@@ -1291,9 +1300,19 @@ impl Coordinator {
             // and no generation will ever announce them. So it gets its own
             // notice — deliberately not a generation event, because there is
             // no generation to name.
-            if let Mutation::WriteFile { path, .. } = &mutation {
-                if vault_index::in_config_zone(path) {
-                    self.emit(RuntimeNotice::ConfigChanged { path: path.clone() });
+            //
+            // Decided on `outcome.written`, never on the requested path. The
+            // caller's spelling is not where the bytes went: an alias resolves
+            // into the zone under any name at all, and `.OBSIDIAN` reaches it
+            // with no symlink on a case-folding filesystem. A host told
+            // nothing in either case is a host running on configuration it
+            // does not know changed, and one told the *alias* cannot match the
+            // notice to the file it knows.
+            if let (Mutation::WriteFile { .. }, Some(written)) = (&mutation, &outcome.written) {
+                if vault_index::in_config_zone(written) {
+                    self.emit(RuntimeNotice::ConfigChanged {
+                        path: written.clone(),
+                    });
                 }
             }
             return Ok(self.report(&outcome, self.committed_generation()));
@@ -1336,6 +1355,7 @@ impl Coordinator {
         MutationReport {
             generation,
             revision: outcome.revision.clone(),
+            written: outcome.written.clone(),
             links_rewritten: outcome.links_rewritten,
             link_rewrite_failures: outcome.link_rewrite_failures.clone(),
             semantic: outcome.semantic,

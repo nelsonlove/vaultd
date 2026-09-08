@@ -125,7 +125,19 @@ fn every_state_refusal_reaches_the_wire_with_its_own_code() {
         ));
         match response.outcome {
             ResponseOutcome::Err(error) => {
-                assert_eq!(error.code, expected, "wrong code for {method}: {error:?}")
+                assert_eq!(error.code, expected, "wrong code for {method}: {error:?}");
+                // `invalid_request` is the one catch-all in the table — seven
+                // distinct `MutationError`s map to it — so the code alone
+                // would still pass if this row started failing for an
+                // unrelated reason, a malformed precondition say. Pin the
+                // refusal it is actually about.
+                if expected == ErrorCode::InvalidRequest {
+                    assert!(
+                        error.message.contains("write_note"),
+                        "the note refusal must name the verb that serves the path: {}",
+                        error.message
+                    );
+                }
             }
             other => panic!("{method} was not refused: {other:?}"),
         }

@@ -6,13 +6,19 @@
 //!
 //! | guard | witness |
 //! | --- | --- |
-//! | a `.md` path outside the zone is refused | `a_raw_write_to_a_markdown_path_is_refused_so_it_cannot_skip_the_generation` |
-//! | the payload cap | `a_payload_past_the_cap_names_the_deferred_alternative` |
+//! | an *indexable* `.md` path is refused (pre-resolve) | `a_raw_write_to_a_markdown_path_is_refused_so_it_cannot_skip_the_generation` |
+//! | the same predicate again, post-resolve | `an_alias_out_of_the_zone_cannot_land_a_note` |
+//! | the write payload cap | `a_payload_past_the_cap_names_the_deferred_alternative` |
+//! | the **read** payload cap | `a_read_past_the_cap_is_refused_with_the_write_paths_own_code` |
+//! | a read refuses a non-regular occupant | `a_read_of_a_folder_is_refused_as_target_exists`, `a_read_of_a_fifo_is_refused_and_the_daemon_keeps_answering` |
 //! | a zone write joins no generation | `a_zone_write_joins_no_generation_and_announces_itself` |
 //! | a zone write announces itself | same test, second half |
 //! | an attachment write *does* name its path | `an_attachment_write_joins_a_generation_because_the_tree_holds_it` |
 //! | every semantic verb still refuses the zone | `every_semantic_operation_refuses_the_zone` |
 //! | the wire's `semantic` is the indexed-universe test | `the_wire_answers_semantic_by_whether_the_path_is_indexed_at_all` |
+//! | …decided from where the bytes **landed** | `a_write_through_an_alias_into_the_zone_answers_for_where_it_landed`, `a_write_that_escapes_the_zone_reports_the_generation_it_published`, `a_case_folded_zone_spelling_is_still_a_zone_write` |
+//! | the notice names the landed path | `an_alias_into_the_zone_announces_the_zone_path_it_reached` |
+//! | hidden Markdown is raw, not refused | `a_trashed_note_round_trips_through_the_raw_pair` |
 //! | a read reports the revision a write compares against | `a_read_returns_the_bytes_and_the_revision_a_write_would_compare_against` |
 
 mod daemon;
@@ -418,5 +424,292 @@ fn a_read_over_the_wire_returns_the_bytes_of_a_note_and_of_the_zone_alike() {
     match absent.outcome {
         ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::NotFound),
         other => panic!("a read of an absent path must be refused: {other:?}"),
+    }
+}
+
+/// `write_file` over the wire, returning the whole envelope so a refusal can
+/// be asserted on as easily as a success.
+fn raw_write(daemon: &mut Daemon, path: &str, bytes: &[u8]) -> ResponseOutcome {
+    let encoded = STANDARD.encode(bytes);
+    daemon
+        .call(&format!(
+            r#"{{"version":1,"id":"w","request":{{"method":"write_file","params":{{"path":"{path}","content_base64":"{encoded}","expected":{{"any":true}}}}}}}}"#
+        ))
+        .outcome
+}
+
+fn read_file(daemon: &mut Daemon, path: &str) -> ResponseOutcome {
+    daemon
+        .call(&format!(
+            r#"{{"version":1,"id":"f","request":{{"method":"read_file","params":{{"path":"{path}"}}}}}}"#
+        ))
+        .outcome
+}
+
+/// Whether this filesystem folds case, decided by asking it rather than by
+/// naming a platform: the zone's case-variant spelling reaches the real zone
+/// on APFS and names a different, absent folder on ext4.
+fn folds_case(vault: &TempDir) -> bool {
+    vault.path().join(".OBSIDIAN").is_dir()
+}
+
+/// **B1.** An alias whose *resolved* target is the zone is a zone write, and
+/// every part of the answer has to say so: no generation, `semantic: false`,
+/// and the notice names the zone path rather than the alias. Reporting from
+/// the caller's spelling answers `semantic: true` with a generation for a
+/// write that silently changed the host's configuration.
+#[cfg(unix)]
+#[test]
+fn a_write_through_an_alias_into_the_zone_answers_for_where_it_landed() {
+    let (vault, _index, mut daemon) = wired();
+    std::os::unix::fs::symlink(
+        vault.path().join(".obsidian"),
+        vault.path().join("ZoneAlias"),
+    )
+    .expect("link an innocuous name at the zone");
+
+    let response = match raw_write(&mut daemon, "ZoneAlias/app.json", b"PROBE") {
+        ResponseOutcome::Ok(Response::WriteFile(response)) => response,
+        other => panic!("the alias resolves into the zone, which is writable: {other:?}"),
+    };
+    assert!(
+        !response.semantic,
+        "the bytes landed in the zone, which is not indexed: {response:?}"
+    );
+    assert_eq!(
+        response.generation, None,
+        "no generation contains a zone write, whatever the caller called it: {response:?}"
+    );
+    assert_eq!(
+        std::fs::read(vault.path().join(".obsidian/app.json")).expect("read back"),
+        b"PROBE"
+    );
+}
+
+/// The same claim on the notice, which only the in-process runtime can see.
+#[cfg(unix)]
+#[test]
+fn an_alias_into_the_zone_announces_the_zone_path_it_reached() {
+    let live = live();
+    std::os::unix::fs::symlink(
+        live.vault.path().join(".obsidian"),
+        live.vault.path().join("ZoneAlias"),
+    )
+    .expect("link an innocuous name at the zone");
+
+    live.handle
+        .mutate(Mutation::WriteFile {
+            path: path("ZoneAlias/app.json"),
+            content: b"PROBE".to_vec(),
+            expected: Precondition::Any,
+        })
+        .expect("write through the alias");
+
+    let mut announced = Vec::new();
+    while let Ok(notice) = live.notices.try_recv() {
+        if let RuntimeNotice::ConfigChanged { path } = notice {
+            announced.push(path.as_str().to_string());
+        }
+    }
+    assert_eq!(
+        announced,
+        vec![".obsidian/app.json".to_string()],
+        "a host watching its own configuration must be told which file changed, \
+         under the name it knows it by"
+    );
+}
+
+/// **B1, the mirror lie.** An alias *out* of the zone lands in the indexed
+/// vault and really does publish a generation. Reporting from the caller's
+/// spelling withholds it, and the client cannot read its own write back.
+#[cfg(unix)]
+#[test]
+fn a_write_that_escapes_the_zone_reports_the_generation_it_published() {
+    let (vault, _index, mut daemon) = wired();
+    std::os::unix::fs::symlink("..", vault.path().join(".obsidian/up"))
+        .expect("link the zone back at the vault root");
+
+    let response = match raw_write(&mut daemon, ".obsidian/up/escaped.bin", b"PROBE") {
+        ResponseOutcome::Ok(Response::WriteFile(response)) => response,
+        other => panic!("the write lands inside the vault: {other:?}"),
+    };
+    assert!(
+        response.semantic,
+        "the bytes landed in the indexed vault, whatever the caller called the \
+         path: {response:?}"
+    );
+    let generation = response
+        .generation
+        .expect("a write the tree holds must name the generation that holds it");
+
+    let info = daemon.call(r#"{"version":1,"id":"v","request":{"method":"get_vault_info"}}"#);
+    match info.outcome {
+        ResponseOutcome::Ok(Response::GetVaultInfo(info)) => assert_eq!(
+            info.generation, generation,
+            "the reported generation must be the one the daemon actually published"
+        ),
+        other => panic!("get_vault_info failed: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(vault.path().join("escaped.bin")).expect("read back"),
+        b"PROBE"
+    );
+}
+
+/// **B1, without a symlink.** A caller that spells the zone folder with
+/// different case reaches the real zone on any case-folding filesystem. The
+/// answer must still be a zone answer.
+#[test]
+fn a_case_folded_zone_spelling_is_still_a_zone_write() {
+    let (vault, _index, mut daemon) = wired();
+    if !folds_case(&vault) {
+        // On a case-sensitive filesystem `.OBSIDIAN` is a different, absent
+        // folder, and the honest answer is that its parent does not exist.
+        match raw_write(&mut daemon, ".OBSIDIAN/app.json", b"PROBE") {
+            ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::ParentNotFound),
+            other => panic!("a case-sensitive filesystem has no .OBSIDIAN: {other:?}"),
+        }
+        return;
+    }
+
+    let response = match raw_write(&mut daemon, ".OBSIDIAN/app.json", b"PROBE") {
+        ResponseOutcome::Ok(Response::WriteFile(response)) => response,
+        other => panic!("the folded spelling reaches the real zone: {other:?}"),
+    };
+    assert!(!response.semantic, "{response:?}");
+    assert_eq!(response.generation, None, "{response:?}");
+    assert_eq!(
+        std::fs::read(vault.path().join(".obsidian/app.json")).expect("read back"),
+        b"PROBE",
+        "the real zone file is what changed"
+    );
+}
+
+/// **I2.** The post-resolve note check, which had no witness of its own.
+/// Delete it and a raw write lands a note in the indexed vault under a zone
+/// spelling.
+#[cfg(unix)]
+#[test]
+fn an_alias_out_of_the_zone_cannot_land_a_note() {
+    let (vault, _index, mut daemon) = wired();
+    std::os::unix::fs::symlink("..", vault.path().join(".obsidian/up"))
+        .expect("link the zone back at the vault root");
+
+    match raw_write(&mut daemon, ".obsidian/up/Evil.md", b"# raw\n") {
+        ResponseOutcome::Err(error) => {
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{error:?}");
+            assert!(
+                error.message.contains("write_note"),
+                "the refusal must name the verb that serves this path: {}",
+                error.message
+            );
+        }
+        other => panic!("a raw write must never land a note in the indexed vault: {other:?}"),
+    }
+    assert!(!vault.path().join("Evil.md").exists());
+}
+
+/// **B2.** A FIFO in the vault must not block the dispatcher. `read_file` runs
+/// on the thread that answers everything, so one open that waits for a writer
+/// is a permanent liveness loss for the whole daemon — and closing stdin does
+/// not end it.
+#[cfg(unix)]
+#[test]
+fn a_read_of_a_fifo_is_refused_and_the_daemon_keeps_answering() {
+    let (vault, _index, mut daemon) = wired();
+    let status = std::process::Command::new("mkfifo")
+        .arg(vault.path().join("pipe.bin"))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed: {status:?}");
+
+    match read_file(&mut daemon, "pipe.bin") {
+        ResponseOutcome::Err(error) => assert_eq!(
+            error.code,
+            ErrorCode::TargetExists,
+            "a fifo is something else occupying the name: {error:?}"
+        ),
+        other => panic!("a fifo must be refused, not opened: {other:?}"),
+    }
+
+    // The claim that matters: the daemon is still there.
+    match read_file(&mut daemon, "One.md") {
+        ResponseOutcome::Ok(Response::ReadFile(read)) => assert_eq!(
+            STANDARD.decode(&read.content_base64).expect("valid base64"),
+            b"# One\n"
+        ),
+        other => panic!("the daemon stopped answering after the fifo: {other:?}"),
+    }
+}
+
+/// **B2, the other half.** A directory answered `storage_failure` — a claim
+/// the daemon is broken, and an invitation to retry a request that can never
+/// succeed.
+#[test]
+fn a_read_of_a_folder_is_refused_as_target_exists() {
+    let (_vault, _index, mut daemon) = wired();
+    match read_file(&mut daemon, ".obsidian") {
+        ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::TargetExists, "{error:?}"),
+        other => panic!("a folder is not a file to read: {other:?}"),
+    }
+}
+
+/// **I1.** The cap is symmetric, and the refusal names the same deferred
+/// alternative the write path names. A file past it is not serialised into a
+/// single JSON line no streaming client can chunk.
+#[test]
+fn a_read_past_the_cap_is_refused_with_the_write_paths_own_code() {
+    let (vault, _index, mut daemon) = wired();
+    // Written straight to disk: the write verb would refuse this, which is
+    // precisely the asymmetry under test — the file is already there, the way
+    // a real vault's video and PDF attachments are.
+    std::fs::write(vault.path().join("huge.bin"), vec![0u8; 17 * 1024 * 1024])
+        .expect("write past the cap");
+
+    match read_file(&mut daemon, "huge.bin") {
+        ResponseOutcome::Err(error) => {
+            assert_eq!(error.code, ErrorCode::PayloadTooLarge, "{error:?}");
+            assert!(error.message.contains("16777216"), "{}", error.message);
+            assert!(
+                error.message.contains("chunked transfer"),
+                "the refusal must name what a caller should do instead: {}",
+                error.message
+            );
+        }
+        other => panic!("a file past the cap must not be serialised: {other:?}"),
+    }
+}
+
+/// The partition ruling's user-visible reason. `delete_note { mode: local }`
+/// puts notes in `.trash/`; every semantic verb then refuses to touch them, on
+/// purpose. A host restoring one reads the bytes and writes them to a real
+/// path — and a host implementing its own trash needs to put them there in the
+/// first place. The raw verb is the only place that can serve either.
+#[test]
+fn a_trashed_note_round_trips_through_the_raw_pair() {
+    let (vault, _index, mut daemon) = wired();
+    std::fs::create_dir_all(vault.path().join(".trash")).expect("create the local trash");
+
+    let response = match raw_write(&mut daemon, ".trash/Deleted.md", b"# Deleted\n") {
+        ResponseOutcome::Ok(Response::WriteFile(response)) => response,
+        other => panic!("the local trash is raw bytes: {other:?}"),
+    };
+    assert!(
+        !response.semantic,
+        "the scan never lists .trash, so nothing there is indexed: {response:?}"
+    );
+    assert_eq!(response.generation, None, "{response:?}");
+    assert_eq!(response.revision, revision_of(b"# Deleted\n"));
+
+    match read_file(&mut daemon, ".trash/Deleted.md") {
+        ResponseOutcome::Ok(Response::ReadFile(read)) => {
+            assert_eq!(
+                STANDARD.decode(&read.content_base64).expect("valid base64"),
+                b"# Deleted\n",
+                "the bytes a host would write back to a real path"
+            );
+            assert_eq!(read.revision, response.revision);
+        }
+        other => panic!("read_file must read what write_file wrote: {other:?}"),
     }
 }

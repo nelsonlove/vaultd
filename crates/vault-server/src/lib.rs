@@ -336,6 +336,57 @@ impl Server {
         })
     }
 
+    /// A raw write's answer, decided from **where the bytes landed**.
+    ///
+    /// `WriteFileResponse::semantic` answers "is this path inside the indexed
+    /// universe" — a question about a path, and deliberately not the same
+    /// question as `MutationOutcome::semantic` ("did indexed rows move", which
+    /// is always `false` for a raw write). The path it is about is the one the
+    /// engine resolved and canonicalized, never the one the request carried:
+    ///
+    /// * an alias anywhere in the vault can resolve **into** `.obsidian/`, and
+    ///   answering `semantic: true` with a generation there tells a client its
+    ///   write joined a generation that will never contain it — the exact lie
+    ///   the absent `generation` exists to prevent;
+    /// * an alias **inside** the zone can resolve back out into the indexed
+    ///   vault, where the write really did publish a generation, and
+    ///   withholding it leaves the client unable to read its own write back;
+    /// * `.OBSIDIAN/app.json` reaches the real zone on any case-folding
+    ///   filesystem with no symlink involved at all.
+    ///
+    /// The engine already knows the answer — it decides `changed_paths` from
+    /// the same spelling — so this reads it out of the report rather than
+    /// recomputing a guess. A raw write always carries one; a missing one is
+    /// an engine invariant violation, refused here rather than papered over
+    /// with a default that would be a coin flip between the two lies above.
+    fn raw_write_response(report: &MutationReport) -> Result<WriteFileResponse, ProtocolError> {
+        let Some(written) = report.written.as_ref() else {
+            return Err(ProtocolError {
+                code: ErrorCode::Internal,
+                message: "the raw write reported no path".into(),
+                supported_version: None,
+                current_generation: None,
+                current_revision: None,
+            });
+        };
+        let indexed = !vault_index::is_unindexable(written);
+        Ok(WriteFileResponse {
+            // Present exactly when the write joined the indexed universe, and
+            // then it is a real published generation rather than a `None`
+            // silently flattened away: `semantic: true` with no generation
+            // would contradict the field's own documented meaning.
+            generation: match indexed {
+                true => Some(Self::mutation_generation(report)?),
+                false => None,
+            },
+            // `mutation_revision` rather than a default: this response's
+            // `revision` is a bare `String`, and `""` would reach a client as
+            // a well-formed revision it could then compare-and-swap against.
+            revision: Self::mutation_revision(report)?,
+            semantic: indexed,
+        })
+    }
+
     fn subscribe(
         &self,
         subscriptions: &mut SubscriptionRegistry,
@@ -750,49 +801,17 @@ impl Server {
                 ) {
                     (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
                     (Ok(expected), Ok(content)) => {
-                        // The wire's `semantic` answers "is this path inside
-                        // the indexed universe", which is a question about the
-                        // path — *not* `MutationOutcome::semantic`, which
-                        // answers "did indexed rows move" and is always
-                        // `false` for a raw write. The indexed universe is
-                        // what the scan lists, so a hidden path is outside it
-                        // exactly as the configuration zone is. Computed
-                        // before `path` is moved into the mutation.
-                        let indexed = !vault_index::is_unindexable(&path);
                         match self.mutate(vault_index::Mutation::WriteFile {
                             path,
                             content,
                             expected,
                         }) {
                             Err(error) => ResponseEnvelope::error(id, error),
-                            // `mutation_revision` rather than a default: this
-                            // response's `revision` is a bare `String`, and
-                            // `""` would reach a client as a well-formed
-                            // revision it could then compare-and-swap against.
-                            // A raw write always has one, so this is an
-                            // invariant guard, not a shape a caller meets.
-                            Ok(report) => match Self::mutation_revision(&report) {
+                            Ok(report) => match Self::raw_write_response(&report) {
                                 Err(error) => ResponseEnvelope::error(id, error),
-                                Ok(revision) => ResponseEnvelope::success(
-                                    id,
-                                    Response::WriteFile(WriteFileResponse {
-                                        // Absent for a write the index does
-                                        // not track: no generation contains
-                                        // it, and claiming one would be a lie
-                                        // a client could act on. For an
-                                        // attachment it is the generation the
-                                        // write itself published — the file
-                                        // tree moved, so the client can read
-                                        // its own write back.
-                                        generation: indexed
-                                            .then(|| {
-                                                report.generation.map(vault_index::Generation::get)
-                                            })
-                                            .flatten(),
-                                        revision,
-                                        semantic: indexed,
-                                    }),
-                                ),
+                                Ok(response) => {
+                                    ResponseEnvelope::success(id, Response::WriteFile(response))
+                                }
                             },
                         }
                     }
@@ -902,10 +921,27 @@ mod tests {
         MutationReport {
             generation: None,
             revision: revision.map(str::to_string),
+            written: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
             semantic: true,
         }
+    }
+
+    /// The other doctored-report guard, and the reason it is worth having:
+    /// `raw_write_response` decides both `semantic` and whether a generation
+    /// is reported from the landed path, so a report without one has no
+    /// honest answer to give. Defaulting either way would pick one of the two
+    /// lies the landed path exists to prevent.
+    #[test]
+    fn a_raw_write_with_no_landed_path_is_an_internal_error_not_a_guess() {
+        let error = Server::raw_write_response(&report(Some("blake3:abc")))
+            .expect_err("a raw write that named no path cannot be answered");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            !error.message.is_empty() && error.current_revision.is_none(),
+            "the refusal says nothing a client could act on, and leaks nothing: {error:?}"
+        );
     }
 
     /// Reachable only by doctoring the report, because every engine operation

@@ -442,7 +442,7 @@ fn an_io_refusal_never_leaks_a_filesystem_path_on_the_wire() {
         other => panic!("a write into an unwritable folder must be refused: {other:?}"),
     };
     assert_eq!(error.code, ErrorCode::StorageFailure);
-    assert_eq!(error.message, "the vault filesystem write failed");
+    assert_eq!(error.message, "the vault filesystem operation failed");
     // The absent half of the `storage_failure` split: the engine writes
     // temp-then-rename, so a failure here means nothing landed, and no
     // revision exists to report. A client that sees no `current_revision` may

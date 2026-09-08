@@ -401,10 +401,17 @@ pub struct RenameResponse {
 ///
 /// It deliberately does not answer "did this write change indexed rows", which
 /// for a raw write is always `false`: `write_file` reaches only attachments,
-/// the zone, and hidden paths, and a `.md` path outside the zone is refused so
-/// a note can never bypass its generation. An attachment inside the vault is
-/// the case where the two answers differ — `semantic: true` here, no semantic
-/// rows moved, and a real generation because the file tree moved.
+/// the zone, and hidden paths, and *indexable* Markdown is refused so a note
+/// can never bypass its generation. An attachment inside the vault is the case
+/// where the two answers differ — `semantic: true` here, no semantic rows
+/// moved, and a real generation because the file tree moved.
+///
+/// Both fields answer about **where the bytes landed**, not about the path the
+/// request carried. The two differ whenever a symlink or a case-folded
+/// spelling resolves across the boundary — into `.obsidian/` under an
+/// ordinary-looking name, or out of it into the indexed vault — and answering
+/// from the request would name a generation that will never contain the write,
+/// or withhold one that already does.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WriteFileResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]

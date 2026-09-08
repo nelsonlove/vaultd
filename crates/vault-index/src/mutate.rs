@@ -128,11 +128,18 @@ pub enum MutationError {
     #[error("{} is not a Markdown note", path.as_str())]
     NotANote { path: VaultPath },
     /// The inverse of [`MutationError::NotANote`], and the reason it exists:
-    /// `write_file` at a `.md` path outside the configuration zone is refused
-    /// so raw writes can never bypass the generation model. `write_note`
-    /// serves that path, publishes it, and gives the caller read-your-writes;
-    /// a raw write would land bytes the caller then could not read back at any
-    /// generation it was told about.
+    /// `write_file` at an **indexable** `.md` path is refused so raw writes
+    /// can never bypass the generation model. `write_note` serves that path,
+    /// publishes it, and gives the caller read-your-writes; a raw write would
+    /// land bytes the caller then could not read back at any generation it was
+    /// told about.
+    ///
+    /// Markdown the scan will never list — inside the configuration zone, or
+    /// any other hidden folder such as `.trash/` — is *not* refused: no
+    /// generation would describe those bytes whichever verb wrote them, so the
+    /// refusal would buy nothing and take away the only verb that can serve
+    /// the path. See [`is_unindexable`], which is the predicate both write
+    /// verbs partition on.
     #[error(
         "{} is a Markdown note; write it with write_note so it joins a generation",
         path.as_str()
@@ -469,12 +476,28 @@ impl MutationEngine {
         path: &VaultPath,
         resolved: &Path,
     ) -> Result<bool, MutationError> {
+        Ok(self.regular_file_metadata(path, resolved)?.is_some())
+    }
+
+    /// The same guard, handing back the `stat` it already performed.
+    ///
+    /// [`MutationEngine::read_file`] needs the size to apply the payload cap
+    /// before it reads, and a second `metadata` call to learn it would be a
+    /// second answer to a question this one already asked — two stats that can
+    /// disagree under a racing writer. The rule about non-regular occupants
+    /// lives here, in one place, so no caller can take the size without also
+    /// taking the refusal.
+    fn regular_file_metadata(
+        &self,
+        path: &VaultPath,
+        resolved: &Path,
+    ) -> Result<Option<std::fs::Metadata>, MutationError> {
         match std::fs::metadata(resolved) {
             Ok(metadata) if !metadata.is_file() => {
                 Err(MutationError::TargetExists { path: path.clone() })
             }
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(io(error)),
         }
     }
@@ -924,6 +947,24 @@ pub struct MutationOutcome {
     /// re-observes a path and finds nothing changed — while under-naming is a
     /// missing generation.
     pub changed_paths: BTreeSet<VaultPath>,
+    /// The **stored spelling of the file a raw write landed on**, which is not
+    /// always a path `changed_paths` may name.
+    ///
+    /// It exists because `write_file` is the only verb whose *answer* varies
+    /// with where the bytes went rather than with what the caller called them.
+    /// Every other verb refuses outright any path that resolves somewhere its
+    /// answer would differ — `write_note` re-asks [`is_unindexable`] on the
+    /// stored spelling and refuses — so for those two the named path and the
+    /// landed path can never disagree in a way a client could see, and they
+    /// leave this `None`. The raw pair deliberately *serves* both sides of
+    /// that predicate, so only it has to carry the answer out.
+    ///
+    /// The caller's spelling is not a substitute. `.OBSIDIAN/app.json` reaches
+    /// the real zone on any case-folding filesystem, a symlink named anything
+    /// at all can resolve into the zone, and one inside the zone can resolve
+    /// back out of it. Reporting from the request in any of those three cases
+    /// tells a client the opposite of what happened.
+    pub written: Option<VaultPath>,
     /// The revision written, for the operations that write content. `None`
     /// for folder operations and deletes: a deleted file has no revision.
     pub revision: Option<String>,
@@ -951,8 +992,8 @@ pub struct MutationOutcome {
     /// | `rename_note` / `rename_folder` | `true` iff any Markdown path moved |
     /// | `patch_frontmatter` | `true` |
     /// | `write_file` | **always `false`** — the zone holds no semantics, an
-    ///   attachment holds none, and a `.md` path outside the zone is refused
-    ///   with [`MutationError::IsANote`] rather than written raw |
+    ///   attachment holds none, and an *indexable* `.md` path is refused with
+    ///   [`MutationError::IsANote`] rather than written raw |
     ///
     /// It is deliberately **not** the same question as "does this write live
     /// inside the indexed vault", which is what the wire's
@@ -994,12 +1035,15 @@ pub fn in_config_zone(path: &VaultPath) -> bool {
 /// cannot drift; it subsumes `.trash`, `.git`, and every nested spelling of
 /// the zone, and `in_config_zone` catches the zone folder named by itself.
 ///
-/// Public because it is also the **wire's** predicate. `write_file` is the one
-/// verb that reaches these paths at all, and its response's `semantic` field
-/// answers "is this path inside the indexed universe" — which is exactly the
-/// negation of this. The server computes it from the path before the mutation
-/// consumes it, and computing it from `in_config_zone` alone would claim a
-/// hidden-folder write joined a generation that will never contain it.
+/// Public because it is also the **wire's** predicate, and the line the two
+/// write verbs partition on. `write_file` serves exactly the paths this
+/// answers `true` for plus every non-Markdown path; `write_note` serves the
+/// rest; neither crosses. Its response's `semantic` field answers "is this
+/// path inside the indexed universe", which is exactly the negation of this —
+/// computed from [`MutationOutcome::written`], the spelling the bytes actually
+/// reached, never from the request. Computing it from `in_config_zone` alone
+/// would claim a hidden-folder write joined a generation that will never
+/// contain it.
 pub fn is_unindexable(path: &VaultPath) -> bool {
     in_config_zone(path) || path.is_hidden()
 }
@@ -1372,6 +1416,7 @@ impl MutationEngine {
         }
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
+            written: None,
             revision: Some(revision_of(bytes)),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -1411,10 +1456,21 @@ impl MutationEngine {
     ) -> Result<MutationOutcome, MutationError> {
         // Once on the caller's spelling, so a note is refused even when its
         // parent does not exist and `resolve` would answer `parent_not_found`
-        // instead. The zone is exempt: a `.md` file under `.obsidian/` is a
-        // plugin's data, never a note the index would read, and refusing it
-        // would leave it writable by nothing at all.
-        if !in_config_zone(path) && path.is_markdown() {
+        // instead.
+        //
+        // The refusal is about **indexable** Markdown, not about the `.md`
+        // suffix. The reason it exists is that a note written raw would land
+        // bytes no generation describes; inside the zone or any other hidden
+        // folder no generation will ever describe them whichever verb writes
+        // them, so the refusal buys nothing there and would only take away the
+        // one verb that can serve the path. `.trash/` makes that concrete:
+        // `delete_note { mode: local }` fills it, every semantic verb then
+        // refuses to touch it on purpose, and `read_file` will read the bytes
+        // back — so something has to be able to write them.
+        //
+        // With `is_unindexable` on both sides, the two write verbs are an
+        // exact partition: every path is served by exactly one of them.
+        if !is_unindexable(path) && path.is_markdown() {
             return Err(MutationError::IsANote { path: path.clone() });
         }
         let actual = content.len() as u64;
@@ -1425,14 +1481,16 @@ impl MutationEngine {
             });
         }
         let resolved = self.resolve(path)?;
-        // And again on the path the write would actually reach. The zone
-        // exemption above is granted on a string, and `in_config_zone` is
-        // exact-case on purpose, so a caller can only *lose* the exemption by
-        // resolving — never gain a way to write a note raw. What this second
-        // check catches is the other direction: a `.obsidian` that is a
-        // symlink out of the zone, whose resolved target is an ordinary note.
+        // And again on the path the write would actually reach, with the same
+        // predicate, or the two checks would disagree about `.hidden`. The
+        // exemption above is granted on a *string*; this one is granted on
+        // where the bytes go. What it catches is the direction the first check
+        // cannot see: a `.obsidian` (or any hidden folder) holding a symlink
+        // that resolves back out into the indexed vault, where the target
+        // really is a note and a raw write really would bypass its generation.
+        // Witnessed by `a_zone_alias_that_escapes_the_zone_cannot_land_a_note`.
         let stored = self.stored_path(path, &resolved)?;
-        if !in_config_zone(&stored) && stored.is_markdown() {
+        if !is_unindexable(&stored) && stored.is_markdown() {
             return Err(MutationError::IsANote { path: path.clone() });
         }
         // The case check comes before the precondition, for `write_note`'s
@@ -1458,14 +1516,20 @@ impl MutationEngine {
         } else {
             write_atomically(&resolved, content)?;
         }
+        // Taken after the write, from a full canonicalize: this is the one
+        // spelling every answer above this call is decided from — whether a
+        // generation contains it, whether the zone was touched, and what the
+        // wire's `semantic` says. Deciding any of them from `path` answers
+        // about a file the write may not have gone anywhere near.
         let written = self.written_path(path, &resolved, stored);
         let changed_paths = if is_unindexable(&written) {
             BTreeSet::new()
         } else {
-            BTreeSet::from([written])
+            BTreeSet::from([written.clone()])
         };
         Ok(MutationOutcome {
             changed_paths,
+            written: Some(written),
             revision: Some(revision_of(content)),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -1482,8 +1546,40 @@ impl MutationEngine {
     ///
     /// Not gated on `read_only`: a read writes nothing, and a read-only daemon
     /// exists to serve reads.
+    ///
+    /// It takes the same two guards every other reader in this file takes,
+    /// **before** it opens anything:
+    ///
+    /// * [`MutationEngine::regular_file_metadata`], because reading a
+    ///   directory answers `EISDIR` — which reaches a client as
+    ///   `storage_failure`, a claim the daemon is broken and an invitation to
+    ///   retry a request that can never succeed — and because opening a fifo
+    ///   *blocks until somebody writes to it*. This read runs on the thread
+    ///   that answers everything, so that block is not a slow request, it is a
+    ///   daemon that has stopped answering.
+    /// * the payload cap, decided on the stat rather than on the bytes. The
+    ///   cap is symmetric on purpose: a client that could read a file it can
+    ///   never write back would be handed a single JSON line no
+    ///   line-delimited reader can chunk, and real vaults hold video and PDF
+    ///   attachments far past it. Chunked transfer is the deferred answer, and
+    ///   the refusal names it.
+    ///
+    /// A file that grows past the cap between the stat and the read is served.
+    /// The cap bounds what a client can *ask* for, not what the filesystem can
+    /// do under it, and re-checking after the read would spend the memory the
+    /// cap exists to avoid before deciding not to.
     pub fn read_file(&self, path: &VaultPath) -> Result<(Vec<u8>, String), MutationError> {
         let resolved = self.resolve(path)?;
+        let Some(metadata) = self.regular_file_metadata(path, &resolved)? else {
+            return Err(MutationError::NotFound { path: path.clone() });
+        };
+        let actual = metadata.len();
+        if actual > self.max_file_bytes {
+            return Err(MutationError::TooLarge {
+                limit: self.max_file_bytes,
+                actual,
+            });
+        }
         match std::fs::read(&resolved) {
             Ok(bytes) => {
                 let revision = revision_of(&bytes);
@@ -1580,6 +1676,7 @@ impl MutationEngine {
             // not whether this call happened to move a byte.
             return Ok(MutationOutcome {
                 changed_paths: BTreeSet::new(),
+                written: None,
                 revision: Some(revision_of(text.as_bytes())),
                 links_rewritten: 0,
                 link_rewrite_failures: Vec::new(),
@@ -1590,6 +1687,7 @@ impl MutationEngine {
         write_atomically(&resolved, patched.as_bytes())?;
         Ok(MutationOutcome {
             changed_paths: BTreeSet::from([self.written_path(path, &resolved, stored)]),
+            written: None,
             revision: Some(revision_of(patched.as_bytes())),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -1700,6 +1798,7 @@ impl MutationEngine {
         }
         Ok(MutationOutcome {
             changed_paths: created,
+            written: None,
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -1783,6 +1882,7 @@ impl MutationEngine {
             // index is keyed by what the scanner emits, so a delete hint keyed
             // any other way leaves the real row behind.
             changed_paths: BTreeSet::from([stored.clone()]),
+            written: None,
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -1867,6 +1967,7 @@ impl MutationEngine {
         Ok(MutationOutcome {
             semantic,
             changed_paths,
+            written: None,
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -2171,6 +2272,7 @@ impl MutationEngine {
             // that never lands. `semantic` is the independent fact — read off
             // the destination, per the `MutationOutcome::semantic` table.
             changed_paths: BTreeSet::from([written]),
+            written: None,
             revision: Some(revision),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -2340,6 +2442,7 @@ impl MutationEngine {
             .flatten();
         Ok(MutationOutcome {
             changed_paths,
+            written: None,
             revision,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
@@ -2397,6 +2500,7 @@ impl MutationEngine {
             // every tree row under it and no semantic row at all.
             semantic: changed_paths.iter().any(VaultPath::is_markdown),
             changed_paths,
+            written: None,
             // A folder has no bytes to hash, so it reports no revision — never
             // an empty string. The wire's `RenameResponse.revision` is optional
             // for exactly this.

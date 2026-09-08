@@ -447,8 +447,11 @@ pub(crate) fn mutation_error(value: vault_index::MutationError) -> ProtocolError
         | MutationError::OverlappingPatch => error.code = ErrorCode::InvalidRequest,
         MutationError::Io { .. } => {
             error.code = ErrorCode::StorageFailure;
-            // Never leak a filesystem path or an OS error string.
-            error.message = "the vault filesystem write failed".into();
+            // Never leak a filesystem path or an OS error string. Neutral
+            // about the direction on purpose: since the raw pair landed this
+            // arm is reachable from a *read* as well, and "write failed" would
+            // then be a false statement about what the daemon attempted.
+            error.message = "the vault filesystem operation failed".into();
         }
     }
     error

@@ -378,6 +378,7 @@ impl IndexService {
 
         Ok(crate::mutate::MutationOutcome {
             changed_paths,
+            written: None,
             revision: moved.revision,
             links_rewritten: *rewritten,
             link_rewrite_failures: failures,

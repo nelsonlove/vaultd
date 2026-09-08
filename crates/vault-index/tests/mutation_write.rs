@@ -720,3 +720,235 @@ fn a_raw_read_answers_for_every_kind_of_path_and_refuses_an_absent_one() {
         "expected not_found, got {error:?}"
     );
 }
+
+/// The partition ruling. `write_file`'s note refusal exists so raw bytes can
+/// never bypass a generation — but inside a hidden folder *no* generation will
+/// ever describe the bytes whichever verb writes them, so the refusal buys
+/// nothing there and only removes the one verb that could serve the path.
+/// `.trash/` makes it concrete: `delete_note` with `mode: local` puts notes
+/// there, `read_file` will read them back, and before this rule nothing could
+/// write one back.
+#[test]
+fn a_markdown_file_in_a_hidden_folder_is_raw_bytes_not_a_note() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".hidden")).expect("create a hidden folder");
+
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path(".hidden/note.md"),
+            content: b"# hidden\n".to_vec(),
+            expected: Precondition::Absent,
+        })
+        .expect("a note the scan will never list is raw bytes, not a note");
+    assert!(!outcome.semantic);
+    assert!(
+        outcome.changed_paths.is_empty(),
+        "empty iff unindexable: the scan never lists a hidden folder, so a \
+         reconciliation of this path could only ever find nothing"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join(".hidden/note.md")).expect("read back"),
+        b"# hidden\n"
+    );
+
+    // The other half of the same rule, so the partition reads as one fact:
+    // the semantic verb still refuses the path outright.
+    let refused = fixture
+        .engine
+        .apply(&Mutation::WriteNote {
+            path: path(".hidden/note.md"),
+            content: "# hidden\n".into(),
+            expected: Precondition::Any,
+        })
+        .expect_err("write_note must still refuse a path no generation can describe");
+    assert!(
+        matches!(refused, MutationError::ZoneViolation { .. }),
+        "expected a zone violation, got {refused:?}"
+    );
+}
+
+/// Every path is served by **exactly one** of the two write verbs. This is the
+/// test that would have caught the gap the first draft opened: a Markdown file
+/// inside a hidden folder was refused by both.
+#[test]
+fn the_two_write_verbs_partition_every_path() {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Verb {
+        Note,
+        Raw,
+    }
+
+    let cases = [
+        // An ordinary note.
+        ("One.md", Verb::Note),
+        // A hidden *file* at the root is not a hidden folder — `is_hidden`
+        // deliberately never judges the last component, the scan indexes it,
+        // and so it is a note like any other.
+        (".hidden-note.md", Verb::Note),
+        // Not Markdown: raw by extension.
+        ("Folder/data.bin", Verb::Raw),
+        // Markdown the scan will never list: raw by location.
+        (".hidden/note.md", Verb::Raw),
+        // A plugin's own Markdown, inside the zone.
+        (".obsidian/plugins/x/data.md", Verb::Raw),
+        // The local trash, which `delete_note { mode: local }` fills.
+        (".trash/Deleted.md", Verb::Raw),
+    ];
+
+    for (spelling, accepted_by) in cases {
+        let fixture = fixture();
+        if let Some(parent) = std::path::Path::new(spelling).parent() {
+            if parent != std::path::Path::new("") {
+                std::fs::create_dir_all(fixture.root.join(parent)).expect("create the parent");
+            }
+        }
+
+        let note = fixture.engine.apply(&Mutation::WriteNote {
+            path: path(spelling),
+            content: "# body\n".into(),
+            expected: Precondition::Any,
+        });
+        let raw = fixture.engine.apply(&Mutation::WriteFile {
+            path: path(spelling),
+            content: b"# body\n".to_vec(),
+            expected: Precondition::Any,
+        });
+
+        match accepted_by {
+            Verb::Note => {
+                note.unwrap_or_else(|error| panic!("write_note must serve {spelling}: {error:?}"));
+                let error = raw.expect_err(&format!("write_file must refuse {spelling}"));
+                assert!(
+                    matches!(error, MutationError::IsANote { .. }),
+                    "{spelling} must be refused as a note, got {error:?}"
+                );
+            }
+            Verb::Raw => {
+                raw.unwrap_or_else(|error| panic!("write_file must serve {spelling}: {error:?}"));
+                let error = note.expect_err(&format!("write_note must refuse {spelling}"));
+                assert!(
+                    matches!(
+                        error,
+                        MutationError::ZoneViolation { .. } | MutationError::NotANote { .. }
+                    ),
+                    "{spelling} must be refused by write_note, got {error:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A raw write answers for **where it landed**, not for what it was called.
+/// The engine already resolves and canonicalizes; the outcome has to carry
+/// that spelling out, or every reporting decision above it is made on the
+/// caller's guess.
+#[cfg(unix)]
+#[test]
+fn a_raw_write_reports_the_path_it_landed_on_not_the_one_it_was_given() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".obsidian")).expect("create the zone");
+    std::os::unix::fs::symlink(
+        fixture.root.join(".obsidian"),
+        fixture.root.join("ZoneAlias"),
+    )
+    .expect("link an innocuous name at the zone");
+
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path("ZoneAlias/app.json"),
+            content: br#"{"trashOption":"local"}"#.to_vec(),
+            expected: Precondition::Absent,
+        })
+        .expect("the alias resolves into the zone, which the raw pair may write");
+    assert_eq!(
+        outcome.written.as_ref().map(vault_core::VaultPath::as_str),
+        Some(".obsidian/app.json"),
+        "the outcome must name the zone path the bytes reached, not the alias"
+    );
+    assert!(
+        outcome.changed_paths.is_empty(),
+        "the bytes landed in the zone, so nothing joins a generation"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join(".obsidian/app.json")).expect("read back"),
+        br#"{"trashOption":"local"}"#.to_vec()
+    );
+}
+
+/// The mirror image, and the reason the post-resolve note check exists: an
+/// alias *out* of the zone must not let a raw write land a note in the indexed
+/// vault. Delete the post-resolve guard and this is what goes red.
+#[cfg(unix)]
+#[test]
+fn a_zone_alias_that_escapes_the_zone_cannot_land_a_note() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join(".obsidian")).expect("create the zone");
+    std::os::unix::fs::symlink("..", fixture.root.join(".obsidian/up"))
+        .expect("link the zone back at the vault root");
+
+    let error = fixture
+        .engine
+        .apply(&Mutation::WriteFile {
+            path: path(".obsidian/up/Evil.md"),
+            content: b"# raw\n".to_vec(),
+            expected: Precondition::Absent,
+        })
+        .expect_err("the zone exemption is about the zone, not about the spelling");
+    assert!(
+        matches!(error, MutationError::IsANote { .. }),
+        "expected is_a_note, got {error:?}"
+    );
+    assert!(
+        !fixture.root.join("Evil.md").exists(),
+        "a raw write must never land a note in the indexed vault"
+    );
+}
+
+/// The read path takes the same file-type guard every other reader takes.
+/// Without it a directory answers `storage_failure` — a claim the daemon is
+/// broken and an invitation to retry a request that can never succeed — and a
+/// FIFO blocks the reading thread on an open that waits for a writer.
+#[test]
+fn a_read_of_a_non_regular_file_is_refused_before_anything_is_opened() {
+    let fixture = fixture();
+    let error = fixture
+        .engine
+        .read_file(&path("Folder"))
+        .expect_err("a directory is not a file to read");
+    assert!(
+        matches!(error, MutationError::TargetExists { .. }),
+        "expected target_exists, got {error:?}"
+    );
+}
+
+/// The cap is symmetric. A client that could read a 20 MiB attachment it can
+/// never write back would get a ~28 MB single JSON line no streaming client
+/// can chunk — and the same typed refusal already names the deferred
+/// alternative.
+#[test]
+fn a_read_past_the_cap_is_refused_rather_than_materialised() {
+    let fixture = fixture();
+    let engine = MutationEngine::new(&fixture.root).with_max_file_bytes(64);
+    std::fs::write(fixture.root.join("Folder/big.bin"), vec![0u8; 65]).expect("write past the cap");
+
+    let error = engine
+        .read_file(&path("Folder/big.bin"))
+        .expect_err("a file past the cap is not served");
+    match error {
+        MutationError::TooLarge { limit, actual } => {
+            assert_eq!(limit, 64);
+            assert_eq!(actual, 65);
+        }
+        other => panic!("expected too_large, got {other:?}"),
+    }
+
+    // Exactly at the cap is served: the bound is inclusive on the read side
+    // exactly as it is on the write side.
+    std::fs::write(fixture.root.join("Folder/edge.bin"), vec![0u8; 64]).expect("write at the cap");
+    let (bytes, _) = engine
+        .read_file(&path("Folder/edge.bin"))
+        .expect("a file at the cap is served");
+    assert_eq!(bytes.len(), 64);
+}
