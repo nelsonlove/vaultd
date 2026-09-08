@@ -32,6 +32,21 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 
 ## Current milestone
 
+### Completed: vault mutations and bulk reads
+
+`vaultd` now writes, and hands a whole vault over in a handful of round trips:
+
+- ten new operations, nine of which write — `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, and `write_file`, plus the raw `read_file` — each with typed refusals that change nothing, per-file temp-then-rename atomicity, and paths canonicalized and contained inside the vault;
+- compare-and-swap preconditions (`{"revision": …}`, `{"absent": true}`, `{"any": true}`) checked against **the bytes on disk** at mutation time, not against the index, so an external edit the index has not seen yet cannot be silently overwritten;
+- **read-your-writes**: a mutation answers only after the generation containing it has published, so a client can read its own write at the generation it was handed;
+- `rename_note`/`rename_folder` repair inbound links in the same generation, preserving each reference's spelling, upgrading only where the rename would make it ambiguous, and reporting every reference they declined with a stable reason code;
+- `patch_frontmatter` edits addressed keys in place and leaves every byte outside the addressed span alone — key order, comments, whitespace, and the body survive;
+- `write_file`/`read_file` carry raw bytes for attachments and the `.obsidian` zone, where nothing is indexed: a zone write joins no generation and announces itself with a `config_changed` event instead;
+- **snapshot sessions** (`open_snapshot`, `snapshot_tree`, `snapshot_notes`, `close_snapshot`) page the whole vault — tree entries and per-note semantic facets — from one pinned read transaction, so an entire hydration is coherent at one generation, with an idle timeout, a concurrency cap, and release on disconnect;
+- `--read-only` refuses every vault write, the configuration zone included.
+
+10,000- and 100,000-note synthetic benchmarks against the design's targets are in `docs/performance/vault-mutation-baseline.md`. See `docs/protocol.md` and `docs/design/vault-mutations-and-bulk-reads.md`.
+
 ### Completed: live incremental runtime and bounded event subscriptions
 
 `vaultd` now keeps the cache live and streams what changed:
@@ -79,8 +94,19 @@ The foundation implements semantic identity primitives, protocol versioning, and
 
 ## Non-goals
 
-`vaultd` does not mutate, rename, or delete vault files, run plugins, render UI, or implement Sync in any shipped milestone so far. The persistent index is rebuildable derived state, never canonical data.
+`vaultd` writes, renames, and deletes vault files as of the milestone above, one operation at a time. It does **not** provide multi-file transactions, conflict merging, journaling, undo, versioning, or Sync semantics, and it does not run plugins or render UI. Server-side read-modify-write is deliberately absent too: a client composes `get_note` and `write_note` into its own compare-and-swap loop. The persistent index is rebuildable derived state, never canonical data; the vault's ordinary files stay authoritative.
 
 ## Development
 
-Run `cargo test --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings`.
+Run `cargo test --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings`. Point `TMPDIR` inside the repository (`TMPDIR="$PWD/target/tmp"`) so the suites' synthetic vaults land on the same filesystem as the build, never in the system temporary directory.
+
+### Property tests
+
+Six suites use `proptest`. `PROPTEST_CASES` is honoured by all of them, including the ones written as `ProptestConfig::with_cases(N)`: `proptest!` passes any config expression through proptest's own `contextualize_config`, which re-applies the environment variable on top of whatever it was given. An earlier note in this repository claimed `with_cases` swallowed the variable and that the suites needed migrating — that claim was disproved against proptest 1.11.0's source, and the measurement behind it compared two runs that both had the variable set. **There is nothing to migrate.** `crates/vault-index/tests/frontmatter_patch.rs`'s `cases()` helper is equivalent to `with_cases(256)`, kept only because it states the default at the call site.
+
+### Known flaky tests (both pre-existing, both load-dependent)
+
+Two tests measure wall-clock time and fail when other multi-second tests run beside them. Both pass in isolation. **Re-run a failure on its own before treating it as a regression** — `cargo test -p vault-server --test <suite> <test_name> -- --exact`.
+
+- `vault-server/tests/subscriptions.rs::a_subscriber_that_never_drains_is_bounded_against_a_live_runtime` — fails with "the marker must name the newest committed generation". The test waits on `published_status`, but notice *delivery* into the channel lags publication, so the final drain can run before the last notice arrives and the lag marker then names an older generation. **Fix sketch:** after reading `final_generation`, block on `notices.recv_timeout` until a notice naming it arrives, then drain.
+- `vault-server/tests/runtime.rs::only_the_configured_threads_are_started` — fails the 5 s bound in `bounded_shutdown`. Measured 2026-09-08 on an Apple M2: 10.8 s in the full workspace run **and** 10.8 s again when only `--test runtime` ran, so its own suite's 22 siblings are load enough; run alone it passes 3/3. The bound exists to catch a shutdown that waits out a whole 60 s reconcile interval, which is a two-order-of-magnitude difference from what is being measured. **Fix sketch:** bound the shutdown against the configured interval rather than a fixed 5 s wall-clock figure, so the assertion keeps its signal and stops measuring the machine's load.

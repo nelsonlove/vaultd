@@ -30,6 +30,11 @@ struct Args {
     /// which performs no source writes.
     #[arg(long, default_value_t = false)]
     live: bool,
+    /// Also run the mutation cases: a committed write, a committed
+    /// frontmatter patch, a committed delete, and the rename fan-out matrix.
+    /// Skipped in `--vault` mode, which performs no source writes.
+    #[arg(long, default_value_t = false)]
+    mutations: bool,
 }
 
 /// Peak resident set size in bytes since process start.
@@ -80,6 +85,10 @@ struct BenchmarkReport {
     /// case. Empty unless `--live` was passed, and always empty in
     /// `--vault` mode (real-vault runs perform no source writes).
     live_cases: Vec<CaseReport>,
+    /// The Task 18 mutation cases, one entry per named case. Empty unless
+    /// `--mutations` was passed, and always empty in `--vault` mode, for the
+    /// same reason `live_cases` is: a mutation case writes to the source.
+    mutation_cases: Vec<CaseReport>,
 }
 
 /// One live-incremental case: a single measured operation (a targeted
@@ -676,6 +685,235 @@ fn case_compact_graph_hydration(
     case_report("compact_graph_hydration", notes, &samples)
 }
 
+// ---------------------------------------------------------------------------
+// Task 18 mutation cases
+// ---------------------------------------------------------------------------
+//
+// Each case measures **the mutation plus its own reconciliation**, which is
+// what a client actually waits for: the daemon answers a mutation only after
+// the generation containing it has published, so the write alone is not the
+// figure any target names.
+
+/// One `write_note` through the engine plus the targeted reconciliation that
+/// publishes it: exactly what a client blocks on, and the figure the design's
+/// "p50 < 25 ms at 100k notes" target names.
+fn case_write_note_commit(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let engine = vault_index::MutationEngine::new(vault_root);
+    let path = VaultPath::new("bench-mutation.md").expect("valid vault path");
+    // Seeded outside the timed loop, so no repeat measures a create where the
+    // others measure a replace.
+    write_note_body(vault_root, "bench-mutation.md", "# Bench seed\n");
+    seed(service, [path.clone()]);
+
+    let mut samples = Vec::with_capacity(repeats);
+    for repeat in 0..repeats {
+        let content = format!("# Bench {repeat}\n\n[[bench-target-0]]\n");
+        let start = Instant::now();
+        engine
+            .apply(&vault_index::Mutation::WriteNote {
+                path: path.clone(),
+                content,
+                expected: vault_index::Precondition::Any,
+            })
+            .expect("bench write");
+        let report = service
+            .refresh_paths(BTreeSet::from([path.clone()]), ChangeCause::Mutation)
+            .expect("bench reconcile");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        samples.push(CaseSample {
+            elapsed_ms,
+            metrics: report.metrics,
+            affected_references: report.affected_reference_count,
+        });
+    }
+    case_report("write_note_commit", notes, &samples)
+}
+
+/// One `patch_frontmatter` plus its reconciliation. The patch addresses a
+/// top-level key, so it takes the span-surgery path — the one a plugin's
+/// `processFrontMatter` shim hits on every call.
+fn case_patch_frontmatter_commit(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let engine = vault_index::MutationEngine::new(vault_root);
+    let path = VaultPath::new("bench-patch.md").expect("valid vault path");
+    write_note_body(
+        vault_root,
+        "bench-patch.md",
+        "---\ntitle: seed\ncount: 0\n---\n# Bench\n\nbody\n",
+    );
+    seed(service, [path.clone()]);
+
+    let mut samples = Vec::with_capacity(repeats);
+    for repeat in 0..repeats {
+        let edit = vault_index::FrontmatterEdit {
+            key_path: vec!["title".to_string()],
+            value: Some(vault_index::PatchValue::String(format!("bench {repeat}"))),
+        };
+        let start = Instant::now();
+        engine
+            .apply(&vault_index::Mutation::PatchFrontmatter {
+                path: path.clone(),
+                patch: vec![edit],
+                expected: vault_index::Precondition::Any,
+            })
+            .expect("bench patch");
+        let report = service
+            .refresh_paths(BTreeSet::from([path.clone()]), ChangeCause::Mutation)
+            .expect("bench reconcile");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        samples.push(CaseSample {
+            elapsed_ms,
+            metrics: report.metrics,
+            affected_references: report.affected_reference_count,
+        });
+    }
+    case_report("patch_frontmatter_commit", notes, &samples)
+}
+
+/// One `delete_note` plus its reconciliation. The note is written back
+/// *before* each timed section, so every repeat deletes the same thing rather
+/// than the first deleting a note and the rest refusing.
+fn case_delete_note_commit(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let engine = vault_index::MutationEngine::new(vault_root);
+    let path = VaultPath::new("bench-delete.md").expect("valid vault path");
+
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        write_note_body(vault_root, "bench-delete.md", "# Bench delete\n");
+        seed(service, [path.clone()]);
+        let start = Instant::now();
+        engine
+            .apply(&vault_index::Mutation::DeleteNote {
+                path: path.clone(),
+                // Never the system trash in a benchmark: it would measure the
+                // platform's trash implementation and leave the operator's
+                // trash full of fixtures.
+                mode: Some(vault_index::DeleteMode::Permanent),
+                expected: vault_index::Precondition::Any,
+            })
+            .expect("bench delete");
+        let report = service
+            .refresh_paths(BTreeSet::from([path.clone()]), ChangeCause::Mutation)
+            .expect("bench reconcile");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        samples.push(CaseSample {
+            elapsed_ms,
+            metrics: report.metrics,
+            affected_references: report.affected_reference_count,
+        });
+    }
+    case_report("delete_note_commit", notes, &samples)
+}
+
+/// Rename with link repair at four fan-outs. Each repeat builds its own
+/// referrers, reconciles them into the index, then times the whole burst:
+/// planning, every rewrite, the move, and the single reconciliation that
+/// publishes all of it.
+///
+/// Four points rather than one, matching the phase-4 benchmark-matrix
+/// practice: repair is the one operation in this phase whose cost is
+/// unbounded in the vault's shape, and a single measurement of it would say
+/// nothing about the curve.
+///
+/// **This case cannot see the repair planner's other cost axis.** It varies
+/// fan-out against a *fixed* vault, and `mutate::rename::plan_repair` rebuilds
+/// a whole-vault resolver from `LiveGraph::note_paths()` on every repairing
+/// rename — one resolution note per note in the vault, headings and block ids
+/// included. That is O(vault), not O(fan-out), so it lands as a constant
+/// offset in all four points and the curve looks flat in exactly the term that
+/// is not. Read these numbers as the fan-out curve only.
+fn case_rename_fanout(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> Vec<CaseReport> {
+    let mut reports = Vec::new();
+    for fanout in [0usize, 10, 100, 1_000] {
+        let mut samples = Vec::with_capacity(repeats);
+        for repeat in 0..repeats {
+            // A fresh target and a fresh set of referrers per repeat: a rename
+            // is not idempotent, and reusing names across repeats would time a
+            // refusal instead of a rename.
+            let target = format!("bench-rename-{fanout}-{repeat}");
+            let mut dirty = BTreeSet::new();
+            dirty.insert(write_note_body(
+                vault_root,
+                &format!("{target}.md"),
+                "# Target\n\ntext ^block\n",
+            ));
+            for index in 0..fanout {
+                dirty.insert(write_note_body(
+                    vault_root,
+                    &format!("bench-referrer-{fanout}-{repeat}-{index}.md"),
+                    &format!("[[{target}]]\n"),
+                ));
+            }
+            // Untimed: the burst is what this case measures, not the fixture.
+            service
+                .refresh_paths(dirty, ChangeCause::Manual)
+                .expect("index the fan-out fixture");
+
+            let from = VaultPath::new(format!("{target}.md")).expect("valid vault path");
+            let to = VaultPath::new(format!("{target}-renamed.md")).expect("valid vault path");
+            let start = Instant::now();
+            let outcome = service
+                .apply_mutation(&vault_index::Mutation::RenameNote {
+                    from,
+                    to,
+                    expected: vault_index::Precondition::Any,
+                    rewrite_links: true,
+                })
+                .expect("bench rename");
+            let report = service
+                .refresh_paths(outcome.changed_paths, ChangeCause::Mutation)
+                .expect("bench reconcile");
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            samples.push(CaseSample {
+                elapsed_ms,
+                metrics: report.metrics,
+                affected_references: report.affected_reference_count,
+            });
+        }
+        reports.push(case_report(
+            &format!("rename_fanout_{fanout}"),
+            notes,
+            &samples,
+        ));
+    }
+    reports
+}
+
+fn run_mutation_cases(
+    vault_root: &Path,
+    service: &mut IndexService,
+    notes: usize,
+    repeats: usize,
+) -> Vec<CaseReport> {
+    let mut cases = Vec::new();
+    cases.push(case_write_note_commit(vault_root, service, notes, repeats));
+    cases.push(case_patch_frontmatter_commit(
+        vault_root, service, notes, repeats,
+    ));
+    cases.push(case_delete_note_commit(vault_root, service, notes, repeats));
+    cases.extend(case_rename_fanout(vault_root, service, notes, repeats));
+    cases
+}
+
 fn run_live_cases(
     vault_root: &Path,
     service: &mut IndexService,
@@ -870,6 +1108,16 @@ fn main() {
         Vec::new()
     };
 
+    let mutation_cases = if args.mutations && mode == "synthetic" {
+        eprintln!("measuring mutation cases...");
+        run_mutation_cases(&vault_root, &mut service, args.notes, args.repeats)
+    } else {
+        if args.mutations {
+            eprintln!("real-vault mode performs no source writes; mutation cases are skipped");
+        }
+        Vec::new()
+    };
+
     let note_count = usize::try_from(service.vault_info().expect("vault info").note_count)
         .expect("note count fits usize");
     let report = BenchmarkReport {
@@ -899,6 +1147,7 @@ fn main() {
             one_file_refresh: stage_distributions(&one_file_metrics),
         },
         live_cases,
+        mutation_cases,
     };
     println!(
         "{}",

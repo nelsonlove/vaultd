@@ -18,7 +18,10 @@ Runtime tuning. Each of these requires `--vault`, exactly as `--index` does, and
 --no-watch                          # reconcile on demand and on the tick only
 --watch-debounce-ms <10..=5000>     # event coalescing window, default 100
 --reconcile-interval-seconds <N>    # periodic complete reconciliation, default 60; 0 disables it
+--read-only                         # refuse every operation that writes into the vault
 ```
+
+`--read-only` refuses every mutating operation — the eight note and folder verbs, the raw `write_file`, and a rename's link repair — with `read_only`, before any path is touched. Reads, snapshot sessions, reconciliation, and the watcher are unaffected: the daemon still indexes what other writers do, it simply never writes itself. The `.obsidian` zone is included; a read-only daemon writes nothing anywhere in the vault. The flag is fixed at startup and there is no operation that changes it.
 
 One process serves at most one explicitly configured vault. Without `--vault`, only `health` succeeds, every indexed operation returns `index_unavailable`, `subscribe_events` returns `runtime_not_ready`, and no runtime — no watcher, no writer lease, no live graph, no timer — is started at all.
 
@@ -172,6 +175,253 @@ Ends a subscription. Events already queued for it reach the client *before* this
 {"version":1,"id":"u","outcome":{"status":"ok","value":{"type":"unsubscribe","value":{"subscription_id":"sub-1"}}}}
 ```
 
+## Mutations
+
+Eight operations write notes and folders, `write_file` writes raw bytes to everything that is not an indexable note, and `read_file` is the raw read half of that pair — ten operations, nine of which write. The filesystem stays authoritative throughout: every write lands as ordinary files through a temporary file and an atomic rename, and the index follows.
+
+**A mutation response is sent only after its own reconciliation has published**, so a client that completes a write can immediately read its result at the returned `generation`. The matching `generation_committed` event carries `cause: "mutation"` and is a confirmation rather than a barrier — a client must not wait for it, and must not assume it arrives before or after the response line.
+
+**Every refusal changes nothing.** Each error below is decided before anything is written, so a refused mutation leaves the vault byte-identical. The single exception is documented at `storage_failure`: bytes that reached disk whose generation then failed to publish.
+
+**Preconditions.** A content-bearing mutation may carry `expected`, in exactly one of three shapes:
+
+- `{"revision": "blake3:…"}` — the target must currently hold this content revision.
+- `{"absent": true}` — nothing may exist at the path.
+- `{"any": true}` — unconditional, said out loud.
+
+Omitting `expected` altogether is also unconditional. An `expected` object that is *present* must name exactly one of the three: an empty object is a typo-shaped client bug and a two-field object has no meaning, and both are `invalid_request`. Mutation parameters reject unknown keys for the same reason — a misspelled `expected` must fail loudly rather than silently downgrade a conditional write to an unconditional one.
+
+A precondition is checked against **the bytes on disk at mutation time**, not against the index. The index lags the filesystem by a debounce window, so an index-based comparison would be blind to an external edit that has not reconciled yet — and would overwrite it, which is the lost update the mechanism exists to prevent. A failed precondition is `revision_conflict`, carrying `current_revision` (the revision the target actually holds) so a retry loop does not have to re-read and race the next writer.
+
+Which operations take one: `write_note`, `delete_note`, `rename_note`, and `write_file` take `expected`; `copy_file` takes `expected_source`, which is about the source it reads. `create_folder`, `delete_folder`, and `rename_folder` take none — a folder has no bytes and therefore no revision.
+
+**Parent folders are never created implicitly by a file operation.** Every operation that resolves a *file* path — `write_note`, `write_file`, `copy_file`, the renames' destination — answers `parent_not_found` when the folder above it does not exist. `create_folder` is the deliberate exception: it is the verb whose job is to make folders, and it makes the whole chain.
+
+**Payloads are capped at 16 MiB** (`payload_too_large`). Chunked transfer is the deferred alternative and does not exist in version 1. The cap is not symmetric between the two raw verbs, and the difference is worth knowing before a client sizes its buffers: `read_file` bounds the file by its size on disk *before* materializing anything, so an oversized read costs one `stat`; `write_file` can only weigh what it was handed, so the full `content_base64` line has already been read off the transport and decoded by the time the cap refuses it. A client that must not pay that cost checks its own payload size first. A `patch_frontmatter` weighs its *edits*, never the resulting file — capping the result would make a note that is already over the cap permanently unpatchable — and a delete under `{"any": true}` stats its target instead of reading it, so a file that is already over the cap can still be removed — a refusal with no remedy would be worse than no cap at all, since the only interface that could shrink it is the one refusing.
+
+**Case collisions are refused, not resolved.** On a case-insensitive filesystem a path that differs from an existing one only by case is `case_collision`, and nothing is written. This is a deliberate divergence from Obsidian, which mishandles the same situation; `VAULTD-COMPATIBILITY.md` records it.
+
+### `write_note`
+
+Writes a Markdown note's exact bytes. The path must be an indexable `.md` path: a non-note path is `invalid_request`, because such a file would never be indexed and read-your-writes would silently break for it.
+
+```json
+{"version":1,"id":"w","request":{"method":"write_note","params":{"path":"Folder/Note.md","content":"# Note\n[[Other]]\n","expected":{"revision":"blake3:8dd1ae6e…"}}}}
+```
+
+```json
+{"version":1,"id":"w","outcome":{"status":"ok","value":{"type":"write_note","value":{"generation":4,"revision":"blake3:0f2c91aa…"}}}}
+```
+
+### `create_folder`
+
+Creates a folder, and every missing folder above it. **A folder that already exists is success, not a conflict** — the postcondition a caller wants is "a folder is there", which is Obsidian's own `createFolder` behaviour. A *file* already sitting at the name is `target_exists`, and a name that differs only by case from an existing folder is `case_collision`. The generation names only the segments this call actually created; a segment that was already there moved nothing and is named by nobody.
+
+```json
+{"version":1,"id":"cf","request":{"method":"create_folder","params":{"path":"Folder/Nested"}}}
+```
+
+```json
+{"version":1,"id":"cf","outcome":{"status":"ok","value":{"type":"create_folder","value":{"generation":5}}}}
+```
+
+### `rename_note`
+
+Moves a note and, with `rewrite_links` (default `true`), repairs every inbound reference to it. The move and every successful rewrite land in **one** generation. `links_rewritten` counts the references retargeted; `link_rewrite_failures` names each one that was not, with a stable `reason` from the closed set under "Link repair failure reasons" below. An empty list means every inbound reference now points at the new path.
+
+Spelling is preserved: a reference that was shortest-form stays shortest-form while it stays unambiguous, and a reference the rename would make ambiguous is upgraded to the explicit path form. Over-specifying is safe; silently retargeting is not.
+
+```json
+{"version":1,"id":"rn","request":{"method":"rename_note","params":{"from":"Folder/Note.md","to":"Folder/Renamed.md","expected":{"any":true},"rewrite_links":true}}}
+```
+
+```json
+{"version":1,"id":"rn","outcome":{"status":"ok","value":{"type":"rename_note","value":{"generation":6,"revision":"blake3:0f2c91aa…","links_rewritten":3,"link_rewrite_failures":[]}}}}
+```
+
+### `rename_folder`
+
+Moves a folder and every path under it, repairing inbound references to each contained note when `rewrite_links` is true. It reports **no** `revision`: a folder has no bytes to hash, and a thing with no content revision reports no `revision` key at all rather than an empty string. An existing destination — including an empty directory already sitting there — is `target_exists`.
+
+```json
+{"version":1,"id":"rf","request":{"method":"rename_folder","params":{"from":"Folder","to":"Renamed","rewrite_links":true}}}
+```
+
+```json
+{"version":1,"id":"rf","outcome":{"status":"ok","value":{"type":"rename_folder","value":{"generation":7,"links_rewritten":12,"link_rewrite_failures":[{"path":"Other.md","reason":"revision_conflict"}]}}}}
+```
+
+### `copy_file`
+
+Byte-copies any vault file, note or attachment. `if_exists` is `"error"` (the default, answering `target_exists`) or `"suffix"`, which appends Obsidian's auto-numbering suffix and is what `getAvailablePath` parity needs. `expected_source` is a precondition on the **source**.
+
+```json
+{"version":1,"id":"cp","request":{"method":"copy_file","params":{"from":"Folder/Note.md","to":"Folder/Copy.md","expected_source":{"any":true},"if_exists":"suffix"}}}
+```
+
+```json
+{"version":1,"id":"cp","outcome":{"status":"ok","value":{"type":"copy_file","value":{"generation":8,"revision":"blake3:0f2c91aa…"}}}}
+```
+
+### `delete_note`
+
+Deletes one note. `mode` is `"trash_system"` (the platform trash), `"trash_local"` (the vault's own `.trash/`, which is a dot-directory and therefore never scanned, watched, or indexed), or `"permanent"`. Omitting `mode` takes the vault's `.obsidian/app.json` `trashOption`, falling back to `"trash_system"` — Obsidian's own default — when that file is missing or unparsable, because a delete must not fail on an unreadable configuration file. The response carries no revision: a deleted file has none.
+
+```json
+{"version":1,"id":"dn","request":{"method":"delete_note","params":{"path":"Folder/Note.md","mode":"trash_local","expected":{"revision":"blake3:0f2c91aa…"}}}}
+```
+
+```json
+{"version":1,"id":"dn","outcome":{"status":"ok","value":{"type":"delete_note","value":{"generation":9}}}}
+```
+
+### `delete_folder`
+
+Deletes a folder. A non-empty folder without `recursive: true` is `target_exists` — something is still in there.
+
+```json
+{"version":1,"id":"df","request":{"method":"delete_folder","params":{"path":"Folder","mode":"permanent","recursive":true}}}
+```
+
+```json
+{"version":1,"id":"df","outcome":{"status":"ok","value":{"type":"delete_folder","value":{"generation":10}}}}
+```
+
+### `patch_frontmatter`
+
+Edits addressed frontmatter keys in place. `patch` is a list of `{ key_path, value }` entries; `key_path` is a dot-path (`a.b.c`) addressing nested keys, and an explicit JSON `value: null` deletes the key. A missing `value` key is a decode error rather than a deletion, so "forgot to set a value" never becomes "delete this key".
+
+Bytes outside the addressed spans are preserved exactly. An edit at or above a stored key's granularity rewrites only that key's span; an edit *below* it — a leaf inside a nested object, which the index does not store a span for — re-serializes the smallest enclosing stored value span and touches nothing outside that property. Key order, comments, whitespace, and the body survive either way.
+
+```json
+{"version":1,"id":"pf","request":{"method":"patch_frontmatter","params":{"path":"Folder/Note.md","patch":[{"key_path":"title","value":"Renamed"},{"key_path":"draft","value":null}],"expected":{"any":true}}}}
+```
+
+```json
+{"version":1,"id":"pf","outcome":{"status":"ok","value":{"type":"patch_frontmatter","value":{"generation":11,"revision":"blake3:44b0c7de…"}}}}
+```
+
+### `write_file`
+
+Raw bytes to any vault file that is **not** an indexable note: an attachment, a hidden path, or the `.obsidian` zone. `content_base64` is base64 in the standard alphabet with padding (RFC 4648 §4, not the URL-safe variant); anything else is `invalid_request`. `read_file` answers in the same encoding.
+
+`semantic` answers "did these bytes land inside the indexed universe", and `generation` is present exactly when `semantic` is true. A write into the configuration zone, or into any hidden folder, answers `semantic: false` with no `generation` — nothing there is indexed, so no generation will ever contain it — and emits a `config_changed` event when it was in the zone. An attachment inside the vault answers `semantic: true` with a real generation: no semantic rows moved, but the file tree did.
+
+Both fields answer about **where the bytes landed**, not about the path the request carried. A symlink or a case-folded spelling can resolve across the boundary in either direction, and answering from the request would name a generation that will never contain the write.
+
+A `.md` path outside the zone is refused with `invalid_request`: a note must go through `write_note` to join a generation. `read_file` has no such rule and reads any path, notes included.
+
+```json
+{"version":1,"id":"wf","request":{"method":"write_file","params":{"path":".obsidian/plugins/example/data.json","content_base64":"eyJrZXkiOiJ2YWx1ZSJ9","expected":{"any":true}}}}
+```
+
+```json
+{"version":1,"id":"wf","outcome":{"status":"ok","value":{"type":"write_file","value":{"revision":"blake3:9c1f0b21…","semantic":false}}}}
+```
+
+### `read_file`
+
+Raw bytes out of any vault file, including notes (byte-identical to `get_note`'s `source`, without the semantics) and the `.obsidian` zone. It is a read: it takes no lease, publishes nothing, joins no generation, and works on a `--read-only` daemon.
+
+A path that exists but is not a regular file — a directory, a fifo, a socket, a device — is refused with `target_exists`. The code is the mutation taxonomy's "something else already occupies this name", and its message is phrased for the write path; on a read, understand it as "this name is not a regular file".
+
+```json
+{"version":1,"id":"rd","request":{"method":"read_file","params":{"path":".obsidian/app.json"}}}
+```
+
+```json
+{"version":1,"id":"rd","outcome":{"status":"ok","value":{"type":"read_file","value":{"content_base64":"eyJrZXkiOiJ2YWx1ZSJ9","revision":"blake3:9c1f0b21…"}}}}
+```
+
+### The `.obsidian` zone
+
+`read_file` and `write_file` accept paths under `.obsidian/`. **Every semantic operation refuses them** with `zone_violation` — `write_note`, `patch_frontmatter`, the renames, the copies, the deletes, and the folder operations alike. Nothing in the zone is indexed, so a zone write joins no generation and answers `semantic: false`, and the daemon announces it with a `config_changed` event instead of a `generation_committed`.
+
+The mirror rule holds on the other side: `write_file` refuses an indexable `.md` path outside the zone with `invalid_request`, so the two verbs partition the vault exactly. Whether a path is in the zone is decided by where it *lands* after symlinks and case folding, never by how the request spelled it.
+
+## Read-modify-write
+
+There is **no server-side `process` operation**. A read-modify-write is a client loop over the operations above:
+
+1. `get_note` (or `read_file`) and keep the `revision` it returned;
+2. compute the new content locally;
+3. `write_note` with `expected: {"revision": "<that revision>"}`;
+4. on `revision_conflict`, take `current_revision` from the error, re-read, and try again.
+
+The loop is a compare-and-swap, and the server holds no state between its steps: there is no lock to leak, no transaction to abandon, and a client that dies mid-loop leaves nothing behind. `patch_frontmatter` is the exception a client should reach for when it only wants a property — it does the read-modify-write inside one serialized mutation and preserves the bytes it did not address, which a naive read-modify-write of the whole file cannot promise.
+
+Multi-file transactions, conflict merging, journaling, and undo are deliberately absent; the reserved operation families below name them.
+
+## Snapshot sessions
+
+Hydrating a whole vault through `list_notes` and `get_note` costs one round trip per note and tears across generations while it runs. A snapshot session replaces both problems: one pinned read transaction, paged through with ordinary requests.
+
+**An entire session is coherent at one generation** — tree entries and semantic rows alike — because both come from the same pinned read transaction. A write may land at any time; this session never sees it. The generation is reported at `open_snapshot` and echoed on every page.
+
+Three numbers are **daemon configuration rather than protocol**. The values below are the defaults; a client must not hard-code them, and only the page size is directly observable (from how many rows a page returns) — the other two announce themselves through their refusals:
+
+- **idle timeout, 60 s since the last page.** An open session pins WAL frames and defers checkpoint truncation, so a session nobody is reading is reclaimed. The sweep rides on traffic the daemon is already handling — any request or runtime notice — rather than on a timer, so residency is bounded by one idle timeout after the last input of any kind. A page against a reclaimed session is `snapshot_not_found`.
+- **concurrency cap, 4 sessions.** Opening a fifth is `too_many_snapshots`.
+- **page size, 500 by default and 2000 at most.** A snapshot `limit` is *clamped* into `1..=2000` rather than refused — including `0`, which becomes 1. This differs from the collection operations above, where an out-of-range `limit` is `invalid_cursor`: a hydration loop that asks for too much should page more times, not fail halfway through a vault.
+
+A client disconnect releases every session that client held, so a crashed host cannot pin the WAL forever.
+
+**Pin loss is reported, never served stale.** If a session's transaction is no longer the one it was pinned at, both pagers refuse on sight with `generation_mismatch` carrying `current_generation`; the client reopens. This is the second cause of that code — the first is an ordinary cursor whose generation has moved on.
+
+Unknown *fields* in these read parameters are tolerated, as everywhere outside the mutation family. An unknown *value* inside `include` is not: a misspelled facet name is `invalid_request`, because ignoring it would serve a page silently missing the facet the client asked for.
+
+### `open_snapshot`
+
+Opens the session and reports what it will serve: `note_count` semantic rows and `entry_count` tree entries, the latter always at least the former.
+
+```json
+{"version":1,"id":"o","request":{"method":"open_snapshot","params":{}}}
+```
+
+```json
+{"version":1,"id":"o","outcome":{"status":"ok","value":{"type":"open_snapshot","value":{"snapshot_id":"snap-1","generation":12,"note_count":2,"entry_count":5}}}}
+```
+
+### `snapshot_tree`
+
+One page of the vault tree in path order: folders, notes, and non-Markdown files. Each entry carries `ctime_unix_ms`, `mtime_unix_ms`, and `size` — which is what a host serves `TFile.stat` from, and why they are stored per entry rather than restated from the filesystem at read time. A folder carries neither `size` nor `revision`; a non-note file carries `size` but no `revision`, because the index stores no content revision for attachments. `kind` is `folder`, `note`, or `file`, and a client must treat an unrecognized kind as unknown rather than as an error.
+
+```json
+{"version":1,"id":"t","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1","cursor":null,"limit":500}}}
+```
+
+```json
+{"version":1,"id":"t","outcome":{"status":"ok","value":{"type":"snapshot_tree","value":{"snapshot_id":"snap-1","generation":12,"entries":[{"path":"Folder","kind":"folder","ctime_unix_ms":1756100000000,"mtime_unix_ms":1756100000000},{"path":"Folder/Note.md","kind":"note","size":24,"ctime_unix_ms":1756100000000,"mtime_unix_ms":1756100000000,"revision":"blake3:0f2c91aa…"}],"next_cursor":"eyJn…"}}}}
+```
+
+### `snapshot_notes`
+
+One page of per-note semantic row-sets, in path order. `include` names the facets to serve: `metadata`, `references`, `resolutions`, `backlinks`, `sections`, and `list_items`. A facet a client does not ask for is not read, not serialized, and absent from the response — absent, never empty, so "I did not ask" and "there are none" stay distinguishable.
+
+`sections` and `list_items` are **top-level facets, siblings of `metadata` rather than nested inside it**. A section carries its `kind`, its span, and the `block_id` that owns it when it has one. A list item carries its span, its raw `task` character when it is a task, and exactly one of `list_start_line` (a top-level item, naming the start line of the list containing it) or `parent_start_line` (a nested item, naming its parent item's own start line). Both are line numbers, never array indexes and never sentinels; a host reconstructing Obsidian's single `parent` number negates `list_start_line` and passes `parent_start_line` through.
+
+Bodies are not a facet: row-sets come from here and bodies from `get_note`.
+
+```json
+{"version":1,"id":"sn","request":{"method":"snapshot_notes","params":{"snapshot_id":"snap-1","cursor":null,"limit":500,"include":["metadata","references"]}}}
+```
+
+```json
+{"version":1,"id":"sn","outcome":{"status":"ok","value":{"type":"snapshot_notes","value":{"snapshot_id":"snap-1","generation":12,"notes":[{"path":"Folder/Note.md","revision":"blake3:0f2c91aa…","metadata":{"properties":[],"aliases":[],"headings":[{"level":1,"text":"Note","span":{"start":0,"end":6}}],"blocks":[],"tags":[],"diagnostics":[]},"references":[{"source_path":"Folder/Note.md","kind":"wikilink","origin":"body","raw_target":"Other","file_target":"Other","subpath":null,"display":null,"span":{"start":7,"end":16},"target_span":{"start":9,"end":14},"resolution":{"kind":"resolved","target":"Other.md","subpath":null}}]}],"next_cursor":null}}}}
+```
+
+### `close_snapshot`
+
+Releases the session and its pinned transaction. A session identifier this process never issued, or already released or reclaimed, is `snapshot_not_found`.
+
+```json
+{"version":1,"id":"c","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}
+```
+
+```json
+{"version":1,"id":"c","outcome":{"status":"ok","value":{"type":"close_snapshot","value":{"snapshot_id":"snap-1"}}}}
+```
+
 ## Events
 
 The stdio transport carries a second top-level envelope shape alongside responses: one JSON object per line, with `version`, `subscription_id`, and `event`, and no `id` or `outcome`. Exactly one writer owns the output stream, so an event line can never split a response line, and a client that never subscribed sees byte-identical output to protocol version 1 without events.
@@ -220,6 +470,16 @@ The generation moved in a way no per-path change set describes: an incremental c
 {"version":1,"subscription_id":"sub-1","event":{"type":"resync_required","value":{"current_generation":4,"reason":"watcher_overflow"}}}
 ```
 
+### `config_changed`
+
+This daemon's own `write_file` landed inside `.obsidian/`. It carries **no generation**: nothing in the zone is indexed, so no generation contains it, and a client re-reads the named path with `read_file` rather than applying a delta. `path` is the path the bytes *landed on*, not the one the request spelled, so a host can match the notice to the file it knows even when a symlink or a case-folded name reached the zone.
+
+The zone is not watched — it is a dot-directory, and the scanner and the watcher skip it — so an edit made by anything other than this daemon raises no event at all. A host that shares the zone with other writers polls or watches it itself.
+
+```json
+{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed","value":{"path":".obsidian/app.json"}}}
+```
+
 ### Bounds
 
 Every queue is bounded and every overflow degrades into a marker, never into silence. Which bound you meet depends on how events are being delivered.
@@ -247,7 +507,7 @@ Stable version 1 codes and when each occurs:
 - `invalid_cursor` — a malformed cursor, a cursor for a different operation or filters, or an out-of-range limit.
 - `note_not_found` — an exact-path lookup found no note.
 - `index_unavailable` — no vault is configured, or no complete generation exists yet.
-- `generation_mismatch` — a cursor's generation is no longer current; carries `current_generation`.
+- `generation_mismatch` — the generation a request was bound to is no longer the one being served; carries `current_generation`. Two causes: a **cursor** whose generation has moved on (restart the listing), and a **snapshot session whose pin was lost** (reopen the session and hydrate again). The message says which.
 
 ```json
 {"version":1,"id":"l","outcome":{"status":"err","value":{"code":"generation_mismatch","message":"cursor generation 2 does not match current generation 3","current_generation":3}}}
@@ -263,7 +523,7 @@ Stable version 1 codes and when each occurs:
 - `storage_failure` — an index storage or filesystem failure not representable as a note diagnostic. A mutation whose write reached disk and whose generation then failed to publish reports this same code, whatever the reconciliation itself failed with. For the operations that carry a content revision (`write_note`, `copy_file`, `patch_frontmatter`), `current_revision` is what tells the two apart, and a client must branch on it rather than retry blindly: **present** means the bytes landed and only the index is behind — it catches up at the next reconciliation, and an immediate retry may now meet `target_exists` or `revision_conflict`; **absent** means nothing was written and a retry is safe. The operations with no content revision of their own — the folder operations and the deletes — carry no `current_revision` in either case, so for them a client must re-read rather than infer.
 
 ```json
-{"version":1,"id":"w","outcome":{"status":"err","value":{"code":"storage_failure","message":"index storage failed","current_revision":"blake3:8dd1ae6e…"}}}
+{"version":1,"id":"w","outcome":{"status":"err","value":{"code":"storage_failure","message":"the write reached the vault but its generation was not published","current_revision":"blake3:8dd1ae6e…"}}}
 ```
 
 - `internal` — an unexpected server failure.
@@ -272,6 +532,21 @@ Stable version 1 codes and when each occurs:
 - `runtime_overloaded` — the runtime's command mailbox was saturated, so this request was dropped. The change it would have covered is escalated to a complete reconciliation; retry for the report.
 - `subscription_not_found` — an identifier this process never issued, or already released.
 - `watch_unavailable` — reserved for a future operation that requires a filesystem watcher. A runtime that cannot watch reports the reason through `live_state: polling_fallback` and `runtime_state_changed` instead of failing requests.
+
+The write path and the snapshot sessions add ten more. Every one of them means **nothing changed**:
+
+- `revision_conflict` — an `expected` precondition did not match the bytes on disk; carries `current_revision`, the revision the target actually holds, so a retry loop does not have to re-read and race the next writer. It carries no `current_generation`: the conflict is with the filesystem, and the index's generation is not what the retry compares against.
+- `not_found` — the operation's subject does not exist.
+- `parent_not_found` — the parent folder of a path does not exist. Parents are never created implicitly; create it and retry.
+- `target_exists` — something already occupies the destination. Also a non-empty folder deleted without `recursive`, a folder-rename destination that already exists, and a `read_file` whose path is not a regular file.
+- `case_collision` — the path differs only by case from one that already exists on a case-insensitive filesystem. `vaultd` refuses; Obsidian does not.
+- `zone_violation` — a semantic operation named a path under `.obsidian/`. Use `read_file`/`write_file` there.
+- `payload_too_large` — the payload exceeds 16 MiB. Chunked transfer is the deferred alternative and is not in version 1.
+- `read_only` — the daemon was started with `--read-only` and refuses every vault write.
+- `snapshot_not_found` — a session identifier this process never issued, or one already closed or reclaimed after its idle timeout.
+- `too_many_snapshots` — the concurrency cap (4) is reached; close a session and retry.
+
+`unknown` is reserved as a client-side catch-all for a code this build has not heard of. The server never emits it.
 
 Errors never contain raw SQL, internal cache paths, or backtraces.
 
@@ -304,15 +579,14 @@ These names document intended boundaries and are not accepted by the version 1 r
 
 - `query`
 - `search`
-- `apply_mutation`
 - `begin_transaction`
 - `commit_transaction`
 - `abort_transaction`
 
-The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above.
+The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above. The reserved `apply_mutation` family is no longer reserved either: it landed as the named operations under "Mutations" above — `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, `write_file`, and `read_file` — rather than as one omnibus verb, because a typed refusal per operation says more than a shared one could.
 
 ## Evolution
 
 Adding optional fields is backward-compatible. Adding operations is backward-compatible for servers and clients that reject unknown tagged variants cleanly. Renaming fields, changing meanings, or removing variants requires a new protocol version.
 
-**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, or a tree entry's `kind` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.
+**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, or a tree entry's `kind` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. Read parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in a read's params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.

@@ -175,6 +175,95 @@ fn live_flag_is_a_no_op_without_it() {
     );
 }
 
+/// The mutation cases, in one run: every named case present, and each
+/// fan-out point actually repairing the fan-out it is named for.
+///
+/// The fan-out assertion is the one that matters. A referrer whose body does
+/// not parse as a link would make `rename_fanout_1000` a rename of a note
+/// nothing points at — measuring the same thing as `rename_fanout_0` while
+/// still reporting a number, which is precisely the way a benchmark lies.
+#[test]
+fn mutation_cases_cover_every_named_case_and_repair_their_named_fan_out() {
+    let report = run_bench_with_mutations(25, 2);
+    let expected_cases = [
+        "write_note_commit",
+        "patch_frontmatter_commit",
+        "delete_note_commit",
+        "rename_fanout_0",
+        "rename_fanout_10",
+        "rename_fanout_100",
+        "rename_fanout_1000",
+    ];
+    let mutation_cases = report["mutation_cases"]
+        .as_array()
+        .expect("mutation_cases array");
+    assert_eq!(
+        mutation_cases.len(),
+        expected_cases.len(),
+        "unexpected case count: {mutation_cases:#?}"
+    );
+    for name in expected_cases {
+        let entry = mutation_cases
+            .iter()
+            .find(|entry| entry["case"] == name)
+            .unwrap_or_else(|| panic!("no case named {name:?} in the report"));
+        assert_eq!(entry["notes"], 25, "case {name} notes field");
+        assert!(
+            entry["timings_ms"]["p50"].is_number(),
+            "case {name} must report a numeric p50"
+        );
+    }
+    for (name, fanout) in [
+        ("rename_fanout_0", 0u64),
+        ("rename_fanout_10", 10),
+        ("rename_fanout_100", 100),
+        ("rename_fanout_1000", 1_000),
+    ] {
+        let entry = mutation_cases
+            .iter()
+            .find(|entry| entry["case"] == name)
+            .expect("the fan-out case is present");
+        assert_eq!(
+            entry["affected_references"].as_u64(),
+            Some(fanout),
+            "case {name} must repair exactly its named fan-out"
+        );
+    }
+}
+
+#[test]
+fn mutation_cases_are_absent_without_the_flag() {
+    let report = run_live_bench_without_live(10, 2);
+    assert_eq!(
+        report["mutation_cases"]
+            .as_array()
+            .expect("mutation_cases array")
+            .len(),
+        0,
+        "mutation_cases must stay empty when --mutations was not passed"
+    );
+}
+
+fn run_bench_with_mutations(notes: usize, repeats: usize) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_vault-bench"))
+        .args([
+            "--notes",
+            &notes.to_string(),
+            "--repeats",
+            &repeats.to_string(),
+            "--mutations",
+        ])
+        .output()
+        .expect("run vault-bench");
+    assert!(
+        output.status.success(),
+        "vault-bench exited with {:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("vault-bench stdout is valid JSON")
+}
+
 fn run_live_bench_without_live(notes: usize, repeats: usize) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_vault-bench"))
         .args([

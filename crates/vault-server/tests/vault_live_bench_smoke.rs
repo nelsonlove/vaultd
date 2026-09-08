@@ -52,6 +52,7 @@ fn every_named_runtime_case_is_present_with_the_documented_shape() {
         "startup_catch_up",
         "subscriber_delivery",
         "lag_recovery",
+        "snapshot_hydration",
         "attachment_burst_500",
         "attachment_burst_500_new_folder",
     ];
@@ -80,6 +81,19 @@ fn every_named_runtime_case_is_present_with_the_documented_shape() {
             "case {name} peak_rss_bytes must be null or a positive integer, got {peak_rss}"
         );
     }
+
+    // `snapshot_hydration` repurposes `affected_references` as "notes
+    // hydrated by the last repeat". The binary already asserts internally
+    // that it paged exactly the counts `open_snapshot` promised; this pins
+    // the *reported* number against the vault it ran on, so a hydration case
+    // that silently hydrated nothing could not still look fast here.
+    let hydrated = case(&report, "snapshot_hydration")["affected_references"]
+        .as_u64()
+        .expect("affected_references is a number");
+    assert!(
+        hydrated >= 25,
+        "snapshot_hydration must report at least the vault's own notes, got {hydrated}"
+    );
 }
 
 #[test]

@@ -112,19 +112,21 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
         }
     }
 
-    // One request/response pair per documented operation, plus the three
-    // event examples and the three extra error-outcome examples under
-    // "Errors" (`generation_mismatch`, `vault_changed_during_refresh`, and
-    // the `storage_failure` shape that carries `current_revision` to say a
-    // write reached disk). A count regression here means an operation lost
-    // its documented example, not just that a JSON block became unparseable.
+    // One request/response pair per documented operation — the eleven read
+    // and subscription operations, the ten mutation and raw-file operations,
+    // and the four snapshot-session operations — plus the four event examples
+    // and the three extra error-outcome examples under "Errors"
+    // (`generation_mismatch`, `vault_changed_during_refresh`, and the
+    // `storage_failure` shape that carries `current_revision` to say a write
+    // reached disk). A count regression here means an operation lost its
+    // documented example, not just that a JSON block became unparseable.
     assert_eq!(
-        requests, 11,
-        "expected 11 request examples, see docs/protocol.md"
+        requests, 25,
+        "expected 25 request examples, see docs/protocol.md"
     );
     assert_eq!(
-        responses, 14,
-        "expected 14 response examples (11 success + 3 error), see docs/protocol.md"
+        responses, 28,
+        "expected 28 response examples (25 success + 3 error), see docs/protocol.md"
     );
-    assert_eq!(events, 3, "expected 3 event examples, see docs/protocol.md");
+    assert_eq!(events, 4, "expected 4 event examples, see docs/protocol.md");
 }

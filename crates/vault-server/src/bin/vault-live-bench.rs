@@ -833,6 +833,97 @@ fn measure_lag_recovery() -> CaseReport {
     }
 }
 
+/// A whole vault hydrated through one snapshot session: open, page the entire
+/// tree, page every note's `metadata` and `references` facets, close.
+///
+/// This is the operation the headless host performs once at startup and the
+/// only one in the phase whose cost is proportional to the whole vault, so it
+/// is the design's "< 10 s wall, < 256 MiB peak added RSS at 100k notes"
+/// target — measured, so it can fail.
+///
+/// Bodies are deliberately not requested: `snapshot_notes` carries row-sets
+/// and `get_note` carries bodies, and a hydration that dragged every body
+/// through would measure something no host does.
+///
+/// `stages_ms`/`work` are empty for the same reason `cached_read_availability`
+/// leaves them empty: nothing reconciles here, so there is no
+/// `ReconcileMetrics` to attribute. `affected_references` is repurposed as the
+/// number of notes the last repeat hydrated.
+fn measure_snapshot_hydration(
+    vault_root: &Path,
+    index_path: &Path,
+    notes: usize,
+    repeats: usize,
+) -> CaseReport {
+    let config = IndexConfig::explicit(vault_root, index_path).expect("bench config");
+    let facets = vault_index::NoteFacets {
+        metadata: true,
+        references: true,
+        resolutions: false,
+        backlinks: false,
+        sections: false,
+        list_items: false,
+    };
+
+    let mut samples = Vec::with_capacity(repeats);
+    let mut last_hydrated = 0u64;
+    for _ in 0..repeats {
+        // A fresh registry per repeat, so no repeat reuses a previous
+        // session's already-open connection.
+        let mut sessions = vault_index::SnapshotSessions::new(&config);
+        let start = Instant::now();
+        let opened = sessions.open().expect("open a snapshot");
+
+        let mut entries = 0u64;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = sessions
+                .tree_page(&opened.snapshot_id, cursor.as_deref(), None)
+                .expect("a tree page");
+            entries += page.entries.len() as u64;
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let mut hydrated = 0u64;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = sessions
+                .notes_page(&opened.snapshot_id, cursor.as_deref(), None, facets)
+                .expect("a notes page");
+            hydrated += page.notes.len() as u64;
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        sessions
+            .close(&opened.snapshot_id)
+            .expect("close the snapshot");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+
+        // The counts the session promised at open are the counts it delivered.
+        // A hydration that silently paged short would otherwise look fast.
+        assert_eq!(entries, opened.entry_count, "the tree paged short");
+        assert_eq!(hydrated, opened.note_count, "the notes paged short");
+
+        last_hydrated = hydrated;
+        samples.push(elapsed_ms);
+    }
+    CaseReport {
+        case: "snapshot_hydration".into(),
+        notes,
+        affected_references: last_hydrated,
+        timings_ms: distribution(samples),
+        stages_ms: empty_stage_distributions(),
+        work: WorkSummary::default(),
+        peak_rss_bytes: peak_rss_bytes(),
+    }
+}
+
 fn main() {
     let args = Args::parse();
     assert!(args.notes > 0, "--notes must be greater than zero");
@@ -864,6 +955,10 @@ fn main() {
 
     eprintln!("measuring lag recovery...");
     let lag_recovery = measure_lag_recovery();
+
+    eprintln!("measuring whole-vault hydration through a snapshot session...");
+    let snapshot_hydration =
+        measure_snapshot_hydration(&vault_root, &index_path, args.notes, args.repeats);
 
     eprintln!("measuring startup catch-up...");
     let catch_up = measure_catch_up(&vault_root, args.notes, args.repeats);
@@ -907,6 +1002,7 @@ fn main() {
             catch_up,
             subscriber_delivery,
             lag_recovery,
+            snapshot_hydration,
             attachment_burst,
             attachment_burst_new_folder,
         ],
