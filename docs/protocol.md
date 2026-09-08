@@ -193,7 +193,9 @@ Omitting `expected` altogether is also unconditional. An `expected` object that 
 
 A precondition is checked against **the bytes on disk at mutation time**, not against the index. The index lags the filesystem by a debounce window, so an index-based comparison would be blind to an external edit that has not reconciled yet — and would overwrite it, which is the lost update the mechanism exists to prevent. A failed precondition is `revision_conflict`, carrying `current_revision` (the revision the target actually holds) so a retry loop does not have to re-read and race the next writer.
 
-Which operations take one: `write_note`, `delete_note`, `rename_note`, and `write_file` take `expected`; `copy_file` takes `expected_source`, which is about the source it reads. `create_folder`, `delete_folder`, and `rename_folder` take none — a folder has no bytes and therefore no revision.
+Which operations take one: `write_note`, `patch_frontmatter`, `delete_note`, `rename_note`, and `write_file` take `expected`; `copy_file` takes `expected_source`, which is about the source it reads. `create_folder`, `delete_folder`, and `rename_folder` take none — a folder has no bytes and therefore no revision — and they reject the field itself with `invalid_request` rather than ignoring it.
+
+**Not every shape is valid on every operation, and the server enforces it.** `{"absent": true}` is accepted only by `write_note` and `write_file`, the two verbs that can create a path that was not there. `patch_frontmatter`, `rename_note`, `delete_note`, and `copy_file`'s `expected_source` accept `{"revision": …}` or `{"any": true}` and refuse `absent` with `invalid_request`: each of them needs its subject to already exist, so "the target must not exist" is a precondition they could only ever fail.
 
 **Parent folders are never created implicitly by a file operation.** Every operation that resolves a *file* path — `write_note`, `write_file`, `copy_file`, the renames' destination — answers `parent_not_found` when the folder above it does not exist. `create_folder` is the deliberate exception: it is the verb whose job is to make folders, and it makes the whole chain.
 
@@ -338,6 +340,8 @@ A path that exists but is not a regular file — a directory, a fifo, a socket, 
 `read_file` and `write_file` accept paths under `.obsidian/`. **Every semantic operation refuses them** with `zone_violation` — `write_note`, `patch_frontmatter`, the renames, the copies, the deletes, and the folder operations alike. Nothing in the zone is indexed, so a zone write joins no generation and answers `semantic: false`, and the daemon announces it with a `config_changed` event instead of a `generation_committed`.
 
 The mirror rule holds on the other side: `write_file` refuses an indexable `.md` path outside the zone with `invalid_request`, so the two verbs partition the vault exactly. Whether a path is in the zone is decided by where it *lands* after symlinks and case folding, never by how the request spelled it.
+
+**Known gap: no operation creates a folder inside the zone.** The two rules above compose into a hole. `write_file` never creates parents, so a write into `.obsidian/plugins/new-plugin/data.json` answers `parent_not_found` when that folder does not exist; `create_folder` refuses every zone path with `zone_violation`. So a client can write into a zone folder that already exists — the ordinary case for an installed plugin, and what the example above assumes — but cannot make a new one. A plugin host that installs a plugin needs exactly that, and the gap is named as the follow-up **"Create folders inside the `.obsidian` zone"**, to be resolved in the headless-plugin-host phase rather than worked around by clients.
 
 ## Read-modify-write
 

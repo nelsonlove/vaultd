@@ -14,7 +14,7 @@ Two binaries produce the numbers, both extended by this milestone:
 - CPU: Apple M2
 - RAM: 16 GiB
 - Rust: rustc 1.97.1, release profile
-- Commit: `46fc404` (branch `feat/vault-mutations-and-bulk-reads`, Tasks 1–17 landed; this document is produced by Task 18 on top of it)
+- Commit: measured at `46fc404` (branch `feat/vault-mutations-and-bulk-reads`, Tasks 1–17 landed) **with this milestone's benchmark cases applied on top** — they land in `eb72907`, which is the first commit the command block below can be run from. `--mutations` and `snapshot_hydration` do not exist at `46fc404`.
 - Filesystem: APFS, case-insensitive, on the internal SSD
 
 ## Commands
@@ -138,6 +138,15 @@ Per the design's "Target measurements" (`docs/design/vault-mutations-and-bulk-re
 - *Ask the filesystem instead of enumerating it.* On a case-insensitive volume, `stat` on the caller's spelling plus a comparison of the stored name answers the same question in one syscall for the common case, leaving the full listing for the case where the stored name differs.
 
 **The rename miss is the same story with a second term.** The 120-link figure was never a benchmarked point (this matrix measures 0/10/100/1000, and the plan says so); interpolated, it lands at about 1.04 s at 100k — over the 500 ms target, with roughly 440 ms of it being the vault-size base rather than the repair itself. Both follow-ups above reduce it, and the resolver follow-up ("Resolve rename repair spellings from the live graph's candidate index") reduces the rest. At a fan-out of 10 — which is what most real renames are — the whole burst is 484 ms at 100k and 82 ms at 10k.
+
+## Named follow-ups
+
+Four, so none of them lives only in a paragraph:
+
+- **Cache or replace the case-collision directory scan.** The dominant cost in every mutation case above. Either cache it per folder and invalidate from the watcher's own events for that folder, or answer the question with a `stat` on the caller's spelling plus a comparison of the stored name, keeping the full listing for the case where they differ.
+- **Resolve rename repair spellings from the live graph's candidate index.** Removes the whole-vault `Resolver` rebuild that `plan_repair` performs on every repairing rename — the larger half of `rename_fanout_0`'s vault-size base.
+- **Create folders inside the `.obsidian` zone.** Not a performance item; surfaced by this milestone's documentation pass. `write_file` never creates parents and `create_folder` refuses every zone path, so no operation can make a new folder in the configuration zone. A plugin host installing a plugin needs one; to be resolved in the headless-plugin-host phase.
+- **Phrase `read_file`'s not-a-regular-file refusal for the read path.** `read_file` on a directory answers `target_exists` with "… already exists", which reads as a write refusal. The code is right and the message is direction-wrong; the fix belongs in `Server::read_file`, where the verb is known, not in the shared error mapping. Documented in `docs/protocol.md` in the meantime.
 
 ## Known limits and honest gaps
 
