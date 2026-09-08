@@ -90,6 +90,9 @@ pub struct RuntimeOptions {
     pub watch_config: vault_watch::WatchConfig,
     pub reconcile_interval: Option<std::time::Duration>,
     pub command_capacity: usize,
+    /// Refuse every mutation before it reaches the vault. Reads, snapshot
+    /// sessions, and reconciliation are unaffected.
+    pub read_only: bool,
 }
 
 impl Default for RuntimeOptions {
@@ -99,6 +102,7 @@ impl Default for RuntimeOptions {
             watch_config: vault_watch::WatchConfig::default(),
             reconcile_interval: Some(std::time::Duration::from_secs(60)),
             command_capacity: 256,
+            read_only: false,
         }
     }
 }
@@ -252,6 +256,10 @@ impl Runtime {
         hooks: RuntimeTestHooks,
     ) -> Result<RuntimeHandle, ServerStartupError> {
         let mut index = IndexService::open(config.clone())?;
+        // Before the reader exists and before the coordinator thread starts,
+        // so no mutation can ever run against a service that has not been
+        // told yet.
+        index.set_read_only(options.read_only);
         // Before anything else: readers answer from the last committed
         // generation, and say so. A caller that reads the instant `start`
         // returns must never see `Starting`.

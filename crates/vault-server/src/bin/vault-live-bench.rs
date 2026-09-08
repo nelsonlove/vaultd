@@ -265,6 +265,7 @@ fn runtime_options() -> RuntimeOptions {
         // from the startup catch-up itself), never from a coalesced tick.
         reconcile_interval: None,
         command_capacity: 256,
+        read_only: false,
     }
 }
 

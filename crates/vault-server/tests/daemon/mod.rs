@@ -70,6 +70,7 @@ impl Daemon {
 
     /// A daemon over `vault` with its index in `index`, watcher and periodic
     /// tick off, so every generation in a test is one the test caused.
+    #[allow(dead_code)]
     pub fn for_vault(vault: &TempDir, index: &TempDir) -> Self {
         Self::start(&[
             "--vault",
