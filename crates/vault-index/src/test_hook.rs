@@ -45,6 +45,12 @@ pub enum HookPoint {
     /// visibly unresolved); editing a referrer forces the write-time
     /// compare-and-swap; and deleting one forces the absent-referrer skip.
     BeforeLinkRewrites,
+    /// Every referencing note has been rewritten, the destination is reserved,
+    /// and the renamed file has not moved yet. Aborting from here produces
+    /// exactly the crash the ordering guarantee is about, so the convergence
+    /// claim can be asserted rather than argued; removing the source from here
+    /// forces the reservation's cleanup path.
+    BeforeRenameMove,
 }
 
 /// A test's callback into the engine. `Send + Sync` because the writer may

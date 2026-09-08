@@ -189,34 +189,37 @@ impl IndexService {
         }
     }
 
-    /// Move the file, then rewrite every referencing note — in that order.
+    /// Rewrite every referencing note, then move the file — in that order,
+    /// and never the reverse.
     ///
-    /// **The movement lands first.** Every refusal a rename can produce is
-    /// therefore reached before a single referrer byte has changed, including
-    /// the ones no preflight can see: a foreign writer that occupies the
-    /// destination in the instant between the check and the `rename(2)` gets
-    /// the same clean refusal a preflight-visible one does, and the vault is
-    /// never edited for a rename that did not happen.
+    /// A crash in between leaves references pointing at a path the note has
+    /// not reached yet: visible as an incomplete rename, convergent when the
+    /// client retries, and never the failure mode the other order produces —
+    /// a moved note whose stale inbound links still *look* resolved. That
+    /// failure mode is not hypothetical: with a same-basename note elsewhere
+    /// in the vault, a `[[Alpha]]` left un-rewritten after `Alpha.md` moved
+    /// resolves cleanly at `Archive/Alpha.md`, which is a different note.
     ///
-    /// A crash in between leaves inbound references pointing at a path that no
-    /// longer exists — visible as unresolved references, which is the design's
-    /// own preferred direction, and never a link that looks resolved and is
-    /// not. The reverse order bought nothing here: a reference retargeted at a
-    /// note that has not moved yet is *also* unresolved, so both orders fail
-    /// the same way, and only this one makes a refusal free.
+    /// **The destination is reserved first**, which is what makes this order
+    /// affordable. A rename used to discover `target_exists` at move time,
+    /// after the whole vault had been edited for it. Now the name is claimed
+    /// with `create_atomically` before a single referrer is touched, so a
+    /// foreign writer racing for it is refused while every referrer is still
+    /// byte-identical — and the repaired links, if a crash intervenes, point
+    /// at a placeholder this burst owns rather than at somebody else's note.
+    /// The retry moves over its own leftover.
     ///
-    /// A repair that fails after the move does **not** un-land it. That is the
+    /// Every exit between the reservation and the move gives the reservation
+    /// back, or a refused rename would leave a placeholder note in the vault.
+    ///
+    /// A repair that fails *after* the move does not un-land it. That is the
     /// `link_rewrite_failures` contract: a rename reports what it moved and,
     /// separately, every reference it could not retarget and why.
     ///
-    /// The plan is still computed *before* the movement, because it reads the
-    /// index's pre-move rows and the pre-move bytes; each rewrite carries the
-    /// post-move path it is written to.
-    ///
     /// `expected` present means the note shape, absent the folder one. The
-    /// movement itself goes back through `MutationEngine::apply`, so the
-    /// repairing and non-repairing renames move bytes through exactly the same
-    /// code — the same `rename_paths` primitive, the same guards, the same
+    /// movement goes back through the engine, so the repairing and
+    /// non-repairing renames move bytes through exactly the same code — the
+    /// same `rename_paths` primitive, the same guards, the same
     /// `MutationOutcome`. Only `changed_paths`, `links_rewritten`, and
     /// `link_rewrite_failures` are this function's own; `revision` and
     /// `semantic` are read off that outcome rather than restated here, because
@@ -231,18 +234,41 @@ impl IndexService {
         // Every refusal the index-side work could trip over, before that work
         // runs. This is `rename_paths`'s own guard set, run for its refusals
         // only; the movement below re-runs it with nothing in between.
-        self.engine.preflight_rename(from, to)?;
+        self.engine
+            .preflight_rename_adopting(from, to, expected.is_none())?;
         if let Some(expected) = expected {
             self.engine.check_rename_source(from, expected)?;
         }
 
+        // Claimed before anything is rewritten. From here on every exit runs
+        // through `finish`, which gives the claim back on failure.
+        let reservation = self
+            .engine
+            .reserve_rename_destination(to, from, expected.is_none())?;
+        let outcome = self.repair_then_move(from, to, expected, &reservation);
+        if outcome.is_err() {
+            self.engine.release_rename_destination(to, &reservation);
+        }
+        outcome
+    }
+
+    /// The body of a repairing rename, from a held reservation to a completed
+    /// move. Split out so its caller can return the reservation on every
+    /// failure without an exit path forgetting to.
+    fn repair_then_move(
+        &mut self,
+        from: &VaultPath,
+        to: &VaultPath,
+        expected: Option<&crate::mutate::Precondition>,
+        reservation: &crate::mutate::Reservation,
+    ) -> Result<crate::mutate::MutationOutcome, IndexError> {
         let moves = self.repair_moves(from, to, expected.is_some())?;
         let mut changed_paths: BTreeSet<VaultPath> = BTreeSet::new();
         let mut links_rewritten = 0u64;
         let mut failures: Vec<crate::mutate::LinkRewriteFailure> = Vec::new();
 
-        // Planned before the movement: it reads the index's pre-move rows and
-        // the pre-move bytes on disk. Nothing is written yet.
+        // Planned against the index's pre-move rows and the pre-move bytes on
+        // disk. Nothing is written yet.
         let planned = match self.store.current_generation()? {
             Some(generation) => {
                 self.republish_current(generation)?;
@@ -273,30 +299,15 @@ impl IndexService {
             }
         };
 
-        let moved = self.engine.apply(&match expected {
-            Some(expected) => crate::mutate::Mutation::RenameNote {
-                from: from.clone(),
-                to: to.clone(),
-                expected: expected.clone(),
-                rewrite_links: false,
-            },
-            None => crate::mutate::Mutation::RenameFolder {
-                from: from.clone(),
-                to: to.clone(),
-                rewrite_links: false,
-            },
-        })?;
-        changed_paths.extend(moved.changed_paths);
-
         self.reach(crate::HookPoint::BeforeLinkRewrites);
         for rewrite in planned {
             // Write-time compare-and-swap, with nothing between it and the
-            // write. The plan's own check is minutes-old by the standards of
-            // this loop — every preceding referrer's write sits inside that
-            // window — so a referrer edited since is reported, and one
-            // *deleted* since is left deleted: `resolve` answers `Ok` for an
-            // absent path by design, so an unguarded write here would
-            // resurrect a note somebody removed.
+            // write. The plan's own check is old by the standards of this loop
+            // — every preceding referrer's write sits inside that window — so
+            // a referrer edited since is reported, and one *deleted* since is
+            // left deleted: `resolve` answers `Ok` for an absent path by
+            // design, so an unguarded write here would resurrect a note
+            // somebody removed.
             let reason = match self.engine.current_revision(&rewrite.path)? {
                 Some(current) if current == rewrite.expected => None,
                 Some(_) => Some(crate::mutate::LinkRewriteReason::RevisionConflict),
@@ -315,15 +326,36 @@ impl IndexService {
                     links_rewritten += rewrite.links;
                     changed_paths.insert(rewrite.path);
                 }
-                Err(_) => failures.push(crate::mutate::LinkRewriteFailure {
+                Err(error) => failures.push(crate::mutate::LinkRewriteFailure {
                     path: rewrite.path,
-                    reason: crate::mutate::LinkRewriteReason::WriteFailed,
+                    reason: crate::mutate::LinkRewriteReason::WriteFailed(
+                        crate::mutate::IoKind::of(&error),
+                    ),
                 }),
             }
         }
         failures.sort_by(|left, right| {
             (&left.path, left.reason.as_str()).cmp(&(&right.path, right.reason.as_str()))
         });
+
+        self.reach(crate::HookPoint::BeforeRenameMove);
+        let moved = self.engine.rename_onto_reservation(
+            &match expected {
+                Some(expected) => crate::mutate::Mutation::RenameNote {
+                    from: from.clone(),
+                    to: to.clone(),
+                    expected: expected.clone(),
+                    rewrite_links: false,
+                },
+                None => crate::mutate::Mutation::RenameFolder {
+                    from: from.clone(),
+                    to: to.clone(),
+                    rewrite_links: false,
+                },
+            },
+            reservation,
+        )?;
+        changed_paths.extend(moved.changed_paths);
 
         Ok(crate::mutate::MutationOutcome {
             changed_paths,

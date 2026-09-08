@@ -24,7 +24,20 @@
 //! the intended note. A name no wikilink can spell falls back to Markdown
 //! syntax, where percent-encoding can express it; a reference with no such
 //! fallback — a frontmatter one, which carries wikilinks and nothing else —
-//! is reported rather than corrupted.
+//! is reported rather than corrupted. A wikilink's file target cannot carry a
+//! `#` (it starts the subpath) or a `|` (it starts the display text), and
+//! cannot contain the `]]` that would close the link early — a lone `]` is
+//! fine, and so is `[`, which is why the predicate decides and this list is
+//! only an illustration.
+//!
+//! **And the check is the whole document, not the reference.** A replacement
+//! can be correct in isolation and still change how the bytes around it parse:
+//! `[x][[Alpha]]` is legal prose, and rewriting that wikilink into
+//! `[a|b](a%7Cb)` turns the pair into a reference-style link whose label the
+//! document may define — one vault reference in, zero out. So the patched body
+//! is re-parsed and its whole reference list compared against the intended
+//! one, and a splice that does not survive that is reported rather than
+//! written.
 //!
 //! **What is repaired.** Every reference reaching a moved path, wherever the
 //! referring note lives: outside the move, inside it (a path-form link between
@@ -40,7 +53,12 @@
 //! same way code fences, inline code and math blocks are suppressed. That is
 //! inherited parser policy rather than a decision here, and it is invisible to
 //! this module — there is nothing to report, because nothing was seen.
-//! Everything this module *does* see and decline lands in
+//! A reference that resolved **nowhere** before the rename and whose spelling
+//! names no moved path is left alone and not reported either: it was broken
+//! before this burst and the burst did not break it, so reporting it would
+//! bury the real failures under links the rename never touched. An
+//! **ambiguous** one is different and *is* reported — the rename changes which
+//! note it lands on. Everything else this module sees and declines lands in
 //! [`LinkRewriteFailure`] with a typed reason.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,9 +76,10 @@ use crate::store::IndexStore;
 
 /// One referencing note's finished new body.
 pub(crate) struct Rewrite {
-    /// Where the patched bytes are written — the referrer's **post-move**
-    /// location, which differs from where they were read when the referrer is
-    /// itself inside a renamed folder.
+    /// Where the patched bytes are written: the referrer's location **now**,
+    /// which is where it still is — the rewrites happen before the move, so a
+    /// referrer that is itself inside a renamed folder is written at its old
+    /// path and travels to its new one with the move that follows.
     pub(crate) path: VaultPath,
     pub(crate) patched: String,
     /// The revision this patch was computed from. Re-compared immediately
@@ -222,8 +241,13 @@ pub(crate) fn plan_repair(
         }
 
         let text = stored.source.text();
+        // The reference list as the index parsed these exact bytes, in ordinal
+        // order — `note_references.ordinal` is the position in
+        // `ParsedNote::references`, so the two line up by construction. This is
+        // what the patched body's own parse is compared against.
+        let baseline: Vec<Fingerprint> = stored.references.iter().map(Fingerprint::of).collect();
         let outgoing = store.load_outgoing_by_ordinal(&source)?;
-        let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        let mut splices: Vec<PlannedSplice> = Vec::new();
         for ordinal in ordinals {
             let Some(reference) = outgoing.get(&ordinal) else {
                 // `load_outgoing_by_ordinal` documents an absent key as a
@@ -241,8 +265,16 @@ pub(crate) fn plan_repair(
                 continue;
             };
             // What this reference means to point at, and where that will be.
-            let Some(intended) = intended_target(&source, existing, reference, moves) else {
-                continue;
+            let intended = match intended_target(&source, existing, reference, moves) {
+                Intent::Target(intended) => intended,
+                Intent::Ambiguous => {
+                    failures.push(LinkRewriteFailure {
+                        path: source.clone(),
+                        reason: LinkRewriteReason::AmbiguousTarget,
+                    });
+                    continue;
+                }
+                Intent::Nothing => continue,
             };
             let destination = moves.get(&intended).cloned().unwrap_or(intended.clone());
             if destination == intended && write_target == source {
@@ -267,27 +299,47 @@ pub(crate) fn plan_repair(
                     resolver_governs: note_destinations.contains(&destination),
                 },
                 existing,
+                ordinal,
             ) {
-                Emitted::Unchanged => {}
-                Emitted::Splice(range, bytes) => splices.push((range, bytes)),
-                Emitted::Impossible => failures.push(LinkRewriteFailure {
-                    path: source.clone(),
-                    reason: LinkRewriteReason::UnwritableSpelling,
-                }),
+                Emitted::Unchanged => {
+                    eprintln!(
+                        "DBG unchanged src={:?} ord={ordinal} existing={existing:?} dest={:?}",
+                        source.as_str(),
+                        destination.as_str()
+                    );
+                }
+                Emitted::Splice(splice) => splices.push(*splice),
+                Emitted::Impossible => {
+                    eprintln!(
+                        "DBG impossible src={:?} ord={ordinal} existing={existing:?} dest={:?}",
+                        source.as_str(),
+                        destination.as_str()
+                    );
+                    failures.push(LinkRewriteFailure {
+                        path: source.clone(),
+                        reason: LinkRewriteReason::UnwritableSpelling,
+                    })
+                }
             }
         }
         if splices.is_empty() {
             continue;
         }
-        // Descending, so no earlier splice invalidates a later span.
-        splices.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        let mut patched = text.to_string();
-        let links = splices.len() as u64;
-        for (range, spelling) in splices {
-            patched.replace_range(range, &spelling);
+        // Every splice is judged against the **whole patched body**, not
+        // against its own span: a replacement that is correct in isolation can
+        // still change how the bytes around it parse.
+        let (patched, links, refused) = commit(text, &write_target, &baseline, splices, &resolver);
+        for _ in &refused {
+            failures.push(LinkRewriteFailure {
+                path: source.clone(),
+                reason: LinkRewriteReason::ContextConflict,
+            });
         }
+        let Some(patched) = patched else {
+            continue;
+        };
         rewrites.push(Rewrite {
-            path: write_target,
+            path: source.clone(),
             patched,
             expected: indexed,
             links,
@@ -298,6 +350,21 @@ pub(crate) fn plan_repair(
         (&left.path, left.reason.as_str()).cmp(&(&right.path, right.reason.as_str()))
     });
     Ok(Repair { rewrites, failures })
+}
+
+/// What a reference means to point at, as far as the repair can tell.
+pub(crate) enum Intent {
+    /// One named path.
+    Target(VaultPath),
+    /// The spelling matched more than one note before the rename, and the
+    /// rename changes which one it lands on. There is nothing to preserve and
+    /// the change is real, so this is reported rather than guessed at.
+    Ambiguous,
+    /// Nothing to repair: the reference resolved nowhere and its spelling
+    /// names no moved path either. It was broken before this rename and the
+    /// rename did not break it, so reporting it would flood the answer with
+    /// links the burst never touched.
+    Nothing,
 }
 
 /// The vault path this reference means to point at, if the repair can name one.
@@ -313,19 +380,34 @@ fn intended_target(
     existing: &str,
     reference: &vault_core::ResolvedReference,
     moves: &BTreeMap<VaultPath, VaultPath>,
-) -> Option<VaultPath> {
+) -> Intent {
     match &reference.resolution {
         Resolution::Resolved { target, .. } | Resolution::MissingSubpath { target, .. } => {
-            Some(target.clone())
+            Intent::Target(target.clone())
+        }
+        // Ambiguous *and* touched by this rename: one of the notes the
+        // spelling matched is moving, so the set it chooses between changes
+        // and the reference silently lands somewhere new. Reported.
+        Resolution::Ambiguous { candidates }
+            if candidates
+                .iter()
+                .any(|candidate| moves.contains_key(candidate)) =>
+        {
+            Intent::Ambiguous
         }
         _ => {
             let spelled = if existing.starts_with("./") || existing.starts_with("../") {
-                relative_to_absolute(source, existing)?
+                match relative_to_absolute(source, existing) {
+                    Some(spelled) => spelled,
+                    None => return Intent::Nothing,
+                }
             } else {
                 existing.to_string()
             };
-            let path = VaultPath::new(spelled).ok()?;
-            moves.contains_key(&path).then_some(path)
+            match VaultPath::new(spelled) {
+                Ok(path) if moves.contains_key(&path) => Intent::Target(path),
+                _ => Intent::Nothing,
+            }
         }
     }
 }
@@ -348,7 +430,7 @@ struct Emission<'a> {
 
 enum Emitted {
     Unchanged,
-    Splice(std::ops::Range<usize>, String),
+    Splice(Box<PlannedSplice>),
     Impossible,
 }
 
@@ -358,7 +440,7 @@ enum Emitted {
 /// in the reference's **own syntax** first and then, if that syntax cannot
 /// spell it, as a Markdown link. Every attempt is re-parsed and checked; the
 /// first that survives wins.
-fn emit(emission: Emission<'_>, existing: &str) -> Emitted {
+fn emit(emission: Emission<'_>, existing: &str, ordinal: u32) -> Emitted {
     for candidate in candidates(emission.source, existing, emission.destination) {
         for replacement in [
             in_place(&emission, &candidate),
@@ -373,10 +455,129 @@ fn emit(emission: Emission<'_>, existing: &str) -> Emitted {
             if emission.text[replacement.range.clone()] == replacement.bytes {
                 return Emitted::Unchanged;
             }
-            return Emitted::Splice(replacement.range, replacement.bytes);
+            return Emitted::Splice(Box::new(PlannedSplice {
+                ordinal,
+                intended: Fingerprint {
+                    kind: replacement.intended_kind,
+                    origin: emission.reference.reference.origin,
+                    raw_target: replacement.intended_raw,
+                    file_target: Some(replacement.intended_file),
+                    subpath: emission.reference.reference.subpath.clone(),
+                    display: replacement.intended_display,
+                },
+                range: replacement.range,
+                bytes: replacement.bytes,
+                destination: emission.destination.clone(),
+                resolver_governs: emission.resolver_governs,
+            }));
         }
     }
     Emitted::Impossible
+}
+
+/// Apply `splices` to `text`, descending so no earlier splice invalidates a
+/// later span.
+fn patch(text: &str, splices: &[&PlannedSplice]) -> String {
+    let mut ordered: Vec<&&PlannedSplice> = splices.iter().collect();
+    ordered.sort_by_key(|splice| std::cmp::Reverse(splice.range.start));
+    let mut patched = text.to_string();
+    for splice in ordered {
+        patched.replace_range(splice.range.clone(), &splice.bytes);
+    }
+    patched
+}
+
+/// Whether the body `splices` produces still parses to exactly the reference
+/// list it was supposed to.
+///
+/// **The whole body, not the spans.** A replacement that is correct in
+/// isolation can still change how the bytes around it parse: `[label]`
+/// immediately before a wikilink is legal prose, and turning that wikilink
+/// into `[text](dest)` makes CommonMark read the pair as a reference-style
+/// link with an undefined label — literal text, and the reference is gone.
+/// Validating each replacement against its own span cannot see that, and no
+/// wider *window* is sound either, because the label can sit on an earlier
+/// line of the same paragraph. So the check is the document.
+///
+/// One parse per referrer on the happy path: the whole set is tried at once,
+/// and only a failure costs a per-splice bisect to find the culprit.
+fn parses_as_planned(
+    text: &str,
+    path: &VaultPath,
+    baseline: &[Fingerprint],
+    splices: &[&PlannedSplice],
+    resolver: &Resolver,
+) -> Option<String> {
+    let patched = patch(text, splices);
+    let mut expected: Vec<Fingerprint> = baseline.to_vec();
+    for splice in splices {
+        let slot = expected.get_mut(splice.ordinal as usize)?;
+        *slot = splice.intended.clone();
+    }
+
+    let parsed = parse_note(SourceDocument::new(path.clone(), patched.clone()));
+    if parsed.references.len() != expected.len() {
+        return None;
+    }
+    for (reference, wanted) in parsed.references.iter().zip(expected.iter()) {
+        if Fingerprint::of(reference) != *wanted {
+            return None;
+        }
+    }
+    // And the rewritten ones land where they were aimed, read from the body
+    // they actually sit in.
+    for splice in splices {
+        if !splice.resolver_governs {
+            continue;
+        }
+        let reference = parsed.references.get(splice.ordinal as usize)?;
+        let resolved = resolver.resolve_target(path, &LinkTarget::from(reference));
+        let reached = match resolved {
+            Resolution::Resolved { target, .. } | Resolution::MissingSubpath { target, .. } => {
+                target
+            }
+            _ => return None,
+        };
+        if reached != splice.destination {
+            return None;
+        }
+    }
+    Some(patched)
+}
+
+/// Commit as many of `splices` as the whole-body check accepts, and name the
+/// references it refuses.
+///
+/// The whole set is tried first, so an ordinary referrer costs one parse. When
+/// that fails, splices are added one at a time and the body re-checked after
+/// each, which finds the culprit exactly rather than throwing the referrer's
+/// whole repair away for one bad reference.
+fn commit(
+    text: &str,
+    path: &VaultPath,
+    baseline: &[Fingerprint],
+    splices: Vec<PlannedSplice>,
+    resolver: &Resolver,
+) -> (Option<String>, u64, Vec<u32>) {
+    let all: Vec<&PlannedSplice> = splices.iter().collect();
+    if let Some(patched) = parses_as_planned(text, path, baseline, &all, resolver) {
+        return (Some(patched), splices.len() as u64, Vec::new());
+    }
+
+    let mut accepted: Vec<&PlannedSplice> = Vec::new();
+    let mut refused = Vec::new();
+    let mut patched = None;
+    for splice in &splices {
+        accepted.push(splice);
+        match parses_as_planned(text, path, baseline, &accepted, resolver) {
+            Some(body) => patched = Some(body),
+            None => {
+                accepted.pop();
+                refused.push(splice.ordinal);
+            }
+        }
+    }
+    (patched, accepted.len() as u64, refused)
 }
 
 struct Replacement {
@@ -391,15 +592,66 @@ struct Replacement {
     /// `[[X]]` shows its target and `[](X)` has nowhere to show one, so it
     /// cannot be compared against the original's `None`.
     intended_display: Option<String>,
+    /// The whole destination the emitted link is supposed to carry, verbatim —
+    /// encoding and subpath included. Compared as well as the decoded halves,
+    /// so a replacement cannot change a spelling this planner did not intend.
+    intended_raw: String,
+    /// The link kind the emitted bytes must parse back as.
+    intended_kind: ReferenceKind,
+}
+
+/// Everything about one reference that must be true of the patched body.
+///
+/// Compared against a **whole-body** re-parse, position by position: the
+/// rewritten references must have changed exactly as planned and every other
+/// reference must be identical. Anything narrower cannot see syntax that
+/// reaches across a reference's own span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Fingerprint {
+    kind: ReferenceKind,
+    origin: ReferenceOrigin,
+    raw_target: String,
+    file_target: Option<String>,
+    subpath: Option<Subpath>,
+    display: Option<String>,
+}
+
+impl Fingerprint {
+    fn of(reference: &Reference) -> Self {
+        Self {
+            kind: reference.kind,
+            origin: reference.origin,
+            raw_target: reference.raw_target.clone(),
+            file_target: reference.file_target.clone(),
+            subpath: reference.subpath.clone(),
+            display: reference.display.clone(),
+        }
+    }
+}
+
+/// One accepted replacement, waiting on the whole-body check.
+struct PlannedSplice {
+    ordinal: u32,
+    range: std::ops::Range<usize>,
+    bytes: String,
+    intended: Fingerprint,
+    destination: VaultPath,
+    resolver_governs: bool,
 }
 
 /// The same syntax, with only the file-target bytes changed.
 fn in_place(emission: &Emission<'_>, candidate: &str) -> Option<Replacement> {
     Some(Replacement {
         range: emission.file_range.clone(),
-        bytes: encode_for(emission.reference.reference.kind, candidate),
+        bytes: encode_for(emission.reference.reference.kind, candidate).clone(),
         intended_file: candidate.to_string(),
         intended_display: emission.reference.reference.display.clone(),
+        intended_raw: format!(
+            "{}{}",
+            encode_for(emission.reference.reference.kind, candidate),
+            &emission.reference.reference.raw_target[emission.file_range.len()..]
+        ),
+        intended_kind: emission.reference.reference.kind,
     })
 }
 
@@ -441,6 +693,12 @@ fn as_markdown_link(emission: &Emission<'_>, candidate: &str) -> Option<Replacem
         ),
         intended_file: candidate.to_string(),
         intended_display: Some(display),
+        intended_raw: destination,
+        intended_kind: if embed {
+            ReferenceKind::MarkdownEmbed
+        } else {
+            ReferenceKind::MarkdownLink
+        },
     })
 }
 
@@ -486,7 +744,8 @@ fn means_what_it_should(emission: &Emission<'_>, replacement: &Replacement) -> b
     if parsed.file_target.as_deref() != Some(replacement.intended_file.as_str())
         || parsed.subpath != original.subpath
         || parsed.display != replacement.intended_display
-        || parsed.kind != expected_kind(original.kind, replacement, &span)
+        || parsed.kind != replacement.intended_kind
+        || parsed.raw_target != replacement.intended_raw
     {
         return false;
     }
@@ -500,24 +759,6 @@ fn means_what_it_should(emission: &Emission<'_>, replacement: &Replacement) -> b
         Resolution::Resolved { target, .. } | Resolution::MissingSubpath { target, .. }
             if &target == emission.destination
     )
-}
-
-/// The link kind the emitted bytes must parse back as: the original's when the
-/// splice stayed inside it, and the Markdown twin when the whole reference was
-/// replaced. Checked so a wikilink that silently stopped being one — an
-/// unbalanced bracket in a name, say — is refused rather than written.
-fn expected_kind(
-    original: ReferenceKind,
-    replacement: &Replacement,
-    span: &std::ops::Range<usize>,
-) -> ReferenceKind {
-    if replacement.range != *span {
-        return original;
-    }
-    match original {
-        ReferenceKind::WikiEmbed | ReferenceKind::MarkdownEmbed => ReferenceKind::MarkdownEmbed,
-        ReferenceKind::Wikilink | ReferenceKind::MarkdownLink => ReferenceKind::MarkdownLink,
-    }
 }
 
 /// The byte range of the **file half** of one reference's destination.

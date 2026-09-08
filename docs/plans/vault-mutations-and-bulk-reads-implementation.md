@@ -11658,6 +11658,8 @@ fn case_rename_fanout(
 }
 ```
 
+**Warning — this case cannot see the repair planner's other cost axis.** `rename_fanout_*` varies *fan-out* against a **fixed** vault, and `mutate::rename::plan_repair` rebuilds a whole-vault `Resolver` from `LiveGraph::note_paths()` on every repairing rename: one `ResolutionNote` clone per note in the vault, headings and block ids included. That is O(vault), not O(fan-out), so it appears as a constant offset in all four points here and the curve looks flat in exactly the term that is not. Read these numbers as the fan-out curve only; the vault-size term needs its own case (same fan-out, vault size varied) or it will not be measured at all. The follow-up that removes the cost — resolving from the live graph's own candidate index instead of a rebuilt catalog — is tracked as *"Resolve rename repair spellings from the live graph's candidate index"*.
+
 Note the two deliberate choices a reviewer should check rather than assume. The fixture reconciliation uses `ChangeCause::Manual`, matching the file's existing `seed` helper, so the *timed* section is the only thing tagged `Mutation` and a stage profile can be read without filtering. And `write_note_body` returns the `VaultPath` it wrote, which is why the dirty set is built from its return value rather than reconstructed — the existing live cases do the same.
 
 - [ ] **Step 3: Add the hydration case to the runtime benchmark**

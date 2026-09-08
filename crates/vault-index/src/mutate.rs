@@ -791,11 +791,28 @@ pub enum LinkRewriteReason {
     /// rewrite the wrong bytes.
     SpanMismatch,
     /// No link syntax available at this reference can spell the destination's
-    /// name. A wikilink cannot express `#`, `|`, `[` or `]` in a file target,
-    /// and a frontmatter reference has no other syntax to fall back to.
+    /// name. A wikilink's file target cannot carry `#` (it starts the subpath)
+    /// or `|` (it starts the display text), and cannot contain the `]]` that
+    /// would close the link early — a lone `]` is fine, and so is `[`. A
+    /// frontmatter reference has no other syntax to fall back to, because
+    /// frontmatter carries wikilinks and nothing else.
     UnwritableSpelling,
+    /// The replacement parses correctly on its own and changes how the
+    /// *surrounding document* parses. `[label]` immediately before a wikilink
+    /// is legal prose; rewriting that wikilink into `[text](dest)` makes
+    /// CommonMark read the pair as a reference-style link with an undefined
+    /// label — literal text, and one reference fewer. Refused rather than
+    /// written, and the referrer is left exactly as it was.
+    ContextConflict,
+    /// The reference was already ambiguous — its spelling matched more than
+    /// one note before the rename — so there is no single target to preserve.
+    /// The rename changes which note it lands on, and guessing would silently
+    /// re-point a link the author never aimed at one note.
+    AmbiguousTarget,
     /// The rewrite was planned and validated and the filesystem write failed.
-    WriteFailed,
+    /// The kind is carried for a diagnostic; it never reaches the wire, where
+    /// this is one flat code.
+    WriteFailed(IoKind),
     /// **Burst-scoped, not per-referrer.** No generation has ever been
     /// published, so there was no graph to ask which references point at the
     /// moved path. `LinkRewriteFailure::path` names the rename's own subject
@@ -813,8 +830,47 @@ impl LinkRewriteReason {
             Self::ReferenceMissing => "reference_missing",
             Self::SpanMismatch => "span_mismatch",
             Self::UnwritableSpelling => "unwritable_spelling",
-            Self::WriteFailed => "write_failed",
+            Self::ContextConflict => "context_conflict",
+            Self::AmbiguousTarget => "ambiguous_target",
+            Self::WriteFailed(_) => "write_failed",
             Self::IndexUnavailable => "index_unavailable",
+        }
+    }
+}
+
+/// The classification of a failed filesystem write, redacted to a kind.
+///
+/// Carried so an operator can tell a full disk from a permissions problem
+/// without the daemon leaking a path or an OS message into a client's answer:
+/// [`MutationError::Io`]'s own text is deliberately not propagated here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoKind {
+    PermissionDenied,
+    StorageFull,
+    NotFound,
+    ReadOnlyFilesystem,
+    Other,
+}
+
+impl IoKind {
+    /// Classify a refusal a write produced. Everything that is not an
+    /// [`MutationError::Io`] is `Other`: the write path's other refusals are
+    /// not filesystem conditions.
+    pub(crate) fn of(error: &MutationError) -> Self {
+        let MutationError::Io { message } = error else {
+            return Self::Other;
+        };
+        let lowered = message.to_lowercase();
+        if lowered.contains("permission denied") {
+            Self::PermissionDenied
+        } else if lowered.contains("no space left") || lowered.contains("quota") {
+            Self::StorageFull
+        } else if lowered.contains("no such file") {
+            Self::NotFound
+        } else if lowered.contains("read-only") {
+            Self::ReadOnlyFilesystem
+        } else {
+            Self::Other
         }
     }
 }
@@ -2088,6 +2144,16 @@ impl MutationEngine {
         to: &VaultPath,
         expected: &Precondition,
     ) -> Result<MutationOutcome, MutationError> {
+        self.rename_note_onto(from, to, expected, None)
+    }
+
+    fn rename_note_onto(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        expected: &Precondition,
+        reservation: Option<&Reservation>,
+    ) -> Result<MutationOutcome, MutationError> {
         if is_unindexable(from) {
             return Err(MutationError::ZoneViolation { path: from.clone() });
         }
@@ -2120,7 +2186,7 @@ impl MutationEngine {
         // neither its content at the old path nor a revision to retry against.
         self.recheck_present(from, &resolved, expected)?;
 
-        let changed_paths = self.rename_paths(from, to)?;
+        let changed_paths = self.rename_paths_onto(from, to, reservation)?;
         let semantic = changed_paths.iter().any(VaultPath::is_markdown);
         // Read after the move, from the file that is now there. Any failure is
         // swallowed rather than propagated, for `written_path`'s reason: the
@@ -2152,6 +2218,15 @@ impl MutationEngine {
         from: &VaultPath,
         to: &VaultPath,
     ) -> Result<MutationOutcome, MutationError> {
+        self.rename_folder_onto(from, to, None)
+    }
+
+    fn rename_folder_onto(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        reservation: Option<&Reservation>,
+    ) -> Result<MutationOutcome, MutationError> {
         if is_unindexable_folder(from) {
             return Err(MutationError::ZoneViolation { path: from.clone() });
         }
@@ -2175,7 +2250,7 @@ impl MutationEngine {
             }
             Err(error) => return Err(io(error)),
         }
-        let changed_paths = self.rename_paths(from, to)?;
+        let changed_paths = self.rename_paths_onto(from, to, reservation)?;
         Ok(MutationOutcome {
             // Read off the Markdown subset, not off `changed_paths`, per the
             // `MutationOutcome::semantic` table: a folder of attachments moves
@@ -2252,7 +2327,25 @@ impl MutationEngine {
         from: &VaultPath,
         to: &VaultPath,
     ) -> Result<BTreeSet<VaultPath>, MutationError> {
-        let plan = self.plan_rename(from, to)?;
+        self.rename_paths_onto(from, to, None)
+    }
+
+    /// [`MutationEngine::rename_paths`], moving over a destination this caller
+    /// already claimed with [`MutationEngine::reserve_rename_destination`].
+    ///
+    /// The occupancy refusals are skipped for exactly that reservation and
+    /// nothing else: the claim is re-verified immediately below, so a squatter
+    /// who removed the placeholder and put their own file there is still
+    /// refused. `rename(2)` replaces a regular file, and an *empty* directory,
+    /// atomically — which is what makes "move over your own placeholder" one
+    /// step rather than an unlink and a race.
+    fn rename_paths_onto(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        reservation: Option<&Reservation>,
+    ) -> Result<BTreeSet<VaultPath>, MutationError> {
+        let plan = self.plan_rename_onto(from, to, reservation)?;
 
         // Enumerated *before* the move, under the stored spelling, per Ruling
         // B4: every path that leaves its old location has to reach
@@ -2295,7 +2388,182 @@ impl MutationEngine {
     /// answer — so the two can never drift apart into a preflight that lets
     /// through what the movement then refuses.
     pub fn preflight_rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), MutationError> {
-        self.plan_rename(from, to).map(|_| ())
+        self.plan_rename_onto(from, to, None).map(|_| ())
+    }
+
+    /// [`MutationEngine::preflight_rename`], tolerating a destination that
+    /// holds nothing but a reservation this operation is about to adopt.
+    ///
+    /// A crash between a repairing rename's rewrites and its move leaves the
+    /// reservation behind, and the retry has to be able to complete — that is
+    /// the design's "self-heal when the client retries the rename". A
+    /// preflight that refused its own leftover would make the retry
+    /// permanently impossible, which is the opposite of convergence.
+    ///
+    /// It tolerates exactly two things: a note whose bytes are
+    /// [`RENAME_RESERVATION`] verbatim, and an **empty** directory. Anything
+    /// else at the destination is `target_exists`, as it would be without a
+    /// reservation in play.
+    pub fn preflight_rename_adopting(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        folder: bool,
+    ) -> Result<(), MutationError> {
+        let adoptable = if folder {
+            Reservation::Folder
+        } else {
+            Reservation::File
+        };
+        self.plan_rename_onto(from, to, Some(&adoptable))
+            .map(|_| ())
+    }
+
+    /// Claim `to` so nothing else can take it while the referrers are
+    /// rewritten.
+    ///
+    /// Link repair rewrites referencing notes **before** the file moves, which
+    /// is what the design's ordering guarantee is about: a crash then leaves
+    /// references pointing at a path the note has not reached yet, which is
+    /// visible, rather than a moved note whose stale inbound links still look
+    /// resolved — and, with a same-basename note elsewhere in the vault, look
+    /// resolved *at the wrong note*. The cost of that order used to be a
+    /// move-time `target_exists` discovered after the whole vault had been
+    /// edited. Claiming the destination first removes it: the name is taken by
+    /// [`create_atomically`] — `link(2)`, so the kernel does the compare and
+    /// the swap in one step — and a foreign writer racing for it is refused
+    /// while every referrer is still byte-identical.
+    ///
+    /// The placeholder carries [`RENAME_RESERVATION`], and a *re-run* adopts a
+    /// placeholder holding exactly those bytes rather than refusing it. That
+    /// is what makes the design's "self-heal when the client retries the
+    /// rename" true: a crash between the rewrites and the move leaves the
+    /// reservation behind, and the retry moves over its own leftover. Adoption
+    /// is a byte-exact match on a marker no ordinary note carries; anything
+    /// else at the name is `target_exists`, as it would be without a
+    /// reservation at all.
+    ///
+    /// A **case-only** rename reserves nothing and answers
+    /// [`Reservation::None`]: there the source and the destination are the
+    /// same file, so there is no free name to claim and nothing for a squatter
+    /// to take.
+    pub fn reserve_rename_destination(
+        &self,
+        to: &VaultPath,
+        from: &VaultPath,
+        folder: bool,
+    ) -> Result<Reservation, MutationError> {
+        if self.read_only {
+            return Err(MutationError::ReadOnly);
+        }
+        if is_case_only_rename(from, to) {
+            return Ok(Reservation::None);
+        }
+        let destination = self.resolve(to)?;
+        if folder {
+            return match std::fs::create_dir(&destination) {
+                Ok(()) => Ok(Reservation::Folder),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Adopted only when it is an *empty* directory: a rename
+                    // over a non-empty one fails `ENOTEMPTY` anyway, so
+                    // adopting one would only move the refusal later.
+                    let empty = std::fs::read_dir(&destination)
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(false);
+                    if empty {
+                        Ok(Reservation::Folder)
+                    } else {
+                        Err(MutationError::TargetExists { path: to.clone() })
+                    }
+                }
+                Err(error) => Err(io(error)),
+            };
+        }
+        match create_atomically(&destination, RENAME_RESERVATION)? {
+            Claimed::Yes => Ok(Reservation::File),
+            Claimed::Taken => {
+                match self.read_regular_file(to, &destination)? {
+                    Some(bytes) if bytes == RENAME_RESERVATION => Ok(Reservation::File),
+                    // Anything else at the name is somebody's file, and this
+                    // is the refusal a rename owes them.
+                    _ => Err(MutationError::TargetExists { path: to.clone() }),
+                }
+            }
+        }
+    }
+
+    /// Give a reservation back, for a rename that will not happen after all.
+    ///
+    /// Removes the placeholder **only** while it is still the placeholder, so
+    /// a refusal never deletes a file a foreign writer put there in the
+    /// meantime. Best-effort by construction: a failure to clean up must not
+    /// replace the refusal the caller is already reporting.
+    pub fn release_rename_destination(&self, to: &VaultPath, reservation: &Reservation) {
+        let Ok(destination) = self.resolve(to) else {
+            return;
+        };
+        match reservation {
+            Reservation::None => {}
+            Reservation::Folder => {
+                // `remove_dir` refuses a non-empty directory, which is the
+                // guard: anything created inside it since is not ours.
+                let _ = std::fs::remove_dir(&destination);
+            }
+            Reservation::File => {
+                if matches!(
+                    self.read_regular_file(to, &destination),
+                    Ok(Some(ref bytes)) if bytes.as_slice() == RENAME_RESERVATION
+                ) {
+                    let _ = std::fs::remove_file(&destination);
+                }
+            }
+        }
+    }
+
+    /// Whether `to` still holds `reservation` and nothing else.
+    fn holds_reservation(
+        &self,
+        to: &VaultPath,
+        destination: &Path,
+        reservation: &Reservation,
+    ) -> Result<bool, MutationError> {
+        Ok(match reservation {
+            Reservation::None => false,
+            Reservation::Folder => match std::fs::read_dir(destination) {
+                Ok(mut entries) => entries.next().is_none(),
+                Err(_) => false,
+            },
+            Reservation::File => {
+                matches!(self.read_regular_file(to, destination)?, Some(bytes) if bytes == RENAME_RESERVATION)
+            }
+        })
+    }
+
+    /// Apply a rename whose destination this caller already reserved.
+    ///
+    /// Routed through the same arms an ordinary rename takes — the same
+    /// guards, the same precondition re-check, the same
+    /// [`MutationOutcome`] — so a repairing rename and a plain one differ in
+    /// the reservation and in nothing else.
+    pub fn rename_onto_reservation(
+        &self,
+        mutation: &Mutation,
+        reservation: &Reservation,
+    ) -> Result<MutationOutcome, MutationError> {
+        if self.read_only {
+            return Err(MutationError::ReadOnly);
+        }
+        match mutation {
+            Mutation::RenameNote {
+                from, to, expected, ..
+            } => self.rename_note_onto(from, to, expected, Some(reservation)),
+            Mutation::RenameFolder { from, to, .. } => {
+                self.rename_folder_onto(from, to, Some(reservation))
+            }
+            _ => Err(MutationError::InvalidPrecondition {
+                expected: Precondition::Any,
+            }),
+        }
     }
 
     /// The stored spelling of an existing path: the one the filesystem holds
@@ -2331,7 +2599,12 @@ impl MutationEngine {
     }
 
     /// Everything `rename_paths` decides before it touches the filesystem.
-    fn plan_rename(&self, from: &VaultPath, to: &VaultPath) -> Result<RenamePlan, MutationError> {
+    fn plan_rename_onto(
+        &self,
+        from: &VaultPath,
+        to: &VaultPath,
+        reservation: Option<&Reservation>,
+    ) -> Result<RenamePlan, MutationError> {
         if self.read_only {
             return Err(MutationError::ReadOnly);
         }
@@ -2423,7 +2696,15 @@ impl MutationEngine {
         {
             return Err(MutationError::ZoneViolation { path: to.clone() });
         }
-        if !case_only {
+        // A destination this caller reserved is not an occupant: the
+        // placeholder is ours, and the move replaces it. Verified against the
+        // reservation's own identity rather than assumed, so a squatter who
+        // replaced the placeholder is refused exactly as an unreserved one is.
+        let reserved = match reservation {
+            Some(reservation) => self.holds_reservation(to, &destination, reservation)?,
+            None => false,
+        };
+        if !case_only && !reserved {
             // Case before existence, for the reason `copy_file` gives: on a
             // case-folding filesystem `two.md` "exists" because `Two.md` does,
             // and `target_exists` would name a path this vault does not store.
@@ -2449,8 +2730,30 @@ impl MutationEngine {
     }
 }
 
-/// A validated rename: everything [`MutationEngine::plan_rename`] resolved and
-/// refused on, handed to the movement so nothing is resolved twice.
+/// The bytes a reserved rename destination holds until the move replaces it.
+///
+/// A marker rather than an empty file, and the difference is load-bearing: a
+/// re-run adopts a placeholder holding exactly these bytes, and an empty note
+/// is something a user plausibly has. Nothing else in a vault carries this
+/// line, so adoption cannot capture somebody's file. It reads as what it is if
+/// a crash ever leaves one behind.
+pub(crate) const RENAME_RESERVATION: &[u8] =
+    b"<!-- vaultd: rename in progress; this placeholder is replaced when the rename completes -->\n";
+
+/// A claim on a rename's destination, held while the referrers are rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reservation {
+    /// A placeholder note holding [`RENAME_RESERVATION`].
+    File,
+    /// An empty directory.
+    Folder,
+    /// Nothing was claimed, because there was nothing to claim: a case-only
+    /// rename addresses one file by two spellings.
+    None,
+}
+
+/// A validated rename: everything `plan_rename_onto` resolved and refused on,
+/// handed to the movement so nothing is resolved twice.
 struct RenamePlan {
     source: PathBuf,
     destination: PathBuf,

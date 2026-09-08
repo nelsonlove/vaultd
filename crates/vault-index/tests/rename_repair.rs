@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 use vault_core::VaultPath;
 use vault_index::{
-    HookPoint, IndexConfig, IndexService, LinkRewriteReason, Mutation, MutationError, Precondition,
-    TestHook, revision_of,
+    HookPoint, IndexConfig, IndexService, IoKind, LinkRewriteReason, Mutation, MutationError,
+    Precondition, TestHook, revision_of,
 };
 
 struct Fixture {
@@ -488,66 +488,50 @@ fn every_rewrite_and_the_move_land_in_one_generation() {
     assert!(report.changes.created.contains(&path("Renamed.md")));
 }
 
-/// A refusal the preflight could not see — a foreign writer occupying the
-/// destination between the preflight and the move — leaves every referrer
-/// byte-identical, because the movement is what runs first.
+/// The destination is claimed **before** a single referrer is rewritten, so a
+/// foreign writer racing for the same name is refused while the vault is still
+/// byte-identical. Asserted from inside the rendezvous point, which is the only
+/// place both facts are simultaneously observable.
 #[test]
-fn a_movement_refused_after_the_preflight_leaves_every_referrer_untouched() {
+fn the_destination_is_reserved_before_any_referrer_is_rewritten() {
     let mut fixture = fixture();
-    let destination = fixture.root.join("Renamed.md");
+    let root = fixture.root.clone();
+    let seen = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&seen);
     fixture
         .service
-        .install_test_hook(once_at(HookPoint::AfterMutationPrecondition, move || {
-            std::fs::write(&destination, "# squatted\n").expect("occupy the destination");
+        .install_test_hook(once_at(HookPoint::BeforeLinkRewrites, move || {
+            assert!(
+                root.join("Renamed.md").is_file(),
+                "the destination must already be claimed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("Short.md")).expect("read Short"),
+                "before [[Alpha]] after\n",
+                "no referrer may have been rewritten yet"
+            );
+            observed.store(true, Ordering::SeqCst);
         }));
 
-    let error = fixture
-        .service
-        .apply_mutation(&Mutation::RenameNote {
-            from: path("Alpha.md"),
-            to: path("Renamed.md"),
-            expected: Precondition::Any,
-            rewrite_links: true,
-        })
-        .expect_err("the destination was occupied under us");
-    assert!(
-        matches!(
-            error,
-            vault_index::IndexError::Mutation(MutationError::TargetExists { .. })
-        ),
-        "expected target_exists, got {error:?}"
-    );
+    rename(&mut fixture, "Alpha.md", "Renamed.md");
+    assert!(seen.load(Ordering::SeqCst), "the rendezvous never fired");
+    assert_eq!(read(&fixture, "Short.md"), "before [[Renamed]] after\n");
     assert_eq!(
-        read(&fixture, "Short.md"),
-        "before [[Alpha]] after\n",
-        "the vault is never edited for a rename that did not happen"
+        read(&fixture, "Renamed.md"),
+        "# Heading\n\ntext ^block\n",
+        "the move replaces the placeholder with the real note"
     );
-    assert_eq!(read(&fixture, "Extended.md"), "[[Alpha.md]]\n");
-    assert!(fixture.root.join("Alpha.md").is_file());
 }
 
-/// A crash between the move and the rewrites leaves inbound links pointing at
-/// a path that no longer exists — visible as unresolved references, which is
-/// the design's own preferred direction, and never a link that looks resolved
-/// and is not.
+/// The spec's ordering claim, restored: referrers first, the file last, and a
+/// crash in between self-heals when the client retries the rename.
 #[test]
-fn a_crash_between_the_move_and_the_rewrites_leaves_the_links_visibly_dead() {
-    struct StopBeforeRewrites {
-        fired: AtomicBool,
-    }
-    impl TestHook for StopBeforeRewrites {
-        fn reach(&self, point: HookPoint) {
-            if point == HookPoint::BeforeLinkRewrites && !self.fired.swap(true, Ordering::SeqCst) {
-                panic!("simulated crash between the move and the rewrites");
-            }
-        }
-    }
-
+fn a_crash_between_the_rewrites_and_the_move_converges_on_a_retry() {
     let mut fixture = fixture();
     fixture
         .service
-        .install_test_hook(Arc::new(StopBeforeRewrites {
-            fired: AtomicBool::new(false),
+        .install_test_hook(once_at(HookPoint::BeforeRenameMove, || {
+            panic!("simulated crash between the rewrites and the move");
         }));
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = fixture.service.apply_mutation(&Mutation::RenameNote {
@@ -559,23 +543,167 @@ fn a_crash_between_the_move_and_the_rewrites_leaves_the_links_visibly_dead() {
     }));
     assert!(crashed.is_err(), "the hook must have aborted the burst");
 
-    assert!(fixture.root.join("Renamed.md").is_file());
-    assert!(!fixture.root.join("Alpha.md").exists());
-    assert_eq!(
-        read(&fixture, "Short.md"),
-        "before [[Alpha]] after\n",
-        "the referrer is untouched, so its reference is unresolved rather than wrong"
+    // Referrers already point at the new path; the note is still at the old
+    // one, and the new one holds the reservation this burst claimed.
+    assert_eq!(read(&fixture, "Short.md"), "before [[Renamed]] after\n");
+    assert!(fixture.root.join("Alpha.md").is_file());
+    assert!(
+        fixture.root.join("Renamed.md").is_file(),
+        "the reservation is what the repaired links point at"
     );
 
-    // And the index agrees it is unresolved rather than pointing somewhere
-    // wrong: `Alpha.md` is gone, so nothing answers for it.
+    // The hook fires once, so the retry completes the move over the
+    // reservation this burst left behind.
+    rename(&mut fixture, "Alpha.md", "Renamed.md");
+    assert!(!fixture.root.join("Alpha.md").exists());
+    assert_eq!(read(&fixture, "Renamed.md"), "# Heading\n\ntext ^block\n");
+    assert_eq!(read(&fixture, "Short.md"), "before [[Renamed]] after\n");
+}
+
+/// The state the ordering exists to prevent. `Archive/Alpha.md` shadows the
+/// basename, so a crash that had moved the file first would leave `[[Alpha]]`
+/// resolving to a **different existing note** — resolved, and wrong. Rewriting
+/// first plus reserving the destination makes the crash state resolve to the
+/// reservation instead: visibly incomplete, never quietly misdirected.
+#[test]
+fn a_crash_before_the_move_never_lets_a_repaired_link_reach_a_shadowed_namesake() {
+    let mut fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join("Archive")).expect("create Archive");
+    std::fs::write(fixture.root.join("Archive/Renamed.md"), "# shadow\n")
+        .expect("write the shadowing namesake");
+    fixture.service.refresh(false).expect("index the shadow");
+
+    fixture
+        .service
+        .install_test_hook(once_at(HookPoint::BeforeRenameMove, || {
+            panic!("simulated crash between the rewrites and the move");
+        }));
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = fixture.service.apply_mutation(&Mutation::RenameNote {
+            from: path("Alpha.md"),
+            to: path("Renamed.md"),
+            expected: Precondition::Any,
+            rewrite_links: true,
+        });
+    }));
+    assert!(crashed.is_err(), "the hook must have aborted the burst");
+    assert_eq!(read(&fixture, "Short.md"), "before [[Renamed]] after\n");
+
     let mut changed = std::collections::BTreeSet::new();
     changed.insert(path("Alpha.md"));
     changed.insert(path("Renamed.md"));
+    changed.insert(path("Short.md"));
+    let resolutions = resolution_after(&mut fixture, changed, "Short.md");
     assert_eq!(
-        resolution_after(&mut fixture, changed, "Short.md"),
-        vec![vault_core::Resolution::Unresolved],
-        "a crash leaves a visibly dead link, never one that looks resolved and is not"
+        resolutions,
+        vec![vault_core::Resolution::Resolved {
+            target: path("Renamed.md"),
+            subpath: None
+        }],
+        "the repaired link reaches the reservation, never Archive/Renamed.md"
+    );
+}
+
+/// A refusal reached *after* the destination was claimed must not leave the
+/// claim behind: the vault would be left holding a placeholder note nobody
+/// asked for.
+#[test]
+fn a_refusal_after_the_reservation_leaves_no_placeholder_behind() {
+    let mut fixture = fixture();
+    let source = fixture.root.join("Alpha.md");
+    fixture
+        .service
+        .install_test_hook(once_at(HookPoint::BeforeRenameMove, move || {
+            std::fs::remove_file(&source).expect("delete the source from the hook");
+        }));
+
+    let error = fixture
+        .service
+        .apply_mutation(&Mutation::RenameNote {
+            from: path("Alpha.md"),
+            to: path("Renamed.md"),
+            expected: Precondition::Any,
+            rewrite_links: true,
+        })
+        .expect_err("the source vanished under us");
+    assert!(
+        matches!(
+            error,
+            vault_index::IndexError::Mutation(MutationError::NotFound { .. })
+        ),
+        "expected not_found, got {error:?}"
+    );
+    assert!(
+        !fixture.root.join("Renamed.md").exists(),
+        "a refused rename leaves no reservation residue"
+    );
+}
+
+/// A replacement that parses correctly *on its own* can still change how the
+/// bytes **around** it parse, and the acceptance check has to be the document
+/// rather than the reference.
+///
+/// `[x][[Alpha]]` is legal prose: `[x]` is literal and the wikilink is a
+/// reference. Rewrite that wikilink into `[a|b](a%7Cb)` and CommonMark reads
+/// `[x][a|b]` as a full reference link — which the definition at the bottom of
+/// the file *defines* — so the whole construct becomes one link to
+/// `example.com` and the vault reference is **gone**. One reference in, zero
+/// out, reported as repaired.
+///
+/// The safe reference in the same file proves the check is per-reference: a
+/// referrer is not thrown away whole because one of its links cannot be
+/// rewritten.
+#[test]
+fn a_replacement_that_would_change_how_the_document_parses_is_refused() {
+    let mut fixture = fixture();
+    let before = "go [x][[Alpha]] end\n\nsafe ![[Alpha]] here\n\n[a|b]: http://example.com\n";
+    std::fs::write(fixture.root.join("Edges.md"), before).expect("write Edges");
+    fixture.service.refresh(false).expect("index Edges");
+
+    let outcome = rename(&mut fixture, "Alpha.md", "a|b.md");
+
+    assert_eq!(
+        read(&fixture, "Edges.md"),
+        "go [x][[Alpha]] end\n\nsafe ![a|b](a%7Cb) here\n\n[a|b]: http://example.com\n",
+        "the reference whose rewrite would be swallowed is left alone; the safe one is repaired"
+    );
+    assert_eq!(
+        reasons(&outcome),
+        vec![("Edges.md", LinkRewriteReason::ContextConflict)]
+    );
+
+    let mut changed = outcome.changed_paths.clone();
+    changed.insert(path("Edges.md"));
+    assert_eq!(
+        resolution_after(&mut fixture, changed, "Edges.md").len(),
+        2,
+        "both references survive: a repair that deletes one is not a repair"
+    );
+}
+
+/// An already-ambiguous reference names no single note, so there is nothing to
+/// preserve — but the rename changes what it resolves to, the planner sees it,
+/// and silence would be the every-decline-reported rule quietly not applying.
+#[test]
+fn an_ambiguous_reference_is_reported_rather_than_silently_re_pointed() {
+    let mut fixture = fixture();
+    std::fs::create_dir_all(fixture.root.join("One")).expect("create One");
+    std::fs::create_dir_all(fixture.root.join("Two")).expect("create Two");
+    std::fs::write(fixture.root.join("One/Twin.md"), "# one\n").expect("write One/Twin");
+    std::fs::write(fixture.root.join("Two/Twin.md"), "# two\n").expect("write Two/Twin");
+    std::fs::write(fixture.root.join("Ambiguous.md"), "[[Twin]]\n").expect("write Ambiguous");
+    fixture.service.refresh(false).expect("index the twins");
+
+    let outcome = rename(&mut fixture, "One/Twin.md", "One/Renamed.md");
+
+    assert_eq!(
+        read(&fixture, "Ambiguous.md"),
+        "[[Twin]]\n",
+        "declining to guess is right; doing it silently is not"
+    );
+    assert_eq!(
+        reasons(&outcome),
+        vec![("Ambiguous.md", LinkRewriteReason::AmbiguousTarget)]
     );
 }
 
@@ -794,7 +922,9 @@ fn every_reason_code_has_a_stable_spelling() {
         LinkRewriteReason::ReferenceMissing,
         LinkRewriteReason::SpanMismatch,
         LinkRewriteReason::UnwritableSpelling,
-        LinkRewriteReason::WriteFailed,
+        LinkRewriteReason::ContextConflict,
+        LinkRewriteReason::AmbiguousTarget,
+        LinkRewriteReason::WriteFailed(IoKind::Other),
         LinkRewriteReason::IndexUnavailable,
     ]
     .iter()
@@ -809,8 +939,15 @@ fn every_reason_code_has_a_stable_spelling() {
             "reference_missing",
             "span_mismatch",
             "unwritable_spelling",
+            "context_conflict",
+            "ambiguous_target",
             "write_failed",
             "index_unavailable",
         ]
+    );
+    assert_eq!(
+        LinkRewriteReason::WriteFailed(IoKind::PermissionDenied).as_str(),
+        "write_failed",
+        "the i/o kind is a diagnostic, never a second wire code"
     );
 }
