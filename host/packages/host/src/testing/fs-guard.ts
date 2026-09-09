@@ -65,6 +65,9 @@ const SYNC_CALLS: readonly CallSpec[] = [
   spec("rmSync", [0]),
   spec("rmdirSync", [0]),
   spec("mkdirSync", [0]),
+  // The argument is a prefix, not a finished path, but a prefix inside the
+  // vault can only produce a directory inside the vault.
+  spec("mkdtempSync", [0]),
   spec("copyFileSync", [1]),
   spec("cpSync", [1]),
   spec("linkSync", [1]),
@@ -86,6 +89,7 @@ const PROMISE_CALLS: readonly CallSpec[] = [
   spec("rm", [0]),
   spec("rmdir", [0]),
   spec("mkdir", [0]),
+  spec("mkdtemp", [0]),
   spec("copyFile", [1]),
   spec("cp", [1]),
   spec("link", [1]),
@@ -182,10 +186,10 @@ export function installFsWriteGuard(vaultRoot: string): FsWriteGuard {
   };
 
   for (const call of SYNC_CALLS) {
-    wrap(fs as unknown as Record<string, unknown>, call);
+    wrap(fs, call);
   }
   for (const call of PROMISE_CALLS) {
-    wrap(fsPromises as unknown as Record<string, unknown>, call);
+    wrap(fsPromises, call);
   }
 
   return {

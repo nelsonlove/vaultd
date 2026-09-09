@@ -14,8 +14,10 @@ describe("dependency tree", () => {
       encoding: "utf8",
     });
     const parsed = JSON.parse(tree) as { dependencies?: Record<string, { version?: string }> };
-    const electron = parsed.dependencies?.["electron"];
-    expect(electron?.version ?? "0.0.0-headless").toBe("0.0.0-headless");
+    // No `?? "0.0.0-headless"` fallback: that would also pass if `electron`
+    // vanished from the tree entirely, so the assertion would go quiet instead
+    // of red the day the workspace layout stopped linking the stub.
+    expect(parsed.dependencies?.["electron"]?.version).toBe("0.0.0-headless");
     expect(tree).not.toContain("electron.zip");
   });
 

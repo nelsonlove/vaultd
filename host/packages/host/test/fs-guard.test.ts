@@ -200,6 +200,47 @@ describe("destination arguments are watched too", () => {
     expect(guard.violations()[0]?.path).toBe(join(root, "Moved.md"));
   });
 
+  it("records a temp directory created inside the vault", () => {
+    const root = vault();
+    const guard = installFsWriteGuard(root);
+    let made = "";
+    try {
+      made = fs.mkdtempSync(join(root, "scratch-"));
+    } finally {
+      guard.release();
+    }
+    expect(guard.violations()).toHaveLength(1);
+    expect(guard.violations()[0]?.call).toBe("mkdtempSync");
+    // The argument is a prefix, not the created directory; the guard records
+    // what the caller passed, and the directory it made starts with it.
+    expect(guard.violations()[0]?.path).toBe(join(root, "scratch-"));
+    expect(made.startsWith(join(root, "scratch-"))).toBe(true);
+  });
+
+  it("records a promise temp directory created inside the vault", async () => {
+    const root = vault();
+    const guard = installFsWriteGuard(root);
+    try {
+      await fsPromises.mkdtemp(join(root, "scratch-"));
+    } finally {
+      guard.release();
+    }
+    expect(guard.violations()).toHaveLength(1);
+    expect(guard.violations()[0]?.call).toBe("mkdtemp");
+  });
+
+  it("ignores a temp directory created outside the vault", () => {
+    const root = vault();
+    const elsewhere = outside();
+    const guard = installFsWriteGuard(root);
+    try {
+      fs.mkdtempSync(join(elsewhere, "scratch-"));
+    } finally {
+      guard.release();
+    }
+    expect(guard.violations()).toHaveLength(0);
+  });
+
   it("records a rename whose source is inside the vault", () => {
     const root = vault();
     const elsewhere = outside();
