@@ -1,0 +1,57 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "sections": [
+      {
+        "type": "yaml",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 5,
+            "col": 3,
+            "offset": 57
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 7,
+            "col": 0,
+            "offset": 59
+          },
+          "end": {
+            "line": 7,
+            "col": 33,
+            "offset": 92
+          }
+        }
+      }
+    ],
+    "frontmatter": {
+      "tags": [
+        "alpha",
+        "beta/gamma",
+        "Tag_With-Chars"
+      ]
+    },
+    "frontmatterPosition": {
+      "start": {
+        "line": 0,
+        "col": 0,
+        "offset": 0
+      },
+      "end": {
+        "line": 5,
+        "col": 3,
+        "offset": 57
+      }
+    },
+    "frontmatterLinks": []
+  }
+}

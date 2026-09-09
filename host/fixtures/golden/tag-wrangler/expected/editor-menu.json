@@ -1,0 +1,66 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "0.6.5-nl.2",
+  "cursor": {
+    "line": 5,
+    "ch": 18
+  },
+  "tagUnderCursor": "#project/alpha",
+  "fileChanged": false,
+  "tagWranglerItems": [
+    {
+      "icon": "pencil",
+      "title": "Rename #project/alpha",
+      "hasOnClick": true,
+      "section": "tag-rename"
+    },
+    {
+      "icon": "trash",
+      "title": "Remove #project/alpha from all notes",
+      "hasOnClick": true,
+      "section": "tag-rename"
+    },
+    {
+      "icon": "create-new",
+      "title": "Create tag page",
+      "hasOnClick": true,
+      "section": "tag-page"
+    },
+    {
+      "icon": "magnifying-glass",
+      "title": "New search for #project/alpha",
+      "hasOnClick": true,
+      "section": "tag-search"
+    },
+    {
+      "icon": "sheets-in-box",
+      "title": "Require #project/alpha in search",
+      "hasOnClick": true,
+      "section": "tag-search"
+    },
+    {
+      "icon": "crossed-star",
+      "title": "Exclude #project/alpha from search",
+      "hasOnClick": true,
+      "section": "tag-search"
+    }
+  ],
+  "otherPluginItems": [
+    {
+      "section": "selection.insert.advanced",
+      "title": "New base",
+      "icon": "lucide-layout-list",
+      "hasOnClick": true
+    },
+    {
+      "title": "Add command",
+      "icon": "plus-circle",
+      "section": "cmdr",
+      "hasOnClick": true
+    },
+    {
+      "title": "Meta Bind",
+      "icon": "blocks"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "2.24.2",
+  "settings": {},
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "quickadd:runQuickAdd"
+    }
+  },
+  "humanAction": "Not performed in the live vault. In the GUI the flagship flow is: run \"QuickAdd: Run QuickAdd\", pick a configured choice from the suggester, answer its prompts, and the choice then captures or templates a note.",
+  "notes": "SETTINGS ARE DELIBERATELY EMPTY. The live data.json is 99 KB of the human's personal QuickAdd choices, full of their own vault paths, and vendoring it into this repo would be both noise and a privacy leak; the captured action mutates no files, so the settings are not load-bearing here. A host replay should supply its own choices. NO FILE MUTATION IS REACHABLE FROM THE INVOKABLE SURFACE: runQuickAdd opens a suggester modal, and the choice-running step lives behind it, so expected/ is byte-identical to vault/. The command was NOT invoked in the human's live session, because it leaves a modal open in their window. OBSERVED COMMAND SHAPE, useful to Task 22: besides the six fixed commands (runQuickAdd, resumePrompt, runTemplateFromFolder, applyTemplateToActiveFile, reloadQuickAdd, openQuickAddSettings) QuickAdd registers one command per configured choice, with an id of the form quickadd:choice:qan:<vault path to the choice note>#choice. Those per-choice commands DO mutate files, and they are the only headless-invokable path to a real capture; a golden that exercises one needs a choice authored inside the fixture vault. Capturing a real capture-choice run needs a scratch vault driven by hand."
+}

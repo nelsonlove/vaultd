@@ -1,0 +1,5 @@
+— em dash [[Parity target]]
+“ curly quote [[Parity target]]
+é accented latin [[Parity target]]
+日本語 CJK [[Parity target]]
+🙂 emoji outside the BMP [[Parity target]]

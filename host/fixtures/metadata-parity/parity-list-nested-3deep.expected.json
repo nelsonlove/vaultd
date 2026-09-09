@@ -1,0 +1,207 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "headings": [
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 13,
+            "offset": 13
+          }
+        },
+        "heading": "Nested list",
+        "level": 1
+      }
+    ],
+    "sections": [
+      {
+        "type": "heading",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 13,
+            "offset": 13
+          }
+        }
+      },
+      {
+        "type": "list",
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 15
+          },
+          "end": {
+            "line": 7,
+            "col": 13,
+            "offset": 126
+          }
+        }
+      },
+      {
+        "type": "list",
+        "position": {
+          "start": {
+            "line": 9,
+            "col": 0,
+            "offset": 128
+          },
+          "end": {
+            "line": 11,
+            "col": 24,
+            "offset": 186
+          }
+        }
+      }
+    ],
+    "listItems": [
+      {
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 15
+          },
+          "end": {
+            "line": 2,
+            "col": 13,
+            "offset": 28
+          }
+        },
+        "parent": -2
+      },
+      {
+        "position": {
+          "start": {
+            "line": 3,
+            "col": 2,
+            "offset": 31
+          },
+          "end": {
+            "line": 3,
+            "col": 17,
+            "offset": 46
+          }
+        },
+        "parent": 2
+      },
+      {
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 6,
+            "offset": 53
+          },
+          "end": {
+            "line": 4,
+            "col": 23,
+            "offset": 70
+          }
+        },
+        "parent": 3
+      },
+      {
+        "position": {
+          "start": {
+            "line": 5,
+            "col": 6,
+            "offset": 77
+          },
+          "end": {
+            "line": 5,
+            "col": 23,
+            "offset": 94
+          }
+        },
+        "parent": 3
+      },
+      {
+        "position": {
+          "start": {
+            "line": 6,
+            "col": 2,
+            "offset": 97
+          },
+          "end": {
+            "line": 6,
+            "col": 17,
+            "offset": 112
+          }
+        },
+        "parent": 2
+      },
+      {
+        "position": {
+          "start": {
+            "line": 7,
+            "col": 0,
+            "offset": 113
+          },
+          "end": {
+            "line": 7,
+            "col": 13,
+            "offset": 126
+          }
+        },
+        "parent": -2
+      },
+      {
+        "position": {
+          "start": {
+            "line": 9,
+            "col": 0,
+            "offset": 128
+          },
+          "end": {
+            "line": 9,
+            "col": 14,
+            "offset": 142
+          }
+        },
+        "parent": -9
+      },
+      {
+        "position": {
+          "start": {
+            "line": 10,
+            "col": 4,
+            "offset": 147
+          },
+          "end": {
+            "line": 10,
+            "col": 18,
+            "offset": 161
+          }
+        },
+        "parent": 9
+      },
+      {
+        "position": {
+          "start": {
+            "line": 11,
+            "col": 8,
+            "offset": 170
+          },
+          "end": {
+            "line": 11,
+            "col": 24,
+            "offset": 186
+          }
+        },
+        "parent": 10
+      }
+    ]
+  }
+}

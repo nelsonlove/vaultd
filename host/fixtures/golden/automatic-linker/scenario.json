@@ -1,0 +1,48 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "4.9.0",
+  "settings": {
+    "formatOnSave": false,
+    "showNotice": false,
+    "respectNewFileFolderPath": true,
+    "includeAliases": true,
+    "proximityBasedLinking": true,
+    "ignoreDateFormats": true,
+    "ignoreHeadings": true,
+    "formatGitHubURLs": true,
+    "githubEnterpriseURLs": [],
+    "formatJiraURLs": false,
+    "jiraURLs": [],
+    "formatLinearURLs": false,
+    "debug": false,
+    "ignoreCase": true,
+    "matchSentenceCase": true,
+    "replaceUrlWithTitle": true,
+    "replaceUrlWithTitleIgnoreDomains": [],
+    "excludeDirsFromAutoLinking": [
+      "System/Project/Archive",
+      "System/Project/Docs (repo mirror)"
+    ],
+    "preventSelfLinking": true,
+    "removeAliasInDirs": [],
+    "ignoreMarkdownTables": false,
+    "linkFrequency": "once-per-file",
+    "linkFrequencyMaxHeadingLevel": 1,
+    "runLinterAfterFormatting": true,
+    "runPrettierAfterFormatting": false,
+    "formatDelayMs": 1,
+    "aiEnabled": false,
+    "aiEndpoint": "http://localhost:1234/v1",
+    "aiModel": "gemma-4-7b",
+    "aiMaxContext": 500
+  },
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "automatic-linker:format-file",
+      "active_file": "Zarquon fixture source.md"
+    }
+  },
+  "humanAction": "Rebuilt the plugin's file-name trie, then ran its modifyLinks transform over Zarquon fixture source.md and wrote the result back with vault.modify. In the GUI the same transform is reached by opening the note and running \"Automatic Linker: Format file\".",
+  "notes": "format-file is registered as an editorCallback and applies its result through a CodeMirror writer against the live editor, so the command is not invokable without an editor; the capture drove modifyLinks(content, path, frontmatter), the pure transform the command applies, and wrote the output with vault.modify. THE TRIE IS BUILT FROM THE WHOLE VAULT: a first capture run inside the live vault also linked the words \"text\" and \"file\" because notes with those names exist there, so the fixture was re-authored with a target name that cannot collide (\"Zarquon fixture target\"). Replaying must build the trie from this fixture vault only. linkFrequency is \"once-per-file\", which is why the second mention of the target stays bare; runLinterAfterFormatting is true in these settings, but the linter did not alter this file."
+}

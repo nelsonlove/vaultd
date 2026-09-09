@@ -1,0 +1,2 @@
+# Fixtures are captured ground truth: store them verbatim, never normalise line endings.
+* -text

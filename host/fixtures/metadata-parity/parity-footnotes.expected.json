@@ -1,0 +1,146 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "footnotes": [
+      {
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 69
+          },
+          "end": {
+            "line": 2,
+            "col": 36,
+            "offset": 105
+          }
+        },
+        "id": "1"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 107
+          },
+          "end": {
+            "line": 4,
+            "col": 39,
+            "offset": 146
+          }
+        },
+        "id": "note"
+      }
+    ],
+    "footnoteRefs": [
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 39,
+            "offset": 39
+          },
+          "end": {
+            "line": 0,
+            "col": 43,
+            "offset": 43
+          }
+        },
+        "id": "1"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 59,
+            "offset": 59
+          },
+          "end": {
+            "line": 0,
+            "col": 66,
+            "offset": 66
+          }
+        },
+        "id": "note"
+      }
+    ],
+    "sections": [
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 67,
+            "offset": 67
+          }
+        }
+      },
+      {
+        "type": "footnoteDefinition",
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 69
+          },
+          "end": {
+            "line": 2,
+            "col": 36,
+            "offset": 105
+          }
+        }
+      },
+      {
+        "type": "footnoteDefinition",
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 107
+          },
+          "end": {
+            "line": 4,
+            "col": 39,
+            "offset": 146
+          }
+        }
+      },
+      {
+        "type": "text",
+        "position": {
+          "start": {
+            "line": 5,
+            "col": 0,
+            "offset": 146
+          },
+          "end": {
+            "line": 5,
+            "col": 0,
+            "offset": 146
+          }
+        }
+      },
+      {
+        "type": "element",
+        "position": {
+          "start": {
+            "line": 5,
+            "col": 0,
+            "offset": 146
+          },
+          "end": {
+            "line": 5,
+            "col": 0,
+            "offset": 146
+          }
+        }
+      }
+    ]
+  }
+}

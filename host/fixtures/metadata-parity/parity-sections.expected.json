@@ -1,0 +1,176 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "headings": [
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 17,
+            "offset": 17
+          }
+        },
+        "heading": "Heading section",
+        "level": 1
+      },
+      {
+        "position": {
+          "start": {
+            "line": 19,
+            "col": 0,
+            "offset": 200
+          },
+          "end": {
+            "line": 20,
+            "col": 14,
+            "offset": 229
+          }
+        },
+        "heading": "Setext heading",
+        "level": 1
+      }
+    ],
+    "sections": [
+      {
+        "type": "heading",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 17,
+            "offset": 17
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 19
+          },
+          "end": {
+            "line": 2,
+            "col": 20,
+            "offset": 39
+          }
+        }
+      },
+      {
+        "type": "code",
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 41
+          },
+          "end": {
+            "line": 6,
+            "col": 3,
+            "offset": 73
+          }
+        }
+      },
+      {
+        "type": "blockquote",
+        "position": {
+          "start": {
+            "line": 8,
+            "col": 0,
+            "offset": 75
+          },
+          "end": {
+            "line": 9,
+            "col": 27,
+            "offset": 123
+          }
+        }
+      },
+      {
+        "type": "table",
+        "position": {
+          "start": {
+            "line": 11,
+            "col": 0,
+            "offset": 125
+          },
+          "end": {
+            "line": 13,
+            "col": 9,
+            "offset": 154
+          }
+        }
+      },
+      {
+        "type": "thematicBreak",
+        "position": {
+          "start": {
+            "line": 15,
+            "col": 0,
+            "offset": 156
+          },
+          "end": {
+            "line": 15,
+            "col": 3,
+            "offset": 159
+          }
+        }
+      },
+      {
+        "type": "html",
+        "position": {
+          "start": {
+            "line": 17,
+            "col": 0,
+            "offset": 161
+          },
+          "end": {
+            "line": 17,
+            "col": 37,
+            "offset": 198
+          }
+        }
+      },
+      {
+        "type": "heading",
+        "position": {
+          "start": {
+            "line": 19,
+            "col": 0,
+            "offset": 200
+          },
+          "end": {
+            "line": 20,
+            "col": 14,
+            "offset": 229
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 22,
+            "col": 0,
+            "offset": 231
+          },
+          "end": {
+            "line": 22,
+            "col": 19,
+            "offset": 250
+          }
+        }
+      }
+    ]
+  }
+}
