@@ -105,12 +105,50 @@ class SubscribedDaemon {
    * Resolve on the first event matching `matches`, past or future. A
    * rendezvous, never a sleep: the daemon decides when the event exists, and
    * this waits exactly that long.
+   *
+   * It gives up before the case's own timeout does, and **says why**: a bare
+   * "timed out in 20000ms" from vitest names neither what was awaited, nor what
+   * did arrive instead, nor what the daemon said on stderr — and a gate failure
+   * nobody can read is one that gets marked flaky and then ignored.
    */
-  nextEvent(matches: (event: RuntimeEventDto) => boolean): Promise<RuntimeEventDto> {
+  nextEvent(
+    description: string,
+    matches: (event: RuntimeEventDto) => boolean,
+    timeoutMs = 15_000,
+  ): Promise<RuntimeEventDto> {
     const already = this.events.find((event) => matches(event));
     if (already) return Promise.resolve(already);
-    return new Promise((resolveEvent) => {
-      this.waiters.push({ matches, resolve: resolveEvent });
+    return new Promise((resolveEvent, rejectEvent) => {
+      // The timer is armed first so the waiter can clear it, and it reaches the
+      // waiter through the closure — it only ever runs after both exist.
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+        rejectEvent(
+          new Error(
+            `timed out after ${timeoutMs}ms waiting for ${description}. ` +
+              `Events delivered: ${JSON.stringify(this.summary())}. ` +
+              `Daemon stderr: ${this.stderr.trim() || "(silent)"}`,
+          ),
+        );
+      }, timeoutMs);
+      const waiter = {
+        matches,
+        resolve: (event: RuntimeEventDto): void => {
+          clearTimeout(timer);
+          resolveEvent(event);
+        },
+      };
+      this.waiters.push(waiter);
+    });
+  }
+
+  /** What arrived, compactly, for a timeout message: type plus its tell. */
+  private summary(): string[] {
+    return this.events.map((event) => {
+      const value = event.value as { cause?: string; live_state?: string; reason?: string };
+      const tell = value.cause ?? value.live_state ?? value.reason;
+      return tell === undefined ? event.type : `${event.type}(${tell})`;
     });
   }
 
@@ -152,6 +190,7 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd", () => {
       content: "# Note\n\n[[Other]]\n",
     });
     const event = await daemon.nextEvent(
+      `generation_committed for the mutation's own generation ${written.generation}`,
       (candidate) =>
         candidate.type === "generation_committed" &&
         (candidate.value as { generation: number }).generation === written.generation,
@@ -189,6 +228,7 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd", () => {
       recursive: true,
     });
     const event = await daemon.nextEvent(
+      `generation_committed for the delete's generation ${deleted.generation}`,
       (candidate) =>
         candidate.type === "generation_committed" &&
         (candidate.value as { generation: number }).generation === deleted.generation,
@@ -206,6 +246,7 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd", () => {
       path: ".obsidian/plugins/example",
     });
     const zoneFolder = await daemon.nextEvent(
+      "config_changed for the zone folder",
       (candidate) =>
         candidate.type === "config_changed" &&
         (candidate.value as { path: string }).path === ".obsidian/plugins/example",
@@ -219,6 +260,7 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd", () => {
     expect(written.semantic).toBe(false);
     expect(written.generation).toBeUndefined();
     const event = await daemon.nextEvent(
+      "config_changed for the zone file",
       (candidate) =>
         candidate.type === "config_changed" &&
         (candidate.value as { path: string }).path === ".obsidian/plugins/example/data.json",
@@ -238,6 +280,7 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd", () => {
     });
     expect(refreshed.added).toBe(1);
     const event = await daemon.nextEvent(
+      "resync_required raised by the manual refresh",
       (candidate) =>
         candidate.type === "resync_required" && daemon.events.indexOf(candidate) >= before,
     );
@@ -302,10 +345,24 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd with the wa
   });
 
   it("reports a change nobody told it about as generation_committed with cause watcher", async () => {
+    // **Wait for the watcher before giving it something to see.** The
+    // subscription opens during `catching_up` in every measured run, and a file
+    // that lands in that window is the startup catch-up's to find, not the
+    // watcher's — it is committed under a different cause, so a predicate
+    // waiting for `watcher` waits forever. That is a ~1-in-50 timeout, and the
+    // precondition is the fix: the same rendezvous the sibling case uses, made
+    // explicit here rather than assumed. No sleep — the daemon decides when.
+    await daemon.nextEvent(
+      "runtime_state_changed reaching watching, before writing anything",
+      (candidate) =>
+        candidate.type === "runtime_state_changed" &&
+        (candidate.value as { live_state: string }).live_state === "watching",
+    );
     // Written behind the daemon's back, so only the watcher can find it —
     // `mutation` is unreachable here by construction.
     writeFileSync(join(daemon.vault, "Watched.md"), "# Watched\n\n[[Other]]\n", "utf8");
     const event = await daemon.nextEvent(
+      "generation_committed with cause watcher",
       (candidate) =>
         candidate.type === "generation_committed" &&
         (candidate.value as { cause: string }).cause === "watcher",
@@ -332,8 +389,11 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd with the wa
     // The subscription opens while the startup catch-up is still running — a
     // cold vault starts at `startGeneration: null`, `live_state: "catching_up"`
     // — so the move to `watching` happens *after* it exists and is delivered
-    // like any other event. Nothing here is untestable end to end.
+    // like any other event. Nothing here is untestable end to end. The case
+    // above awaits the same event as its precondition, so by now this one
+    // resolves from what already arrived; it is the assertion that reads it.
     const event = await daemon.nextEvent(
+      "runtime_state_changed reaching watching",
       (candidate) =>
         candidate.type === "runtime_state_changed" &&
         (candidate.value as { live_state: string }).live_state === "watching",
