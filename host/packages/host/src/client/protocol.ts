@@ -726,13 +726,51 @@ export type GenerationCauseDto =
   | (string & {});
 
 /**
- * The semantic change one generation carries. Internally tagged on `kind`. A
- * generation larger than the transport's detail limit is reported
- * counts-only, followed by `resync_required { reason: oversized_change_set }`.
+ * The two change-set shapes this build understands. Internally tagged on
+ * `kind`. A generation larger than the transport's detail limit (1024 paths)
+ * is reported counts-only, followed immediately by
+ * `resync_required { reason: oversized_change_set }`.
  */
-export type ChangeSetDto =
+export type KnownChangeSetDto =
   | { kind: "detailed"; created: string[]; modified: string[]; deleted: string[] }
   | { kind: "counts_only"; created: number; modified: number; deleted: number };
+
+/**
+ * A change-set shape a later daemon introduced.
+ *
+ * `ChangeSetDto` is the one open union here whose Rust counterpart is **not**
+ * open: `vault_protocol::events::ChangeSetDto` derives `Deserialize` with no
+ * `#[serde(other)]`, so today's daemon emits `detailed` or `counts_only` and
+ * nothing else. The member exists anyway, because the hazard it removes is
+ * real and one-directional: a two-member union lets a consumer write
+ * `kind === "detailed" ? … : <read the counts>`, and a third kind would then
+ * be silently read as counts that are not there. With this member the compiler
+ * demands {@link isKnownChangeSet} first, and an unrecognized kind is handled
+ * as what it is — a generation whose detail this build cannot interpret, which
+ * is a resync.
+ */
+export interface UnknownChangeSetDto {
+  kind: string & {};
+}
+
+export type ChangeSetDto = KnownChangeSetDto | UnknownChangeSetDto;
+
+/** Every change-set `kind` this build understands, in `events.rs` order. */
+export const KNOWN_CHANGE_SET_KINDS = [
+  "detailed",
+  "counts_only",
+] as const satisfies ReadonlyArray<KnownChangeSetDto["kind"]>;
+
+/**
+ * Narrow a change set to the shapes this build knows.
+ *
+ * Same reason {@link isKnownRuntimeEvent} exists: the open member's `kind` is
+ * comparable to every literal, so `kind === "detailed"` alone never removes
+ * it. Call this first, then switch on `kind` inside the guard.
+ */
+export function isKnownChangeSet(changes: ChangeSetDto): changes is KnownChangeSetDto {
+  return (KNOWN_CHANGE_SET_KINDS as readonly string[]).includes(changes.kind);
+}
 
 /** Why per-path detail is unavailable for a generation move. Open-ended. */
 export type ResyncReasonDto =

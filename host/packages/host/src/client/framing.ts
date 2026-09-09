@@ -81,7 +81,17 @@ function validateEnvelope(parsed: unknown): Frame | string {
   if (!isRecord(parsed)) return "not a JSON object";
   if (typeof parsed.version !== "number") return "no numeric version";
 
-  if ("id" in parsed || "outcome" in parsed) {
+  // The event shape is tested FIRST, and it is tested as a pair. Routing on
+  // the presence of `id` alone contradicted the tail-field tolerance this
+  // decoder otherwise keeps: an event envelope that carries a top-level `id` —
+  // a field a later daemon may add for its own correlation — went down the
+  // response branch, was refused for having no `outcome`, and (naming no
+  // pending request) killed the connection. An envelope with both
+  // `subscription_id` and an `event` object is an event, whatever else it
+  // carries; a response is what is left.
+  const isEventShape = typeof parsed.subscription_id === "string" && isRecord(parsed.event);
+
+  if (!isEventShape && ("id" in parsed || "outcome" in parsed)) {
     if (typeof parsed.id !== "string") return "response envelope with no string id";
     const outcome = parsed.outcome;
     if (!isRecord(outcome)) return "response envelope with no outcome object";
