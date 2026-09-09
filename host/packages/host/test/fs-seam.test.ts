@@ -33,7 +33,12 @@ const FORBIDDEN: ReadonlyArray<readonly [string, RegExp]> = [
   ["a bare \"fs/promises\" specifier", /["']fs\/promises["']/],
   ["createRequire", /\bcreateRequire\b/],
   ["a dynamic import()", /\bimport\s*\(/],
-  ["require aliased into a variable", /=\s*require\b/],
+  // Narrowed with a negative lookahead so the pattern matches only what its
+  // label claims: `= require` *not* followed by a call. Without it this also
+  // flagged `const mod = require("some-package")` — an ordinary literal
+  // require of a non-fs module, which the specifier bans already cover and
+  // which the "still allows" case below says is fine.
+  ["require aliased into a variable", /=\s*require\b(?!\s*\()/],
   ["require() with a computed specifier", /\brequire\s*\(\s*[^"'\s)\\]/],
 ];
 
@@ -62,6 +67,14 @@ const SPELL_AROUNDS: ReadonlyArray<readonly [string, string]> = [
  * guard sees it. Only destructuring the functions out breaks the instrument.
  * `const { O_WRONLY } = fs.constants` is likewise fine — constants are values,
  * and nothing patches them.
+ *
+ * One further residual, and it is deliberate: `const f = fs; const { writeFileSync } = f;`
+ * destructures the seam through an alias and this check does not see it, because
+ * the check matches on the seam's own two names rather than tracking assignment.
+ * Following aliases would mean parsing rather than grepping, and the grep is
+ * meant to catch the shape someone writes by habit, not the two-step one nobody
+ * writes by accident. The fs-guard test is the backstop for a call that does
+ * escape.
  */
 const DESTRUCTURES_SEAM = /(?:const|let|var)\s*\{[^}]*\}\s*=\s*(?:fs|fsPromises)(?![\w.])/;
 
