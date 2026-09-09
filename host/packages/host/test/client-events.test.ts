@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { VaultdClient } from "../src/client/client";
 import { LineFramer } from "../src/client/framing";
@@ -330,6 +330,44 @@ describe("unknown-variant tolerance", () => {
     expect(fatal).toBeNull();
   });
 
+  it("settles a response envelope carrying an event tail field, rather than routing it", async () => {
+    // The mirror of the case above, and the worse direction: dispatching on the
+    // presence of `event` alone sent a *response* that carries an `event` tail
+    // field to the event router, where it matched no subscription and vanished
+    // — leaving its caller pending forever. Both layers now ask the same
+    // question: is `subscription_id` a string AND `event` an object?
+    const daemon = new FakeDaemon();
+    const seen: EventEnvelope[] = [];
+    let fatal: Error | null = null;
+    const client = new VaultdClient({
+      stdout: daemon.stdout,
+      stdin: daemon.stdin,
+      onEvent: (envelope) => seen.push(envelope),
+      onFatal: (error) => {
+        fatal = error;
+      },
+    });
+    const nullTail = client.request<{ service: string }>("health");
+    const objectTail = client.request<{ service: string }>("health");
+    const sent = await daemon.received(2);
+    const answer = (id: string, tail: unknown): string =>
+      `${JSON.stringify({
+        version: 1,
+        id,
+        outcome: {
+          status: "ok",
+          value: { type: "health", value: { service: "vaultd", status: "ok" } },
+        },
+        event: tail,
+      })}\n`;
+    daemon.writeRaw(answer(sent[0]!.id, null) + answer(sent[1]!.id, {}));
+    await expect(nullTail).resolves.toEqual({ service: "vaultd", status: "ok" });
+    await expect(objectTail).resolves.toEqual({ service: "vaultd", status: "ok" });
+    expect(seen).toEqual([]);
+    expect(fatal).toBeNull();
+    expect(client.pendingCount()).toBe(0);
+  });
+
   it("decodes an event line with a top-level id tail field as an event frame", () => {
     // The same fix, one layer down: the boundary decoder must not route on
     // `id` before it has looked for the event shape.
@@ -396,6 +434,46 @@ describe("a subscriber that throws", () => {
     const requests = await daemon.received(2);
     daemon.respondOk(requests[1]!.id, "health", { service: "vaultd", status: "ok" });
     await expect(health).resolves.toEqual({ service: "vaultd", status: "ok" });
+  });
+
+  it("warns once when nobody claims the throw, and still does not go fatal", async () => {
+    // The asymmetry this closes: omitting `onHandlerError` means "fatal" for a
+    // throw out of `onEvent`, and the subscription path reinterprets the same
+    // omission as "drop". Dropping stays right — one buggy subscriber must not
+    // kill a transport others share — but it must not be invisible.
+    const daemon = new FakeDaemon();
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    try {
+      let fatal: Error | null = null;
+      const client = new VaultdClient({
+        stdout: daemon.stdout,
+        stdin: daemon.stdin,
+        onEvent: () => {},
+        onFatal: (error) => {
+          fatal = error;
+        },
+      });
+      const pending = client.subscribeEvents(() => {
+        throw new Error("nobody is listening");
+      });
+      const [sent] = await daemon.received(1);
+      daemon.respondOk(sent!.id, "subscribe_events", {
+        subscription_id: "sub-1",
+        generation: 4,
+        live_state: "watching",
+      });
+      await pending;
+      daemon.emit("sub-1", { type: "config_changed", value: { path: "x" } });
+      daemon.emit("sub-1", { type: "config_changed", value: { path: "y" } });
+      await settled();
+      // Once per client, not once per event: a handler that throws on every
+      // event must not flood the warning channel.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]![0])).toContain("nobody is listening");
+      expect(fatal).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("falls back to onHandlerError when the subscription named no channel", async () => {
@@ -478,6 +556,43 @@ describe("the orphan buffer", () => {
     expect(paths).toEqual(
       Array.from({ length: paths.length }, (_unused, index) => `p-${first + index}`),
     );
+  });
+
+  it("sweeps what it buffered when the subscribe itself failed", async () => {
+    // The sweep runs when nothing is in flight any more, and a *rejected*
+    // subscribe leaves nothing in flight just as surely as a successful one.
+    // Without it, events buffered under an id the daemon never confirmed
+    // survive to be replayed to whichever subscription is granted that id next.
+    const daemon = new FakeDaemon();
+    const routed: RuntimeEventDto[] = [];
+    const client = connect(daemon, []);
+    const failing = client.subscribeEvents(() => {});
+    const [first] = await daemon.received(1);
+    daemon.writeRaw(
+      `${JSON.stringify({
+        version: 1,
+        subscription_id: "sub-1",
+        event: { type: "config_changed", value: { path: "orphaned" } },
+      })}\n` +
+        `${JSON.stringify({
+          version: 1,
+          id: first!.id,
+          outcome: {
+            status: "err",
+            value: { code: "runtime_not_ready", message: "no runtime" },
+          },
+        })}\n`,
+    );
+    await expect(failing).rejects.toThrow(/no runtime/);
+    const second = client.subscribeEvents((event) => routed.push(event));
+    const sent = await daemon.received(2);
+    daemon.respondOk(sent[1]!.id, "subscribe_events", {
+      subscription_id: "sub-1",
+      generation: 9,
+      live_state: "watching",
+    });
+    await second;
+    expect(routed).toEqual([]);
   });
 
   it("holds no handler once the transport is finished", async () => {

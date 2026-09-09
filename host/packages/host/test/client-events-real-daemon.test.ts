@@ -29,8 +29,13 @@ import type {
  * emits; the fake is the only instrument that can put one on the wire.
  *
  * The binary is a Rust build artifact and is not in the repository. Its absence
- * fails `client-real-daemon.test.ts` loudly and skips here, so the loud failure
- * is stated once. Build it with `cargo build --release --bin vaultd`.
+ * fails **`client-real-daemon.test.ts`** loudly — that file carries an
+ * unconditional assertion plus the deliberate `VAULTD_ALLOW_MISSING_BINARY=1`
+ * opt-out — and merely skips here, so the loud failure is stated once. That
+ * coupling is this file's only guard: if that assertion is ever removed or that
+ * file renamed, these cases go quietly green with no real-daemon coverage at
+ * all, and the guard must be moved here in the same motion. Build the binary
+ * with `cargo build --release --bin vaultd`.
  */
 const BINARY = resolve(__dirname, "..", "..", "..", "..", "target", "release", "vaultd");
 const BINARY_EXISTS = existsSync(BINARY);
@@ -50,28 +55,21 @@ class SubscribedDaemon {
     resolve(event: RuntimeEventDto): void;
   }> = [];
 
-  constructor() {
+  /**
+   * @param watch `false` — the default — runs with no watcher and no periodic
+   * tick, so every event is caused by an operation the test issued and the
+   * resync *reason* is assertable. With the watcher live, a `watcher_overflow`
+   * raised by the test's own writes races the manual refresh's
+   * `runtime_recovered`. `true` is for the two cases that need the watcher and
+   * assert nothing about reasons.
+   */
+  constructor(watch = false) {
     this.root = mkdtempSync(join(tmpdir(), "vaultd-host-events-"));
     this.vault = join(this.root, "vault");
     mkdirSync(this.vault);
-    // No watcher and no periodic tick: every event in this file is then caused
-    // by an operation one of these cases issued, which is what makes the
-    // reasons assertable. With the watcher live, a `watcher_overflow` raised by
-    // this test's own writes races the manual refresh's `runtime_recovered` and
-    // the file goes flaky. The watcher path is the daemon's own to prove.
-    this.child = spawn(
-      BINARY,
-      [
-        "--vault",
-        this.vault,
-        "--index",
-        join(this.root, "index.db"),
-        "--no-watch",
-        "--reconcile-interval-seconds",
-        "0",
-      ],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
+    const args = ["--vault", this.vault, "--index", join(this.root, "index.db")];
+    if (!watch) args.push("--no-watch", "--reconcile-interval-seconds", "0");
+    this.child = spawn(BINARY, args, { stdio: ["pipe", "pipe", "pipe"] });
     // Drained, not ignored: a stderr nobody reads is a pipe that eventually
     // blocks the daemon, and its text is the only diagnosis when a case fails.
     this.child.stderr.setEncoding("utf8");
@@ -281,6 +279,69 @@ describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd", () => {
     await daemon.client.request("health");
     expect(daemon.events).toHaveLength(seen);
     expect(daemon.fatal).toBeNull();
+    expect(daemon.diagnostics()).not.toContain("panicked");
+  }, 20_000);
+});
+
+/**
+ * The two paths the `--no-watch` block above deliberately gives up, on a second
+ * daemon that keeps its watcher. Neither asserts a resync *reason*, so the race
+ * that forced the first block's determinism cannot reach these.
+ */
+describe.skipIf(!BINARY_EXISTS)("subscriptions against a real vaultd with the watcher live", () => {
+  let daemon: SubscribedDaemon;
+  let handle: SubscriptionHandle;
+
+  beforeAll(async () => {
+    daemon = new SubscribedDaemon(true);
+    handle = await daemon.subscribe();
+  }, 20_000);
+
+  afterAll(() => {
+    daemon.dispose();
+  });
+
+  it("reports a change nobody told it about as generation_committed with cause watcher", async () => {
+    // Written behind the daemon's back, so only the watcher can find it —
+    // `mutation` is unreachable here by construction.
+    writeFileSync(join(daemon.vault, "Watched.md"), "# Watched\n\n[[Other]]\n", "utf8");
+    const event = await daemon.nextEvent(
+      (candidate) =>
+        candidate.type === "generation_committed" &&
+        (candidate.value as { cause: string }).cause === "watcher",
+    );
+    const value = event.value as {
+      cause: string;
+      generation: number;
+      changes: { kind: string; created: string[] };
+      affected_note_count: number;
+    };
+    expect(value.cause).toBe("watcher");
+    expect(value.changes.kind).toBe("detailed");
+    expect(value.changes.created).toContain("Watched.md");
+    expect(value.affected_note_count).toBe(1);
+    // The start point is strict on this path too, whatever the subscription
+    // opened at — `null` on a vault whose catch-up had not committed yet.
+    if (handle.startGeneration !== null) {
+      expect(value.generation).toBeGreaterThan(handle.startGeneration);
+    }
+    expect(daemon.fatal).toBeNull();
+  }, 20_000);
+
+  it("observes the runtime reaching watching", async () => {
+    // The subscription opens while the startup catch-up is still running — a
+    // cold vault starts at `startGeneration: null`, `live_state: "catching_up"`
+    // — so the move to `watching` happens *after* it exists and is delivered
+    // like any other event. Nothing here is untestable end to end.
+    const event = await daemon.nextEvent(
+      (candidate) =>
+        candidate.type === "runtime_state_changed" &&
+        (candidate.value as { live_state: string }).live_state === "watching",
+    );
+    const value = event.value as { generation: number | null; live_state: string };
+    expect(value.live_state).toBe("watching");
+    // `error_code` is reserved for a future typed code and is never populated.
+    expect((event.value as { error_code?: string }).error_code).toBeUndefined();
     expect(daemon.diagnostics()).not.toContain("panicked");
   }, 20_000);
 });

@@ -1,5 +1,5 @@
 import { VaultdError } from "./errors";
-import { LineFramer, MalformedEnvelopeError } from "./framing";
+import { LineFramer, MalformedEnvelopeError, isEventFrame } from "./framing";
 import { PROTOCOL_VERSION } from "./protocol";
 import type {
   EventEnvelope,
@@ -72,9 +72,11 @@ function asError(thrown: unknown): Error {
  * Request / response over one vaultd stdio pair.
  *
  * The whole correlation story is one `Map<string, Deferred>` keyed by request
- * id. The frame router tells a response from an event by the presence of `id`:
- * a response envelope has `id` and `outcome`, an event envelope has
- * `subscription_id` and `event`, and the two never share a shape.
+ * id. The frame router tells a response from an event with `isEventFrame` —
+ * the decoder's own pair test, `subscription_id` a string and `event` an
+ * object. The two shapes are distinct but they do **not** have disjoint key
+ * sets: either may carry the other's discriminator as a tail field a later
+ * daemon added, which is why one key is never enough to route on.
  *
  * Ids are `h-<counter>` **strings**, never numbers, because
  * `RequestEnvelope.id` is a Rust `String` and a JSON number there is a decode
@@ -96,11 +98,22 @@ export class VaultdClient {
   private counter = 0;
   private closed = false;
   private pendingSubscribes = 0;
+  private warnedUnclaimedThrow = false;
 
   /**
-   * How many events may be held for a subscription whose handler is not
-   * installed yet. Deliberately larger than the daemon's own per-subscription
-   * bound of 64, because this buffer only has to cover one round trip.
+   * How many buffer slots a subscription whose handler is not installed yet
+   * gets — at most 255 real events, because once the overflow marker exists it
+   * occupies the first one.
+   *
+   * **Against a conformant daemon the limit is unreachable**, and the overflow
+   * arm is defence in depth rather than a case to plan around: the dispatcher
+   * drains queued events immediately after every notice, so no subscription
+   * queue holds more than one notice's worth, the registry's own per-
+   * subscription bound of 64 is "not reachable through the stdio dispatcher"
+   * (protocol.md §Bounds), and a subscription receives nothing at all before
+   * its response is written. The buffer earns its place on the *other* axis:
+   * one round trip's worth of events genuinely does arrive before the handler
+   * is installed.
    */
   private static readonly ORPHAN_LIMIT = 256;
 
@@ -175,9 +188,10 @@ export class VaultdClient {
    * expected shape of a subscription: a subscriber bug must not take down the
    * transport that every other subscription on this connection shares. With no
    * `onError`, the throw falls back to the client's `onHandlerError`; with
-   * neither, it is dropped, because the alternative — `onFatal` — would let one
-   * buggy subscriber kill the daemon connection. Either way the event behind
-   * the throw is still delivered.
+   * neither, it is dropped — because the alternative, `onFatal`, would let one
+   * buggy subscriber kill the daemon connection — and the first such drop
+   * raises one `process.emitWarning`, so the silence is at least audible.
+   * Either way the event behind the throw is still delivered.
    *
    * **The registration race, and why the fix is a buffer.** `subscribe_events`
    * takes `{}` and the daemon mints the `subscription_id`, so there is no token
@@ -196,11 +210,18 @@ export class VaultdClient {
     const subscriber: Subscriber = onError ? { handler, onError } : { handler };
     this.pendingSubscribes += 1;
     let response: SubscribeEventsResponse;
+    let answered = false;
     try {
       // `subscribe_events` takes an empty params object, not an absent one.
       response = await this.request<SubscribeEventsResponse>("subscribe_events", {});
+      answered = true;
     } finally {
       this.pendingSubscribes -= 1;
+      // A *rejected* subscribe leaves nothing in flight just as surely as a
+      // successful one, and the id it buffered under is one no handler will
+      // ever claim. Sweeping here too is what stops those events surviving to
+      // be replayed to whichever subscription is granted that id next.
+      if (!answered && this.pendingSubscribes === 0) this.orphanEvents.clear();
     }
     const id = response.subscription_id;
     this.subscriptions.set(id, subscriber);
@@ -286,8 +307,33 @@ export class VaultdClient {
           subscription_id: subscriptionId,
           event,
         });
+      } else {
+        this.warnUnclaimedThrow(error);
       }
     }
+  }
+
+  /**
+   * A subscriber threw and named no channel, and the client's own is absent
+   * too. Dropping it stays right — routing it to `onFatal` would let one buggy
+   * subscriber kill the transport every other subscription on this connection
+   * shares — but silence is not, and the asymmetry is why: for a throw out of
+   * `onEvent`, an absent `onHandlerError` *means* fatal, so a consumer that
+   * omitted it deliberately chose that, and the subscription path quietly
+   * reinterprets the same omission as "drop".
+   *
+   * One warning per client, not per event: a handler that throws on every event
+   * must not flood the channel. No control flow changes.
+   */
+  private warnUnclaimedThrow(error: Error): void {
+    if (this.warnedUnclaimedThrow) return;
+    this.warnedUnclaimedThrow = true;
+    process.emitWarning(
+      `vaultd subscription handler threw and nothing claimed it: ${error.message}. ` +
+        "Pass an onError to subscribeEvents, or an onHandlerError to the client. " +
+        "Further throws from this client's subscribers are dropped silently.",
+      { type: "VaultdSubscriberError" },
+    );
   }
 
   /**
@@ -332,11 +378,13 @@ export class VaultdClient {
     // loop.
     let handlerFailure: { error: Error; envelope: EventEnvelope } | null = null;
     for (const frame of frames) {
-      // Dispatch on the EVENT shape, not on `"id" in frame`. An event envelope
-      // that carries a top-level `id` tail field — which the boundary decoder
-      // accepts, because tail fields are a widening — used to be routed to
-      // `settle`, where it named no pending request and was dropped in silence.
-      if (!("event" in frame)) {
+      // Dispatched by `isEventFrame`, which is the decoder's own pair test —
+      // `subscription_id` a string AND `event` an object. Asking a weaker
+      // question here is how the two layers drift: on `"id" in frame` an event
+      // with an `id` tail reached `settle` and vanished; on `"event" in frame`
+      // a response with an `event` tail reached the event router and left its
+      // caller pending forever.
+      if (!isEventFrame(frame)) {
         this.settle(frame);
         continue;
       }

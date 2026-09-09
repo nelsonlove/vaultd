@@ -48,20 +48,38 @@
  * `resync_required` means the generation moved in a way no per-path change set
  * describes. This client never retries anything on its own: it has no idea what
  * the caller's state is, and a retry it invented would race the caller's own
- * recovery. `current_generation` names the generation to re-read at, and is
- * never null in protocol version 1.
+ * recovery. `current_generation` names the generation to re-read at, and **from
+ * the daemon** it is never null in protocol version 1 — an event that could not
+ * name a generation would tell a client nothing, so it is withheld rather than
+ * emitted. The one null a subscriber can meet is this client's own, and the
+ * next section says exactly which marker it is.
  *
  * - `runtime_recovered` — a startup catch-up, a periodic tick, a manual
  *   refresh, or a watcher-failure recovery. Re-read current state. This is also
- *   what a **slow stdio client** meets: backpressure latches dropped notices and
- *   announces them this way, not as `subscriber_lag`.
+ *   what a **slow stdio client** meets: backpressure latches dropped notices
+ *   and announces them this way, not as the daemon's `subscriber_lag`.
  * - `watcher_overflow` — the watcher lost events. Re-read current state; the
  *   subscription itself is fine and detail resumes after it.
  * - `root_invalidated` — the vault root was removed or renamed. Re-reading is
  *   not enough: the host's whole view of the vault is suspect, and the correct
  *   response is to stop applying deltas and surface the condition.
- * - `subscriber_lag` — this subscription stopped draining and its queued detail
- *   was collapsed onto one marker. Re-read current state, and drain faster.
+ * - `subscriber_lag` — events were lost and detail was collapsed onto one
+ *   marker. Re-read current state, and drain faster. **This is the one reason
+ *   with two producers, and `current_generation` tells them apart.** From the
+ *   daemon it names a generation (`lag_marker` always sets one) and means the
+ *   *subscription's* queue filled because this client stopped draining. With
+ *   `current_generation: null` it is **synthesized by this client**: its
+ *   pre-registration buffer — the events that arrive between the daemon writing
+ *   the subscribe response and the handler being installed — overflowed, and
+ *   the client genuinely does not know which generations went missing, so it
+ *   says null rather than inventing one. Null on `subscriber_lag`, and only
+ *   there, is therefore the reliable signature of a client-synthesized marker.
+ *   Both mean the same thing to a consumer: you lost events, re-read. The
+ *   client's own marker is unreachable against a conformant daemon (§Bounds:
+ *   the dispatcher drains after every notice, the registry's per-subscription
+ *   bound of 64 is not reachable over stdio, and a subscription receives
+ *   nothing before its response is written), so treat it as defence in depth
+ *   rather than a case to plan around.
  * - `oversized_change_set` — the *preceding* generation held more than 1024
  *   paths and arrived as `counts_only`. Re-read current state; the counts are
  *   real, the paths are not coming.
