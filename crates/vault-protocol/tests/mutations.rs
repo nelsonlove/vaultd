@@ -223,7 +223,7 @@ fn every_new_method_name_and_field_spelling_round_trips_through_its_exact_json()
 /// entirely when absent rather than serializing as `null`.
 #[test]
 fn every_new_response_shape_round_trips_through_its_exact_json() {
-    let cases: [(Response, &str); 11] = [
+    let cases: [(Response, &str); 12] = [
         (
             Response::WriteNote(MutationResponse {
                 generation: 1,
@@ -232,8 +232,18 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
             r#"{"type":"write_note","value":{"generation":1,"revision":"r"}}"#,
         ),
         (
-            Response::CreateFolder(GenerationResponse { generation: 2 }),
+            Response::CreateFolder(GenerationResponse {
+                generation: Some(2),
+            }),
             r#"{"type":"create_folder","value":{"generation":2}}"#,
+        ),
+        // The unindexable half of the same verb: a folder the index will never
+        // list joins no generation, and the key is omitted outright rather
+        // than fabricated as `0` — which is a well-formed generation a client
+        // would then read at.
+        (
+            Response::CreateFolder(GenerationResponse { generation: None }),
+            r#"{"type":"create_folder","value":{}}"#,
         ),
         (
             Response::RenameNote(RenameResponse {
@@ -261,11 +271,15 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
             r#"{"type":"copy_file","value":{"generation":5,"revision":"r"}}"#,
         ),
         (
-            Response::DeleteNote(GenerationResponse { generation: 6 }),
+            Response::DeleteNote(GenerationResponse {
+                generation: Some(6),
+            }),
             r#"{"type":"delete_note","value":{"generation":6}}"#,
         ),
         (
-            Response::DeleteFolder(GenerationResponse { generation: 7 }),
+            Response::DeleteFolder(GenerationResponse {
+                generation: Some(7),
+            }),
             r#"{"type":"delete_folder","value":{"generation":7}}"#,
         ),
         (

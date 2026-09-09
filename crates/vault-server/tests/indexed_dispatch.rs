@@ -100,6 +100,7 @@ fn configured_server_dispatches_indexed_reads_and_refresh() {
         "note-1",
         Request::GetNote(NotePathParams {
             path: "Note.md".into(),
+            include: Vec::new(),
         }),
     ));
 
@@ -121,6 +122,7 @@ fn health_only_server_keeps_health_and_refuses_indexed_reads() {
             "note-2",
             Request::GetNote(NotePathParams {
                 path: "Note.md".into(),
+                include: Vec::new(),
             }),
         ),
         &mut subscriptions,
@@ -282,6 +284,7 @@ fn invalid_paths_and_missing_notes_map_to_stable_errors() {
         "d-invalid",
         Request::GetNote(NotePathParams {
             path: "../escape.md".into(),
+            include: Vec::new(),
         }),
     ));
     assert!(matches!(
@@ -294,6 +297,7 @@ fn invalid_paths_and_missing_notes_map_to_stable_errors() {
         "d-missing",
         Request::GetNote(NotePathParams {
             path: "Nope.md".into(),
+            include: Vec::new(),
         }),
     ));
     assert!(matches!(

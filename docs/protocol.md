@@ -89,6 +89,34 @@ Exact source, content revision, properties, aliases, headings, blocks, tags, the
 {"version":1,"id":"n","outcome":{"status":"ok","value":{"type":"get_note","value":{"generation":3,"note":{"path":"Folder/Note.md","revision":"blake3:…","source":"# Note\n[[Other]]\n","properties":[],"aliases":[],"headings":[{"level":1,"text":"Note","span":{"start":0,"end":6}}],"blocks":[],"tags":[],"diagnostics":[],"outgoing":[{"source_path":"Folder/Note.md","kind":"wikilink","origin":"body","raw_target":"Other","file_target":"Other","subpath":null,"display":null,"span":{"start":7,"end":16},"target_span":{"start":9,"end":14},"resolution":{"kind":"resolved","target":"Other.md","subpath":null}}]}}}}}
 ```
 
+`include` optionally names the note's **structural** row-sets: `sections` and `list_items`, spelled exactly as `snapshot_notes` spells them and carrying exactly the same rows. They are the two facets `get_note` does not already return, and asking for one of the four it does — `metadata`, `references`, `resolutions`, `backlinks` — is `invalid_request`, as is a facet name the server does not know. Omitting `include` asks for nothing, and the answer is byte-identical to what this operation has always returned.
+
+A requested facet is present and an unrequested one is **absent**, never an empty list, so "I did not ask" and "there are none" stay distinguishable — the same rule `snapshot_notes` follows. This is how a client refetches one note's structure after an edit without paging the whole vault.
+
+```json
+{"version":1,"id":"ns","request":{"method":"get_note","params":{"path":"Folder/Note.md","include":["sections","list_items"]}}}
+```
+
+```json
+{"version":1,"id":"ns","outcome":{"status":"ok","value":{"type":"get_note","value":{"generation":3,"note":{"path":"Folder/Note.md","revision":"blake3:…","source":"# Note\n- [ ] task\n","properties":[],"aliases":[],"headings":[{"level":1,"text":"Note","span":{"start":0,"end":6}}],"blocks":[],"tags":[],"diagnostics":[],"outgoing":[],"sections":[{"kind":"heading","span":{"start":0,"end":6}},{"kind":"list","span":{"start":7,"end":18}}],"list_items":[{"span":{"start":7,"end":18},"list_start_line":1,"task":" "}]}}}}}
+```
+
+### `get_tree_entries`
+
+Tree rows for exactly the paths a client names, at one generation. The answer a mirror needs after an edit: a change set names a handful of paths, and this returns their `kind`, `size`, `ctime_unix_ms`, `mtime_unix_ms`, and — for a note — `revision`, the same fields `snapshot_tree` pages out and from the same rows.
+
+`entries` comes back in request order with the absentees left out; `absent` names those, spelled the way the request spelled them. **A path with no row is not an error.** The index lists neither the `.obsidian` zone nor any hidden folder, and a path may simply have gone, so "there is nothing there at this generation" is an answer rather than a failure. A path that is not a valid vault path is still `invalid_path`, and more than 1024 paths is `invalid_request` — the same per-generation detail limit under "Bounds", because a change set larger than it is reported as counts rather than paths and a client holding more has no detailed change set to be working from.
+
+It is a read: it takes no lease, publishes nothing, and works on a `--read-only` daemon.
+
+```json
+{"version":1,"id":"te","request":{"method":"get_tree_entries","params":{"paths":["Attachments/a.png","Folder","gone.txt"]}}}
+```
+
+```json
+{"version":1,"id":"te","outcome":{"status":"ok","value":{"type":"get_tree_entries","value":{"generation":12,"entries":[{"path":"Attachments/a.png","kind":"file","size":3,"ctime_unix_ms":1756100000000,"mtime_unix_ms":1756100000000},{"path":"Folder","kind":"folder","ctime_unix_ms":1756100000000,"mtime_unix_ms":1756100000000}],"absent":["gone.txt"]}}}}
+```
+
 ### `resolve_link`
 
 Applies the same resolution rules used during reconciliation to a destination string from a given source note.
@@ -227,6 +255,18 @@ Creates a folder, and every missing folder above it. **A folder that already exi
 {"version":1,"id":"cf","outcome":{"status":"ok","value":{"type":"create_folder","value":{"generation":5}}}}
 ```
 
+**`create_folder` is the one folder operation that serves the `.obsidian` zone and hidden folders**, because a plugin host has to make `.obsidian/plugins/<id>/` and its own configuration directory, and `write_file` never creates parents. `delete_folder` and `rename_folder` still refuse both with `zone_violation`: a directory that was made can be removed again, while an emptied `.trash/` or a removed `.git/` cannot be put back.
+
+Such a create is a **raw** folder create. It joins no generation — nothing there is indexed, so the `generation` key is **absent** rather than `0` — and the daemon announces it with a `config_changed` event when the folder landed inside `.obsidian/`, exactly as a zone `write_file` does. A folder that was already there announces itself too: the notice means "re-read this path", not "a delta happened". Every other refusal stands unchanged, and one in particular: a request naming an ordinary folder that *lands* on an unindexable one — through a symlink, or a case-folded spelling — is still `zone_violation`. The permission is granted to a caller that said out loud where it was writing, never to a spelling that hides it.
+
+```json
+{"version":1,"id":"cz","request":{"method":"create_folder","params":{"path":".obsidian/plugins/example"}}}
+```
+
+```json
+{"version":1,"id":"cz","outcome":{"status":"ok","value":{"type":"create_folder","value":{}}}}
+```
+
 ### `rename_note`
 
 Moves a note and, with `rewrite_links` (default `true`), repairs every inbound reference to it. The move and every successful rewrite land in **one** generation. `links_rewritten` counts the references retargeted; `link_rewrite_failures` names each one that was not, with a stable `reason` from the closed set under "Link repair failure reasons" below. An empty list means every inbound reference now points at the new path.
@@ -337,11 +377,11 @@ A path that exists but is not a regular file — a directory, a fifo, a socket, 
 
 ### The `.obsidian` zone
 
-`read_file` and `write_file` accept paths under `.obsidian/`. **Every semantic operation refuses them** with `zone_violation` — `write_note`, `patch_frontmatter`, the renames, the copies, the deletes, and the folder operations alike. Nothing in the zone is indexed, so a zone write joins no generation and answers `semantic: false`, and the daemon announces it with a `config_changed` event instead of a `generation_committed`.
+`read_file`, `write_file`, and `create_folder` accept paths under `.obsidian/`. **Every other operation refuses them** with `zone_violation` — `write_note`, `patch_frontmatter`, the renames, the copies, the deletes, and the two destructive folder verbs alike. Nothing in the zone is indexed, so a zone write joins no generation and answers `semantic: false`, and the daemon announces it with a `config_changed` event instead of a `generation_committed`.
 
-The mirror rule holds on the other side: `write_file` refuses an indexable `.md` path outside the zone with `invalid_request`, so the two verbs partition the vault exactly. Whether a path is in the zone is decided by where it *lands* after symlinks and case folding, never by how the request spelled it.
+The mirror rule holds on the other side: `write_file` refuses an indexable `.md` path outside the zone with `invalid_request`, so the two write verbs partition the vault exactly. Whether a path is in the zone is decided by where it *lands* after symlinks and case folding, never by how the request spelled it.
 
-**Known gap: no operation creates a folder inside the zone.** The two rules above compose into a hole. `write_file` never creates parents, so a write into `.obsidian/plugins/new-plugin/data.json` answers `parent_not_found` when that folder does not exist; `create_folder` refuses every zone path with `zone_violation`. So a client can write into a zone folder that already exists — the ordinary case for an installed plugin, and what the example above assumes — but cannot make a new one. A plugin host that installs a plugin needs exactly that, and the gap is named as the follow-up **"Create folders inside the `.obsidian` zone"**, to be resolved in the headless-plugin-host phase rather than worked around by clients.
+**A client makes zone folders with `create_folder`, and only that way.** `write_file` still never creates parents, so a write into `.obsidian/plugins/new-plugin/data.json` answers `parent_not_found` until that folder exists — the client creates it explicitly first. The create reports no `generation` and emits `config_changed`; the write into it then behaves exactly as the `write_file` example above. The same rule covers every hidden folder, `.obsidian-headless/` and `.trash/` included, except that only a path inside `.obsidian/` raises `config_changed`. This closes the gap earlier versions of this document named as the follow-up "Create folders inside the `.obsidian` zone".
 
 ## Read-modify-write
 
@@ -476,7 +516,7 @@ The generation moved in a way no per-path change set describes: an incremental c
 
 ### `config_changed`
 
-This daemon's own `write_file` landed inside `.obsidian/`. It carries **no generation**: nothing in the zone is indexed, so no generation contains it, and a client re-reads the named path with `read_file` rather than applying a delta. `path` is the path the bytes *landed on*, not the one the request spelled, so a host can match the notice to the file it knows even when a symlink or a case-folded name reached the zone.
+This daemon's own `write_file` or `create_folder` landed inside `.obsidian/`. It carries **no generation**: nothing in the zone is indexed, so no generation contains it, and a client re-reads the named path with `read_file` (or lists it again) rather than applying a delta. `path` is the path the write *landed on*, not the one the request spelled, so a host can match the notice to the file or folder it knows even when a symlink or a case-folded name reached the zone. A `create_folder` of a zone folder that was already there announces itself too — the notice means "re-read this path", not "a delta happened".
 
 The zone is not watched — it is a dot-directory, and the scanner and the watcher skip it — so an edit made by anything other than this daemon raises no event at all. A host that shares the zone with other writers polls or watches it itself.
 

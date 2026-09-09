@@ -13,6 +13,7 @@ use crate::error::IndexError;
 use crate::model::{Generation, IndexState};
 use crate::reader::IndexReader;
 use crate::reconcile::IndexService;
+use crate::snapshot::{ListItemRow, SectionRow, TreeEntryRow};
 use crate::store::{
     StoredTreeEntry, load_note_with, load_outgoing_with, resolved_reference_from_row_with, tree,
 };
@@ -40,6 +41,27 @@ pub struct IndexedNote {
     pub note: ParsedNote,
     pub diagnostics: Vec<Diagnostic>,
     pub outgoing: Vec<ResolvedReference>,
+    /// The structural row-sets, present exactly when they were asked for.
+    ///
+    /// `None` is "not requested" and `Some(vec![])` is "requested, and there
+    /// are none" — the snapshot pager's own convention, kept here so the
+    /// per-note refetch and the bulk page mean the same thing by an absent
+    /// facet. Every other field on this struct is unconditional.
+    pub sections: Option<Vec<SectionRow>>,
+    pub list_items: Option<Vec<ListItemRow>>,
+}
+
+/// Which structural row-sets a per-note read serves alongside the note.
+///
+/// Only two, and deliberately not [`crate::NoteFacets`]: the other four
+/// snapshot facets are `get_note`'s own unconditional fields, so a type that
+/// could express "give me backlinks too" here would be a type with four
+/// unreachable states. `Default` is both off, which is what a request naming
+/// no facet asks for.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StructuralFacets {
+    pub sections: bool,
+    pub list_items: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,18 +237,83 @@ impl IndexReader {
     }
 
     pub fn get_note(&self, path: &VaultPath) -> Result<IndexedNote, IndexError> {
+        self.get_note_with(path, StructuralFacets::default())
+    }
+
+    /// `get_note`, plus whichever structural row-sets `facets` names.
+    ///
+    /// The rows come from the snapshot pager's own loaders rather than from a
+    /// second query written for this path: a mirror refetching one note's
+    /// structure after an edit must get exactly the rows a `snapshot_notes`
+    /// page would have given it, and two query texts would be free to drift.
+    /// Everything runs inside the one read transaction `read` opens, so the
+    /// facets belong to the same generation as the note.
+    pub fn get_note_with(
+        &self,
+        path: &VaultPath,
+        facets: StructuralFacets,
+    ) -> Result<IndexedNote, IndexError> {
         self.read(|transaction, generation| {
             let note = load_note_with(transaction, path)?
                 .ok_or_else(|| IndexError::NoteNotFound(path.as_str().to_string()))?;
             let outgoing = load_outgoing_with(transaction, path)?;
             let diagnostics = diagnostics::note_diagnostics(transaction, path.as_str())?;
+            let sections = match facets.sections {
+                true => Some(crate::snapshot::load_sections(transaction, path)?),
+                false => None,
+            };
+            let list_items = match facets.list_items {
+                true => Some(crate::snapshot::load_list_items(transaction, path)?),
+                false => None,
+            };
 
             Ok(IndexedNote {
                 generation,
                 note,
                 diagnostics,
                 outgoing,
+                sections,
+                list_items,
             })
+        })
+    }
+
+    /// One tree row per requested path, in request order, at one published
+    /// generation. `None` in a slot means the index holds no row for that
+    /// path — a hidden path the scan never lists, or one that has gone.
+    ///
+    /// Reads through [`crate::store::tree::load_one`] and
+    /// [`crate::store::note_revision_with`], the two query texts that already
+    /// exist, rather than a by-path copy of `snapshot_tree`'s joined page
+    /// query. The revision comes from the `notes` row because
+    /// `tree_entries.content_revision` is written NULL for every kind, which
+    /// is exactly what that page's `COALESCE` resolves to: a note carries a
+    /// revision, a folder and an attachment do not.
+    pub fn tree_entries_for(
+        &self,
+        paths: &[VaultPath],
+    ) -> Result<(Generation, Vec<Option<TreeEntryRow>>), IndexError> {
+        self.read(|transaction, generation| {
+            let mut rows = Vec::with_capacity(paths.len());
+            for path in paths {
+                let Some(stored) = tree::load_one(transaction, path)? else {
+                    rows.push(None);
+                    continue;
+                };
+                let revision = match stored.content_revision {
+                    Some(revision) => Some(revision),
+                    None => crate::store::note_revision_with(transaction, path)?,
+                };
+                rows.push(Some(TreeEntryRow {
+                    path: stored.path,
+                    kind: stored.kind,
+                    size: stored.size,
+                    ctime_unix_ms: stored.ctime_unix_ms,
+                    mtime_unix_ms: stored.mtime_unix_ms,
+                    revision,
+                }));
+            }
+            Ok((generation, rows))
         })
     }
 
@@ -476,6 +563,22 @@ impl IndexService {
 
     pub fn get_note(&self, path: &VaultPath) -> Result<IndexedNote, IndexError> {
         self.reader_handle().get_note(path)
+    }
+
+    pub fn get_note_with(
+        &self,
+        path: &VaultPath,
+        facets: StructuralFacets,
+    ) -> Result<IndexedNote, IndexError> {
+        self.reader_handle().get_note_with(path, facets)
+    }
+
+    /// The tree rows for exactly these paths, at the published generation.
+    pub fn tree_entries_for(
+        &self,
+        paths: &[VaultPath],
+    ) -> Result<(Generation, Vec<Option<TreeEntryRow>>), IndexError> {
+        self.reader_handle().tree_entries_for(paths)
     }
 
     pub fn resolve_link(

@@ -371,9 +371,20 @@ pub struct MutationResponse {
 
 /// A mutation with no content revision to report — a folder operation, or a
 /// delete (a deleted file has no revision).
+///
+/// `generation` is absent for exactly one case: a `create_folder` that landed
+/// on an **unindexable** path — the configuration zone, or any hidden folder.
+/// The scan never lists such a folder, so no generation will ever contain it,
+/// and naming one would be a generation the client could read at and never
+/// find its own write in. It is the same rule, and the same absent-not-zero
+/// spelling, `WriteFileResponse::generation` already follows; `0` is a
+/// well-formed generation a client would act on, so the key is omitted
+/// outright instead. Every indexed create, every delete, and every folder
+/// rename keeps reporting one, byte-identically.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenerationResponse {
-    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

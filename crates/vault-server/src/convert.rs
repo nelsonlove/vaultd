@@ -237,7 +237,42 @@ pub(crate) fn note(value: IndexedNote) -> NoteDto {
             .collect(),
         diagnostics: value.diagnostics.iter().map(diagnostic).collect(),
         outgoing: value.outgoing.iter().map(reference).collect(),
+        // Present exactly when the request's `include` named them, through the
+        // same two mappers a `snapshot_notes` page uses — so a per-note
+        // refetch and a bulk page cannot disagree about a section's shape any
+        // more than they can about its rows.
+        sections: value
+            .sections
+            .as_ref()
+            .map(|sections| sections_dto(sections)),
+        list_items: value.list_items.as_ref().map(|items| list_items_dto(items)),
     }
+}
+
+fn sections_dto(sections: &[vault_index::SectionRow]) -> Vec<SectionDto> {
+    sections
+        .iter()
+        .map(|section| SectionDto {
+            kind: section.kind.clone(),
+            span: span(section.span),
+            block_id: section.block_id.clone(),
+        })
+        .collect()
+}
+
+fn list_items_dto(items: &[vault_index::ListItemRow]) -> Vec<ListItemDto> {
+    items
+        .iter()
+        .map(|item| ListItemDto {
+            span: span(item.span),
+            // Both carried through unchanged: the wire mirrors the stored
+            // line-number model, and a host does its own negation to reach
+            // Obsidian's single `parent` number.
+            list_start_line: item.list_start_line,
+            parent_start_line: item.parent_start_line,
+            task: item.task.clone(),
+        })
+        .collect()
 }
 
 fn index_state(value: IndexState) -> IndexStateDto {
@@ -619,6 +654,50 @@ pub(crate) fn tree_entry(value: &vault_index::TreeEntryRow) -> TreeEntryDto {
 /// and is answered `invalid_request` — the same strictness the mutation params
 /// get. An empty list is the documented default and stays legal: it pages
 /// identities, which is what a client resuming a mirror asks for.
+/// Which structural facets a `get_note` request asked for.
+///
+/// `get_note` accepts only the two row-set facets. The other four are already
+/// unconditional fields of its answer, so naming one is `invalid_request`
+/// rather than a redundant ask: a request that names something the server does
+/// not serve *in that position* must not be answered as though it named
+/// nothing, which is the evolution rule's own value-versus-field split. An
+/// unknown name never reaches here at all — `NoteFacetDto` has no unknown
+/// variant, so a misspelling fails the request's deserialization exactly as it
+/// does for `snapshot_notes`.
+///
+/// The rejected facet is named back through its own `Serialize`, not a second
+/// spelling table: a name written out here by hand would be free to drift from
+/// the wire spelling it is complaining about.
+pub(crate) fn structural_facets(
+    include: &[NoteFacetDto],
+) -> Result<vault_index::StructuralFacets, ProtocolError> {
+    let mut facets = vault_index::StructuralFacets::default();
+    for facet in include {
+        match facet {
+            NoteFacetDto::Sections => facets.sections = true,
+            NoteFacetDto::ListItems => facets.list_items = true,
+            NoteFacetDto::Metadata
+            | NoteFacetDto::References
+            | NoteFacetDto::Resolutions
+            | NoteFacetDto::Backlinks => {
+                let name =
+                    serde_json::to_string(facet).unwrap_or_else(|_| "that facet".to_string());
+                return Err(ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!(
+                        "get_note already carries {name}; `include` accepts only \
+                         \"sections\" and \"list_items\""
+                    ),
+                    supported_version: None,
+                    current_generation: None,
+                    current_revision: None,
+                });
+            }
+        }
+    }
+    Ok(facets)
+}
+
 pub(crate) fn note_facets(include: &[NoteFacetDto]) -> vault_index::NoteFacets {
     let mut facets = vault_index::NoteFacets::default();
     for facet in include {
@@ -703,30 +782,11 @@ pub(crate) fn snapshot_note(value: &vault_index::SnapshotNoteRow) -> SnapshotNot
             .backlinks
             .as_ref()
             .map(|backlinks| backlinks.iter().map(reference).collect()),
-        sections: value.sections.as_ref().map(|sections| {
-            sections
-                .iter()
-                .map(|section| SectionDto {
-                    kind: section.kind.clone(),
-                    span: span(section.span),
-                    block_id: section.block_id.clone(),
-                })
-                .collect()
-        }),
-        list_items: value.list_items.as_ref().map(|items| {
-            items
-                .iter()
-                .map(|item| ListItemDto {
-                    span: span(item.span),
-                    // Both carried through unchanged: the wire mirrors the
-                    // stored line-number model, and a host does its own
-                    // negation to reach Obsidian's single `parent` number.
-                    list_start_line: item.list_start_line,
-                    parent_start_line: item.parent_start_line,
-                    task: item.task.clone(),
-                })
-                .collect()
-        }),
+        sections: value
+            .sections
+            .as_ref()
+            .map(|sections| sections_dto(sections)),
+        list_items: value.list_items.as_ref().map(|items| list_items_dto(items)),
     }
 }
 

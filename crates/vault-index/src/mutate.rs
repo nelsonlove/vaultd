@@ -947,17 +947,19 @@ pub struct MutationOutcome {
     /// re-observes a path and finds nothing changed — while under-naming is a
     /// missing generation.
     pub changed_paths: BTreeSet<VaultPath>,
-    /// The **stored spelling of the file a raw write landed on**, which is not
+    /// The **stored spelling of the path a write landed on**, which is not
     /// always a path `changed_paths` may name.
     ///
-    /// It exists because `write_file` is the only verb whose *answer* varies
-    /// with where the bytes went rather than with what the caller called them.
-    /// Every other verb refuses outright any path that resolves somewhere its
-    /// answer would differ — `write_note` re-asks [`is_unindexable`] on the
-    /// stored spelling and refuses — so for those two the named path and the
-    /// landed path can never disagree in a way a client could see, and they
-    /// leave this `None`. The raw pair deliberately *serves* both sides of
-    /// that predicate, so only it has to carry the answer out.
+    /// It exists because `write_file` and `create_folder` are the two verbs
+    /// whose *answer* varies with where the write went rather than with what
+    /// the caller called it. Every other verb refuses outright any path that
+    /// resolves somewhere its answer would differ — `write_note` re-asks
+    /// [`is_unindexable`] on the stored spelling and refuses — so for those the
+    /// named path and the landed path can never disagree in a way a client
+    /// could see, and they leave this `None`. These two deliberately *serve*
+    /// both sides of that predicate, so they have to carry the answer out:
+    /// `write_file` for its `semantic` and its generation, `create_folder` for
+    /// its generation and for whether the configuration zone was touched.
     ///
     /// The caller's spelling is not a substitute. `.OBSIDIAN/app.json` reaches
     /// the real zone on any case-folding filesystem, a symlink named anything
@@ -1072,7 +1074,16 @@ pub fn is_unindexable(path: &VaultPath) -> bool {
 /// with the post-resolve one — a target that does not exist has no stored
 /// spelling to check, and `.git/hooks` must be refused as a zone violation
 /// rather than reported as merely absent.
-fn is_unindexable_folder(path: &VaultPath) -> bool {
+///
+/// `create_folder` is the one verb that *serves* the paths this answers `true`
+/// for rather than refusing them, so for it the two applications mean
+/// different things: the caller's spelling grants the permission, and the
+/// stored spelling only refuses the mismatch (an ordinary name that resolves
+/// onto an unindexable folder). Public because it is also the **wire's**
+/// folder predicate — the server decides `create_folder`'s reported generation
+/// from it, applied to the landed spelling, exactly as `write_file` decides
+/// `semantic` from [`is_unindexable`].
+pub fn is_unindexable_folder(path: &VaultPath) -> bool {
     is_unindexable(path) || path.name().starts_with('.')
 }
 
@@ -1722,17 +1733,38 @@ impl MutationEngine {
     /// caller wants is "a folder is there", and Obsidian's own
     /// `createFolder` is the only thing that would tell them otherwise.
     ///
-    /// The outcome names **every folder segment this call actually created**,
-    /// and nothing else. Per `MutationOutcome::changed_paths`: since the tree
-    /// pre-task the index holds a row per folder, so a created directory the
-    /// outcome does not name is a `tree_entries` row that never lands, and
-    /// `snapshot_tree` at the generation this call published would serve a
-    /// tree missing the daemon's own write. A segment that was already there
-    /// is named by no one, because nothing about it moved.
+    /// The outcome names **every folder segment this call actually created
+    /// that the index will list**, and nothing else. Per
+    /// `MutationOutcome::changed_paths`: since the tree pre-task the index
+    /// holds a row per folder, so a created directory the outcome does not
+    /// name is a `tree_entries` row that never lands, and `snapshot_tree` at
+    /// the generation this call published would serve a tree missing the
+    /// daemon's own write. A segment that was already there is named by no
+    /// one, because nothing about it moved — and an **unindexable** segment is
+    /// named by no one either, because the scan never lists it and a hint for
+    /// it could only ever produce a phantom row.
+    ///
+    /// **This verb serves unindexable folders too**, which is the one place it
+    /// differs from every other folder operation. A plugin host has to make
+    /// `.obsidian/plugins/<id>/` and its own `.obsidian-headless/`, and
+    /// `write_file` deliberately never creates parents — so without this the
+    /// two rules composed into a hole no client could work around. `delete_folder`
+    /// and `rename_folder` still refuse: making a directory is recoverable by
+    /// removing it, while removing `.git` or emptying `.trash` is not.
+    ///
+    /// What is **not** lifted is the resolved-path half of the guard. A
+    /// request that names an ordinary folder may not *land* on an unindexable
+    /// one — that is the symlink called `Link` pointing at `.obsidian`, which
+    /// carries no dot and names no zone, and it stays a `zone_violation`. The
+    /// permission is granted to a caller that said out loud where it was
+    /// writing, never to a spelling that hides it. Every other gate is
+    /// untouched: NUL, containment under the vault root, a file at the name, and
+    /// the final segment's case guard all refuse exactly as before.
     fn create_folder(&self, path: &VaultPath) -> Result<MutationOutcome, MutationError> {
-        if is_unindexable_folder(path) {
-            return Err(MutationError::ZoneViolation { path: path.clone() });
-        }
+        // Whether the *request* named a path outside the indexed universe.
+        // Not a refusal any more — it is the permission the resolved-path
+        // check below is measured against.
+        let requested_unindexable = is_unindexable_folder(path);
         // Called here rather than inherited from `resolve`, which this verb
         // never reaches: see [`refuse_nul`].
         refuse_nul(path)?;
@@ -1779,8 +1811,15 @@ impl MutationEngine {
                     // see a segment which *resolves* somewhere the caller's
                     // spelling never mentions: a symlink named `Link` pointing
                     // at `.obsidian` carries no dot and names no zone.
+                    //
+                    // Now conditional on the request, and only in the
+                    // direction that widens nothing: a caller that spelled an
+                    // unindexable path is served there, a caller that did not
+                    // may not be laundered into one. Without the condition the
+                    // lifted refusal would be unreachable — every path under
+                    // `.obsidian` passes through the zone folder itself.
                     let stored = self.stored_path(path, &canonical)?;
-                    if is_unindexable_folder(&stored) {
+                    if !requested_unindexable && is_unindexable_folder(&stored) {
                         return Err(MutationError::ZoneViolation { path: path.clone() });
                     }
                     current = canonical;
@@ -1797,9 +1836,24 @@ impl MutationEngine {
                 Err(error) => return Err(io(error)),
             }
         }
+        // The stored spelling of the folder this call was *about*, taken from
+        // the fully canonicalized walk. Reported for the same reason
+        // `write_file` reports one: the answer — whether a generation contains
+        // this folder, and whether the configuration zone was touched — is
+        // decided by where the call landed, not by how the request spelled it.
+        let target = self.stored_path(path, &current)?;
+        // Filtered rather than emptied. A pure zone or hidden create names
+        // nothing at all, which is what makes it publish no generation; but
+        // `Visible/.hidden` really did create `Visible`, and the scan really
+        // will list it, so dropping that path would be the under-naming
+        // hazard `changed_paths` exists to prevent.
+        let changed_paths: BTreeSet<VaultPath> = created
+            .into_iter()
+            .filter(|created| !is_unindexable_folder(created))
+            .collect();
         Ok(MutationOutcome {
-            changed_paths: created,
-            written: None,
+            changed_paths,
+            written: Some(target),
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),

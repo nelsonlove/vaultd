@@ -141,11 +141,11 @@ Per the design's "Target measurements" (`docs/design/vault-mutations-and-bulk-re
 
 ## Named follow-ups
 
-Four, so none of them lives only in a paragraph:
+Four, so none of them lives only in a paragraph. One is now closed:
 
 - **Cache or replace the case-collision directory scan.** The dominant cost in every mutation case above. Either cache it per folder and invalidate from the watcher's own events for that folder, or answer the question with a `stat` on the caller's spelling plus a comparison of the stored name, keeping the full listing for the case where they differ.
 - **Resolve rename repair spellings from the live graph's candidate index.** Removes the whole-vault `Resolver` rebuild that `plan_repair` performs on every repairing rename — the larger half of `rename_fanout_0`'s vault-size base.
-- **Create folders inside the `.obsidian` zone.** Not a performance item; surfaced by this milestone's documentation pass. `write_file` never creates parents and `create_folder` refuses every zone path, so no operation can make a new folder in the configuration zone. A plugin host installing a plugin needs one; to be resolved in the headless-plugin-host phase.
+- ~~**Create folders inside the `.obsidian` zone.**~~ **CLOSED** in the headless-plugin-host phase. Not a performance item; surfaced by this milestone's documentation pass. `write_file` never creates parents and `create_folder` refused every zone path, so no operation could make a new folder in the configuration zone. `create_folder` now serves the zone and every hidden folder as a raw create — no generation, a `config_changed` notice inside `.obsidian/`, and every other containment gate unchanged. See `docs/protocol.md`, `create_folder`.
 - **Phrase `read_file`'s not-a-regular-file refusal for the read path.** `read_file` on a directory answers `target_exists` with "… already exists", which reads as a write refusal. The code is right and the message is direction-wrong; the fix belongs in `Server::read_file`, where the verb is known, not in the shared error mapping. Documented in `docs/protocol.md` in the meantime.
 
 ## Known limits and honest gaps

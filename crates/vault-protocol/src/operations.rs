@@ -10,8 +10,9 @@ use crate::semantic::{
     DiagnosticDto, IndexStateDto, NoteDto, NoteSummaryDto, ReferenceDto, ResolutionDto, SeverityDto,
 };
 use crate::snapshots::{
-    CloseSnapshotParams, CloseSnapshotResponse, OpenSnapshotParams, OpenSnapshotResponse,
-    SnapshotNotesParams, SnapshotNotesResponse, SnapshotTreeParams, SnapshotTreeResponse,
+    CloseSnapshotParams, CloseSnapshotResponse, NoteFacetDto, OpenSnapshotParams,
+    OpenSnapshotResponse, SnapshotNotesParams, SnapshotNotesResponse, SnapshotTreeParams,
+    SnapshotTreeResponse, TreeEntryDto,
 };
 
 // `Eq` is not derivable here: `PatchFrontmatter` carries `PatchValueDto`,
@@ -25,6 +26,7 @@ pub enum Request {
     GetVaultInfo,
     ListNotes(PageParams),
     GetNote(NotePathParams),
+    GetTreeEntries(GetTreeEntriesParams),
     ResolveLink(ResolveLinkParams),
     GetBacklinks(PathPageParams),
     ListReferences(ListReferencesParams),
@@ -56,9 +58,40 @@ pub struct PageParams {
     pub limit: Option<u32>,
 }
 
+/// `get_note`'s parameters.
+///
+/// `include` names the **structural** row-sets to serve alongside the note:
+/// `sections` and `list_items`, spelled with the same [`NoteFacetDto`] names
+/// `snapshot_notes` uses, because a client that has learned one set of facet
+/// names should not have to learn a second. Only those two are accepted here —
+/// `metadata`, `references`, `resolutions`, and `backlinks` are `get_note`'s
+/// own fields already, so naming one is `invalid_request` rather than a
+/// silently redundant ask. An omitted `include` asks for nothing and the
+/// answer is byte-identical to the one this operation has always given.
+///
+/// The list is `#[serde(default)]` rather than an `Option`, exactly as
+/// `SnapshotNotesParams::include` is: "asked for no facet" and "did not
+/// mention facets" are the same request, and a facet name this build does not
+/// know fails the decode instead of degrading to an empty ask.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NotePathParams {
     pub path: String,
+    #[serde(default)]
+    pub include: Vec<NoteFacetDto>,
+}
+
+/// `get_tree_entries`' parameters: the exact paths a caller wants tree rows
+/// for, in the order it wants them answered.
+///
+/// Deliberately not a page and not a filter. The mirror this serves knows
+/// precisely which paths a change set named and wants their rows, so a cursor
+/// would only make it page through an answer it already sized. The count is
+/// capped at the transport's own per-generation detail limit (1024 paths), so
+/// a caller that has to ask about more than one generation's worth of detail
+/// meets a refusal rather than an unbounded read.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetTreeEntriesParams {
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -129,6 +162,7 @@ pub enum Response {
     GetVaultInfo(GetVaultInfoResponse),
     ListNotes(PageResponse<NoteSummaryDto>),
     GetNote(GetNoteResponse),
+    GetTreeEntries(GetTreeEntriesResponse),
     ResolveLink(ResolveLinkResponse),
     GetBacklinks(PageResponse<ReferenceDto>),
     ListReferences(PageResponse<ReferenceDto>),
@@ -190,6 +224,21 @@ pub struct GetVaultInfoResponse {
 pub struct GetNoteResponse {
     pub generation: u64,
     pub note: NoteDto,
+}
+
+/// `get_tree_entries`' answer, at one generation.
+///
+/// `entries` holds the rows that exist, in the order the request named them,
+/// with the absentees left out; `absent` names those, in request order too.
+/// A path with no row is **not** an error: the mirror asking about it is
+/// working from a change set that may have named a path the index never listed
+/// (a hidden file, a path the scan skipped) or one that has since gone, and
+/// "there is nothing there at generation N" is exactly the answer it needs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetTreeEntriesResponse {
+    pub generation: u64,
+    pub entries: Vec<TreeEntryDto>,
+    pub absent: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

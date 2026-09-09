@@ -20,6 +20,20 @@
 //! | the notice names the landed path | `an_alias_into_the_zone_announces_the_zone_path_it_reached` |
 //! | hidden Markdown is raw, not refused | `a_trashed_note_round_trips_through_the_raw_pair` |
 //! | a read reports the revision a write compares against | `a_read_returns_the_bytes_and_the_revision_a_write_would_compare_against` |
+//!
+//! `create_folder` reaches the same places since the headless-plugin-host
+//! phase, and carries the same guards:
+//!
+//! | guard | witness |
+//! | --- | --- |
+//! | a zone folder is created rather than refused | `a_zone_folder_can_be_created_and_then_written_into` |
+//! | …and the write into it then lands | same test, second half |
+//! | a hidden non-zone folder is created too | `a_hidden_folder_outside_the_zone_is_created_with_no_generation_either` |
+//! | an unindexable create reports no generation | `a_zone_folder_create_announces_itself_and_publishes_no_generation` |
+//! | an indexed create still reports one | `an_ordinary_folder_still_reports_the_generation_that_holds_it` |
+//! | a zone create announces itself | `a_zone_folder_create_announces_itself_and_publishes_no_generation` |
+//! | …and only the **zone** does | `a_hidden_folder_create_outside_the_zone_announces_nothing` |
+//! | every other folder gate still refuses | `the_lifted_zone_refusal_left_every_other_folder_gate_standing` |
 
 mod daemon;
 
@@ -213,6 +227,12 @@ fn a_zone_write_joins_no_generation_and_announces_itself() {
     assert_eq!(announced, vec![".obsidian/app.json".to_string()]);
 }
 
+/// `create_folder` used to be in the list below and is deliberately not any
+/// more: it is the one verb that now serves the zone, because a plugin host
+/// has to make `.obsidian/plugins/<id>/` and `write_file` never creates
+/// parents. The destructive folder verbs stay refused — a directory that was
+/// made can be removed again, while an emptied `.trash` or a removed `.git`
+/// cannot be put back — so `delete_folder` takes the slot `create_folder` left.
 #[test]
 fn every_semantic_operation_refuses_the_zone() {
     let live = live();
@@ -227,8 +247,10 @@ fn every_semantic_operation_refuses_the_zone() {
             mode: Some(vault_index::DeleteMode::Permanent),
             expected: Precondition::Any,
         },
-        Mutation::CreateFolder {
+        Mutation::DeleteFolder {
             path: path(".obsidian/plugins"),
+            mode: Some(vault_index::DeleteMode::Permanent),
+            recursive: true,
         },
         Mutation::PatchFrontmatter {
             path: path(".obsidian/app.json"),
@@ -711,5 +733,221 @@ fn a_trashed_note_round_trips_through_the_raw_pair() {
             assert_eq!(read.revision, response.revision);
         }
         other => panic!("read_file must read what write_file wrote: {other:?}"),
+    }
+}
+
+/// `create_folder` over the wire, returning the whole envelope so a refusal is
+/// as easy to assert on as a success.
+fn create_folder(daemon: &mut Daemon, path: &str) -> ResponseOutcome {
+    daemon
+        .call(&format!(
+            r#"{{"version":1,"id":"cf","request":{{"method":"create_folder","params":{{"path":"{path}"}}}}}}"#
+        ))
+        .outcome
+}
+
+/// The hole the phase-5 protocol left open, closed end to end: make the
+/// folder, then write into it. Before this, `create_folder` refused every zone
+/// path and `write_file` answered `parent_not_found` for a folder that did not
+/// exist yet, so a host could write into a plugin directory that was already
+/// there and could never make a new one.
+///
+/// The generation is **absent**, not zero: no generation will ever contain a
+/// zone folder, and `0` is a well-formed generation a client would read at.
+/// Asserted on the re-encoded line as well as on the decoded `Option`, because
+/// "absent" is a statement about the bytes.
+#[test]
+fn a_zone_folder_can_be_created_and_then_written_into() {
+    let (vault, _index, mut daemon) = wired();
+
+    let response = match create_folder(&mut daemon, ".obsidian/plugins/example") {
+        ResponseOutcome::Ok(Response::CreateFolder(response)) => response,
+        other => panic!("a zone folder must be creatable: {other:?}"),
+    };
+    assert_eq!(
+        response.generation, None,
+        "no generation contains a zone folder, so none may be reported: {response:?}"
+    );
+    let encoded = serde_json::to_string(&response).expect("re-encode");
+    assert_eq!(
+        encoded, "{}",
+        "an absent generation is an absent key, never a fabricated 0: {encoded}"
+    );
+    assert!(vault.path().join(".obsidian/plugins/example").is_dir());
+
+    // The whole point of the verb: the parent now exists, so the write lands.
+    let written = write_file(
+        &mut daemon,
+        ".obsidian/plugins/example/data.json",
+        br#"{"key":"value"}"#,
+    );
+    assert!(!written.semantic, "{written:?}");
+    assert_eq!(written.generation, None, "{written:?}");
+    assert_eq!(
+        std::fs::read(vault.path().join(".obsidian/plugins/example/data.json")).expect("read back"),
+        br#"{"key":"value"}"#
+    );
+}
+
+/// A hidden folder that is not the configuration zone: created the same way,
+/// reporting no generation for the same reason, and announcing nothing —
+/// `config_changed` is about `.obsidian/`, and `.obsidian-headless/` is a
+/// different directory that merely starts with the same letters.
+#[test]
+fn a_hidden_folder_outside_the_zone_is_created_with_no_generation_either() {
+    let (vault, _index, mut daemon) = wired();
+
+    for path in [".obsidian-headless/plugins", ".trash/restored"] {
+        let response = match create_folder(&mut daemon, path) {
+            ResponseOutcome::Ok(Response::CreateFolder(response)) => response,
+            other => panic!("{path} must be creatable: {other:?}"),
+        };
+        assert_eq!(
+            response.generation, None,
+            "the scan never lists {path}, so no generation contains it: {response:?}"
+        );
+        assert!(vault.path().join(path).is_dir(), "{path} must exist");
+    }
+}
+
+/// An ordinary folder is unaffected: it joins a generation, and the key is
+/// present. The pin that the optional field did not quietly become optional
+/// for everybody.
+#[test]
+fn an_ordinary_folder_still_reports_the_generation_that_holds_it() {
+    let (vault, _index, mut daemon) = wired();
+
+    let response = match create_folder(&mut daemon, "Folder/Nested") {
+        ResponseOutcome::Ok(Response::CreateFolder(response)) => response,
+        other => panic!("an ordinary create must succeed: {other:?}"),
+    };
+    let generation = response
+        .generation
+        .expect("an indexed folder joins a generation");
+    let encoded = serde_json::to_string(&response).expect("re-encode");
+    assert_eq!(encoded, format!(r#"{{"generation":{generation}}}"#));
+    assert!(vault.path().join("Folder/Nested").is_dir());
+}
+
+/// Every refusal `create_folder` carried before still refuses; only the
+/// zone/hidden one was lifted. A NUL never reaches a syscall, a traversal
+/// never becomes a vault path, a file at the name is still `target_exists`,
+/// and a symlink is not a way to reach the zone under an ordinary name.
+#[test]
+fn the_lifted_zone_refusal_left_every_other_folder_gate_standing() {
+    let (vault, _index, mut daemon) = wired();
+
+    // A NUL byte: refused as a containment violation before any segment is
+    // created, never handed to the filesystem as a `storage_failure`.
+    match create_folder(&mut daemon, "bad\\u0000name/Deep") {
+        ResponseOutcome::Err(error) => {
+            assert_eq!(error.code, ErrorCode::ZoneViolation, "{error:?}")
+        }
+        other => panic!("a NUL byte must be refused: {other:?}"),
+    }
+    // Traversal: not a vault path at all, refused before the engine.
+    match create_folder(&mut daemon, "../escape") {
+        ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::InvalidPath, "{error:?}"),
+        other => panic!("a traversal must be refused: {other:?}"),
+    }
+    // A file already at the name, inside the zone: the lift is about where a
+    // folder may be made, never about what may be replaced.
+    match create_folder(&mut daemon, ".obsidian/app.json") {
+        ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::TargetExists, "{error:?}"),
+        other => panic!("a file at the name must be refused: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(vault.path().join(".obsidian/app.json")).expect("read back"),
+        br#"{"trashOption":"local"}"#
+    );
+    // A case twin of a stored folder, where the platform folds.
+    if folds_case(&vault) {
+        match create_folder(&mut daemon, ".OBSIDIAN") {
+            ResponseOutcome::Err(error) => {
+                assert_eq!(error.code, ErrorCode::CaseCollision, "{error:?}");
+            }
+            other => panic!("a case twin must be refused: {other:?}"),
+        }
+    }
+    assert!(!vault.path().join("bad").exists());
+    assert!(!vault.path().join("escape").exists());
+}
+
+/// A zone folder create emits `config_changed` naming the folder, and emits no
+/// generation event at all — the same split `write_file` already holds to, and
+/// the reason it holds: nothing in the zone is indexed, so there is no
+/// generation to name and a host has to be told some other way.
+#[test]
+fn a_zone_folder_create_announces_itself_and_publishes_no_generation() {
+    let live = live();
+    let before = live
+        .handle
+        .reader()
+        .vault_info()
+        .expect("vault info")
+        .generation;
+
+    let report = live
+        .handle
+        .mutate(Mutation::CreateFolder {
+            path: path(".obsidian/plugins/example"),
+        })
+        .expect("a zone folder is created, not refused");
+    assert!(
+        !report.semantic,
+        "a folder holds nothing the semantic layer indexes: {report:?}"
+    );
+    assert_eq!(
+        report.written.as_ref().map(|written| written.as_str()),
+        Some(".obsidian/plugins/example"),
+        "the stored spelling is what every answer above this is decided from"
+    );
+    assert_eq!(
+        live.handle
+            .reader()
+            .vault_info()
+            .expect("vault info")
+            .generation,
+        before,
+        "a folder the index never lists must publish no generation"
+    );
+
+    let mut announced = Vec::new();
+    while let Ok(notice) = live.notices.try_recv() {
+        match notice {
+            RuntimeNotice::ConfigChanged { path } => announced.push(path.as_str().to_string()),
+            RuntimeNotice::Generation(report) => {
+                panic!("a zone folder create must publish no generation: {report:?}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(announced, vec![".obsidian/plugins/example".to_string()]);
+    assert!(live.vault.path().join(".obsidian/plugins/example").is_dir());
+}
+
+/// The negative half, and the reason the emission predicate is
+/// `in_config_zone` rather than the wider unindexable test: `config_changed`
+/// means "this daemon changed your Obsidian configuration". A hidden folder
+/// that is not the zone changed nothing a host reads from `.obsidian/`, so it
+/// says nothing at all. Deleting the `in_config_zone` guard in
+/// `Coordinator::apply_mutation` reddens this test; deleting the emission
+/// altogether reddens the one above.
+#[test]
+fn a_hidden_folder_create_outside_the_zone_announces_nothing() {
+    let live = live();
+    for spelling in [".obsidian-headless/plugins", ".trash/restored"] {
+        live.handle
+            .mutate(Mutation::CreateFolder {
+                path: path(spelling),
+            })
+            .expect("a hidden folder is created, not refused");
+        assert!(live.vault.path().join(spelling).is_dir());
+    }
+
+    while let Ok(notice) = live.notices.try_recv() {
+        if let RuntimeNotice::ConfigChanged { path } = notice {
+            panic!("only the configuration zone announces itself, not {path:?}");
+        }
     }
 }

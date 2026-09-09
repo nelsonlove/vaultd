@@ -110,43 +110,142 @@ fn creating_a_folder_where_a_file_sits_is_refused() {
     assert!(fixture.root.join("One.md").is_file());
 }
 
-/// The caller-spelling half of the folder guard. Every one of these is
-/// refused before the filesystem is touched at all, which is what makes the
-/// check load-bearing: `.trash` and `.git` do not exist here, so a check that
-/// only ran against a *stored* path would never see them.
+/// The refusal this verb used to carry, flipped. `create_folder` is the one
+/// folder operation that **serves** unindexable paths: a plugin host has to
+/// make `.obsidian/plugins/<id>/` and its own `.obsidian-headless/`, and
+/// `write_file` never creates parents, so before this the two rules composed
+/// into a hole no client could work around.
+///
+/// The outcome is the whole point: the folder is on disk, and `changed_paths`
+/// names **nothing**, because the scan never lists such a path and a hint for
+/// it could only produce a `tree_entries` row no reconciliation would ever
+/// confirm. `written` names the stored spelling, which is what the wire
+/// decides "no generation" from.
+///
+/// (This is a create, not a delete: `delete_folder` and `rename_folder` still
+/// refuse every one of these spellings. Making a directory is undone by
+/// removing it; emptying `.trash` or removing `.git` is not.)
 #[test]
-fn creating_a_hidden_or_zone_folder_is_refused() {
+fn creating_a_hidden_or_zone_folder_succeeds_and_names_no_path() {
     let fixture = fixture();
     for spelling in [
-        ".obsidian",
-        ".OBSIDIAN",
         ".obsidian/plugins",
+        ".obsidian/plugins/example",
+        ".obsidian-headless/plugins",
         ".trash",
-        ".git",
         ".git/hooks",
         "A/.hidden",
     ] {
-        let error = fixture
+        let outcome = fixture
             .engine
             .apply(&Mutation::CreateFolder {
                 path: path(spelling),
             })
-            .expect_err("the daemon may not create what it does not index");
+            .expect("an unindexable folder is created, not refused");
         assert!(
-            matches!(error, MutationError::ZoneViolation { .. }),
-            "expected zone_violation for {spelling}, got {error:?}"
+            fixture.root.join(spelling).is_dir(),
+            "{spelling} must exist on disk"
+        );
+        assert_eq!(
+            outcome.written.as_ref().map(VaultPath::as_str),
+            Some(spelling),
+            "the outcome names the stored spelling it landed on"
+        );
+        assert!(
+            !outcome.semantic,
+            "a folder holds nothing the semantic layer indexes"
+        );
+        assert_eq!(
+            outcome.revision, None,
+            "a folder has no bytes and therefore no revision"
         );
     }
-    // Named one by one rather than in the loop: `.obsidian` is there because
-    // the harness wrote it, and on a case-folding volume `.OBSIDIAN` "exists"
-    // for the same reason, so `!exists()` per spelling would assert the wrong
-    // thing. These are the paths that must not have appeared.
-    for absent in [".trash", ".git", "A", ".obsidian/plugins"] {
-        assert!(
-            !fixture.root.join(absent).exists(),
-            "{absent} must not have been created"
-        );
-    }
+    // `A/.hidden` is the mixed case, and the one place `changed_paths` is not
+    // empty: `A` really was created and the scan really will list it, so
+    // dropping it would be the under-naming hazard `changed_paths` exists to
+    // prevent. The hidden leaf itself is still named by nobody.
+    assert!(fixture.root.join("A/.hidden").is_dir());
+}
+
+/// The pure-zone create names nothing at all, which is what makes it publish
+/// no generation. Separated from the loop above so the assertion is about one
+/// call's whole outcome rather than the last of six.
+#[test]
+fn a_zone_folder_create_names_no_changed_path_at_all() {
+    let fixture = fixture();
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian/plugins/example"),
+        })
+        .expect("a zone folder chain is created");
+    assert!(
+        outcome.changed_paths.is_empty(),
+        "the index never lists a zone path, so a hint for one is a phantom row: {:?}",
+        outcome.changed_paths
+    );
+    assert!(fixture.root.join(".obsidian/plugins/example").is_dir());
+}
+
+/// The mixed chain: an indexable segment created on the way to an unindexable
+/// target. Deleting the `is_unindexable_folder` filter in `create_folder`
+/// leaves `A/.hidden` in the change set (a hint for a path the scan never
+/// emits); replacing the filter with an unconditional empty set drops `A` (a
+/// folder the scan *will* list, whose tree row would then never land).
+#[test]
+fn a_hidden_folder_under_a_visible_one_names_only_the_visible_segment() {
+    let fixture = fixture();
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path("A/.hidden"),
+        })
+        .expect("a hidden leaf under a fresh visible folder");
+    assert_eq!(
+        outcome.changed_paths,
+        BTreeSet::from([path("A")]),
+        "the visible segment is a tree row that must land; the hidden one never will"
+    );
+    assert!(fixture.root.join("A/.hidden").is_dir());
+}
+
+/// The zone folder named by itself, which `in_config_zone` catches as a whole
+/// string rather than as a prefix. Already there in this fixture, so it is
+/// also the idempotent case: success, nothing created, and still the stored
+/// spelling reported.
+#[test]
+fn creating_the_zone_folder_itself_is_idempotent_success() {
+    let fixture = fixture();
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian"),
+        })
+        .expect("an existing folder is success, not a conflict");
+    assert!(outcome.changed_paths.is_empty());
+    assert_eq!(
+        outcome.written.as_ref().map(VaultPath::as_str),
+        Some(".obsidian")
+    );
+    assert!(fixture.root.join(".obsidian/app.json").is_file());
+}
+
+/// A **file** at the name is still `target_exists`, inside the zone exactly as
+/// outside it. The lifted refusal is about where a folder may be made, never
+/// about what may be overwritten.
+#[test]
+fn creating_a_zone_folder_where_a_zone_file_sits_is_refused() {
+    let fixture = fixture();
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian/app.json"),
+        })
+        .expect_err("a file occupies the name");
+    assert!(
+        matches!(error, MutationError::TargetExists { .. }),
+        "expected target_exists, got {error:?}"
+    );
     assert!(fixture.root.join(".obsidian/app.json").is_file());
 }
 
@@ -219,6 +318,13 @@ fn creating_a_folder_that_only_differs_in_case_is_refused() {
 /// stand in for: `Link` carries no dot and names no zone, and only resolving
 /// it reveals that the folder the caller addressed *is* the configuration
 /// zone.
+///
+/// This one did **not** move when the zone refusal was lifted, and the
+/// distinction is the whole shape of that lift: the permission is granted to a
+/// caller that said out loud where it was writing, never to a spelling that
+/// hides it. A request naming an ordinary folder that lands on an unindexable
+/// one would answer "no generation" for a path the caller believes is indexed,
+/// which is the laundering this refusal exists to stop.
 #[cfg(unix)]
 #[test]
 fn creating_through_a_link_into_the_configuration_zone_is_refused() {
@@ -239,6 +345,74 @@ fn creating_through_a_link_into_the_configuration_zone_is_refused() {
         !fixture.root.join(".obsidian/plugins").exists(),
         "nothing may be created inside the zone"
     );
+
+    // The companion, in the same fixture so the two are read together: the
+    // *same* destination, named openly, is served.
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian/plugins"),
+        })
+        .expect("a caller that names the zone is served there");
+    assert!(fixture.root.join(".obsidian/plugins").is_dir());
+    assert!(outcome.changed_paths.is_empty());
+}
+
+/// The other direction across the same boundary, which the lifted refusal must
+/// not turn into a lie: a link *inside* the zone that resolves back out into
+/// the indexed vault creates an indexed folder, so the outcome names it and a
+/// generation really will contain it. Decided from where the create landed,
+/// never from the `.obsidian/…` spelling the request carried.
+#[cfg(unix)]
+#[test]
+fn creating_through_a_zone_link_that_escapes_the_zone_names_the_indexed_path() {
+    let fixture = fixture();
+    std::os::unix::fs::symlink(
+        fixture.root.join("Empty"),
+        fixture.root.join(".obsidian/Escape"),
+    )
+    .expect("link out of the zone");
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian/Escape/Inner"),
+        })
+        .expect("the create lands in the indexed vault");
+    assert!(fixture.root.join("Empty/Inner").is_dir());
+    assert_eq!(
+        outcome.changed_paths,
+        BTreeSet::from([path("Empty/Inner")]),
+        "a folder the scan will list must be named, whatever the request called it"
+    );
+    assert_eq!(
+        outcome.written.as_ref().map(VaultPath::as_str),
+        Some("Empty/Inner")
+    );
+}
+
+/// The case guard on the zone folder itself. On a case-folding volume
+/// `.OBSIDIAN` reaches the stored `.obsidian`, and the final-segment guard
+/// refuses rather than silently succeeding on a folder the caller did not
+/// name. On a case-sensitive volume it is simply a different, absent folder
+/// and the create legitimately makes it — so the assertion is conditional, the
+/// way `creating_a_folder_that_only_differs_in_case_is_refused` already is.
+#[test]
+fn a_case_folded_spelling_of_the_zone_folder_is_still_refused() {
+    let fixture = fixture();
+    if !folds_case(&fixture) {
+        return;
+    }
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".OBSIDIAN"),
+        })
+        .expect_err("a case variant of the stored zone folder is not a folder to create");
+    assert!(
+        matches!(&error, MutationError::CaseCollision { existing, .. } if existing == ".obsidian"),
+        "expected case_collision naming the stored spelling, got {error:?}"
+    );
+    assert!(fixture.root.join(".obsidian/app.json").is_file());
 }
 
 #[test]

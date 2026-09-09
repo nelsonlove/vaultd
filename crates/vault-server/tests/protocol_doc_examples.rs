@@ -112,21 +112,25 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
         }
     }
 
-    // One request/response pair per documented operation — the eleven read
+    // One request/response pair per documented operation — the twelve read
     // and subscription operations, the ten mutation and raw-file operations,
     // and the four snapshot-session operations — plus the four event examples
     // and the three extra error-outcome examples under "Errors"
     // (`generation_mismatch`, `vault_changed_during_refresh`, and the
     // `storage_failure` shape that carries `current_revision` to say a write
-    // reached disk). A count regression here means an operation lost its
-    // documented example, not just that a JSON block became unparseable.
+    // reached disk). Two operations carry a second pair, because a second
+    // shape of their answer is contractual: `get_note` with `include` (the
+    // structural facets, absent from the first) and `create_folder` inside the
+    // `.obsidian` zone (whose `generation` key is absent, not zero). A count
+    // regression here means an operation lost its documented example, not just
+    // that a JSON block became unparseable.
     assert_eq!(
-        requests, 25,
-        "expected 25 request examples, see docs/protocol.md"
+        requests, 28,
+        "expected 28 request examples, see docs/protocol.md"
     );
     assert_eq!(
-        responses, 28,
-        "expected 28 response examples (25 success + 3 error), see docs/protocol.md"
+        responses, 31,
+        "expected 31 response examples (28 success + 3 error), see docs/protocol.md"
     );
     assert_eq!(events, 4, "expected 4 event examples, see docs/protocol.md");
 }

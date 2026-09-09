@@ -23,11 +23,11 @@ pub use mutations::{
     WriteNoteParams,
 };
 pub use operations::{
-    GetDiagnosticsParams, GetNoteResponse, GetVaultInfoResponse, HealthResponse,
-    ListReferencesParams, NotePathParams, PageParams, PageResponse, PathPageParams,
-    ReferenceStatusFilter, RefreshIndexParams, RefreshIndexResponse, Request, ResolveLinkParams,
-    ResolveLinkResponse, Response, SubscribeEventsParams, SubscribeEventsResponse,
-    UnsubscribeParams, UnsubscribeResponse,
+    GetDiagnosticsParams, GetNoteResponse, GetTreeEntriesParams, GetTreeEntriesResponse,
+    GetVaultInfoResponse, HealthResponse, ListReferencesParams, NotePathParams, PageParams,
+    PageResponse, PathPageParams, ReferenceStatusFilter, RefreshIndexParams, RefreshIndexResponse,
+    Request, ResolveLinkParams, ResolveLinkResponse, Response, SubscribeEventsParams,
+    SubscribeEventsResponse, UnsubscribeParams, UnsubscribeResponse,
 };
 pub use semantic::{
     AliasDto, BlockDto, DiagnosticDto, HeadingDto, IndexStateDto, NoteDto, NoteSummaryDto,

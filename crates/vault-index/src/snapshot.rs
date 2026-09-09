@@ -632,7 +632,14 @@ fn load_backlinks(
         .collect()
 }
 
-fn load_sections(connection: &Connection, path: &VaultPath) -> Result<Vec<SectionRow>, IndexError> {
+/// Also the per-path read `get_note`'s `sections` facet is served from — one
+/// query text for both, so a page and a single-note refetch can never disagree
+/// about what a section is. `&Transaction` derefs to `&Connection`, so the
+/// reader's own transaction runs byte-identical SQL to a snapshot session's.
+pub(crate) fn load_sections(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Vec<SectionRow>, IndexError> {
     let mut statement = connection.prepare(
         "SELECT kind, span_start, span_end, block_id FROM sections \
          WHERE note_path = ?1 ORDER BY ordinal",
@@ -661,7 +668,8 @@ fn load_sections(connection: &Connection, path: &VaultPath) -> Result<Vec<Sectio
         .collect()
 }
 
-fn load_list_items(
+/// The `list_items` half of the same pairing — see [`load_sections`].
+pub(crate) fn load_list_items(
     connection: &Connection,
     path: &VaultPath,
 ) -> Result<Vec<ListItemRow>, IndexError> {

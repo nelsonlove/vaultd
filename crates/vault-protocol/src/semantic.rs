@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::snapshots::{ListItemDto, SectionDto};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SpanDto {
     pub start: u64,
@@ -152,6 +154,17 @@ pub struct NoteSummaryDto {
     pub title: Option<String>,
 }
 
+/// One note in full: its bytes, its metadata, and its outgoing references.
+///
+/// `sections` and `list_items` are the two **structural** row-sets, and the
+/// only two fields here a caller has to ask for: they are present exactly when
+/// the request's `include` named them, `Some(vec![])` when named and empty,
+/// and absent otherwise. That is the snapshot pager's own convention — absent
+/// is not empty, so "I did not ask" and "there are none" stay distinguishable —
+/// carried onto the per-note read so a mirror can refetch one note's structure
+/// after an edit without paging the whole vault. Every other field is
+/// unconditional, and a request that names no facet serializes byte-identically
+/// to what this operation has always answered.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NoteDto {
     pub path: String,
@@ -164,6 +177,10 @@ pub struct NoteDto {
     pub tags: Vec<TagDto>,
     pub diagnostics: Vec<DiagnosticDto>,
     pub outgoing: Vec<ReferenceDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<SectionDto>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_items: Option<Vec<ListItemDto>>,
 }
 
 impl NoteDto {
@@ -193,6 +210,11 @@ impl NoteDto {
             tags: Vec::new(),
             diagnostics: Vec::new(),
             outgoing: Vec::new(),
+            // The structural facets are opt-in, and this constructor asks for
+            // nothing: `None` is "not requested", which is what a caller that
+            // named no facet gets.
+            sections: None,
+            list_items: None,
         }
     }
 }
