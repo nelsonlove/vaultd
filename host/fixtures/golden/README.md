@@ -21,7 +21,11 @@ Task 0's recipe is a scratch vault with only the plugin under test enabled. That
 The capture ran **inside a live vault with its full plugin set loaded**, in a disposable scratch folder (`Fixtures/vaultd-golden-capture/<id>/`, trashed afterwards), driven through the `obsidian` CLI. Opening a second vault by hand was not available to this session. The consequences were measured, not assumed:
 
 - Before each action, the staged input tree was diffed against `vault/` in this repo. **All eight were byte-identical**, so no other loaded plugin rewrote an input during staging.
-- `folder-notes` auto-creates a folder note whenever a folder appears. Its `autoCreate` and `autoCreateFocusFiles` were switched off **in memory** for the staging step (never written to its `data.json`, restored afterwards) so the other seven inputs stayed clean. `folder-notes/scenario.json` records `false` for both, because that is what was in force at capture time.
+- `folder-notes` auto-creates a folder note whenever a folder appears. Its `autoCreate` and `autoCreateFocusFiles` were switched off for the staging step and switched back on afterwards, so the other seven inputs stayed clean. `folder-notes/scenario.json` records `false` for both, because that is what was in force at capture time.
+
+  **What that toggle actually did, corrected.** The switch was made on the plugin's in-memory `settings` object with no call to `saveSettings`, and the first version of this README claimed on that basis that `data.json` was never written. **That claim was wrong.** The vault backup repo's 08:30 mid-capture commit (`53b202d`) holds `.obsidian/plugins/folder-notes/data.json` with `"autoCreate": false` and `"autoCreateFocusFiles": false` — the plugin persisted the change itself, through its own `saveData` path, without being asked to. Restoring the flags then wrote the file back. The live file is now **byte-identical to the 07:32 pre-capture version** in that same backup repo, so the vault is fully restored and nothing leaked; but the mechanism was not what was claimed.
+
+  **Lesson for the next capture: an in-memory plugin flag toggle can persist through the plugin's own `saveData`.** Never assume `data.json` stays untouched. Snapshot the file before the toggle, diff it after the restore, and report the diff — do not infer "not written" from "did not call save".
 - The one place contamination did show up is `tag-wrangler`'s menu capture, where three items came from other loaded plugins. They are separated out in `expected/editor-menu.json` under `otherPluginItems` and are not part of the assertion.
 
 Two further honest limits, both recorded per case in `notes`:
@@ -30,6 +34,21 @@ Two further honest limits, both recorded per case in `notes`:
 - **`nested-properties`' flagship commands are vault-wide.** `rename-nested-property-across-vault` and `delete-nested-property-across-vault` would rewrite frontmatter across every note in the vault they run in. They were categorically unsafe to invoke in a live vault and were not captured.
 
 Four cases do carry a real, byte-level mutation: `folder-notes`, `obsidian-linter`, `automatic-linker`, and `obsidian-rollover-daily-todos`.
+
+## What this corpus can and cannot be used to claim
+
+**The conformance set is five cases: the four mutating goldens plus `tag-wrangler`'s menu harvest.** Those are the ones where a real Obsidian outcome exists to match against, so they are the ones Task 22 may report conformance for.
+
+**`find-replace`, `nested-properties` and `quickadd` are load-and-invoke smoke tests, not conformance.** What they assert is: the plugin loads in the headless host, its command registry matches, the named command invokes without throwing, and no file changes. That will catch shim regressions and it is worth having, but it is **not** evidence that the plugin's flagship behaviour reproduces. Do not word Task 22's acceptance as "eight plugins conform". Real mutation captures for those three wait on a scratch vault opened by hand.
+
+**Two of the four mutating goldens need editor-context support before a driver can reproduce them verbatim.** Their `action.op` records the command a human would run, which is the honest GUI record Step 4b asks for, but it is not the path that produced `expected/`:
+
+| golden | recorded `op` | how it is registered | how `expected/` was actually produced |
+| --- | --- | --- | --- |
+| `automatic-linker` | `automatic-linker:format-file` | `editorCallback`, applies through a CodeMirror writer | `modifyLinks(content, path, frontmatter)` + `vault.modify` |
+| `obsidian-linter` | `obsidian-linter:lint-all-files-in-folder` | `editorCheckCallback`, derives the folder from the live active file | `runLinterAllFilesInFolder(folder)` with the folder explicit |
+
+A driver doing `await host.call(op, params)` verbatim will not reproduce either `expected/` until the host can supply an editor context (an active file plus an editor the command can read and write). **This is a Task 22 precondition, not a fixture defect** — so those two cases do not get read as conformance failures for a reason that has nothing to do with conformance.
 
 ## Per plugin
 

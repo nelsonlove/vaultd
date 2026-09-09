@@ -66,10 +66,10 @@ A list element is `field.<index>`; a scalar is the bare `field`. A markdown link
 | `tags[]` | `position`, `tag` (the `tag` value **includes** the leading `#`) |
 | `headings[]` | `heading`, `level`, `position` |
 | `blocks` (a map, id → entry) | `id`, `position` |
-| `listItems[]` | `parent`, `position`, `task` (task absent on non-tasks) |
+| `listItems[]` | `parent`, `position`, `task` (absent on non-tasks), `id` (present **only** when the item carries a block id) |
 | `footnotes[]`, `footnoteRefs[]` | `id`, `position` |
 
-`parity-tags-frontmatter` pins one more thing: **frontmatter tags do not appear in `cache.tags`.** That file's `tags` key is absent entirely and the values live in `frontmatter.tags`; `cache.tags` only ever holds body tags. `parity-blocks` pins that a `^id` written inline on a heading line does register in `blocks` and as `sections[].id`, while the heading's own `heading` text still contains the literal `^heading-inline`.
+`parity-tags-frontmatter` pins one more thing: **frontmatter tags do not appear in `cache.tags`.** That file's `tags` key is absent entirely and the values live in `frontmatter.tags`; `cache.tags` only ever holds body tags. `parity-blocks` pins two things about block ids. A `^id` written inline on a heading line does register in `blocks` and as `sections[].id`, while the heading's own `heading` text still contains the literal `^heading-inline`. And **a `^id` on a list item appears as an `id` key on that `listItems[]` entry** — `parity-blocks` line 11 is `{ id: "item-block", parent: -11, position: … }` while line 12, the item without an id, has only `parent` and `position`. The key is present only when the item carries a block id, exactly like `task`. `buildCachedMetadata` written against the field table alone, without this row, omits the key and fails parity on `parity-blocks`; the pre-task structural corpus records the same behaviour (case 13 refinement), so the two corpora agree.
 
 ### The empty note
 
