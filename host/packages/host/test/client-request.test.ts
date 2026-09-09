@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { VaultdClient, VaultdError } from "../src/client/client";
+import { MalformedEnvelopeError } from "../src/client/framing";
 import { FakeDaemon } from "../src/testing/fake-daemon";
 
 describe("VaultdClient", () => {
@@ -218,6 +219,123 @@ describe("VaultdClient", () => {
     expect(client.pendingCount()).toBe(0);
     await expect(client.request("health")).rejects.toThrow(/client is closed/);
     expect(daemon.rawLines()).toHaveLength(1);
+  });
+
+  it("settles the pending request when its answer is not a well-formed envelope", async () => {
+    // The reviewer's exact line. Before the boundary decoder this dereferenced
+    // `outcome.status` on `undefined` inside a stream listener: an uncaught
+    // TypeError that killed the process and left the promise pending forever.
+    const daemon = new FakeDaemon();
+    let fatal: Error | null = null;
+    const client = new VaultdClient({
+      stdout: daemon.stdout,
+      stdin: daemon.stdin,
+      onEvent: () => undefined,
+      onFatal: (error) => {
+        fatal = error;
+      },
+    });
+    const pending = client.request("health");
+    const [sent] = await daemon.received(1);
+    daemon.writeRaw(`{"version":1,"id":"${sent!.id}"}\n`);
+    await expect(pending).rejects.toBeInstanceOf(MalformedEnvelopeError);
+    // Attributable: the request that asked for it is told, and the connection
+    // lives — the stream is still byte-aligned, so there is nothing to tear down.
+    expect(fatal).toBeNull();
+    const second = client.request<{ service: string }>("health");
+    const [, next] = await daemon.received(2);
+    daemon.respondOk(next!.id, "health", { service: "vaultd", status: "ok" });
+    await expect(second).resolves.toEqual({ service: "vaultd", status: "ok" });
+  });
+
+  it("treats an unattributable malformed line as fatal, after settling the chunk", async () => {
+    const daemon = new FakeDaemon();
+    let fatal: Error | null = null;
+    const client = new VaultdClient({
+      stdout: daemon.stdout,
+      stdin: daemon.stdin,
+      onEvent: () => undefined,
+      onFatal: (error) => {
+        fatal = error;
+      },
+    });
+    const pending = client.request<{ service: string }>("health");
+    const [sent] = await daemon.received(1);
+    daemon.writeRaw(
+      `{"version":1,"id":"${sent!.id}","outcome":{"status":"ok","value":{"type":"health","value":{"service":"vaultd","status":"ok"}}}}\n{"version":1}\n`,
+    );
+    await expect(pending).resolves.toEqual({ service: "vaultd", status: "ok" });
+    expect(fatal).toBeInstanceOf(MalformedEnvelopeError);
+  });
+
+  it("survives an onEvent that throws, and settles the response behind it", async () => {
+    const daemon = new FakeDaemon();
+    const handlerErrors: string[] = [];
+    let fatal: Error | null = null;
+    const client = new VaultdClient({
+      stdout: daemon.stdout,
+      stdin: daemon.stdin,
+      onEvent: () => {
+        throw new Error("the subscription handler is buggy");
+      },
+      onHandlerError: (error) => handlerErrors.push(error.message),
+      onFatal: (error) => {
+        fatal = error;
+      },
+    });
+    const pending = client.request<{ service: string }>("health");
+    const [sent] = await daemon.received(1);
+    daemon.writeRaw(
+      `{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed","value":{"path":".obsidian/app.json"}}}\n` +
+        `{"version":1,"id":"${sent!.id}","outcome":{"status":"ok","value":{"type":"health","value":{"service":"vaultd","status":"ok"}}}}\n`,
+    );
+    await expect(pending).resolves.toEqual({ service: "vaultd", status: "ok" });
+    expect(handlerErrors).toEqual(["the subscription handler is buggy"]);
+    // A handler bug is the consumer's, not the transport's: with a channel to
+    // report it on, the client keeps working.
+    expect(fatal).toBeNull();
+    const second = client.request<{ service: string }>("health");
+    const [, next] = await daemon.received(2);
+    daemon.respondOk(next!.id, "health", { service: "vaultd", status: "ok" });
+    await expect(second).resolves.toEqual({ service: "vaultd", status: "ok" });
+  });
+
+  it("reports an unclaimed handler throw to onFatal, after finishing the chunk", async () => {
+    const daemon = new FakeDaemon();
+    let fatal: Error | null = null;
+    const client = new VaultdClient({
+      stdout: daemon.stdout,
+      stdin: daemon.stdin,
+      onEvent: () => {
+        throw new Error("nobody claims this");
+      },
+      onFatal: (error) => {
+        fatal = error;
+      },
+    });
+    const pending = client.request<{ service: string }>("health");
+    const [sent] = await daemon.received(1);
+    daemon.writeRaw(
+      `{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed","value":{"path":"x"}}}\n` +
+        `{"version":1,"id":"${sent!.id}","outcome":{"status":"ok","value":{"type":"health","value":{"service":"vaultd","status":"ok"}}}}\n`,
+    );
+    await expect(pending).resolves.toEqual({ service: "vaultd", status: "ok" });
+    expect((fatal as unknown as Error | null)?.message).toBe("nobody claims this");
+  });
+
+  it("accepts a string chunk from a stream someone gave an encoding", async () => {
+    const daemon = new FakeDaemon();
+    daemon.stdout.setEncoding("utf8");
+    const client = new VaultdClient({
+      stdout: daemon.stdout,
+      stdin: daemon.stdin,
+      onEvent: () => undefined,
+      onFatal: () => undefined,
+    });
+    const pending = client.request<{ service: string }>("health");
+    const [sent] = await daemon.received(1);
+    daemon.respondOk(sent!.id, "health", { service: "vaultd", status: "ok" });
+    await expect(pending).resolves.toEqual({ service: "vaultd", status: "ok" });
   });
 
   it("ignores a response whose id nobody is waiting on", async () => {

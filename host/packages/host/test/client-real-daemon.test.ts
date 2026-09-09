@@ -21,18 +21,34 @@ import type { GetVaultInfoResponse, HealthResponse } from "../src/client/protoco
  * starts no runtime, takes no lease, touches no filesystem, and still answers
  * one success, one typed refusal, and one version rejection.
  *
- * The binary is a Rust build artifact and is not in the repository, so these
- * cases skip when it is absent rather than failing a TypeScript-only checkout.
+ * The binary is a Rust build artifact and is not in the repository. **Its
+ * absence fails this file**, loudly, rather than skipping: these five cases are
+ * the only wire truth in the whole client, and a green run with them silently
+ * gone is a green run that proved nothing about the envelope. A TypeScript-only
+ * checkout opts out deliberately with `VAULTD_ALLOW_MISSING_BINARY=1`, which is
+ * a decision someone has to make on purpose and which CI must not set.
+ *
  * Build it with `cargo build --release --bin vaultd`.
  */
 const BINARY = resolve(__dirname, "..", "..", "..", "..", "target", "release", "vaultd");
 const BINARY_EXISTS = existsSync(BINARY);
+const ALLOW_MISSING = process.env.VAULTD_ALLOW_MISSING_BINARY === "1";
 
-if (!BINARY_EXISTS) {
+if (!BINARY_EXISTS && ALLOW_MISSING) {
   console.warn(
-    `[client-real-daemon] skipping: ${BINARY} is absent. Build it with \`cargo build --release --bin vaultd\`.`,
+    `[client-real-daemon] skipping under VAULTD_ALLOW_MISSING_BINARY=1: ${BINARY} is absent. Build it with \`cargo build --release --bin vaultd\`.`,
   );
 }
+
+describe("the real vaultd binary", () => {
+  it("is built, or its absence was opted into on purpose", () => {
+    expect(
+      BINARY_EXISTS || ALLOW_MISSING,
+      `${BINARY} is absent, so the only tests that check this client against the real wire cannot run. ` +
+        "Build it with `cargo build --release --bin vaultd`, or set VAULTD_ALLOW_MISSING_BINARY=1 to skip them deliberately.",
+    ).toBe(true);
+  });
+});
 
 /** A spawned `vaultd`, with a line rendezvous over its stdout. */
 class RealDaemon {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { FramingError, LineFramer } from "../src/client/framing";
+import { FramingError, LineFramer, MalformedEnvelopeError } from "../src/client/framing";
 
 describe("LineFramer", () => {
   it("reassembles a response split across three chunks", () => {
@@ -68,6 +68,93 @@ describe("LineFramer", () => {
     expect(error).toBeUndefined();
     expect(frames).toHaveLength(1);
     expect(frames[0]).toMatchObject({ id: "h-10" });
+  });
+
+  it("reports a malformed envelope without stopping, and keeps the stream position", () => {
+    // A line that parses as JSON but is not an envelope is a different failure
+    // from a corrupt one: the stream is still byte-aligned, so the framer reads
+    // on rather than discarding the buffer.
+    const framer = new LineFramer();
+    const good =
+      '{"version":1,"id":"h-2","outcome":{"status":"ok","value":{"type":"health","value":{}}}}';
+    const { frames, malformed, error } = framer.push(
+      Buffer.from(`{"version":1,"id":"h-1"}\n${good}\n`),
+    );
+    expect(error).toBeUndefined();
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ id: "h-2" });
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]).toBeInstanceOf(MalformedEnvelopeError);
+    expect(malformed[0]?.id).toBe("h-1");
+    expect(malformed[0]?.line).toBe('{"version":1,"id":"h-1"}');
+  });
+
+  it("claims no id when the malformed line named none", () => {
+    const framer = new LineFramer();
+    const { frames, malformed } = framer.push(Buffer.from('{"version":1}\n'));
+    expect(frames).toEqual([]);
+    expect(malformed[0]?.id).toBeNull();
+  });
+
+  it("refuses an outcome whose status it does not understand", () => {
+    const framer = new LineFramer();
+    const { malformed } = framer.push(
+      Buffer.from('{"version":1,"id":"h-1","outcome":{"status":"maybe","value":{}}}\n'),
+    );
+    expect(malformed).toHaveLength(1);
+  });
+
+  it("refuses an error body whose fields are the wrong types", () => {
+    const framer = new LineFramer();
+    const { malformed } = framer.push(
+      Buffer.from(
+        '{"version":1,"id":"h-1","outcome":{"status":"err","value":{"code":5,"message":"nope"}}}\n',
+      ),
+    );
+    expect(malformed).toHaveLength(1);
+  });
+
+  it("accepts an error body carrying only its two required fields", () => {
+    const framer = new LineFramer();
+    const { frames, malformed } = framer.push(
+      Buffer.from(
+        '{"version":1,"id":"h-1","outcome":{"status":"err","value":{"code":"internal","message":"boom"}}}\n',
+      ),
+    );
+    expect(malformed).toEqual([]);
+    expect(frames).toHaveLength(1);
+  });
+
+  it("accepts an unknown error code, and an unknown tail field, unchanged", () => {
+    // Unknown-variant tolerance reaches the decoder too: a code this build has
+    // never heard of is a widening, not a malformed line.
+    const framer = new LineFramer();
+    const { frames, malformed } = framer.push(
+      Buffer.from(
+        '{"version":1,"id":"h-1","outcome":{"status":"err","value":{"code":"from_the_future","message":"m","tomorrow":true}}}\n',
+      ),
+    );
+    expect(malformed).toEqual([]);
+    expect(frames).toHaveLength(1);
+  });
+
+  it("refuses an event line with no event type", () => {
+    const framer = new LineFramer();
+    const { malformed } = framer.push(
+      Buffer.from('{"version":1,"subscription_id":"sub-1","event":{}}\n'),
+    );
+    expect(malformed).toHaveLength(1);
+  });
+
+  it("accepts an event kind it has never heard of", () => {
+    const framer = new LineFramer();
+    const { frames, malformed } = framer.push(
+      Buffer.from(
+        '{"version":1,"subscription_id":"sub-1","event":{"type":"from_the_future","value":{}}}\n',
+      ),
+    );
+    expect(malformed).toEqual([]);
+    expect(frames).toHaveLength(1);
   });
 
   it("encodes a request as one JSON line terminated by a single newline", () => {

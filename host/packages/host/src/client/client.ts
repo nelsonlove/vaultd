@@ -1,5 +1,5 @@
 import { VaultdError } from "./errors";
-import { LineFramer } from "./framing";
+import { LineFramer, MalformedEnvelopeError } from "./framing";
 import { PROTOCOL_VERSION } from "./protocol";
 import type { EventEnvelope, RequestEnvelope, ResponseEnvelope } from "./protocol";
 
@@ -15,6 +15,20 @@ export interface VaultdClientOptions {
   stdin: NodeJS.WritableStream;
   onEvent(envelope: EventEnvelope): void;
   onFatal(error: Error): void;
+  /**
+   * Where a throw out of `onEvent` goes. Optional, and the default matters:
+   * with a handler here, a consumer bug is the consumer's problem and the
+   * client keeps running; **without** one, the throw is reported to `onFatal`
+   * once the current chunk has finished settling, because a bug nobody claims
+   * must not be swallowed. Either way the rest of the chunk is delivered
+   * first — a response sharing a chunk with a throwing event handler still
+   * settles.
+   */
+  onHandlerError?(error: Error, envelope: EventEnvelope): void;
+}
+
+function asError(thrown: unknown): Error {
+  return thrown instanceof Error ? thrown : new Error(String(thrown));
 }
 
 /**
@@ -44,7 +58,7 @@ export class VaultdClient {
 
   constructor(options: VaultdClientOptions) {
     this.options = options;
-    options.stdout.on("data", (chunk: Buffer) => {
+    options.stdout.on("data", (chunk: unknown) => {
       this.consume(chunk);
     });
     options.stdout.on("end", () => {
@@ -95,17 +109,69 @@ export class VaultdClient {
     this.failAllPending(new Error("client closed"));
   }
 
-  private consume(chunk: Buffer): void {
-    const { frames, error } = this.framer.push(chunk);
-    // Settle every frame that arrived intact BEFORE reporting the framing
-    // failure. A response and a corrupt line can share one chunk, and the
-    // response's caller is entitled to its answer even though the connection
-    // is about to die.
+  private consume(rawChunk: unknown): void {
+    // A `NodeJS.ReadableStream` hands its `data` listener `any`, and a stream
+    // someone called `setEncoding` on hands it a string. Normalizing here is
+    // what keeps `Buffer.concat` from throwing inside a listener, where a throw
+    // is an uncaught exception rather than a returned error.
+    const chunk = Buffer.isBuffer(rawChunk)
+      ? rawChunk
+      : Buffer.from(typeof rawChunk === "string" ? rawChunk : String(rawChunk), "utf8");
+    const { frames, malformed, error } = this.framer.push(chunk);
+    // Settle every frame that arrived intact BEFORE reporting any failure. A
+    // response and a bad line can share one chunk, and the response's caller is
+    // entitled to its answer even though the connection may be about to die.
+    // A consumer callback that throws must not strand the frames behind it
+    // either, so each dispatch is isolated and the throw is reported after the
+    // loop.
+    let handlerFailure: { error: Error; envelope: EventEnvelope } | null = null;
     for (const frame of frames) {
-      if ("id" in frame) this.settle(frame);
-      else this.options.onEvent(frame);
+      if ("id" in frame) {
+        this.settle(frame);
+        continue;
+      }
+      try {
+        this.options.onEvent(frame);
+      } catch (thrown) {
+        handlerFailure ??= { error: asError(thrown), envelope: frame };
+      }
     }
+    for (const bad of malformed) this.reportMalformed(bad);
+    if (handlerFailure) this.reportHandlerFailure(handlerFailure.error, handlerFailure.envelope);
     if (error) this.die(error);
+  }
+
+  /**
+   * A line that was JSON but not an envelope.
+   *
+   * When it named a pending request, that request is told — a caller waiting on
+   * an answer the daemon has already spent is strictly worse off hanging than
+   * failing. The connection survives: the framer kept its place, so there is
+   * nothing to tear down. A line that named no pending request cannot be
+   * attributed to anybody, and something writing unrecognizable lines to this
+   * stdout is a transport failure the supervisor above needs to hear about.
+   */
+  private reportMalformed(bad: MalformedEnvelopeError): void {
+    if (bad.id !== null) {
+      const deferred = this.pending.get(bad.id);
+      if (deferred) {
+        this.pending.delete(bad.id);
+        deferred.reject(bad);
+        return;
+      }
+    }
+    this.die(bad);
+  }
+
+  private reportHandlerFailure(error: Error, envelope: EventEnvelope): void {
+    // Called through `this.options` rather than lifted into a local: these are
+    // interface methods, and detaching one from its object is how a consumer's
+    // `this` quietly goes missing.
+    if (this.options.onHandlerError) {
+      this.options.onHandlerError(error, envelope);
+      return;
+    }
+    this.die(error);
   }
 
   private settle(frame: ResponseEnvelope): void {
