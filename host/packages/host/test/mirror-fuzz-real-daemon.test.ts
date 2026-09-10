@@ -145,26 +145,9 @@ function snapshotOf(mirror: Mirror): Snap {
           headings: row.headings,
           blocks: row.blocks,
           tags: row.tags,
-          // **`diagnostics` is deliberately not compared, and the reason is a
-          // daemon asymmetry rather than a host one.** `get_note` answers the
-          // *union* of a note's diagnostics — `query::diagnostics`, which reads
-          // `note_diagnostics` **and** `resolution_diagnostics` — while
-          // `snapshot_notes`' `metadata` facet reads `load_metadata_with`,
-          // which reads only `note_diagnostics`. So a refetched note carries
-          // `unresolved_reference` and a hydrated one does not, for the same
-          // bytes at the same generation, and no host can make the two agree:
-          // hydration has no facet that would yield the resolution half.
-          //
-          // FOLLOW-UP (vaultd): have the snapshot metadata facet read the same
-          // union `get_note` does, and delete this exclusion. Until then the
-          // mirror's `note(path).diagnostics` is "whatever road that row came
-          // by", which nothing downstream reads — Obsidian's `CachedMetadata`
-          // has no diagnostics concept — but which this oracle would otherwise
-          // report as drift on every single comparison, drowning the drift it
-          // exists to catch.
-          sections: row.sections,
-          listItems: row.listItems,
-          outgoing: row.outgoing,
+          // `diagnostics` is compared like every other facet: since Task 1c the
+          // snapshot `metadata` facet and `get_note` report the same union.
+          diagnostics: row.diagnostics,
         })),
     ),
     resolved: stable(mirror.resolvedLinks()),
