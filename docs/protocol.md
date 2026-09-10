@@ -79,7 +79,7 @@ Compact note summaries ordered by vault path. A summary's `title` is the string 
 
 ### `get_note`
 
-Exact source, content revision, properties, aliases, headings, blocks, tags, the note's diagnostics, and outgoing references with their resolutions. Spans are half-open UTF-8 byte offsets into the exact source.
+Exact source, content revision, properties, aliases, headings, blocks, tags, the note's diagnostics, and outgoing references with their resolutions. Spans are half-open UTF-8 byte offsets into the exact source. `diagnostics` is every diagnostic attributed to the note — parsing diagnostics and reference-resolution diagnostics alike, so a `[[wikilink]]` the note carries to a note that does not exist appears here as `unresolved_reference` — and it is the same set `snapshot_notes`' `metadata` facet reports for the note at the same generation.
 
 ```json
 {"version":1,"id":"n","request":{"method":"get_note","params":{"path":"Folder/Note.md"}}}
@@ -443,6 +443,8 @@ One page of the vault tree in path order: folders, notes, and non-Markdown files
 ### `snapshot_notes`
 
 One page of per-note semantic row-sets, in path order. `include` names the facets to serve: `metadata`, `references`, `resolutions`, `backlinks`, `sections`, and `list_items`. A facet a client does not ask for is not read, not serialized, and absent from the response — absent, never empty, so "I did not ask" and "there are none" stay distinguishable.
+
+The `metadata` facet's `diagnostics` is the same set `get_note` reports for that note at that generation — parsing diagnostics and reference-resolution diagnostics alike, `unresolved_reference` included. A client that hydrates from a snapshot and later refreshes one note through `get_note` sees the same diagnostics either way.
 
 `sections` and `list_items` are **top-level facets, siblings of `metadata` rather than nested inside it**. A section carries its `kind`, its span, and the `block_id` that owns it when it has one. A list item carries its span, its raw `task` character when it is a task, and exactly one of `list_start_line` (a top-level item, naming the start line of the list containing it) or `parent_start_line` (a nested item, naming its parent item's own start line). Both are line numbers, never array indexes and never sentinels; a host reconstructing Obsidian's single `parent` number negates `list_start_line` and passes `parent_start_line` through.
 

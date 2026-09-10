@@ -523,13 +523,31 @@ impl SnapshotSessions {
             let path = crate::codec::decode_path(&path)?;
             let metadata = if facets.metadata {
                 let loaded = crate::store::load_metadata_with(&session.connection, &path)?;
+                // `load_metadata_with`'s own `diagnostics` field is
+                // note-local only (`note_diagnostics`, the table a fresh
+                // parse populates) — exactly what `load_all_notes`'s
+                // graph-rebuild callers need it to stay. `get_note` answers
+                // with the full union (`note_diagnostics` ∪
+                // `resolution_diagnostics` ∪ `scan_diagnostics`, see
+                // `crate::query::diagnostics::note_diagnostics`), and this
+                // facet must match it row for row — a `[[wikilink]]` to a
+                // note that does not exist stores its
+                // `unresolved_reference` diagnostic in
+                // `resolution_diagnostics` only, so reusing the union here
+                // (rather than `loaded.diagnostics`) is what keeps a
+                // snapshot-hydrated client and a `get_note` refresh in
+                // agreement about the same note at the same generation.
+                let diagnostics = crate::query::diagnostics::note_diagnostics(
+                    &session.connection,
+                    path.as_str(),
+                )?;
                 Some(SnapshotMetadata {
                     properties: loaded.properties,
                     aliases: loaded.aliases,
                     headings: loaded.headings,
                     blocks: loaded.blocks,
                     tags: loaded.tags,
-                    diagnostics: loaded.diagnostics,
+                    diagnostics,
                 })
             } else {
                 None
