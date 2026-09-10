@@ -1,4 +1,5 @@
 mod convert;
+pub mod fixture_row;
 pub mod runtime;
 pub mod stdio;
 pub mod subscriptions;

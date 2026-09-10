@@ -17,7 +17,11 @@ const tseslint = require("typescript-eslint");
  */
 module.exports = [
   {
-    ignores: ["**/dist/**", "**/node_modules/**"],
+    // `src/testing/pending/**` is excluded from `tsconfig.test.json`, and this
+    // config lints the whole tree against that project — a file outside every
+    // project is a lint error rather than a lint pass, so the two exclusions
+    // have to move together. Each activating task drops its file from both.
+    ignores: ["**/dist/**", "**/node_modules/**", "**/src/testing/pending/**"],
   },
   {
     files: ["**/*.js"],

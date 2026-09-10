@@ -75,7 +75,12 @@ export interface RefetchAnswer {
 export class MirrorHarness extends DaemonHarness {
   private mirrorValue: Mirror | null = null;
 
-  private constructor(overrides: Partial<HostConfig>) {
+  /**
+   * Protected rather than private so a subclass can exist: Task 6b's
+   * `ShimHarness` extends this one, and a private constructor cannot be
+   * called by a derived class's `super()`. Nothing else about it changed.
+   */
+  protected constructor(overrides: Partial<HostConfig>) {
     super(overrides);
   }
 
@@ -85,11 +90,23 @@ export class MirrorHarness extends DaemonHarness {
     overrides: Partial<HostConfig> = {},
   ): Promise<MirrorHarness> {
     const harness = new MirrorHarness(overrides);
-    const opening = Mirror.open(() => harness.client, harness.config);
-    await harness.answerHydration(spec);
-    harness.mirrorValue = await opening;
-    harness.clearMethodLog();
+    await harness.openMirror(spec);
     return harness;
+  }
+
+  /**
+   * Open this harness's mirror and answer the hydration `spec` asks for.
+   *
+   * Split out of {@link hydrated} for the subclasses Task 6b builds on top of
+   * this one: a `ShimHarness` has to construct itself, wire a shim around the
+   * mirror, and only then hand back a harness, so it cannot go through a static
+   * that both constructs and returns a `MirrorHarness`.
+   */
+  protected async openMirror(spec: HydrationSpec): Promise<void> {
+    const opening = Mirror.open(() => this.client, this.config);
+    await this.answerHydration(spec);
+    this.mirrorValue = await opening;
+    this.clearMethodLog();
   }
 
   get mirror(): Mirror {

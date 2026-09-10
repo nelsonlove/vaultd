@@ -12,6 +12,13 @@ path = "src/main.rs"
 name = "vault-live-bench"
 path = "src/bin/vault-live-bench.rs"
 
+# Test support: prints the snapshot-page JSON for markdown on stdin, so the
+# headless host's fixtures are produced by the real parser. See
+# `src/fixture_row.rs`.
+[[bin]]
+name = "fixture-row"
+path = "src/bin/fixture-row.rs"
+
 [dependencies]
 base64.workspace = true
 clap.workspace = true

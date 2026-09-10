@@ -1,3 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+# Fixture rows produced by the real parser through
+# `cargo run -q -p vault-server --bin fixture-row`. Regenerable from the
+# fixtures themselves, so they are never committed.
+fixtures/cache/
