@@ -32,6 +32,11 @@ module.exports = [
         __filename: "readonly",
         process: "readonly",
         console: "readonly",
+        // `test/fixtures/fake-vaultd.js` is a spawned Node program, so the
+        // timer globals are as real for it as `process` is.
+        setImmediate: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
       },
     },
     rules: js.configs.recommended.rules,
