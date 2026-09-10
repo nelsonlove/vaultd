@@ -2,7 +2,10 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { Mirror } from "../src/mirror/mirror";
 import { Supervisor } from "../src/supervisor";
+import type { GetVaultInfoResponse } from "../src/client/protocol";
+import type { VaultdClient } from "../src/client/client";
 import type { HostConfig } from "../src/config";
 import type { SupervisorEvents } from "../src/supervisor";
 
@@ -110,6 +113,47 @@ export function waitFor(
     };
     check();
   });
+}
+
+/**
+ * Hydrate a second mirror **at the same generation** the live one has applied
+ * through, so the two are comparable.
+ *
+ * This is the oracle every drift case in this suite rests on: a mirror kept
+ * current by deltas must equal a mirror hydrated from scratch, and the only
+ * honest way to say "equal" is to compare two views of one generation.
+ *
+ * It is a rendezvous rather than a wait. Each turn is two real round trips —
+ * ask the daemon where it is, wait for the live mirror to catch up, hydrate —
+ * and it returns the instant the fresh mirror lands on the generation the live
+ * one holds. A vault that is still moving simply takes another turn; nothing
+ * here picks a duration and hopes, which is what makes it stable under a busy
+ * machine as well as an idle one.
+ *
+ * `undefined` rather than a throw when the vault never goes quiet, so a caller
+ * that is sampling — the fuzz — can skip a comparison the vault moved under,
+ * and a caller that is asserting can fail on the `undefined`.
+ */
+export async function freshMirrorAt(
+  live: Mirror,
+  config: HostConfig,
+  client: () => VaultdClient,
+  turns = 20,
+): Promise<Mirror | undefined> {
+  for (let attempt = 0; attempt < turns; attempt += 1) {
+    const info = await client().request<GetVaultInfoResponse>("get_vault_info");
+    await waitFor(
+      `the live mirror to apply through generation ${String(info.generation)}`,
+      () => live.appliedThrough() >= info.generation && !live.resyncing(),
+      () =>
+        `the live mirror is at generation ${String(live.generation())}, applied through ` +
+        `${String(live.appliedThrough())}, resyncing=${String(live.resyncing())}`,
+      30_000,
+    );
+    const fresh = await Mirror.open(client, config);
+    if (fresh.generation() === live.appliedThrough()) return fresh;
+  }
+  return undefined;
 }
 
 /** Race a promise against a watchdog that reports rather than merely expiring. */

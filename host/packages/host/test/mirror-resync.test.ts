@@ -45,6 +45,7 @@ function plain(batch: MirrorChangeBatch): Record<string, unknown> {
     created: [...batch.created],
     modified: [...batch.modified],
     deleted: [...batch.deleted],
+    revisions: { ...batch.revisions },
     synthetic: batch.synthetic,
   };
 }
@@ -93,6 +94,14 @@ describe("Mirror resync", () => {
         created: ["New.md"],
         modified: ["A.md"],
         deleted: ["Gone.md"],
+        // A synthetic batch carries revisions too, and the **deleted** path's
+        // is its last-known one — the row is gone from the mirror by the time
+        // any listener sees this, so there is nowhere else to read it from.
+        revisions: {
+          "New.md": "blake3:n1",
+          "A.md": "blake3:a2",
+          "Gone.md": "blake3:g1",
+        },
         synthetic: true,
       },
     ]);
@@ -347,13 +356,188 @@ describe("Mirror resync", () => {
         { path: "B.md", revision: "blake3:b1" },
       ],
     });
+    // Exactly one `read_file`, for the one note whose revision moved. B is not
+    // asked for: `answerWarm` returns when every fixture it was given has been
+    // served, so a second request would hang this case rather than pass it.
+    expect(await harness.answerWarm({ "A.md": "# A v2 — longer\n" })).toBe(1);
     await applying;
 
     // B did not move, so its table is still correct and is worth a `read_file`
     // never issued. A moved, so its old table would put every span in that note
-    // at the wrong offset — it is dropped, and stays dropped until re-warmed.
+    // at the wrong offset — it is dropped **and rebuilt**, because nothing else
+    // ever would: `positions` would answer `undefined` for the rest of the
+    // session and Task 8's `getFileCache` would answer `null` to every plugin.
     expect(harness.mirror.positions("B.md")).toBeDefined();
-    expect(harness.mirror.positions("A.md")).toBeUndefined();
+    expect(harness.mirror.positions("A.md")).toBeDefined();
+    expect(harness.mirror.positions("A.md")?.byteLength).toBe(18);
+  });
+
+  it("re-hydrates when an event's previous_generation names a change set it never saw", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+
+    // Generation 6's event was lost and 7's arrived. Applying it would advance
+    // `appliedThrough` to 7 and leave 6's paths — which this mirror never
+    // fetched — wrong forever, with nothing anywhere to notice.
+    const applying = harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 6,
+        generation: 7,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+    await harness.answerHydration({
+      generation: 7,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a2" },
+        { path: "B.md", kind: "note", revision: "blake3:b1" },
+      ],
+      notes: [
+        { path: "A.md", revision: "blake3:a2" },
+        { path: "B.md", revision: "blake3:b1" },
+      ],
+    });
+    await applying;
+
+    expect(harness.mirror.lastResyncReason()).toBe("generation_gap");
+    // Not one path was refetched: the first thing it did was open a snapshot.
+    expect(harness.methodsSeen()[0]).toBe("open_snapshot");
+    expect(harness.methodsSeen()).not.toContain("get_tree_entries");
+    // And generation 6's path, which no change set ever named to this mirror,
+    // is present.
+    expect(harness.mirror.entry("B.md")).toBeDefined();
+    expect(harness.mirror.appliedThrough()).toBe(7);
+  });
+
+  it("stays quiet for this host's own write echo and for the first event after a resync", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+
+    // The write's own response came back first, so `applyMutation` advanced
+    // `appliedThrough` to 6. The echo for 6 is dropped by the staleness guard,
+    // and the **next** event's `previous_generation` is 6 — which matches, so
+    // the continuity check must not fire.
+    const mutating = harness.mirror.applyMutation(6, ["A.md"]);
+    await harness.answerRefetch(6, [{ path: "A.md", revision: "blake3:a2" }]);
+    await mutating;
+    await harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 5,
+        generation: 6,
+        cause: "mutation",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+
+    const applying = harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 6,
+        generation: 7,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+    await harness.answerRefetch(7, [{ path: "A.md", revision: "blake3:a3" }]);
+    await applying;
+    expect(harness.mirror.lastResyncReason()).toBeNull();
+    expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a3");
+
+    // Now a resync, landing on generation 20. The next event's
+    // `previous_generation` is that snapshot's generation, so it applies as a
+    // delta rather than triggering a second re-hydration.
+    const resyncing = harness.mirror.applyEvent(resync("watcher_overflow", 20));
+    await harness.answerHydration({
+      generation: 20,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a3" }],
+      notes: [{ path: "A.md", revision: "blake3:a3" }],
+    });
+    await resyncing;
+    expect(harness.mirror.appliedThrough()).toBe(20);
+    harness.clearMethodLog();
+
+    const after = harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 20,
+        generation: 21,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+    await harness.answerRefetch(21, [{ path: "A.md", revision: "blake3:a4" }]);
+    await after;
+
+    expect(harness.mirror.lastResyncReason()).toBe("watcher_overflow");
+    expect(harness.methodsSeen()).toEqual(["get_tree_entries", "get_note"]);
+    expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a4");
+  });
+
+  it("tells its listeners and takes the resync road when an apply cannot complete", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+    const failures: Array<{ message: string; eventType: string }> = [];
+    harness.mirror.onApplyError((error, event) => {
+      failures.push({
+        message: error instanceof Error ? error.message : String(error),
+        eventType: event.type,
+      });
+    });
+
+    const event: RuntimeEventDto = {
+      type: "generation_committed",
+      value: {
+        previous_generation: 5,
+        generation: 6,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    };
+    const applying = harness.mirror.applyEvent(event);
+    const tree = await harness.expectRequest("get_tree_entries");
+    harness.respondErr(tree.id, { code: "internal", message: "the daemon fell over" });
+    await expect(applying).rejects.toThrow(/the daemon fell over/);
+
+    // The seam fired, with the event that could not be applied.
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.eventType).toBe("generation_committed");
+    // **And the mirror did not stop there.** `appliedThrough` was correctly
+    // left un-advanced, which means generation 6's paths are stale and nothing
+    // retries them — so the mirror asks for the road it has: a re-hydration.
+    expect(harness.mirror.resyncing()).toBe(true);
+    await harness.answerHydration({
+      generation: 6,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a2" }],
+      notes: [{ path: "A.md", revision: "blake3:a2" }],
+    });
+    await harness.quiesce();
+
+    expect(harness.mirror.lastResyncReason()).toBe("apply_failed");
+    expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a2");
+    expect(harness.mirror.appliedThrough()).toBe(6);
+    expect(harness.mirror.resyncing()).toBe(false);
   });
 
   it("re-warms a note the delta path replaced, when it was warm before", async () => {

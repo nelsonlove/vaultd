@@ -106,12 +106,37 @@ export interface HostConfig {
    * How many changed paths a single `generation_committed` may carry before the
    * mirror stops refetching them one by one and re-hydrates instead.
    *
-   * A delta is cheaper than a hydration exactly while the change set is small:
-   * each changed path costs one row in a `get_tree_entries` batch plus, for a
-   * note, one `get_note` round trip. Past this many, the round trips outweigh
-   * the two-page snapshot walk a whole re-hydration costs, and the re-hydration
-   * has the better coherence story besides. Configuration rather than a literal
-   * so a test can drive the escalation without a 65-path fixture.
+   * **Measured, not guessed.** Against the shipped daemon on a 1000-note vault
+   * (1001 entries, each note carrying frontmatter, two wikilinks, two list
+   * items and two headings):
+   *
+   * | what | cost |
+   * | --- | --- |
+   * | full hydration, warm | 102 ms |
+   * | delta apply, 16 paths | 6 ms (0.38 ms/path) |
+   * | delta apply, 64 paths | 10 ms (0.16 ms/path) |
+   * | delta apply, 256 paths | 36 ms (0.14 ms/path) |
+   * | delta apply, 1000 paths | 140 ms (0.14 ms/path) |
+   *
+   * The marginal cost per path is **flat at about 0.14 ms** — the
+   * `mirrorWarmConcurrency` fan-out amortises the round trips completely, which
+   * is what that bound is for — so the curve is a straight line rather than a
+   * knee, and it crosses a full re-hydration at roughly **730 paths** on that
+   * vault. The crossover only moves *up* with vault size, because a delta costs
+   * O(change set) and a hydration costs O(vault).
+   *
+   * 512 rather than 1024, for two reasons. The mirror adds the ancestors of
+   * created and deleted paths to the same `get_tree_entries` batch, so the
+   * request can be larger than the change set and 512 keeps it comfortably
+   * under `TREE_ENTRIES_PATH_LIMIT`. And above roughly 700 the two costs really
+   * are comparable, at which point a re-hydration's coherence story — one
+   * pinned snapshot, one atomic swap — is worth having.
+   *
+   * The value only ever governs the range 1..1024: `docs/protocol.md` has the
+   * daemon report a larger change set as `counts_only` followed by
+   * `resync_required { oversized_change_set }`, and both of those already take
+   * the resync road. Configuration rather than a literal so a test can drive
+   * the escalation without a 513-path fixture.
    */
   readonly mirrorDeltaPathLimit: number;
   /**
@@ -210,7 +235,7 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     snapshotPageSizeMax: 2_000,
     snapshotCapRetries: 4,
     hydrationPinLossRestarts: 3,
-    mirrorDeltaPathLimit: 64,
+    mirrorDeltaPathLimit: 512,
     mirrorWarmConcurrency: 16,
     writeFileCapBytes: 16 * 1024 * 1024,
     unloadBudgetMs: 5_000,

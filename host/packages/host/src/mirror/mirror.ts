@@ -29,6 +29,27 @@
  * A **deleted** path needs no fetch at all: the mirror already knows everything
  * it is about to forget.
  *
+ * ## The change set is not the whole of what moved
+ *
+ * `vaultd` names the paths that actually changed, and two things change with
+ * them that it does not name. Both were found by comparing a live mirror
+ * against a fresh hydration over three hundred random mutations
+ * (`mirror-fuzz-real-daemon.test.ts`), and both were silent, permanent drift
+ * before that comparison existed.
+ *
+ * - **The referrers of a path that appeared or disappeared.** The daemon
+ *   re-resolves references and reports `affected_reference_count`, but the
+ *   referring note did not change, so it is not in `modified`. The mirror adds
+ *   it from its own indexes: the backlinks of everything a delete removes, and
+ *   the sources of any unresolved link key a creation now answers.
+ * - **The ancestors of every changed path.** A folder's `mtime` moves when a
+ *   child appears, disappears **or is rewritten** — the daemon writes a note
+ *   atomically, through a temporary file renamed into place — and the folder is
+ *   never named.
+ *
+ * Both are refetches rather than escalations: one more row in a
+ * `get_tree_entries` batch that is already going out, plus one `get_note` each.
+ *
  * ## The three rules a change set is applied under
  *
  * All three come from `docs/protocol.md` §Events by way of `client/events.ts`,
@@ -89,6 +110,18 @@
  * so a reader never sees a torn view, and a re-hydration that fails leaves the
  * previous view intact. The reason is recorded ({@link Mirror.lastResyncReason})
  * for the compatibility report and is never branched on.
+ *
+ * Two of those reasons are the mirror's own rather than the daemon's, and both
+ * exist to turn an invisible permanent hole into a bounded, loud recovery — see
+ * `MirrorResyncReason`. `apply_failed` is an event that could not be applied at
+ * all; `generation_gap` is an event whose `previous_generation` says a change
+ * set went missing.
+ *
+ * The re-hydration also **re-warms the position index of every note whose
+ * revision moved**, exactly as the delta path does. A note whose index was
+ * dropped and never rebuilt reads as "not cached" to every plugin for the rest
+ * of the session, and after a recovery that is every note that changed while
+ * this host was blind.
  */
 
 import { VaultdError } from "../client/errors";
@@ -108,7 +141,6 @@ import type {
   NoteDto,
   ReadFileResponse,
   ReferenceDto,
-  ResyncReasonDto,
   RuntimeEventDto,
   TreeEntryDto,
 } from "../client/protocol";
@@ -118,6 +150,7 @@ import type {
   MirrorEntry,
   MirrorNoteRow,
   MirrorQuery,
+  MirrorResyncReason,
   MirrorSink,
 } from "./types";
 
@@ -139,8 +172,37 @@ export const REFETCH_FACETS: readonly GetNoteFacetDto[] = ["sections", "list_ite
  */
 export const TREE_ENTRIES_PATH_LIMIT = 1024;
 
-/** A `MirrorQuery` plus everything only the owner of the mirror may call. */
-export type MirrorClientSource = VaultdClient | (() => VaultdClient);
+/**
+ * Where a mirror gets its client — **a supplier, never a client**.
+ *
+ * The connection dies with its engine, so a mirror that captured one client
+ * could not issue the re-hydration an engine restart asks for: it would keep
+ * talking to a socket nobody is listening on, and it would stop resynchronizing
+ * with no error anywhere. Narrowing the type to the supplier is what stops that
+ * call compiling at all.
+ */
+export type MirrorClientSource = () => VaultdClient;
+
+/**
+ * The refusal codes that mean "there are no bytes to read at that path".
+ *
+ * The position warm-up swallows exactly these, because every one of them is an
+ * ordinary answer about a note that vanished or a path this host may not read,
+ * and a note without a position index is a state Obsidian's own API has a word
+ * for. Everything else — `invalid_request`, `invalid_path`, `index_unavailable`
+ * — is either a protocol mistake by this host or a real fault, and swallowing
+ * one would report a wrong `read_file` shape as "the whole vault is uncached".
+ *
+ * `parent_not_found` is in the list and was put there by the fuzz oracle rather
+ * than by reasoning: a note whose whole folder was removed between the row and
+ * the read answers that, not `not_found`, and it is the same fact.
+ */
+const WARM_ABSENCE_CODES: ReadonlySet<string> = new Set([
+  "not_found",
+  "note_not_found",
+  "parent_not_found",
+  "zone_violation",
+]);
 
 /** Why a refetch could not be turned into a row. */
 export type MirrorRefetchReason = "facet_missing";
@@ -239,6 +301,18 @@ export function resolvedTargetOf(reference: ReferenceDto): string | null {
   }
 }
 
+/**
+ * The link text a reference wrote, lowercased — the key it is indexed under.
+ *
+ * `null` for an external URL, which names no vault path and so can never be
+ * answered, orphaned, or made ambiguous by one appearing or disappearing.
+ */
+function linkKeyOf(reference: ReferenceDto): string | null {
+  if (reference.resolution.kind === "non_vault") return null;
+  const written = stripSubpath(reference.file_target ?? reference.raw_target).trim();
+  return written.length > 0 ? written.toLowerCase() : null;
+}
+
 /** The link text an unresolved reference is filed under. */
 function unresolvedKeyOf(reference: ReferenceDto): string | null {
   if (reference.resolution.kind === "non_vault") return null;
@@ -271,8 +345,32 @@ class MirrorState implements MirrorSink {
   private readonly outgoingTargets = new Map<string, Set<string>>();
   private readonly resolvedBySource = new Map<string, Map<string, number>>();
   private readonly unresolvedBySource = new Map<string, Map<string, number>>();
+  /**
+   * Lowercased link text to the notes that wrote it — **every** reference, not
+   * only the unresolved ones.
+   *
+   * The delta path asks "whose links might this path have changed the meaning
+   * of?", and answering it by scanning every note is O(vault) on every create.
+   * Neither `resolvedBySource` nor `unresolvedBySource` is keyed for it, and
+   * the backlink index answers only half: it is keyed by resolved *target*, so
+   * it finds a note whose link already points at the path and misses one whose
+   * link the path is about to start, stop, or begin competing for.
+   *
+   * All three of those are real and all three were caught by the fuzz oracle:
+   * a creation that answers a link nobody could resolve, a creation that makes
+   * an already-resolved link **ambiguous** by adding a second file of the same
+   * name, and a deletion of a note linked by path rather than by name. So the
+   * index holds the text as written, and the backlink index stays beside it for
+   * the case text cannot answer — a link that resolved through an alias, whose
+   * spelling names no path at all.
+   */
+  private readonly linkKeyIndex = new Map<string, Set<string>>();
+  /** Per source note, the lowercased link keys it contributed. */
+  private readonly linkKeysBySource = new Map<string, Set<string>>();
   private linkEpoch = 0;
   private entryEpoch = 0;
+  private readonly childrenCache = new Map<string, readonly MirrorEntry[]>();
+  private childrenCacheEpoch = -1;
   private resolvedCache: { epoch: number; value: Record<string, Record<string, number>> } | null =
     null;
   private unresolvedCache: { epoch: number; value: Record<string, Record<string, number>> } | null =
@@ -293,6 +391,8 @@ class MirrorState implements MirrorSink {
     this.outgoingTargets.clear();
     this.resolvedBySource.clear();
     this.unresolvedBySource.clear();
+    this.linkKeyIndex.clear();
+    this.linkKeysBySource.clear();
     this.linkEpoch += 1;
     this.entryEpoch += 1;
   }
@@ -316,6 +416,16 @@ class MirrorState implements MirrorSink {
     if (existing) this.detach(existing);
     this.entries.set(entry.path, entry);
     this.attach(entry);
+    // A path that stopped being a note takes its note row with it. Unreachable
+    // today — a row's kind follows its extension and the extension is part of
+    // the path, so a kind change is a different path — but it is one line, and
+    // it makes "the mirror never serves a note row for something that is not a
+    // note" true by construction rather than by that argument.
+    if (entry.kind !== "note" && this.notes.has(entry.path)) {
+      this.removeLinks(entry.path);
+      this.notes.delete(entry.path);
+      this.positionIndexes.delete(entry.path);
+    }
     this.entryEpoch += 1;
   }
 
@@ -332,18 +442,15 @@ class MirrorState implements MirrorSink {
    * every key for a prefix: a prefix scan is O(vault) per delete, and it is
    * also wrong in the obvious way — `Deeper.md` is not under `Deep`.
    *
-   * Returns every path that actually went away, which is what the change batch
-   * reports: the shim cannot apply the subtree rule for itself once the mirror
-   * has forgotten the subtree.
+   * Returns **the rows** that actually went away, which is what the change
+   * batch reports: the shim cannot apply the subtree rule for itself once the
+   * mirror has forgotten the subtree, and it cannot read a deleted path's
+   * last-known revision out of a mirror that no longer holds it either.
    */
-  removeSubtree(path: string): string[] {
+  removeSubtree(path: string): MirrorEntry[] {
     if (!this.entries.has(path)) return [];
-    const removed: string[] = [];
-    const stack = [path];
-    while (stack.length > 0) {
-      const current = stack.pop()!;
-      const children = this.childIndex.get(current);
-      if (children) for (const child of children) stack.push(child);
+    const removed: MirrorEntry[] = [];
+    for (const current of this.subtreePaths(path)) {
       const entry = this.entries.get(current);
       if (!entry) continue;
       this.detach(entry);
@@ -353,19 +460,55 @@ class MirrorState implements MirrorSink {
         this.notes.delete(current);
       }
       this.positionIndexes.delete(current);
-      removed.push(current);
+      removed.push(entry);
     }
     this.entryEpoch += 1;
     return removed;
   }
 
-  /** Keep the position indexes of every note whose revision did not change. */
-  adoptPositions(previous: MirrorState): void {
-    for (const [path, index] of previous.positionIndexes) {
-      const before = previous.notes.get(path);
-      const after = this.notes.get(path);
-      if (before && after && before.revision === after.revision) this.positionIndexes.set(path, index);
+  /**
+   * A path and everything under it, **without removing any of it**.
+   *
+   * The same walk {@link removeSubtree} does — through {@link childIndex}, so
+   * `Deeper.md` is not under `Deep` — and it exists separately because the
+   * delta path has to ask who *referred* to a subtree before it forgets that
+   * the subtree existed.
+   */
+  subtreePaths(path: string): string[] {
+    if (!this.entries.has(path)) return [];
+    const paths: string[] = [];
+    const stack = [path];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      const children = this.childIndex.get(current);
+      if (children) for (const child of children) stack.push(child);
+      paths.push(current);
     }
+    return paths;
+  }
+
+  /**
+   * Keep the position indexes of every note whose revision did not change, and
+   * report the rows that need re-warming.
+   *
+   * A note whose revision moved loses its index — one built from the old bytes
+   * would put every span in that note a few characters off, silently. The
+   * returned rows are exactly those whose index existed *and* is now void, so
+   * the caller re-warms what was warm and leaves a cold mirror cold.
+   */
+  adoptPositions(previous: MirrorState): MirrorNoteRow[] {
+    const restale: MirrorNoteRow[] = [];
+    for (const [path, index] of previous.positionIndexes) {
+      const after = this.notes.get(path);
+      if (!after) continue;
+      const before = previous.notes.get(path);
+      if (before && before.revision === after.revision) {
+        this.positionIndexes.set(path, index);
+        continue;
+      }
+      restale.push(after);
+    }
+    return restale;
   }
 
   // --- Queries --------------------------------------------------------------
@@ -377,15 +520,51 @@ class MirrorState implements MirrorSink {
     return value;
   }
 
+  /**
+   * The direct children of a folder, path-sorted — and cached under the same
+   * epoch {@link sortedEntries} uses.
+   *
+   * Task 7's `FileIndex.rebuild` calls this once per folder, so an uncached
+   * implementation allocates and sorts on every call and is O(n log n) per
+   * folder per rebuild. The epoch is bumped by every tree mutation, so a stale
+   * answer is not possible: the whole cache is dropped the moment one row
+   * moves.
+   */
   children(folderPath: string): readonly MirrorEntry[] {
-    const paths = this.childIndex.get(folderPath);
-    if (!paths) return [];
-    const value: MirrorEntry[] = [];
-    for (const path of paths) {
-      const entry = this.entries.get(path);
-      if (entry) value.push(entry);
+    if (this.childrenCacheEpoch !== this.entryEpoch) {
+      this.childrenCache.clear();
+      this.childrenCacheEpoch = this.entryEpoch;
     }
-    return value.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const cached = this.childrenCache.get(folderPath);
+    if (cached) return cached;
+    const paths = this.childIndex.get(folderPath);
+    const value: MirrorEntry[] = [];
+    if (paths) {
+      for (const path of paths) {
+        const entry = this.entries.get(path);
+        if (entry) value.push(entry);
+      }
+      value.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    }
+    this.childrenCache.set(folderPath, value);
+    return value;
+  }
+
+  /**
+   * The notes whose links a path appearing or disappearing would re-resolve.
+   *
+   * Three spellings, because all three name one file in Obsidian and the
+   * daemon's own resolver accepts all three: the full path, the path with `.md`
+   * dropped, and the bare basename. Case-insensitive, like link resolution.
+   */
+  linkSourcesFor(path: string): readonly string[] {
+    const sources = new Set<string>();
+    const withoutExtension = path.endsWith(".md") ? path.slice(0, -3) : path;
+    for (const key of [path, withoutExtension, basenameOf(path)]) {
+      const bucket = this.linkKeyIndex.get(key.toLowerCase());
+      if (bucket) for (const source of bucket) sources.add(source);
+    }
+    return [...sources];
   }
 
   backlinks(path: string): readonly ReferenceDto[] {
@@ -426,6 +605,22 @@ class MirrorState implements MirrorSink {
     return stamps;
   }
 
+  /**
+   * Every mirrored path against its **real** revision, `null` where there is
+   * none.
+   *
+   * Not the same map as {@link revisionStamps}: a stamp is a comparison token
+   * and invents one for a folder and an attachment, and handing an invented
+   * token to a consumer pairing renames by revision would be worse than
+   * handing it nothing. This is what {@link MirrorChangeBatch.revisions}
+   * reports for a path a re-hydration found gone.
+   */
+  revisionMap(): Map<string, string | null> {
+    const revisions = new Map<string, string | null>();
+    for (const entry of this.entries.values()) revisions.set(entry.path, entry.revision);
+    return revisions;
+  }
+
   // --- Index maintenance ----------------------------------------------------
 
   private attach(entry: MirrorEntry): void {
@@ -457,7 +652,10 @@ class MirrorState implements MirrorSink {
     const resolved = new Map<string, number>();
     const unresolved = new Map<string, number>();
     const targets = new Set<string>();
+    const keys = new Set<string>();
     for (const reference of row.outgoing) {
+      const written = linkKeyOf(reference);
+      if (written !== null) keys.add(written);
       const target = resolvedTargetOf(reference);
       if (target !== null) {
         resolved.set(target, (resolved.get(target) ?? 0) + 1);
@@ -473,6 +671,12 @@ class MirrorState implements MirrorSink {
     if (resolved.size > 0) this.resolvedBySource.set(row.path, resolved);
     if (unresolved.size > 0) this.unresolvedBySource.set(row.path, unresolved);
     if (targets.size > 0) this.outgoingTargets.set(row.path, targets);
+    if (keys.size > 0) this.linkKeysBySource.set(row.path, keys);
+    for (const key of keys) {
+      const bucket = this.linkKeyIndex.get(key);
+      if (bucket) bucket.add(row.path);
+      else this.linkKeyIndex.set(key, new Set([row.path]));
+    }
     this.linkEpoch += 1;
   }
 
@@ -494,6 +698,18 @@ class MirrorState implements MirrorSink {
         else this.backlinkIndex.delete(target);
       }
       this.outgoingTargets.delete(source);
+    }
+    const keys = this.linkKeysBySource.get(source);
+    if (keys) {
+      // Only the keys this note actually wrote, for the same reason the
+      // backlink buckets above are visited by target rather than swept.
+      for (const key of keys) {
+        const bucket = this.linkKeyIndex.get(key);
+        if (!bucket) continue;
+        bucket.delete(source);
+        if (bucket.size === 0) this.linkKeyIndex.delete(key);
+      }
+      this.linkKeysBySource.delete(source);
     }
     this.resolvedBySource.delete(source);
     this.unresolvedBySource.delete(source);
@@ -533,10 +749,13 @@ export class Mirror implements MirrorQuery {
   private appliedThroughValue = 0;
   private queue: Promise<void> = Promise.resolve();
   private resyncingValue = false;
-  private pendingResync: { reason: ResyncReasonDto } | null = null;
-  private lastResyncReasonValue: ResyncReasonDto | null = null;
+  private pendingResync: { reason: MirrorResyncReason } | null = null;
+  private lastResyncReasonValue: MirrorResyncReason | null = null;
   private readonly batchListeners = new Set<(batch: MirrorChangeBatch) => void>();
   private readonly configListeners = new Set<(path: string) => void | Promise<void>>();
+  private readonly applyErrorListeners = new Set<
+    (error: unknown, event: RuntimeEventDto) => void
+  >();
 
   private constructor(clientSource: MirrorClientSource, config: HostConfig) {
     this.clientSource = clientSource;
@@ -546,10 +765,12 @@ export class Mirror implements MirrorQuery {
   /**
    * Hydrate a mirror and return it.
    *
-   * `client` may be a supplier rather than a client, and for anything driven by
-   * a {@link Supervisor} it must be: the connection dies with its engine, and
-   * the resync that follows a restart has to be issued on the **new** engine's
-   * client. A supplier is read at the moment each request is made.
+   * `client` is a **supplier**, read at the moment each request is made, and
+   * that is the whole signature deliberately: the connection dies with its
+   * engine, and the resync that follows a restart has to be issued on the *new*
+   * engine's client. A mirror handed one captured client compiles just as well,
+   * runs just as well, and silently stops resynchronizing after the first
+   * restart — so the type does not allow one.
    */
   static async open(client: MirrorClientSource, config: HostConfig): Promise<Mirror> {
     const mirror = new Mirror(client, config);
@@ -683,8 +904,13 @@ export class Mirror implements MirrorQuery {
     return this.resyncingValue;
   }
 
-  /** The reason of the most recent resync. Recorded, never branched on. */
-  lastResyncReason(): ResyncReasonDto | null {
+  /**
+   * The reason of the most recent resync. Recorded, never branched on.
+   *
+   * Two members of {@link MirrorResyncReason} are this host's own and never
+   * appear on the wire: `apply_failed` and `generation_gap`.
+   */
+  lastResyncReason(): MirrorResyncReason | null {
     return this.lastResyncReasonValue;
   }
 
@@ -699,8 +925,19 @@ export class Mirror implements MirrorQuery {
     return this.state.revisionStamps();
   }
 
-  /** Compare a previous revision map against the current one. */
-  synthesizeDiff(previous: ReadonlyMap<string, string>): MirrorChangeBatch {
+  /**
+   * Compare a previous revision map against the current one.
+   *
+   * `previousRevisions` is optional and is the only way a deleted path can
+   * carry a revision in the batch: a stamp map invents `"folder"` and
+   * `"size:…@…"` for rows that have no revision, and those are comparison
+   * tokens rather than revisions. Without it a deleted path reports `null`,
+   * which is honest — the caller simply did not keep the map.
+   */
+  synthesizeDiff(
+    previous: ReadonlyMap<string, string>,
+    previousRevisions?: ReadonlyMap<string, string | null>,
+  ): MirrorChangeBatch {
     const current = this.state.revisionStamps();
     const created: string[] = [];
     const modified: string[] = [];
@@ -711,12 +948,20 @@ export class Mirror implements MirrorQuery {
       else if (before !== stamp) modified.push(path);
     }
     for (const path of previous.keys()) if (!current.has(path)) deleted.push(path);
+    const revisions: Record<string, string | null> = {};
+    for (const path of [...created, ...modified]) {
+      revisions[path] = this.state.entries.get(path)?.revision ?? null;
+    }
+    for (const path of deleted) revisions[path] = previousRevisions?.get(path) ?? null;
     return {
       generation: this.generationValue,
       created: created.sort(),
       modified: modified.sort(),
       deleted: deleted.sort(),
-      cause: "resync",
+      revisions,
+      // No cause: this batch is the difference between two coherent views and
+      // describes no one generation. `synthetic` is what says so.
+      cause: null,
       synthetic: true,
     };
   }
@@ -746,6 +991,24 @@ export class Mirror implements MirrorQuery {
     };
   }
 
+  /**
+   * Subscribe to applications that could not complete. Returns the detach.
+   *
+   * The seam exists for **reporting**, not for repair: the mirror's own answer
+   * to an event it could not apply is already a resync (see {@link applyEvent}),
+   * so a listener here is a place to log, count, or surface the failure in
+   * Task 22's compatibility report — not a place that has to arrange recovery.
+   *
+   * Without it every caller writes its own `.catch`, and Task 15's subscription
+   * handler is a `(event) => void` with nowhere to put one.
+   */
+  onApplyError(listener: (error: unknown, event: RuntimeEventDto) => void): () => void {
+    this.applyErrorListeners.add(listener);
+    return (): void => {
+      this.applyErrorListeners.delete(listener);
+    };
+  }
+
   // --- Driving --------------------------------------------------------------
 
   /**
@@ -761,8 +1024,37 @@ export class Mirror implements MirrorQuery {
    * synthesized `runtime_recovered` is already on its way, and rejecting into a
    * subscription fan-out would be noise about a recovery that is already
    * arranged.
+   *
+   * **An application that could not complete takes the resync road.** The
+   * rejection is still delivered, and {@link onApplyError} still fires, but the
+   * mirror does not stop there: `appliedThrough` was correctly left
+   * un-advanced, which means that generation's paths are now stale and *nothing
+   * retries them*. Only an unrelated future event naming the same paths, or a
+   * resync that a quiet vault never has, would ever repair them. "I could not
+   * get to this generation one path at a time" is the definition of the resync
+   * road, so the mirror asks for one itself and the hole becomes a bounded,
+   * loud recovery.
    */
   applyEvent(event: RuntimeEventDto): Promise<void> {
+    return this.dispatch(event).catch((error: unknown) => {
+      // The engine went away. The supervisor's marker is already on its way and
+      // will re-hydrate everything; asking for a second resync here would be
+      // noise about a recovery that is already arranged.
+      if (error instanceof EngineLostError) throw error;
+      this.fanOutApplyError(error, event);
+      this.requestResync("apply_failed").catch((resyncError: unknown) => {
+        // The recovery itself failed. Reported through the same seam rather
+        // than swallowed, and not retried: a second re-hydration against an
+        // engine that just refused one buys nothing, and the next event's
+        // continuity check will ask again.
+        this.fanOutApplyError(resyncError, event);
+      });
+      throw error;
+    });
+  }
+
+  /** {@link applyEvent}'s body, before the failure policy wraps it. */
+  private dispatch(event: RuntimeEventDto): Promise<void> {
     if (!isKnownRuntimeEvent(event)) return Promise.resolve();
     switch (event.type) {
       case "generation_committed":
@@ -790,6 +1082,12 @@ export class Mirror implements MirrorQuery {
    * Unlike an event, a mutation is **never** skipped by the guard. Its whole
    * job is to have refetched these paths, and a race in which the subscription
    * happened to arrive first must not turn that into a maybe.
+   *
+   * Also unlike an event, a mutation that fails does **not** fan out through
+   * {@link onApplyError} and does not ask for a resync. The caller is the shim
+   * write that is still in progress, it is holding this promise, and a failure
+   * is its answer to give to the plugin — not a background condition to
+   * recover from behind its back.
    */
   applyMutation(generation: number, paths: readonly string[]): Promise<void> {
     return this.enqueue(async () => {
@@ -826,7 +1124,7 @@ export class Mirror implements MirrorQuery {
   // --- Internals ------------------------------------------------------------
 
   private client(): VaultdClient {
-    return typeof this.clientSource === "function" ? this.clientSource() : this.clientSource;
+    return this.clientSource();
   }
 
   /**
@@ -853,6 +1151,13 @@ export class Mirror implements MirrorQuery {
     // open, and a third kind read as counts that are not there is exactly the
     // silent misapply the guard exists to prevent.
     if (!isKnownChangeSet(changes)) return this.requestResync(`unknown_change_set:${changes.kind}`);
+    // The daemon sends `resync_required { oversized_change_set }` immediately
+    // after a `counts_only` generation, so this escalation and that event
+    // normally ask for the same thing twice — and `requestResync` coalesces
+    // them, so only one re-hydration actually runs. Do not "fix" the apparent
+    // duplication by deleting this: a counts-only change set with no follow-up
+    // would otherwise leave the mirror believing it is current when it holds
+    // nothing about that generation at all.
     if (changes.kind === "counts_only") return this.requestResync("oversized_change_set");
     // `affected_note_count` is not consulted here and must not be: it counts
     // notes alone, and a generation that moved only the file tree reports zero
@@ -861,6 +1166,31 @@ export class Mirror implements MirrorQuery {
       return this.requestResync("oversized_change_set");
     }
     return this.enqueue(async () => {
+      // **Continuity, checked where `appliedThrough` is final.** If generation
+      // 7's event were lost and 8's arrived, 8 would apply, `appliedThrough`
+      // would jump to 8, and 7's paths would be wrong forever with nothing to
+      // notice. One comparison converts that invisible permanent hole into a
+      // bounded recovery.
+      //
+      // The placement is the whole of it. In `onCommitted`'s synchronous
+      // arrival path an earlier event's application may still be queued and
+      // `appliedThrough` is a number from the past, so the check would fire on
+      // every burst. Inside the queued task, two cases stay quiet by
+      // construction: the echo of this host's own write, because
+      // `applyMutation` already advanced `appliedThrough` to that generation;
+      // and the first event after a resync, because the re-hydration set
+      // `appliedThrough` to the snapshot's generation, which is what that
+      // event's `previous_generation` names.
+      if (
+        this.appliedThroughValue !== 0 &&
+        value.previous_generation !== this.appliedThroughValue
+      ) {
+        // `runResync` directly, not `requestResync`: this task is already on
+        // the queue, and enqueuing behind itself would wait forever.
+        this.markResync("generation_gap");
+        await this.runResync();
+        return;
+      }
       await this.applyChangeSet(
         value.generation,
         value.cause,
@@ -891,19 +1221,92 @@ export class Mirror implements MirrorQuery {
     if (options.guarded && generation <= this.appliedThroughValue) return;
 
     const wanted = new Set<string>([...created, ...modified]);
-    // A created path in a folder this mirror has never seen needs that folder's
-    // row too, or the shim has a file with nowhere to put it. The daemon may
-    // well have named the folder itself; asking twice for one path is free,
-    // because `get_tree_entries` takes a set.
-    for (const path of [...wanted]) {
-      for (const ancestor of ancestorsOf(path)) {
-        if (!this.state.entries.has(ancestor)) wanted.add(ancestor);
+
+    // **Every ancestor of every changed path, seen or not.** Two reasons in one
+    // loop. A created path in a folder this mirror has never seen needs that
+    // folder's row, or the shim has a file with nowhere to put it. And a
+    // folder's own `mtime` moves whenever a child appears, disappears **or is
+    // rewritten** — the daemon writes a note atomically, through a temporary
+    // file renamed into place, so even a plain edit bumps the directory — while
+    // the change set names only what actually moved. A mirror that asked for
+    // the unseen ancestors alone would serve a stale folder `mtime` forever:
+    // Task 7's `DataAdapter.stat` reports it, and `stampOf` cannot even notice
+    // the drift, because a folder's stamp is the literal "folder".
+    //
+    // Measured against the shipped daemon rather than assumed: the fuzz oracle
+    // in `mirror-fuzz-real-daemon.test.ts` caught folders whose only recent
+    // generation was a `modified` child. Asking twice for one path is free —
+    // `get_tree_entries` takes a set — and a vault is not deep, so this adds a
+    // handful of rows to a request that is already going out.
+    for (const path of [...created, ...modified, ...deleted]) {
+      for (const ancestor of ancestorsOf(path)) wanted.add(ancestor);
+    }
+
+    // **The referrers of a path that moved, which the daemon never names.**
+    // `vaultd` re-resolves references when a link target appears or disappears
+    // and says so — the generation carries `affected_reference_count` — but the
+    // change set names only the path that actually moved. A mirror that
+    // refetched only those paths would keep the referring note's old
+    // resolutions: `resolvedLinks`, `unresolvedLinks`, `backlinks` and
+    // `note(path).outgoing[].resolution` all wrong, silently, until a resync
+    // that a quiet vault never has. Task 8 hands all four straight to plugin
+    // code, so a wrong answer here is a wrong answer inside a plugin.
+    //
+    // Two indexes, because neither answers the whole question, and both are
+    // O(affected) rather than O(vault).
+    const doomed = new Set<string>();
+    for (const path of deleted) for (const gone of this.state.subtreePaths(path)) doomed.add(gone);
+    // **By resolved target.** Whoever already pointed at a path that is going
+    // away. This must read the backlinks *before* the removals — which is the
+    // order this method already uses, fetch first and install second — and a
+    // folder delete is walked as a subtree for the same reason it is removed as
+    // one. It is the only half that can find a link written as an **alias**,
+    // whose text names no path at all.
+    for (const path of doomed) {
+      for (const reference of this.state.backlinks(path)) {
+        if (!doomed.has(reference.source_path)) wanted.add(reference.source_path);
+      }
+    }
+    // **By link text.** Whoever wrote the name, however it resolved — or did
+    // not. A note that already wrote `[[Y]]` is the referrer of a `Y.md` that
+    // has just appeared, and **filling in a link somebody already wrote is the
+    // most ordinary thing that happens in a vault**. It also catches the two
+    // shapes the backlink index cannot: a creation that makes an
+    // already-resolved link *ambiguous* by adding a second file of that name,
+    // and a deletion of one candidate of an ambiguous link, which is filed
+    // under the other one.
+    for (const path of [...created, ...deleted]) {
+      for (const source of this.state.linkSourcesFor(path)) {
+        if (!doomed.has(source)) wanted.add(source);
       }
     }
 
     let plan: RefetchPlan;
     try {
       plan = await this.refetch([...wanted]);
+      // **A late removal has referrers too.** A path that comes back `absent`
+      // was deleted again between the event and the refetch, so nothing knew it
+      // was going to be a removal when `wanted` was built and its referrers
+      // were never asked for — leaving them resolved to a path that no longer
+      // exists, which is the same permanent silent drift the deleted half above
+      // exists to prevent. One more pass, over those referrers alone.
+      //
+      // One pass, not a loop: the second pass can itself meet a path that has
+      // gone in the meantime, and chasing that is a vault mutating faster than
+      // this host can read it — which is what `resync_required` is for.
+      const late = new Set<string>();
+      for (const path of plan.absent) {
+        // A late removal moves its folder's `mtime` as surely as a planned one,
+        // and the folder was not an ancestor of anything in `wanted` either.
+        for (const ancestor of ancestorsOf(path)) late.add(ancestor);
+        for (const gone of this.state.subtreePaths(path)) {
+          doomed.add(gone);
+          for (const reference of this.state.backlinks(gone)) late.add(reference.source_path);
+        }
+      }
+      for (const path of doomed) late.delete(path);
+      for (const path of wanted) late.delete(path);
+      if (late.size > 0) plan = mergedPlans(plan, await this.refetch([...late]));
     } catch (error) {
       // The engine went away mid-refetch. A `runtime_recovered` marker is on
       // its way and will re-hydrate the whole mirror; nothing here is worth
@@ -913,8 +1316,16 @@ export class Mirror implements MirrorQuery {
     }
 
     const removed = new Set<string>();
-    for (const path of deleted) for (const gone of this.state.removeSubtree(path)) removed.add(gone);
-    for (const path of plan.absent) for (const gone of this.state.removeSubtree(path)) removed.add(gone);
+    // Captured as the rows go, because that is the only moment they exist:
+    // Task 7 pairs a delete with a create by the deleted path's **last-known**
+    // revision, and by the time this batch fires `entry(path)` is `undefined`.
+    const revisions: Record<string, string | null> = {};
+    for (const path of [...deleted, ...plan.absent]) {
+      for (const gone of this.state.removeSubtree(path)) {
+        removed.add(gone.path);
+        revisions[gone.path] = gone.revision;
+      }
+    }
 
     const batchCreated: string[] = [];
     const batchModified: string[] = [];
@@ -945,8 +1356,25 @@ export class Mirror implements MirrorQuery {
       // `deleted` as well so the shim can replay the same two steps. A folder
       // replaced by a file of the same name is the case that produces it, and a
       // shim told only "created" would keep serving the folder's children.
-      if (previousStamp === null) batchCreated.push(entry.path);
-      else if (previousStamp !== stampOf(entry) || noteMoved) batchModified.push(entry.path);
+      //
+      // `|| noteMoved` is defence in depth and is unreachable in practice — a
+      // note's tree revision and its note revision are the same hash — so it
+      // fires only if `get_tree_entries` and `get_note` were answered at
+      // different generations for one path, which the refetch does not
+      // otherwise notice. Losing that would report a note whose content moved
+      // as unchanged.
+      //
+      // A referrer refetched because its *resolutions* moved is normally in
+      // neither list, and that is right: its bytes did not change, so its
+      // revision did not either. The mirror's tables are corrected; the shim is
+      // told about files that moved.
+      if (previousStamp === null) {
+        batchCreated.push(entry.path);
+        revisions[entry.path] = entry.revision;
+      } else if (previousStamp !== stampOf(entry) || noteMoved) {
+        batchModified.push(entry.path);
+        revisions[entry.path] = entry.revision;
+      }
     }
 
     this.generationValue = Math.max(this.generationValue, plan.generation, generation);
@@ -970,6 +1398,7 @@ export class Mirror implements MirrorQuery {
       created: batchCreated,
       modified: batchModified,
       deleted: [...removed].sort(),
+      revisions,
       cause,
       synthetic: false,
     });
@@ -1028,10 +1457,21 @@ export class Mirror implements MirrorQuery {
    * has not started yet is folded into it, since a re-hydration that has not
    * begun will read the same current state either way.
    */
-  private requestResync(reason: ResyncReasonDto): Promise<void> {
+  private requestResync(reason: MirrorResyncReason): Promise<void> {
+    this.markResync(reason);
+    return this.enqueue(() => this.runResync());
+  }
+
+  /**
+   * Record that a resync is wanted, without queueing the run.
+   *
+   * Separate from {@link requestResync} for exactly one caller: a task that is
+   * already **on** the queue, which cannot enqueue behind itself and then wait
+   * for it. That caller marks, then awaits {@link runResync} directly.
+   */
+  private markResync(reason: MirrorResyncReason): void {
     this.pendingResync = { reason };
     this.resyncingValue = true;
-    return this.enqueue(() => this.runResync());
   }
 
   private async runResync(): Promise<void> {
@@ -1042,16 +1482,34 @@ export class Mirror implements MirrorQuery {
     this.pendingResync = null;
     this.lastResyncReasonValue = requested.reason;
     const previous = this.snapshotRevisions();
+    const previousRevisions = this.state.revisionMap();
     try {
       // Into a staging state, never into the live one: the old mirror answers
       // every query until the swap, so nothing reads a half-filled vault.
       const staging = new MirrorState();
       const summary = await hydrateInto(this.client(), this.config, staging);
-      staging.adoptPositions(this.state);
+      const restale = staging.adoptPositions(this.state);
       this.state = staging;
       this.generationValue = Math.max(this.generationValue, summary.generation);
       this.appliedThroughValue = Math.max(this.appliedThroughValue, summary.generation);
-      const batch = this.synthesizeDiff(previous);
+      // **Re-warm what the swap invalidated**, exactly as the delta path does.
+      // `adoptPositions` kept the index of every note whose revision did not
+      // move — a `read_file` well saved — and a note whose revision *did* move
+      // has no index at all until something builds one. Nothing else ever
+      // would: `positions` would answer `undefined` and Task 8's `getFileCache`
+      // would answer `null` for that note, to every plugin, for the rest of the
+      // session. After `watcher_overflow`, `subscriber_lag` or an engine
+      // restart, that is every note that changed while this host was blind.
+      //
+      // After the swap, because `warmOne` checks the row it is warming against
+      // the live state. Before `emit`, so a listener that reads `positions` on
+      // the batch finds them.
+      if (restale.length > 0) {
+        await mapConcurrent(restale, this.config.mirrorWarmConcurrency, async (row) => {
+          await this.warmOne(row);
+        });
+      }
+      const batch = this.synthesizeDiff(previous, previousRevisions);
       // Same rule as the delta path: a re-hydration that found the vault
       // exactly as the mirror already held it has nothing to tell anyone.
       // `lastResyncReason()` is where the fact that it happened is recorded.
@@ -1077,7 +1535,13 @@ export class Mirror implements MirrorQuery {
       // A note that vanished, a zone refusal, an engine that went away: none of
       // them is worth failing a warm-up over. The path simply stays uncached,
       // which is a state Obsidian's own API has a word for.
-      if (error instanceof EngineLostError || error instanceof VaultdError) return false;
+      //
+      // **Narrowly**, though. Swallowing every `VaultdError` would report a
+      // wrong `read_file` shape — `invalid_request`, this host's own protocol
+      // mistake — as "the whole vault is uncached", which is the loudest
+      // possible symptom for the quietest possible cause.
+      if (error instanceof EngineLostError) return false;
+      if (error instanceof VaultdError && WARM_ABSENCE_CODES.has(error.code)) return false;
       throw error;
     }
     // Two checks for the same hazard from two directions: the bytes moved past
@@ -1099,6 +1563,21 @@ export class Mirror implements MirrorQuery {
         process.emitWarning(
           `a mirror batch listener threw: ${describe(error)}. The remaining listeners still ran.`,
           { type: "VaultdMirrorListenerFailed" },
+        );
+      }
+    }
+  }
+
+  /** Every apply-error listener, and a throw stays local. */
+  private fanOutApplyError(error: unknown, event: RuntimeEventDto): void {
+    for (const listener of [...this.applyErrorListeners]) {
+      try {
+        listener(error, event);
+      } catch (listenerError) {
+        process.emitWarning(
+          `a mirror apply-error listener threw: ${describe(listenerError)}. ` +
+            "The remaining listeners still ran.",
+          { type: "VaultdMirrorApplyErrorListenerFailed" },
         );
       }
     }
@@ -1128,6 +1607,18 @@ export class Mirror implements MirrorQuery {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Two refetch passes as one plan. The later answer wins for a path in both. */
+function mergedPlans(first: RefetchPlan, second: RefetchPlan): RefetchPlan {
+  const notes = new Map(first.notes);
+  for (const [path, row] of second.notes) notes.set(path, row);
+  return {
+    generation: Math.max(first.generation, second.generation),
+    entries: [...first.entries, ...second.entries],
+    notes,
+    absent: [...first.absent, ...second.absent],
+  };
+}
 
 /** Every ancestor folder of a path, shallowest first. `""` is not one. */
 function ancestorsOf(path: string): string[] {

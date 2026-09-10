@@ -28,6 +28,7 @@ import type {
   ListItemDto,
   PropertyDto,
   ReferenceDto,
+  ResyncReasonDto,
   SectionDto,
   TagDto,
   TreeEntryKindDto,
@@ -52,6 +53,7 @@ export type {
   PropertyValueDto,
   ReferenceDto,
   ResolutionDto,
+  ResyncReasonDto,
   SectionDto,
   SnapshotNoteDto,
   SnapshotNotesResponse,
@@ -239,14 +241,36 @@ export interface MirrorQuery {
 }
 
 /**
+ * Why the mirror re-hydrated.
+ *
+ * Every reason the daemon can send, plus the two the **host** raises on its own
+ * initiative. They are named here rather than invented at the call site so a
+ * consumer can see the whole set, and so it is plain which two never appear on
+ * the wire:
+ *
+ * - `apply_failed` — a committed generation could not be applied one path at a
+ *   time (a refused refetch, or a facet the daemon did not serve). "I cannot
+ *   get to this generation path by path" is the definition of the resync road,
+ *   and taking it turns a silent permanent hole into a bounded recovery.
+ * - `generation_gap` — an event's `previous_generation` did not match the
+ *   generation this mirror had applied through, so a change set went missing.
+ *   The daemon signals a lost event with `resync_required` rather than silence,
+ *   so this is belt and braces against a daemon that misbehaves.
+ *
+ * `ResyncReasonDto` is open, so a reason a later daemon introduces lands here
+ * as itself and is recorded rather than branched on.
+ */
+export type MirrorResyncReason = ResyncReasonDto | "apply_failed" | "generation_gap";
+
+/**
  * One applied change, as the shim's event layer consumes it.
  *
  * **No `renamed` field, deliberately.** The wire has none: `ChangeSetDto` is
  * `created` / `modified` / `deleted` and a `rename_note` reports the move as a
  * delete plus a create. So the mirror does not invent a rename it was never
  * told about; Task 7's `FileIndex.applyBatch` synthesizes `vault.on("rename")`
- * from the delete/create pair, where the revisions needed to pair them are
- * already in hand. The mirror models the wire; the shim models Obsidian.
+ * from the delete/create pair, pairing them through {@link revisions}. The
+ * mirror models the wire; the shim models Obsidian.
  */
 export interface MirrorChangeBatch {
   /**
@@ -255,14 +279,66 @@ export interface MirrorChangeBatch {
    * For a synthetic batch it is the generation the re-hydration landed on.
    */
   readonly generation: number;
+  /**
+   * Paths the mirror installed a row for and had no entry for before.
+   *
+   * May name a path that {@link deleted} also names — see that field.
+   */
   readonly created: readonly string[];
   readonly modified: readonly string[];
+  /**
+   * **Every path the mirror removed, subtree-expanded.**
+   *
+   * This is *not* `ChangeSetDto.deleted`, and it is usually longer than it. A
+   * deleted folder is named on the wire alone with its descendants implied; the
+   * mirror expands the subtree because a consumer cannot — once the mirror has
+   * forgotten those rows there is nothing left to expand from.
+   *
+   * **`created` and `deleted` may name the same path in one batch.** That is
+   * Ruling W6's folder-replaced-by-a-file: the thing that was there was removed
+   * and a *different* thing was put in its place, and a consumer must replay
+   * both steps **in that order** — delete, then create. A rename pairing that
+   * iterates `deleted` × `created` therefore has to tolerate a path present in
+   * both, or it will pair that path with itself.
+   */
   readonly deleted: readonly string[];
-  readonly cause: GenerationCauseDto;
+  /**
+   * The revision of every path this batch names, in one lookup.
+   *
+   * Covers every path in {@link created}, {@link modified} and
+   * {@link deleted}. A created or modified path carries the revision of the row
+   * just installed — `null` for a folder and for every non-note file, neither
+   * of which has one. A **deleted** path carries its **last-known** revision,
+   * captured before the row was removed, which is the one Task 7's rename
+   * pairing needs: by the time this batch fires the row is gone and
+   * `mirror.entry(path)` answers `undefined`.
+   *
+   * A path in both `created` and `deleted` carries the **new** value. That
+   * costs the pairing nothing, because a rename never re-creates the path it
+   * deleted — the folder-replaced-by-a-file case is the only one that produces
+   * such a path, and it is not a rename.
+   */
+  readonly revisions: Readonly<Record<string, string | null>>;
+  /**
+   * Why the generation advanced, exactly as the daemon reported it — and
+   * `null` for a synthetic batch, which describes no one generation's cause.
+   *
+   * No `GenerationCauseDto` value is invented for the synthetic case. The union
+   * is open, so a host-made member would type-check and would then be
+   * indistinguishable, to a later consumer switching on `cause`, from something
+   * that came off the wire. {@link synthetic} is the field that says where a
+   * batch came from.
+   */
+  readonly cause: GenerationCauseDto | null;
   /**
    * True when the paths were derived by comparing revision maps rather than
    * read off a change set — a re-hydration, from any resync reason or from an
    * engine restart.
+   *
+   * A synthetic batch reports the difference between two coherent views. It
+   * cannot say *why* any one path moved, in what order, or how many times, and
+   * a consumer that needs per-generation causality has to treat it as "the
+   * world changed while I was not looking" rather than as a change set.
    */
   readonly synthetic: boolean;
 }

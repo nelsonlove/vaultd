@@ -85,7 +85,7 @@ export class MirrorHarness extends DaemonHarness {
     overrides: Partial<HostConfig> = {},
   ): Promise<MirrorHarness> {
     const harness = new MirrorHarness(overrides);
-    const opening = Mirror.open(harness.client, harness.config);
+    const opening = Mirror.open(() => harness.client, harness.config);
     await harness.answerHydration(spec);
     harness.mirrorValue = await opening;
     harness.clearMethodLog();

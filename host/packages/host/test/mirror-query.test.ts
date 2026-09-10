@@ -350,7 +350,12 @@ describe("Mirror revision stamps", () => {
       modified: ["Folder/pixel.png"],
       deleted: [],
       synthetic: true,
-      cause: "resync",
+      // No invented `GenerationCauseDto`: a synthetic batch describes no one
+      // generation, and `synthetic` is the field that says where it came from.
+      cause: null,
+      // The attachment has no revision to report, and the stamp that made the
+      // move visible is deliberately not passed off as one.
+      revisions: { "Folder/pixel.png": null },
     });
   });
 });
