@@ -354,12 +354,71 @@ fn asking_about_no_paths_still_names_the_generation() {
 #[test]
 fn an_invalid_path_is_refused_before_anything_is_read() {
     let (_vault, _index, mut daemon) = wired();
-    for spelling in ["../escape.md", "/absolute.md"] {
+    // `\\u0000` is a JSON escape: the daemon decodes a real NUL byte from it.
+    // A NUL is not a vault-relative path — no filesystem accepts one — and
+    // answering `ok` for it puts a NUL byte on the wire inside a success
+    // response, which a host's own path handling has no reason to expect.
+    for spelling in ["../escape.md", "/absolute.md", "bad\\u0000name.md"] {
         match tree_entries(&mut daemon, &["Folder", spelling]) {
             ResponseOutcome::Err(error) => {
                 assert_eq!(error.code, ErrorCode::InvalidPath, "{spelling}: {error:?}");
             }
             other => panic!("{spelling} must not be answered: {other:?}"),
+        }
+    }
+}
+
+/// A NUL byte is refused by **every** operation that takes a path, not just by
+/// the ones whose engine happens to carry its own gate.
+///
+/// `VaultPath::new` rejects an empty component, `.`, `..`, a leading `/`, and
+/// `\` — but never rejected a NUL. The write path did not notice because
+/// `MutationEngine::refuse_nul` compensates for the verbs that reach the
+/// filesystem; a *read* has no such gate, so `get_tree_entries` shipped
+/// answering `ok` and echoing the NUL back inside `absent`. The fix belongs in
+/// `parse_path`, which is the one door every path-taking request comes
+/// through, so this test enumerates them rather than pinning the one that was
+/// broken.
+#[test]
+fn every_request_that_takes_a_path_refuses_a_nul_byte() {
+    let (_vault, _index, mut daemon) = wired();
+    let nul = "bad\\u0000name.md";
+    let requests = [
+        format!(r#"{{"method":"get_note","params":{{"path":"{nul}"}}}}"#),
+        format!(r#"{{"method":"get_backlinks","params":{{"path":"{nul}"}}}}"#),
+        format!(r#"{{"method":"list_references","params":{{"source_path":"{nul}"}}}}"#),
+        format!(r#"{{"method":"get_diagnostics","params":{{"path":"{nul}"}}}}"#),
+        format!(
+            r#"{{"method":"resolve_link","params":{{"source_path":"{nul}","destination":"Other"}}}}"#
+        ),
+        format!(r#"{{"method":"read_file","params":{{"path":"{nul}"}}}}"#),
+        format!(r#"{{"method":"get_tree_entries","params":{{"paths":["{nul}"]}}}}"#),
+        // The write half comes through the same door. `create_folder` also
+        // has the engine's own `refuse_nul` behind this, which stays — it
+        // guards a direct engine caller that never passes a dispatcher.
+        format!(r#"{{"method":"create_folder","params":{{"path":"{nul}"}}}}"#),
+        format!(
+            r#"{{"method":"write_note","params":{{"path":"{nul}","content":"x\n","expected":{{"absent":true}}}}}}"#
+        ),
+        format!(
+            r#"{{"method":"write_file","params":{{"path":"{nul}","content_base64":"AAEC","expected":{{"any":true}}}}}}"#
+        ),
+        format!(
+            r#"{{"method":"delete_note","params":{{"path":"{nul}","mode":"permanent","expected":{{"any":true}}}}}}"#
+        ),
+        format!(r#"{{"method":"delete_folder","params":{{"path":"{nul}","recursive":false}}}}"#),
+    ];
+    for request in requests {
+        let response = daemon.call(&format!(
+            r#"{{"version":1,"id":"nul","request":{request}}}"#
+        ));
+        match response.outcome {
+            ResponseOutcome::Err(error) => assert_eq!(
+                error.code,
+                ErrorCode::InvalidPath,
+                "a NUL byte must be `invalid_path` for {request}: {error:?}"
+            ),
+            other => panic!("{request} answered a NUL path: {other:?}"),
         }
     }
 }

@@ -98,7 +98,7 @@ A requested facet is present and an unrequested one is **absent**, never an empt
 ```
 
 ```json
-{"version":1,"id":"ns","outcome":{"status":"ok","value":{"type":"get_note","value":{"generation":3,"note":{"path":"Folder/Note.md","revision":"blake3:…","source":"# Note\n- [ ] task\n","properties":[],"aliases":[],"headings":[{"level":1,"text":"Note","span":{"start":0,"end":6}}],"blocks":[],"tags":[],"diagnostics":[],"outgoing":[],"sections":[{"kind":"heading","span":{"start":0,"end":6}},{"kind":"list","span":{"start":7,"end":18}}],"list_items":[{"span":{"start":7,"end":18},"list_start_line":1,"task":" "}]}}}}}
+{"version":1,"id":"ns","outcome":{"status":"ok","value":{"type":"get_note","value":{"generation":3,"note":{"path":"Folder/Note.md","revision":"blake3:…","source":"# Note\n- [ ] task\n","properties":[],"aliases":[],"headings":[{"level":1,"text":"Note","span":{"start":0,"end":6}}],"blocks":[],"tags":[],"diagnostics":[],"outgoing":[],"sections":[{"kind":"heading","span":{"start":0,"end":6}},{"kind":"list","span":{"start":7,"end":17}}],"list_items":[{"span":{"start":7,"end":17},"list_start_line":1,"task":" "}]}}}}}
 ```
 
 ### `get_tree_entries`
@@ -257,7 +257,9 @@ Creates a folder, and every missing folder above it. **A folder that already exi
 
 **`create_folder` is the one folder operation that serves the `.obsidian` zone and hidden folders**, because a plugin host has to make `.obsidian/plugins/<id>/` and its own configuration directory, and `write_file` never creates parents. `delete_folder` and `rename_folder` still refuse both with `zone_violation`: a directory that was made can be removed again, while an emptied `.trash/` or a removed `.git/` cannot be put back.
 
-Such a create is a **raw** folder create. It joins no generation — nothing there is indexed, so the `generation` key is **absent** rather than `0` — and the daemon announces it with a `config_changed` event when the folder landed inside `.obsidian/`, exactly as a zone `write_file` does. A folder that was already there announces itself too: the notice means "re-read this path", not "a delta happened". Every other refusal stands unchanged, and one in particular: a request naming an ordinary folder that *lands* on an unindexable one — through a symlink, or a case-folded spelling — is still `zone_violation`. The permission is granted to a caller that said out loud where it was writing, never to a spelling that hides it.
+Such a create is a **raw** folder create. It joins no generation — nothing there is indexed, so the `generation` key is **absent** rather than `0` — and the daemon announces it with a `config_changed` event when the folder landed inside `.obsidian/`, exactly as a zone `write_file` does.
+
+**`generation` answers about the path you asked for, not about every folder the call made.** A chain can straddle the boundary: `create_folder` on `Visible/.hidden` creates `Visible` too, and `Visible` *is* indexed — so a generation containing it is published (and a `generation_committed` names it) while the response still omits `generation`, because the folder the request named will never be in one. A client that needs to know about the segments above its target reads them back with `get_tree_entries` rather than inferring them from this answer. A folder that was already there announces itself too: the notice means "re-read this path", not "a delta happened". Every other refusal stands unchanged, and one in particular: a request naming an ordinary folder that *lands* on an unindexable one — through a symlink, or a case-folded spelling — is still `zone_violation`. The permission is granted to a caller that said out loud where it was writing, never to a spelling that hides it.
 
 ```json
 {"version":1,"id":"cz","request":{"method":"create_folder","params":{"path":".obsidian/plugins/example"}}}

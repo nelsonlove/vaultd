@@ -1801,6 +1801,23 @@ impl MutationEngine {
             }
             match current.canonicalize() {
                 Ok(canonical) => {
+                    // The vault boundary, and it must be asked **first**.
+                    //
+                    // `stored_path` below refuses an outside path too (its
+                    // `strip_prefix` fails), so for a segment that resolves to
+                    // a *directory* outside the vault this check looks
+                    // redundant — deleting it changes no answer. It is not
+                    // redundant for a segment that resolves to a regular
+                    // **file** outside the vault: without it `is_file()` on
+                    // the next line answers first, and the daemon reports
+                    // `target_exists` — "something already occupies that
+                    // name" — about a path that is not in the vault at all.
+                    // That is both the wrong direction of refusal and a small
+                    // existence oracle for files outside the vault.
+                    //
+                    // Witnessed by
+                    // `an_escape_onto_a_regular_file_outside_the_vault_is_a_zone_violation_not_target_exists`,
+                    // which flips to `target_exists` the moment this goes.
                     if !canonical.starts_with(&self.canonical_root) {
                         return Err(MutationError::ZoneViolation { path: path.clone() });
                     }

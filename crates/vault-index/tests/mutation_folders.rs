@@ -514,6 +514,54 @@ fn a_zone_folder_that_is_itself_a_link_out_of_the_vault_is_refused() {
     );
 }
 
+/// The probe the first round was missing, and the one that makes the explicit
+/// containment check a **witnessed** gate rather than a gate that reddens
+/// nothing.
+///
+/// Every other escape probe aliases a *directory* outside the vault, and for
+/// those `MutationEngine::stored_path`'s own `strip_prefix` refuses second if
+/// the explicit check is deleted — so deleting it changes nothing observable.
+/// A regular *file* outside the vault is the shape that separates them: with
+/// the check deleted, `canonical.is_file()` reaches the decision first and the
+/// daemon answers `target_exists` — "something already occupies that name" —
+/// about a path that is **not in the vault at all**. Wrong direction of
+/// refusal, and a small existence oracle for files outside the vault.
+///
+/// Deleting `if !canonical.starts_with(&self.canonical_root)` flips both rows
+/// below from `zone_violation` to `target_exists`. That is this test's whole
+/// job: a gate a test does not defend is a gate the next refactor deletes.
+#[cfg(unix)]
+#[test]
+fn an_escape_onto_a_regular_file_outside_the_vault_is_a_zone_violation_not_target_exists() {
+    let fixture = fixture();
+    let outside = TempDir::new().expect("a directory outside the vault");
+    let outside_root = outside.path().canonicalize().expect("canonical outside");
+    let secret = outside_root.join("secret.txt");
+    std::fs::write(&secret, b"not the vault's business\n").expect("write the outside file");
+
+    std::os::unix::fs::symlink(&secret, fixture.root.join("Out")).expect("ordinary alias");
+    std::os::unix::fs::symlink(&secret, fixture.root.join(".obsidian/Out")).expect("zone alias");
+
+    for spelling in ["Out", ".obsidian/Out"] {
+        let error = fixture
+            .engine
+            .apply(&Mutation::CreateFolder {
+                path: path(spelling),
+            })
+            .expect_err("a path outside the vault is not a name to report about");
+        assert!(
+            matches!(error, MutationError::ZoneViolation { .. }),
+            "{spelling} must answer zone_violation, never target_exists — the latter \
+             would answer about a file outside the vault: {error:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&secret).expect("read back"),
+        b"not the vault's business\n",
+        "the outside file must be untouched"
+    );
+}
+
 /// A NUL inside a **zone** path. `refuse_nul` runs before the segment walk and
 /// after the request's own unindexable test, so lifting the zone refusal could
 /// have reordered it out of the way — this is the probe that it did not. A NUL

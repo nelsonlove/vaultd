@@ -132,14 +132,35 @@ fn runtime_not_ready(message: &str) -> ProtocolError {
     }
 }
 
+/// The one door every path-taking request comes through, read and write alike.
+///
+/// A NUL byte is refused here rather than left to each operation. `VaultPath`
+/// is a string-level type: it rejects an empty component, `.`, `..`, a leading
+/// `/`, and `\`, but a NUL is none of those and tightening that constructor is
+/// a `vault-core` change this crate does not own. The **write** path never
+/// noticed, because `MutationEngine::refuse_nul` compensates for every verb
+/// that reaches the filesystem — but a *read* has no engine gate behind it, so
+/// `get_tree_entries` shipped answering `ok` for a NUL path and echoing the
+/// byte back inside `absent`. Refusing at this door closes every read at once,
+/// and closes any read added later without its author having to know.
+///
+/// The engine's own `refuse_nul` deliberately stays: it guards a caller
+/// holding a `MutationEngine` directly, which never passes through here.
+/// A NUL is `invalid_path` — "a parameter is not a valid vault-relative path" —
+/// rather than the `zone_violation` the engine answers, which was always an
+/// overload of the one refusal the engine had a variant for.
 fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
-    VaultPath::new(value).map_err(|_| ProtocolError {
+    let invalid = |value: &str| ProtocolError {
         code: ErrorCode::InvalidPath,
         message: format!("invalid vault path: {value:?}"),
         supported_version: None,
         current_generation: None,
         current_revision: None,
-    })
+    };
+    if value.contains('\0') {
+        return Err(invalid(value));
+    }
+    VaultPath::new(value).map_err(|_| invalid(value))
 }
 
 fn status_filter(value: ReferenceStatusFilter) -> ReferenceStatus {

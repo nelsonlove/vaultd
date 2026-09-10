@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use rusqlite::{OptionalExtension, params};
 use vault_core::{
-    Diagnostic, LinkTarget, ParsedNote, Resolution, ResolvedReference, Revision, VaultPath,
+    Diagnostic, LinkTarget, ParsedNote, Resolution, ResolvedReference, Revision, TreeEntryKind,
+    VaultPath,
 };
 
 pub(crate) mod diagnostics;
@@ -300,9 +301,20 @@ impl IndexReader {
                     rows.push(None);
                     continue;
                 };
-                let revision = match stored.content_revision {
-                    Some(revision) => Some(revision),
-                    None => crate::store::note_revision_with(transaction, path)?,
+                // Only a note can have a `notes` row, so only a note is worth
+                // the second lookup. `tree_entries.content_revision` is written
+                // NULL for every kind, so without the `kind` gate a folder and
+                // an attachment each pay a primary-key lookup that can only
+                // ever answer `None` — half the rows of a typical change set.
+                // Behaviour-identical: this is what `snapshot_tree`'s
+                // `COALESCE` join resolves to, since the join finds no `notes`
+                // row for a folder or an attachment either.
+                let revision = match (stored.content_revision, stored.kind) {
+                    (Some(revision), _) => Some(revision),
+                    (None, TreeEntryKind::Note) => {
+                        crate::store::note_revision_with(transaction, path)?
+                    }
+                    (None, _) => None,
                 };
                 rows.push(Some(TreeEntryRow {
                     path: stored.path,

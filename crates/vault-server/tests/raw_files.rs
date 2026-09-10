@@ -829,6 +829,52 @@ fn an_ordinary_folder_still_reports_the_generation_that_holds_it() {
     assert!(vault.path().join("Folder/Nested").is_dir());
 }
 
+/// The mixed chain, on the wire. `create_folder("Visible/.hidden")` really
+/// creates `Visible`, which the scan really will list, so a generation
+/// containing it **is** published — while the response omits `generation`,
+/// because the wire answers about the path the caller asked for and that one
+/// is unindexable.
+///
+/// Both halves are asserted here rather than reasoned about: the response is
+/// `{}`, and a following `get_tree_entries` shows `Visible` with a real tree
+/// row (only a published generation can produce one) while `Visible/.hidden`
+/// is absent. Proven through the wire alone, with no event plumbing.
+#[test]
+fn a_mixed_chain_answers_about_its_target_while_publishing_its_visible_segment() {
+    let (vault, _index, mut daemon) = wired();
+
+    let response = match create_folder(&mut daemon, "Visible/.hidden") {
+        ResponseOutcome::Ok(Response::CreateFolder(response)) => response,
+        other => panic!("a mixed chain must be creatable: {other:?}"),
+    };
+    assert_eq!(
+        response.generation, None,
+        "the wire answers about the target, and the target is unindexable: {response:?}"
+    );
+    assert_eq!(serde_json::to_string(&response).expect("re-encode"), "{}");
+    assert!(vault.path().join("Visible/.hidden").is_dir());
+
+    let entries = daemon.call(
+        r#"{"version":1,"id":"te","request":{"method":"get_tree_entries","params":{"paths":["Visible","Visible/.hidden"]}}}"#,
+    );
+    match entries.outcome {
+        ResponseOutcome::Ok(Response::GetTreeEntries(entries)) => {
+            assert_eq!(
+                entries.entries.len(),
+                1,
+                "the visible segment joined a generation, so it has a tree row: {entries:?}"
+            );
+            assert_eq!(entries.entries[0].path, "Visible");
+            assert_eq!(
+                entries.absent,
+                vec!["Visible/.hidden".to_string()],
+                "the index never lists the hidden leaf"
+            );
+        }
+        other => panic!("get_tree_entries failed: {other:?}"),
+    }
+}
+
 /// Every refusal `create_folder` carried before still refuses; only the
 /// zone/hidden one was lifted. A NUL never reaches a syscall, a traversal
 /// never becomes a vault path, a file at the name is still `target_exists`,
@@ -837,11 +883,19 @@ fn an_ordinary_folder_still_reports_the_generation_that_holds_it() {
 fn the_lifted_zone_refusal_left_every_other_folder_gate_standing() {
     let (vault, _index, mut daemon) = wired();
 
-    // A NUL byte: refused as a containment violation before any segment is
-    // created, never handed to the filesystem as a `storage_failure`.
+    // A NUL byte: refused before any segment is created, never handed to the
+    // filesystem as a `storage_failure`.
+    //
+    // The **code** changed in the task-1b fix round, deliberately. The
+    // dispatcher's `parse_path` now refuses a NUL for every path-taking
+    // request, so this no longer reaches the engine and answers `invalid_path`
+    // rather than the `zone_violation` the engine has to overload — it has no
+    // other variant for "that is not a path". The engine gate stays and is
+    // still witnessed at its own layer by
+    // `vault-index`'s `creating_a_folder_with_a_nul_byte_is_refused`.
     match create_folder(&mut daemon, "bad\\u0000name/Deep") {
         ResponseOutcome::Err(error) => {
-            assert_eq!(error.code, ErrorCode::ZoneViolation, "{error:?}")
+            assert_eq!(error.code, ErrorCode::InvalidPath, "{error:?}")
         }
         other => panic!("a NUL byte must be refused: {other:?}"),
     }
