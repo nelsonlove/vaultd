@@ -1,0 +1,165 @@
+/**
+ * Byte offsets in, Obsidian positions out — without retaining a single note
+ * body.
+ *
+ * `vaultd` reports every span as **half-open UTF-8 byte offsets** into a note's
+ * exact source. Obsidian reports every position as `{ line, col, offset }`
+ * where `line` is zero-based, `col` counts **JavaScript string units** from the
+ * start of the line, and `offset` counts them from the start of the file. The
+ * two agree only while a note is pure ASCII, so a host that hands one to a
+ * plugin expecting the other is wrong on the first emoji, em dash, or CJK
+ * character — silently, in a position a plugin then slices a string with.
+ *
+ * A {@link PositionIndex} is the conversion table for one note. It holds the
+ * start of every line, in both units, plus one triple per character whose UTF-8
+ * encoding is longer than one byte. That is roughly 8 bytes per line and 12
+ * bytes per non-ASCII character, against the alternative of keeping every
+ * note's source in memory for the lifetime of the host — which is the whole
+ * reason the mirror exists.
+ */
+
+/**
+ * One note's byte ↔ UTF-16 conversion table.
+ *
+ * `wide` is a flat `Uint32Array` of `[byteStart, byteLen, u16Len]` triples in
+ * ascending `byteStart` order — flat rather than an array of objects because a
+ * note of CJK prose has one triple per character and 100k of those as objects
+ * is the memory this class exists to avoid.
+ *
+ * `byteLength` and `u16Length` are additive to the shape the phase plan sketched
+ * and they earn their place: without a length there is no way to tell an offset
+ * past the end of the note from one inside it, and a stale span outliving an
+ * edit is exactly how that arrives.
+ */
+export interface PositionIndex {
+  /** Byte offset of each line start. Always begins with 0. */
+  readonly lineStarts: Uint32Array;
+  /** UTF-16 offset of each line start, index-for-index with {@link lineStarts}. */
+  readonly lineU16Starts: Uint32Array;
+  /** Flattened `[byteStart, byteLen, u16Len]` per non-ASCII character. */
+  readonly wide: Uint32Array;
+  /** Total UTF-8 length of the source this index was built from. */
+  readonly byteLength: number;
+  /** Total UTF-16 length of the same source. */
+  readonly u16Length: number;
+}
+
+/** Obsidian's own position shape: zero-based line, UTF-16 column and offset. */
+export interface Loc {
+  line: number;
+  col: number;
+  offset: number;
+}
+
+/** Obsidian's `Pos`: a half-open range of two {@link Loc}s. */
+export interface Pos {
+  start: Loc;
+  end: Loc;
+}
+
+/**
+ * Build the conversion table for one source, in a single pass.
+ *
+ * A line starts after every `\n`. A lone `\r` is *not* a line break here,
+ * matching Obsidian's own line counting, and a `\r\n` therefore leaves the `\r`
+ * as the last character of the preceding line — which is also where Obsidian
+ * puts it.
+ */
+export function buildPositionIndex(source: string): PositionIndex {
+  const lineStarts: number[] = [0];
+  const lineU16Starts: number[] = [0];
+  const wide: number[] = [];
+  let byte = 0;
+  for (let u16 = 0; u16 < source.length; ) {
+    // `codePointAt` returns the whole astral code point at a high surrogate, so
+    // a surrogate pair is visited once and advances `u16` by two.
+    const codePoint = source.codePointAt(u16)!;
+    const u16Len = codePoint > 0xffff ? 2 : 1;
+    const byteLen = codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+    if (byteLen > 1) wide.push(byte, byteLen, u16Len);
+    byte += byteLen;
+    u16 += u16Len;
+    if (codePoint === 0x0a) {
+      lineStarts.push(byte);
+      lineU16Starts.push(u16);
+    }
+  }
+  return {
+    lineStarts: Uint32Array.from(lineStarts),
+    lineU16Starts: Uint32Array.from(lineU16Starts),
+    wide: Uint32Array.from(wide),
+    byteLength: byte,
+    u16Length: source.length,
+  };
+}
+
+/**
+ * Convert one UTF-8 byte offset into an Obsidian {@link Loc}.
+ *
+ * Two malformed inputs are answered rather than thrown, because both are
+ * reachable from a stale span and neither is the caller's fault:
+ *
+ * - an offset **outside** `0 .. byteLength` clamps into that range;
+ * - an offset **inside** a multi-byte character resolves to the start of that
+ *   character, which is the only nearby position that is a real string index.
+ *
+ * The cost is two binary searches plus a scan bounded by the number of
+ * non-ASCII characters on the target line — never a scan of the note.
+ */
+export function locate(index: PositionIndex, byteOffset: number): Loc {
+  const target = byteOffset < 0 ? 0 : byteOffset > index.byteLength ? index.byteLength : byteOffset;
+  const line = lineAt(index.lineStarts, target);
+  const lineStart = index.lineStarts[line]!;
+  const lineU16Start = index.lineU16Starts[line]!;
+  // Where this line's first wide character sits in the flat triple array.
+  let triple = firstWideAtOrAfter(index.wide, lineStart);
+  let delta = 0;
+  for (; triple < index.wide.length; triple += 3) {
+    const start = index.wide[triple]!;
+    if (start >= target) break;
+    const byteLen = index.wide[triple + 1]!;
+    const u16Len = index.wide[triple + 2]!;
+    if (start + byteLen > target) {
+      // The offset landed inside this character: snap to its start.
+      const offset = lineU16Start + (start - lineStart) + delta;
+      return { line, col: offset - lineU16Start, offset };
+    }
+    delta += u16Len - byteLen;
+  }
+  const offset = lineU16Start + (target - lineStart) + delta;
+  return { line, col: offset - lineU16Start, offset };
+}
+
+/**
+ * Convert one half-open byte span into an Obsidian {@link Pos}.
+ *
+ * The daemon's spans are half-open and Obsidian's are too, so `end` is
+ * converted exactly like `start` and no ±1 is applied anywhere.
+ */
+export function span(index: PositionIndex, start: number, end: number): Pos {
+  return { start: locate(index, start), end: locate(index, end) };
+}
+
+/** The greatest `i` with `lineStarts[i] <= byteOffset`. */
+function lineAt(lineStarts: Uint32Array, byteOffset: number): number {
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low < high) {
+    const mid = (low + high + 1) >>> 1;
+    if (lineStarts[mid]! <= byteOffset) low = mid;
+    else high = mid - 1;
+  }
+  return low;
+}
+
+/** The index of the first triple whose `byteStart >= byteOffset`, or `wide.length`. */
+function firstWideAtOrAfter(wide: Uint32Array, byteOffset: number): number {
+  let low = 0;
+  let high = wide.length / 3;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (wide[mid * 3]! < byteOffset) low = mid + 1;
+    else high = mid;
+  }
+  return low * 3;
+}
