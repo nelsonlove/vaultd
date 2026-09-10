@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -253,6 +254,25 @@ describe("Supervisor", () => {
     expect(supervisor.restartCount()).toBe(0);
   });
 });
+
+/**
+ * Every child process of this test process, asked of the operating system.
+ *
+ * The supervisor's engines are direct children of the vitest worker, so this
+ * counts engines — including the ones the supervisor has lost track of, which
+ * is the only way to see a double spawn at all. `pgrep` exits 1 when nothing
+ * matches, which is an answer, not a failure.
+ */
+function childPids(): number[] {
+  try {
+    return execFileSync("/usr/bin/pgrep", ["-P", String(process.pid)], { encoding: "utf8" })
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => Number(line.trim()));
+  } catch {
+    return [];
+  }
+}
 
 /** Does the operating system still know this pid? The orphan question. */
 function alive(pid: number): boolean {
@@ -520,18 +540,121 @@ describe("Supervisor error paths", () => {
     await supervisor.stop();
   }, 15_000);
 
+  it("runs one climb at a time, even when start races an in-flight restart", async () => {
+    let ready = 0;
+    // `slow-health` widens the window this case aims at: the replacement takes
+    // 400 ms to answer its readiness probe, so "the restart is in flight" is a
+    // state a test can be inside of rather than a moment it has to hit.
+    const supervisor = new Supervisor(
+      configFor("slow-health", { restartBackoffMs: [50, 50, 50] }),
+      {
+        ...silent,
+        onClientReady: () => {
+          ready += 1;
+        },
+      },
+    );
+    // A clean slate, so the child count below is this case's own.
+    await until(() => childPids().length === 0);
+    await supervisor.start();
+    await expect(supervisor.client().request("die")).rejects.toThrow();
+    await until(() => supervisor.state() === "restarting");
+    // Inside the restart window: `this.engine` is null and the restart's climb
+    // is not the one `start()` remembers, so an explicit start here used to
+    // open a second, parallel climb — two live engines, of which the
+    // supervisor tracked one and `stop()` could only end that one.
+    await supervisor.start();
+    await until(() => supervisor.state() === "running");
+    expect(ready).toBe(2);
+    expect(childPids()).toHaveLength(1);
+    await supervisor.stop();
+    // Nothing survives the stop: the orphan question, asked of the operating
+    // system rather than of the supervisor.
+    await until(() => childPids().length === 0);
+    expect(supervisor.state()).toBe("stopped");
+  }, 15_000);
+
+  it("classifies the lease refusal on the exit code as well as the message", async () => {
+    const held = new Supervisor(
+      configFor("refuse", {
+        restartBackoffMs: [1],
+        env: {
+          FAKE_VAULTD_MODE: "refuse",
+          FAKE_VAULTD_EXIT_CODE: "2",
+          FAKE_VAULTD_STDERR_LINE: "vaultd: index storage is already in use by another writer",
+        },
+      }),
+      silent,
+    );
+    const refusal: unknown = await held.start().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect((refusal as EngineStartError).exit?.code).toBe(2);
+    expect((refusal as EngineStartError).leaseHeld).toBe(true);
+
+    // The same sentence, a different exit code: not the lease. The message
+    // alone is a string nothing on the daemon side pins, so a reworded
+    // diagnostic must not be able to flip this on its own — and neither must
+    // some other failure that happens to quote it.
+    const impostor = new Supervisor(
+      configFor("refuse", {
+        restartBackoffMs: [1],
+        env: {
+          FAKE_VAULTD_MODE: "refuse",
+          FAKE_VAULTD_EXIT_CODE: "3",
+          FAKE_VAULTD_STDERR_LINE: "vaultd: index storage is already in use by another writer",
+        },
+      }),
+      silent,
+    );
+    const other: unknown = await impostor.start().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect((other as EngineStartError).exit?.code).toBe(3);
+    expect((other as EngineStartError).leaseHeld).toBe(false);
+  }, 15_000);
+
+  it("resolves the lost engine's exit once the process has actually exited", async () => {
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    const thrown: unknown = await supervisor
+      .client()
+      .request("die")
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(thrown).toBeInstanceOf(EngineLostError);
+    // The stream's `end` beats the process's `exit`, so at the instant this
+    // error is raised there is no exit code yet. Reading it later gets the
+    // real one rather than a permanent null.
+    await until(() => supervisor.restartCount() >= 1);
+    expect((thrown as EngineLostError).exit?.code).toBe(9);
+    await supervisor.stop();
+  }, 15_000);
+
   it("keeps one subscriber's throw off every other subscriber", async () => {
     const errors: Error[] = [];
     const quiet: RuntimeEventDto[] = [];
     const supervisor = new Supervisor(configFor("ok"), silent);
     await supervisor.start();
-    await supervisor.subscribe(
-      () => {
-        throw new Error("subscriber is broken");
-      },
-      (error) => errors.push(error),
-    );
-    await supervisor.subscribe((event) => quiet.push(event));
+    // Both in the same turn, because this fake emits exactly one event: a
+    // subscriber that attaches after that event has been delivered correctly
+    // receives nothing, and awaiting the first subscribe before starting the
+    // second loses the race about one run in ten. `subscribe` adds to the
+    // fan-out synchronously, so issuing both here attaches both before any
+    // event can be routed.
+    await Promise.all([
+      supervisor.subscribe(
+        () => {
+          throw new Error("subscriber is broken");
+        },
+        (error) => errors.push(error),
+      ),
+      supervisor.subscribe((event) => quiet.push(event)),
+    ]);
     await supervisor.whenWatching();
     await until(() => quiet.length > 0 && errors.length > 0);
     expect(errors[0]?.message).toBe("subscriber is broken");

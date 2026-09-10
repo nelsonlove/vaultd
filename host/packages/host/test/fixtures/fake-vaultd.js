@@ -52,6 +52,12 @@ if (mode === "exit-immediately") {
   process.stderr.write("fake-vaultd: refusing to start\n");
   process.exit(3);
 }
+if (mode === "refuse") {
+  // A refusal whose stderr line and exit code the test chooses, so the two
+  // halves of the lease classification can be varied independently.
+  process.stderr.write(`${process.env.FAKE_VAULTD_STDERR_LINE ?? "fake-vaultd: refusing"}\n`);
+  process.exit(Number(process.env.FAKE_VAULTD_EXIT_CODE ?? "3"));
+}
 
 let subscriptions = 0;
 

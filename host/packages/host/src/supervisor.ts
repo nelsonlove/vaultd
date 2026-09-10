@@ -69,7 +69,13 @@ export class EngineStartError extends Error {
     this.name = "EngineStartError";
     this.exit = exit;
     this.stderrTail = stderrTail;
-    this.leaseHeld = LEASE_HELD.test(stderrTail);
+    // **Both halves, because either alone is weak.** The message is a string
+    // nothing on the daemon side pins, so a reworded diagnostic would silently
+    // turn this off and any other failure quoting the phrase would turn it on;
+    // the exit code alone is the daemon's general "refused to start" and says
+    // nothing about why. Together they classify, and `exit.code` stays the
+    // durable half for a host that wants to branch on something narrower.
+    this.leaseHeld = exit?.code === 2 && LEASE_HELD.test(stderrTail);
     // The transport error that arrived first is kept rather than discarded: it
     // is the wrong headline but it is still evidence.
     if (cause !== undefined) this.cause = cause;
@@ -85,12 +91,27 @@ export class EngineStartError extends Error {
  * same event.
  */
 export class EngineLostError extends Error {
-  readonly exit: EngineExit | null;
+  private readonly exitSource: () => EngineExit | null;
 
-  constructor(message: string, exit: EngineExit | null = null) {
+  constructor(message: string, exit: EngineExit | null | (() => EngineExit | null) = null) {
     super(message);
     this.name = "EngineLostError";
-    this.exit = exit;
+    this.exitSource = typeof exit === "function" ? exit : (): EngineExit | null => exit;
+  }
+
+  /**
+   * How the engine ended, **resolved when read**.
+   *
+   * The stream's `end` is what fails a pending request, and it arrives before
+   * the process's `exit` — so at the instant this error is raised, in the
+   * common crash case, there is no exit code yet. A caller that reads `exit` a
+   * turn later gets the real one instead of a permanent `null`, which is why
+   * this is a getter over the engine's own record rather than a snapshot taken
+   * too early. It is `null` only while the process is genuinely still going, or
+   * when the engine never reported an exit at all.
+   */
+  get exit(): EngineExit | null {
+    return this.exitSource();
   }
 }
 
@@ -253,7 +274,8 @@ export class Supervisor {
   private engine: Engine | null = null;
   /** The engine between `spawn` and adoption. `stop()` must be able to see it. */
   private spawning: Engine | null = null;
-  private starting: Promise<void> | null = null;
+  /** The one climb in flight, whether a `start()` or a restart owns it. */
+  private climbing: Promise<void> | null = null;
   private restarts = 0;
   private restartTimes: number[] = [];
   private stopping = false;
@@ -285,10 +307,16 @@ export class Supervisor {
    */
   start(): Promise<void> {
     if (this.engine) return Promise.reject(new Error("the supervisor already has an engine"));
-    this.starting ??= this.runStart().finally(() => {
-      this.starting = null;
-    });
-    return this.starting;
+    // **One climb in flight, ever.** The in-flight climb may be another
+    // `start()`'s or a restart's — the restart used to bypass this guard by
+    // calling `climb()` directly, and an explicit `start()` in that window
+    // opened a second parallel climb, two live engines, and an orphan that
+    // survived `stop()` because the supervisor only ever tracked one of them.
+    if (this.climbing) return this.climbing;
+    this.stopping = false;
+    this.restartTimes = [];
+    this.setState("starting");
+    return this.runClimb();
   }
 
   state(): SupervisorState {
@@ -420,11 +448,19 @@ export class Supervisor {
     await this.shutdown(engine);
   }
 
-  private async runStart(): Promise<void> {
-    this.stopping = false;
-    this.restartTimes = [];
-    this.setState("starting");
-    await this.climb();
+  /**
+   * The one door to {@link climb}.
+   *
+   * Both entrances — an explicit `start()` and an engine's own restart — go
+   * through this, so there is exactly one ladder being climbed at any moment
+   * and therefore at most one engine being spawned. A caller that arrives while
+   * one is running joins it instead of starting another.
+   */
+  private runClimb(): Promise<void> {
+    this.climbing ??= this.climb().finally(() => {
+      this.climbing = null;
+    });
+    return this.climbing;
   }
 
   /** One attempt per rung; rung `i`'s wait precedes attempt `i + 1`. */
@@ -511,7 +547,7 @@ export class Supervisor {
       engine.client.failAllPending(
         new EngineLostError(
           engine.everReady ? "vaultd restarted" : "the engine ended before it was ready",
-          engine.exit,
+          () => engine.exit,
         ),
       );
     });
@@ -552,6 +588,13 @@ export class Supervisor {
     self = engine;
     if (stderr) {
       stderr.setEncoding("utf8");
+      // The same class of door as `stdin`'s: a pipe this supervisor created,
+      // whose error would otherwise be an uncaught exception. Rare on a
+      // readable stream, one line to close, and the diagnostics channel is a
+      // poor place to lose the host.
+      stderr.on("error", (error: Error) => {
+        this.warn(`the engine's stderr failed: ${error.message}`);
+      });
       stderr.on("data", (chunk: string) => {
         engine.stderrTail = (engine.stderrTail + chunk).slice(-STDERR_TAIL_BYTES);
         process.stderr.write(chunk);
@@ -750,7 +793,7 @@ export class Supervisor {
     engine.client.failAllPending(
       new EngineLostError(
         engine.everReady ? "vaultd restarted" : "the engine ended before it was ready",
-        engine.exit,
+        () => engine.exit,
       ),
     );
     engine.client.close();
@@ -788,7 +831,7 @@ export class Supervisor {
     // on a connection that no longer exists.
     this.resyncOwed = this.durable.size > 0;
     try {
-      await this.climb();
+      await this.runClimb();
     } catch {
       // `climb` has already recorded the failure and stopped the supervisor.
       // Nothing above this call is waiting on it — a crash long after `start()`
