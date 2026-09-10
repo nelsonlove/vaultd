@@ -549,7 +549,7 @@ Stable version 1 codes and when each occurs:
 
 - `incompatible_version` — the envelope version is unsupported; carries `supported_version`.
 - `invalid_request` — a supported version whose request cannot be decoded.
-- `invalid_path` — a parameter is not a valid vault-relative path.
+- `invalid_path` — a parameter is not a valid vault-relative path. A NUL byte anywhere in a path is refused with this code by every operation, reads and mutations alike (the `parse_path` door); it never reaches the engine, so it is never reported as a zone or containment refusal.
 - `invalid_cursor` — a malformed cursor, a cursor for a different operation or filters, or an out-of-range limit.
 - `note_not_found` — an exact-path lookup found no note.
 - `index_unavailable` — no vault is configured, or no complete generation exists yet.

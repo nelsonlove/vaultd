@@ -2,6 +2,14 @@
 //! the real protocol types: each block must parse as JSON and deserialize
 //! cleanly as a `RequestEnvelope`, `ResponseEnvelope`, or `EventEnvelope`.
 //!
+//! What this proves and what it does not: every block PARSES into the
+//! shipped types — it never checks a documented VALUE. A well-formed but
+//! wrong number (the `get_note` `include` example once said `end: 18` where
+//! the daemon answers `17`) passes here untouched; documented values are
+//! pinned where a live daemon is spawned over the example's own source
+//! (see `tests/tree_entries.rs`), and the phase-6 docs task carries the
+//! general live-truth check for examples.
+//!
 //! This exists because the documentation drifted from the shipped types
 //! once already (the `get_vault_info` example was missing `live_state`
 //! until Task 12's checkpoint caught it by hand). A doc example that no
