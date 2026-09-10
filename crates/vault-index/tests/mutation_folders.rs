@@ -314,6 +314,279 @@ fn creating_a_folder_that_only_differs_in_case_is_refused() {
     assert!(fixture.root.join("Folder/New").is_dir());
 }
 
+// ---------------------------------------------------------------------------
+// The conditional resolved-path guard, probed in every direction.
+//
+// Lifting `create_folder`'s zone refusal left exactly one refusal doing the
+// containment work that the lifted one used to share: a request naming an
+// ordinary folder may not *land* on an unindexable one. That asymmetry is the
+// whole shape of the lift, so it is probed rather than argued — one test per
+// way a spelling can disagree with where it resolves, plus the two gates that
+// are not about the zone at all and must survive the lift untouched.
+// ---------------------------------------------------------------------------
+
+/// The alias is the **final** segment rather than an ancestor of it. The
+/// per-segment guard runs on every existing segment including the last, so
+/// this is refused for the same reason `Link/plugins` is — but the last
+/// segment is also the one carrying the case guard, and a guard ordering that
+/// let the case check answer first would turn this into `case_collision` or a
+/// silent success on the zone itself.
+#[cfg(unix)]
+#[test]
+fn creating_a_folder_whose_own_name_is_a_link_into_the_zone_is_refused() {
+    let fixture = fixture();
+    std::os::unix::fs::symlink(fixture.root.join(".obsidian"), fixture.root.join("Link"))
+        .expect("link into the zone");
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder { path: path("Link") })
+        .expect_err("the zone under an ordinary name is still the zone");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(fixture.root.join(".obsidian/app.json").is_file());
+}
+
+/// Two hops. `canonicalize` resolves a chain in full, so the guard sees the
+/// same stored spelling it would for one hop — asserted rather than assumed,
+/// because a guard written against `read_link` instead would stop at the first
+/// hop and see an ordinary vault path.
+#[cfg(unix)]
+#[test]
+fn a_chain_of_links_into_the_zone_is_refused_like_a_single_one() {
+    let fixture = fixture();
+    std::os::unix::fs::symlink(fixture.root.join(".obsidian"), fixture.root.join("Inner"))
+        .expect("inner link into the zone");
+    std::os::unix::fs::symlink(fixture.root.join("Inner"), fixture.root.join("Outer"))
+        .expect("outer link at the inner one");
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path("Outer/plugins"),
+        })
+        .expect_err("a chain is not a way into the zone either");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(!fixture.root.join(".obsidian/plugins").exists());
+}
+
+/// The alias is not at the vault root. The guard runs per segment against the
+/// canonicalized path so far, so nesting changes nothing — but a guard that
+/// compared only the request's first component would miss this one.
+#[cfg(unix)]
+#[test]
+fn a_link_into_the_zone_nested_under_a_real_folder_is_refused_too() {
+    let fixture = fixture();
+    std::os::unix::fs::symlink(
+        fixture.root.join(".obsidian"),
+        fixture.root.join("Folder/Link"),
+    )
+    .expect("nested link into the zone");
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path("Folder/Link/plugins"),
+        })
+        .expect_err("a nested link is not a way into the zone");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(!fixture.root.join(".obsidian/plugins").exists());
+}
+
+/// **The probe that matters most.** A zone-spelled request skips the
+/// zone/hidden refusal by design — so the *containment* refusal is the only
+/// thing left standing between `.obsidian/Out/x` and a directory outside the
+/// vault. If lifting the zone check had also lifted this one, the daemon would
+/// write outside the vault on request.
+#[cfg(unix)]
+#[test]
+fn a_zone_spelled_request_that_escapes_the_vault_is_still_refused() {
+    let fixture = fixture();
+    let outside = TempDir::new().expect("a directory outside the vault");
+    let outside_root = outside.path().canonicalize().expect("canonical outside");
+    std::os::unix::fs::symlink(&outside_root, fixture.root.join(".obsidian/Out"))
+        .expect("link out of the vault");
+
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian/Out/escaped"),
+        })
+        .expect_err("naming the zone is not permission to leave the vault");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(
+        !outside_root.join("escaped").exists(),
+        "nothing may be created outside the vault"
+    );
+}
+
+/// The same escape from an ordinary spelling, which the lift never touched.
+/// Kept beside the probe above so the pair reads as one statement: the vault
+/// boundary is unconditional, and only the *zone* boundary is conditional.
+#[cfg(unix)]
+#[test]
+fn creating_through_a_link_out_of_the_vault_is_refused() {
+    let fixture = fixture();
+    let outside = TempDir::new().expect("a directory outside the vault");
+    let outside_root = outside.path().canonicalize().expect("canonical outside");
+    std::os::unix::fs::symlink(&outside_root, fixture.root.join("Out")).expect("link out");
+
+    let error = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path("Out/escaped"),
+        })
+        .expect_err("a link out of the vault is not a folder to create in");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(!outside_root.join("escaped").exists());
+}
+
+/// The no-symlink way a spelling reaches the zone: case folding. `.OBSIDIAN`
+/// is not the zone as a *string* (`in_config_zone` is exact-case on purpose)
+/// but it starts with a dot, so the request is unindexable on its own terms
+/// and the create is served — landing in the real `.obsidian`, and reporting
+/// the real `.obsidian` spelling, which is what the `config_changed` notice is
+/// built from. Reporting `.OBSIDIAN` would hand a host a path it cannot match
+/// against the file it knows.
+#[test]
+fn a_case_folded_zone_spelling_lands_in_the_real_zone_and_reports_it() {
+    let fixture = fixture();
+    if !folds_case(&fixture) {
+        return;
+    }
+    let outcome = fixture
+        .engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".OBSIDIAN/plugins"),
+        })
+        .expect("a folded ancestor still reaches the stored zone folder");
+    assert_eq!(
+        outcome.written.as_ref().map(VaultPath::as_str),
+        Some(".obsidian/plugins"),
+        "the outcome names the stored spelling, not the caller's"
+    );
+    assert!(outcome.changed_paths.is_empty());
+    assert!(fixture.root.join(".obsidian/plugins").is_dir());
+}
+
+/// The zone folder is **itself** the alias, pointing out of the vault. The
+/// worst shape of the escape: `requested_unindexable` is true from the first
+/// segment, so the zone/hidden refusal never runs at all, and the only thing
+/// between the request and a directory outside the vault is the containment
+/// check on the very first canonicalize.
+///
+/// Built with its own vault rather than [`fixture`], because the fixture makes
+/// `.obsidian` a real directory and the whole point here is that it is not.
+#[cfg(unix)]
+#[test]
+fn a_zone_folder_that_is_itself_a_link_out_of_the_vault_is_refused() {
+    let vault = TempDir::new().expect("vault tempdir");
+    let root = vault.path().canonicalize().expect("canonical vault root");
+    let outside = TempDir::new().expect("a directory outside the vault");
+    let outside_root = outside.path().canonicalize().expect("canonical outside");
+    std::os::unix::fs::symlink(&outside_root, root.join(".obsidian"))
+        .expect("the zone itself is a link out of the vault");
+    let engine = MutationEngine::new(&root);
+
+    let error = engine
+        .apply(&Mutation::CreateFolder {
+            path: path(".obsidian/plugins"),
+        })
+        .expect_err("the vault boundary does not care what the path is called");
+    assert!(
+        matches!(error, MutationError::ZoneViolation { .. }),
+        "expected zone_violation, got {error:?}"
+    );
+    assert!(
+        !outside_root.join("plugins").exists(),
+        "nothing may be created outside the vault"
+    );
+}
+
+/// A NUL inside a **zone** path. `refuse_nul` runs before the segment walk and
+/// after the request's own unindexable test, so lifting the zone refusal could
+/// have reordered it out of the way — this is the probe that it did not. A NUL
+/// must never reach a syscall: which one notices first depends on where in the
+/// path it sits, so the engine refuses it once, in one typed way, for every
+/// verb and every zone.
+#[test]
+fn a_nul_byte_in_a_zone_path_is_refused_before_any_segment_is_walked() {
+    let fixture = fixture();
+    for spelling in [".obsidian/bad\0name", ".obsidian/plugins/bad\0name"] {
+        let error = fixture
+            .engine
+            .apply(&Mutation::CreateFolder {
+                path: path(spelling),
+            })
+            .expect_err("a NUL byte is refused, not attempted");
+        assert!(
+            matches!(error, MutationError::ZoneViolation { .. }),
+            "expected zone_violation for {spelling:?}, got {error:?}"
+        );
+    }
+    assert!(
+        !fixture.root.join(".obsidian/plugins").exists(),
+        "the refusal must come before any segment is created"
+    );
+    assert!(fixture.root.join(".obsidian/app.json").is_file());
+}
+
+/// Traversal through a zone path cannot even be **spelled**: `VaultPath`
+/// rejects a `..` component, so `.obsidian/../escape` never becomes a path the
+/// engine could be asked about. Asserted here rather than assumed, because the
+/// zone verbs are the ones where a traversal would matter most and the
+/// engine's own guards would never see one.
+#[test]
+fn a_traversal_through_a_zone_path_is_not_a_vault_path_at_all() {
+    for spelling in [
+        ".obsidian/../escape",
+        ".obsidian/./plugins",
+        "/.obsidian/plugins",
+        ".obsidian//plugins",
+    ] {
+        assert!(
+            VaultPath::new(spelling).is_err(),
+            "{spelling:?} must not be constructible as a vault path"
+        );
+    }
+}
+
+/// Read-only, at the engine rather than at the dispatcher. `create_folder` is
+/// the one folder verb that now serves the zone, so it is the one that could
+/// have grown a way past the flag — and the refusal must come before the
+/// filesystem is touched, not after the first `mkdir`.
+#[test]
+fn a_read_only_engine_refuses_a_zone_folder_create() {
+    let fixture = fixture();
+    let engine = MutationEngine::new(&fixture.root).with_read_only(true);
+    for spelling in [".obsidian/plugins", ".obsidian-headless", "Fresh"] {
+        let error = engine
+            .apply(&Mutation::CreateFolder {
+                path: path(spelling),
+            })
+            .expect_err("a read-only daemon writes nothing anywhere in the vault");
+        assert!(
+            matches!(error, MutationError::ReadOnly),
+            "expected read_only for {spelling}, got {error:?}"
+        );
+        assert!(
+            !fixture.root.join(spelling).exists(),
+            "{spelling} must not have been created"
+        );
+    }
+}
+
 /// The stored-spelling half of the folder guard, which nothing lexical can
 /// stand in for: `Link` carries no dot and names no zone, and only resolving
 /// it reveals that the folder the caller addressed *is* the configuration
