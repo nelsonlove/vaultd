@@ -724,3 +724,176 @@ describe("hydrate", () => {
     });
   });
 });
+
+/**
+ * The reviewer's own probes for Task 5's five surviving mutations, kept.
+ *
+ * Each of these was written against the *finished* hydration code by someone
+ * who had not written it, to answer one question apiece: does that guard
+ * actually fire? They live here rather than in a scratch file because a guard
+ * with no case of its own is a guard that can be deleted without a test going
+ * red — which is exactly what a mutation probe is for.
+ */
+const ENTRY = (path: string): Record<string, unknown> => ({
+  path,
+  kind: "note",
+  revision: "blake3:x",
+  size: 1,
+  ctime_unix_ms: 1,
+  mtime_unix_ms: 1,
+});
+
+const NOTE = (path: string): Record<string, unknown> => ({
+  path,
+  revision: "blake3:x",
+  metadata: EMPTY_METADATA,
+  references: [],
+  sections: [],
+  list_items: [],
+});
+
+describe("hydration coherence probes", () => {
+  /** N5: the NOTE loop's over-walk guard — does it actually fire? */
+  it("refuses a NOTE walk that pages out more rows than promised", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const pending = hydrate(client, configFor({ snapshotPageSize: 1 }));
+
+    const open = (await daemon.received(1))[0]!;
+    daemon.respondOk(open.id, "open_snapshot", {
+      snapshot_id: "s",
+      generation: 5,
+      note_count: 1,
+      entry_count: 1,
+    });
+    const tree = (await daemon.received(2))[1]!;
+    daemon.respondOk(tree.id, "snapshot_tree", {
+      snapshot_id: "s",
+      generation: 5,
+      next_cursor: null,
+      entries: [ENTRY("A.md")],
+    });
+    // The note loop repeats its cursor forever.
+    for (let page = 0; page < 2; page += 1) {
+      const notes = (await daemon.received(page + 3))[page + 2]!;
+      daemon.respondOk(notes.id, "snapshot_notes", {
+        snapshot_id: "s",
+        generation: 5,
+        next_cursor: "stuck",
+        notes: [NOTE(`N${String(page)}.md`)],
+      });
+    }
+    await expect(pending).rejects.toThrow(/more notes than the 1 it promised/);
+  });
+
+  /** N2: the entry half of the short-walk check, alone. */
+  it("refuses a short TREE walk even when the note count is exactly right", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const pending = hydrate(client, configFor({ snapshotPageSize: 10 }));
+    const open = (await daemon.received(1))[0]!;
+    daemon.respondOk(open.id, "open_snapshot", {
+      snapshot_id: "s",
+      generation: 6,
+      note_count: 1,
+      entry_count: 2,
+    });
+    const tree = (await daemon.received(2))[1]!;
+    daemon.respondOk(tree.id, "snapshot_tree", {
+      snapshot_id: "s",
+      generation: 6,
+      next_cursor: null,
+      entries: [ENTRY("A.md")],
+    });
+    const notes = (await daemon.received(3))[2]!;
+    daemon.respondOk(notes.id, "snapshot_notes", {
+      snapshot_id: "s",
+      generation: 6,
+      next_cursor: null,
+      notes: [NOTE("A.md")],
+    });
+    await expect(pending).rejects.toThrow(
+      /promised 2 tree entries and 1 notes, but the walk had 1 and 1/,
+    );
+  });
+
+  /** N3: the note half of the short-walk check, alone. */
+  it("refuses a short NOTE walk even when the entry count is exactly right", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const pending = hydrate(client, configFor({ snapshotPageSize: 10 }));
+    const open = (await daemon.received(1))[0]!;
+    daemon.respondOk(open.id, "open_snapshot", {
+      snapshot_id: "s",
+      generation: 7,
+      note_count: 2,
+      entry_count: 1,
+    });
+    const tree = (await daemon.received(2))[1]!;
+    daemon.respondOk(tree.id, "snapshot_tree", {
+      snapshot_id: "s",
+      generation: 7,
+      next_cursor: null,
+      entries: [ENTRY("A.md")],
+    });
+    const notes = (await daemon.received(3))[2]!;
+    daemon.respondOk(notes.id, "snapshot_notes", {
+      snapshot_id: "s",
+      generation: 7,
+      next_cursor: null,
+      notes: [NOTE("A.md")],
+    });
+    await expect(pending).rejects.toThrow(
+      /promised 1 tree entries and 2 notes, but the walk had 1 and 1/,
+    );
+  });
+
+  /** N6: is the runaway page really refused BEFORE it reaches the sink? */
+  it("refuses a runaway page before staging it in the sink", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const staged: string[] = [];
+    const sink: MirrorSink = {
+      begin(): void {
+        staged.push("begin");
+      },
+      applyTreePage(entries: readonly MirrorEntry[]): void {
+        staged.push(`tree ${entries.map((entry) => entry.path).join(",")}`);
+      },
+      applyNotePage(notes: readonly MirrorNoteRow[]): void {
+        staged.push(`notes ${notes.map((note) => note.path).join(",")}`);
+      },
+      commit(): void {
+        staged.push("commit");
+      },
+    };
+    const pending = hydrateInto(client, configFor({ snapshotPageSize: 1 }), sink);
+    const open = (await daemon.received(1))[0]!;
+    daemon.respondOk(open.id, "open_snapshot", {
+      snapshot_id: "s",
+      generation: 8,
+      note_count: 0,
+      entry_count: 1,
+    });
+    for (let page = 0; page < 2; page += 1) {
+      const tree = (await daemon.received(page + 2))[page + 1]!;
+      daemon.respondOk(tree.id, "snapshot_tree", {
+        snapshot_id: "s",
+        generation: 8,
+        next_cursor: "stuck",
+        entries: [ENTRY(`Loop ${String(page)}.md`)],
+      });
+    }
+    await expect(pending).rejects.toThrow(/more tree entries/);
+    // The first page was legal and staged; the second exceeded the promise and
+    // must never have reached the sink.
+    expect(staged).toEqual(["begin", "tree Loop 0.md"]);
+  });
+
+  /** N12 / N13: are the shipped defaults what the ruling asked for? */
+  it("ships the ruled default budgets", () => {
+    const config = defaultHostConfig("/vault");
+    expect(config.snapshotCapRetries).toBe(4);
+    expect(config.hydrationPinLossRestarts).toBe(3);
+  });
+});

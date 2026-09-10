@@ -1,15 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig } from "../src/config";
-import { Supervisor } from "../src/supervisor";
 import { hydrate } from "../src/mirror/hydrate";
 import { SNAPSHOT_RETRY_BACKOFF_MS } from "../src/mirror/hydrate";
 import type { HostConfig } from "../src/config";
 import type { MutationResponse, OpenSnapshotResponse } from "../src/client/protocol";
 import { FakeClock } from "./fake-clock";
+import { BINARY, BINARY_EXISTS, cleanupRealDaemons, scratchRoot, startedOn } from "./real-daemon";
 
 /**
  * Hydration against the **real** `vaultd`.
@@ -36,20 +35,20 @@ import { FakeClock } from "./fake-clock";
  * opt-out — and merely skips here, so the loud failure is stated once. If that
  * assertion is ever removed or that file renamed, the guard must move here in
  * the same motion. Build it with `cargo build --release --bin vaultd`.
+ *
+ * `startedOn` comes from `real-daemon.ts` rather than being spelled here, and
+ * that is a fix rather than tidying: these cases previously started their
+ * engines with a bare `await` and, under machine load, timed out at 60 s
+ * reporting nothing whatsoever about why. The shared helper's watchdog reports
+ * the supervisor's own view instead.
  */
-const BINARY = resolve(__dirname, "..", "..", "..", "..", "target", "release", "vaultd");
-const BINARY_EXISTS = existsSync(BINARY);
 
 /** Enough notes that paging is many round trips, so a writer can overlap it. */
 const NOTE_COUNT = 200;
 
-const roots: string[] = [];
-const running: Supervisor[] = [];
-
 /** A scratch vault of `NOTE_COUNT` notes, one folder, and one attachment. */
 function vaultFor(overrides: Partial<HostConfig> = {}): HostConfig {
-  const root = mkdtempSync(join(tmpdir(), "vaultd-hydrate-real-"));
-  roots.push(root);
+  const root = scratchRoot("vaultd-hydrate-real-");
   const vault = join(root, "vault");
   mkdirSync(join(vault, "Folder"), { recursive: true });
   for (let i = 0; i < NOTE_COUNT; i += 1) {
@@ -76,24 +75,7 @@ function vaultFor(overrides: Partial<HostConfig> = {}): HostConfig {
   };
 }
 
-const silent = {
-  onClientReady: (): void => {},
-  onEngineLost: (): void => {},
-  onStateChange: (): void => {},
-};
-
-async function startedOn(config: HostConfig): Promise<Supervisor> {
-  const supervisor = new Supervisor(config, silent);
-  running.push(supervisor);
-  await supervisor.start();
-  await supervisor.whenWatching();
-  return supervisor;
-}
-
-afterEach(async () => {
-  for (const supervisor of running.splice(0)) await supervisor.stop();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+afterEach(cleanupRealDaemons);
 
 describe.skipIf(!BINARY_EXISTS)("hydrate against a real vaultd", () => {
   it("mirrors the whole vault at one generation while the vault is being written", async () => {

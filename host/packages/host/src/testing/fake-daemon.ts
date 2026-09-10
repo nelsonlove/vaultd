@@ -27,6 +27,16 @@ export class FakeDaemon {
   private readonly sent: RequestEnvelope[] = [];
   private readonly lines: string[] = [];
   private readonly waiters: Waiter[] = [];
+  /**
+   * Called as each request line is decoded, before any waiter is resolved.
+   *
+   * `received(n)` is a rendezvous on a count, which is the right shape for a
+   * test that knows how many requests it expects. A harness driving a subject
+   * that decides for itself how many to send needs the other shape — tell me as
+   * they arrive — and building that out of `received` means a polling loop that
+   * never settles when the subject falls quiet. One hook, set by the harness.
+   */
+  onRequest: ((request: RequestEnvelope) => void) | null = null;
 
   constructor() {
     let pending = "";
@@ -38,7 +48,9 @@ export class FakeDaemon {
         pending = pending.slice(newline + 1);
         if (line.trim().length) {
           this.lines.push(line);
-          this.sent.push(JSON.parse(line) as RequestEnvelope);
+          const request = JSON.parse(line) as RequestEnvelope;
+          this.sent.push(request);
+          this.onRequest?.(request);
         }
         newline = pending.indexOf("\n");
       }

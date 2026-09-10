@@ -102,6 +102,28 @@ export interface HostConfig {
    * to wait for.
    */
   readonly hydrationPinLossRestarts: number;
+  /**
+   * How many changed paths a single `generation_committed` may carry before the
+   * mirror stops refetching them one by one and re-hydrates instead.
+   *
+   * A delta is cheaper than a hydration exactly while the change set is small:
+   * each changed path costs one row in a `get_tree_entries` batch plus, for a
+   * note, one `get_note` round trip. Past this many, the round trips outweigh
+   * the two-page snapshot walk a whole re-hydration costs, and the re-hydration
+   * has the better coherence story besides. Configuration rather than a literal
+   * so a test can drive the escalation without a 65-path fixture.
+   */
+  readonly mirrorDeltaPathLimit: number;
+  /**
+   * How many `read_file` calls the position warm-up keeps in flight.
+   *
+   * The warm-up is the one place the host reads every note's bytes, and it is
+   * bounded here rather than by the daemon: the daemon answers as fast as it is
+   * asked, and an unbounded fan-out over 100k notes would hold every note's
+   * source in memory at once — which is the thing `PositionIndex` exists to
+   * avoid.
+   */
+  readonly mirrorWarmConcurrency: number;
   readonly writeFileCapBytes: number;
   readonly unloadBudgetMs: number;
   /**
@@ -188,6 +210,8 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     snapshotPageSizeMax: 2_000,
     snapshotCapRetries: 4,
     hydrationPinLossRestarts: 3,
+    mirrorDeltaPathLimit: 64,
+    mirrorWarmConcurrency: 16,
     writeFileCapBytes: 16 * 1024 * 1024,
     unloadBudgetMs: 5_000,
     restartBackoffMs: [250, 500, 1_000, 2_000, 5_000],

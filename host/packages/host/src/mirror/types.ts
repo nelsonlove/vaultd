@@ -23,6 +23,7 @@ import type {
   AliasDto,
   BlockDto,
   DiagnosticDto,
+  GenerationCauseDto,
   HeadingDto,
   ListItemDto,
   PropertyDto,
@@ -31,13 +32,19 @@ import type {
   TagDto,
   TreeEntryKindDto,
 } from "../client/protocol";
+import type { PositionIndex } from "./positions";
 
 export type {
   AliasDto,
   BlockDto,
   DiagnosticDto,
+  GenerationCauseDto,
+  GetNoteFacetDto,
+  GetNoteResponse,
+  GetTreeEntriesResponse,
   HeadingDto,
   ListItemDto,
+  NoteDto,
   NoteFacetDto,
   NoteMetadataDto,
   OpenSnapshotResponse,
@@ -192,4 +199,70 @@ export interface MirrorSink {
   applyTreePage(entries: readonly MirrorEntry[], page: number): void;
   applyNotePage(notes: readonly MirrorNoteRow[], page: number): void;
   commit(generation: number): void;
+}
+
+/**
+ * The mirror's read surface — the one every shim task consumes, and the one
+ * nothing may bypass.
+ *
+ * It is declared here rather than beside the class so a consumer imports the
+ * *shape* without importing the machine: Task 7's `FileIndex` takes a
+ * `MirrorQuery`, and a test that hands it a fixture object should not have to
+ * construct a `Mirror` with a client behind it.
+ *
+ * Every method is **synchronous**, and that is the whole point of a mirror: a
+ * shim answers `vault.getFiles()` from memory because Obsidian's own API is
+ * synchronous and no plugin will await it.
+ */
+export interface MirrorQuery {
+  /**
+   * The highest generation any row in this mirror was fetched at.
+   *
+   * **Not the same number as "the last change set I applied"** — see
+   * `Mirror.appliedThrough`. A refetch for generation 6 is served at whatever
+   * generation is published when it lands, which may be later, so this is what
+   * the mirror actually holds and it never moves backwards.
+   */
+  generation(): number;
+  entry(path: string): MirrorEntry | undefined;
+  entries(): readonly MirrorEntry[];
+  /** The direct children of a folder, path-sorted. `""` is the vault root. */
+  children(folderPath: string): readonly MirrorEntry[];
+  note(path: string): MirrorNoteRow | undefined;
+  /** `undefined` until the note's source has been read — see `warmPositions`. */
+  positions(path: string): PositionIndex | undefined;
+  resolvedLinks(): Readonly<Record<string, Readonly<Record<string, number>>>>;
+  unresolvedLinks(): Readonly<Record<string, Readonly<Record<string, number>>>>;
+  /** Every reference from anywhere in the vault that resolves to `path`. */
+  backlinks(path: string): readonly ReferenceDto[];
+  firstLinkpathDest(linkpath: string, sourcePath: string): MirrorEntry | undefined;
+}
+
+/**
+ * One applied change, as the shim's event layer consumes it.
+ *
+ * **No `renamed` field, deliberately.** The wire has none: `ChangeSetDto` is
+ * `created` / `modified` / `deleted` and a `rename_note` reports the move as a
+ * delete plus a create. So the mirror does not invent a rename it was never
+ * told about; Task 7's `FileIndex.applyBatch` synthesizes `vault.on("rename")`
+ * from the delete/create pair, where the revisions needed to pair them are
+ * already in hand. The mirror models the wire; the shim models Obsidian.
+ */
+export interface MirrorChangeBatch {
+  /**
+   * The generation whose change set this batch describes.
+   *
+   * For a synthetic batch it is the generation the re-hydration landed on.
+   */
+  readonly generation: number;
+  readonly created: readonly string[];
+  readonly modified: readonly string[];
+  readonly deleted: readonly string[];
+  readonly cause: GenerationCauseDto;
+  /**
+   * True when the paths were derived by comparing revision maps rather than
+   * read off a change set — a re-hydration, from any resync reason or from an
+   * engine restart.
+   */
+  readonly synthetic: boolean;
 }

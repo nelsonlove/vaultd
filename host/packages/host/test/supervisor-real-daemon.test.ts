@@ -1,6 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig } from "../src/config";
@@ -9,6 +8,15 @@ import type { SupervisorEvents } from "../src/supervisor";
 import type { HostConfig } from "../src/config";
 import type { GetNoteResponse, GetVaultInfoResponse, MutationResponse } from "../src/client/protocol";
 import type { RuntimeEventDto } from "../src/client/events";
+import {
+  BINARY,
+  BINARY_EXISTS,
+  cleanupRealDaemons,
+  scratchRoot,
+  silentEvents,
+  superviseOn,
+  waitFor,
+} from "./real-daemon";
 
 /**
  * The supervisor against the **real** `vaultd`.
@@ -38,12 +46,11 @@ import type { RuntimeEventDto } from "../src/client/events";
  * opt-out — and merely skips here, so the loud failure is stated once. If that
  * assertion is ever removed or that file renamed, the guard must move here in
  * the same motion. Build it with `cargo build --release --bin vaultd`.
+ *
+ * The binary path, the scratch-root registry, `silent`, and `waitFor` now live
+ * in `real-daemon.ts`, so every real-daemon file shares one set — the mirror
+ * files had no `waitFor` at all until it was lifted out of here.
  */
-const BINARY = resolve(__dirname, "..", "..", "..", "..", "target", "release", "vaultd");
-const BINARY_EXISTS = existsSync(BINARY);
-
-const roots: string[] = [];
-const running: Supervisor[] = [];
 
 /**
  * A config over a fresh scratch vault and its own index.
@@ -53,8 +60,7 @@ const running: Supervisor[] = [];
  * config's ladder, taken through the config's clock.
  */
 function configFor(): HostConfig {
-  const root = mkdtempSync(join(tmpdir(), "vaultd-sup-real-"));
-  roots.push(root);
+  const root = scratchRoot("vaultd-sup-real-");
   const vault = join(root, "vault");
   mkdirSync(vault);
   const index = join(root, "index.db");
@@ -67,59 +73,13 @@ function configFor(): HostConfig {
   };
 }
 
-const silent = {
-  onClientReady: (): void => {},
-  onEngineLost: (): void => {},
-  onStateChange: (): void => {},
-};
+const silent = silentEvents;
 
 function supervise(config: HostConfig, events: SupervisorEvents = silent): Supervisor {
-  const supervisor = new Supervisor(config, events);
-  running.push(supervisor);
-  return supervisor;
+  return superviseOn(config, events);
 }
 
-/**
- * Resolve when `predicate` holds — a rendezvous on the supervisor's own state,
- * never a sleep — and **say what was true instead** when it does not.
- *
- * A bare vitest timeout names neither what was awaited nor what the supervisor
- * thought was happening, which is how a real failure becomes "flaky" and then
- * invisible. The daemon's own stderr is inherited by this process, so vitest
- * has already printed it above any failure here.
- */
-function waitFor(
-  description: string,
-  predicate: () => boolean,
-  diagnose: () => string,
-  timeoutMs = 15_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise<void>((resolve_, reject) => {
-    const check = (): void => {
-      if (predicate()) {
-        resolve_();
-        return;
-      }
-      if (Date.now() > deadline) {
-        reject(
-          new Error(
-            `timed out after ${timeoutMs}ms waiting for ${description}. ${diagnose()} ` +
-              "The daemon's stderr is inherited by this process and printed above.",
-          ),
-        );
-        return;
-      }
-      setImmediate(check);
-    };
-    check();
-  });
-}
-
-afterEach(async () => {
-  for (const supervisor of running.splice(0)) await supervisor.stop();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+afterEach(cleanupRealDaemons);
 
 describe.skipIf(!BINARY_EXISTS)("Supervisor against a real vaultd", () => {
   it("ends the engine by closing its stdin, with no signal and no escalation", async () => {
@@ -155,16 +115,12 @@ describe.skipIf(!BINARY_EXISTS)("Supervisor against a real vaultd", () => {
     // The same index, a different supervisor: the daemon's writer lease is what
     // this meets, and it meets it as a startup refusal.
     let lost = 0;
-    const second = new Supervisor(
-      { ...first, restartBackoffMs: [20, 20] },
-      {
-        ...silent,
-        onEngineLost: () => {
-          lost += 1;
-        },
+    const second = superviseOn({ ...first, restartBackoffMs: [20, 20] }, {
+      ...silent,
+      onEngineLost: () => {
+        lost += 1;
       },
-    );
-    running.push(second);
+    });
     const thrown: unknown = await second.start().then(
       () => null,
       (error: unknown) => error,
