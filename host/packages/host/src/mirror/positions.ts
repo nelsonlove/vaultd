@@ -135,6 +135,12 @@ export function locate(index: PositionIndex, byteOffset: number): Loc {
  *
  * The daemon's spans are half-open and Obsidian's are too, so `end` is
  * converted exactly like `start` and no ±1 is applied anywhere.
+ *
+ * **Ordering is the caller's**: `span(index, 7, 3)` answers a `Pos` whose end
+ * precedes its start. Every span the daemon sends is ordered, and silently
+ * swapping the two here would hide a malformed one rather than surface it —
+ * unlike an out-of-range or interior offset, which {@link locate} does defend
+ * against because both are reachable from an ordinary stale span.
  */
 export function span(index: PositionIndex, start: number, end: number): Pos {
   return { start: locate(index, start), end: locate(index, end) };

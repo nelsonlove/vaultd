@@ -28,10 +28,12 @@
  * - **`snapshot_not_found`** — the session was reclaimed (60 s idle) or never
  *   existed. Same answer: reopen and walk again.
  *
- * And one refusal that is not retried: a page whose `generation` differs from
- * the session's own. That is a daemon that is not pinning, and no recovery
- * exists for it — merging the page anyway produces exactly the torn mirror the
- * session was opened to prevent.
+ * And two refusals that are not retried, both {@link HydrationCoherenceError}:
+ * a page whose `generation` differs from the session's own — a daemon that is
+ * not pinning — and a walk whose row counts differ from the ones
+ * `open_snapshot` promised. The second is the quiet one: without it, a cursor
+ * bug or a `next_cursor: null` one page early produces a mirror silently
+ * missing notes, which commits cleanly and reports a coherent generation.
  *
  * Whatever happens, the session is released: on the way out of a completed
  * walk, awaited, so a caller that resolved knows the pin is gone; on the way
@@ -61,14 +63,23 @@ import type { MirrorEntry, MirrorNoteRow, MirrorSink, SnapshotSession } from "./
  * `metadata.sections` gets nothing — silently, forever, with no error — which
  * is the failure the wire-convention note exists to prevent.
  *
- * `backlinks` is deliberately absent: the mirror derives every note's backlinks
- * from the other notes' `outgoing`, so asking for them would page the same
- * edges a second time in the opposite direction.
+ * Two of the six facets are deliberately absent, for the same reason: the
+ * mirror already holds the answer.
+ *
+ * - `backlinks` — derived from the other notes' `outgoing`, so asking would
+ *   page the same edges a second time in the opposite direction.
+ * - `resolutions` — the **answers-only projection of `references`**. The daemon
+ *   loads `outgoing` once when either facet is asked for and builds
+ *   `resolutions` as `outgoing.map(|r| r.resolution.clone())`
+ *   (`vault-index/src/snapshot.rs`), and every `ReferenceDto` carries its own
+ *   `resolution` on the wire. Asking for it costs the daemon nothing to compute
+ *   and a whole second copy to serialize, and `MirrorNoteRow` has no field for
+ *   that copy. Dropped after the wire was read: the plan's five-facet list came
+ *   from the same DTO model that gave `AliasDto` an `alias` field.
  */
 export const HYDRATION_FACETS: readonly NoteFacetDto[] = [
   "metadata",
   "references",
-  "resolutions",
   "sections",
   "list_items",
 ];
@@ -76,15 +87,19 @@ export const HYDRATION_FACETS: readonly NoteFacetDto[] = [
 /**
  * The `open_snapshot` retry ladder, in milliseconds.
  *
- * Its **length is the number of attempts**, not the number of retries, so the
- * last rung is never waited on: four attempts, three waits. Every wait is asked
- * of `config.clock`, which is what lets a test prove the ladder without
+ * One rung per retry: retry `i` waits `SNAPSHOT_RETRY_BACKOFF_MS[i]` before
+ * asking again, and `HostConfig.snapshotCapRetries` says how many retries there
+ * are. A retry past the end of the ladder reuses the last rung. Every wait is
+ * asked of `config.clock`, which is what lets a test prove the ladder without
  * spending 1.5 s of wall clock on it.
+ *
+ * **How many attempts a hydration makes is configuration, not this constant.**
+ * The two budgets live on `HostConfig` — `snapshotCapRetries` for the cap arm,
+ * `hydrationPinLossRestarts` for the pin-loss arm — because the two failures
+ * have different physics, and one shared counter let ordinary cap contention at
+ * startup eat the restarts a long walk needs.
  */
 export const SNAPSHOT_RETRY_BACKOFF_MS: readonly number[] = [100, 200, 400, 800];
-
-/** How many snapshot sessions one hydration may open before giving up. */
-export const HYDRATION_ATTEMPTS = SNAPSHOT_RETRY_BACKOFF_MS.length;
 
 /**
  * What hydration needs from {@link HostConfig} — and nothing else.
@@ -96,7 +111,11 @@ export const HYDRATION_ATTEMPTS = SNAPSHOT_RETRY_BACKOFF_MS.length;
  */
 export type HydrationConfig = Pick<
   HostConfig,
-  "clock" | "snapshotPageSize" | "snapshotPageSizeMax"
+  | "clock"
+  | "snapshotPageSize"
+  | "snapshotPageSizeMax"
+  | "snapshotCapRetries"
+  | "hydrationPinLossRestarts"
 >;
 
 /** What one completed hydration did, without the rows it did it to. */
@@ -123,25 +142,85 @@ export interface HydrationResult extends HydrationSummary {
   readonly notes: readonly MirrorNoteRow[];
 }
 
+/** Which way a session failed to be the coherent thing it claimed to be. */
+export type HydrationCoherenceReason = "generation_drift" | "count_mismatch";
+
 /**
- * A page arrived carrying a generation that is not its session's.
+ * The session did not serve one coherent view of one vault.
  *
  * Separate from {@link VaultdError} on purpose: this is not something the
  * daemon said, it is something this host noticed the daemon doing, and it is
- * never retried.
+ * never retried — a session that is not pinning, or that pages out a different
+ * number of rows than it promised, has no recovery that is not a guess.
+ *
+ * Two reasons, and the second is the one that took a review to notice:
+ *
+ * - `generation_drift` — a page's `generation` is not the session's.
+ * - `count_mismatch` — the walk did not page out exactly what `open_snapshot`
+ *   promised. A cursor bug, or a daemon answering `next_cursor: null` one page
+ *   early, otherwise yields a mirror silently missing notes that commits
+ *   cleanly and reports a coherent generation. The over-count half also bounds
+ *   the page loop, which is what makes a daemon repeating one cursor forever an
+ *   error rather than a slow death by memory.
  */
 export class HydrationCoherenceError extends Error {
+  readonly reason: HydrationCoherenceReason;
   readonly sessionGeneration: number;
-  readonly pageGeneration: number;
+  /** The page's generation, for `generation_drift`; `null` otherwise. */
+  readonly pageGeneration: number | null;
 
-  constructor(method: string, sessionGeneration: number, pageGeneration: number) {
-    super(
-      `${method} answered generation ${pageGeneration} inside a session pinned at ` +
-        `${sessionGeneration}: the snapshot is not coherent and the mirror refuses to mix generations`,
-    );
+  private constructor(
+    reason: HydrationCoherenceReason,
+    message: string,
+    sessionGeneration: number,
+    pageGeneration: number | null,
+  ) {
+    super(message);
     this.name = "HydrationCoherenceError";
+    this.reason = reason;
     this.sessionGeneration = sessionGeneration;
     this.pageGeneration = pageGeneration;
+  }
+
+  static generationDrift(
+    method: string,
+    sessionGeneration: number,
+    pageGeneration: number,
+  ): HydrationCoherenceError {
+    return new HydrationCoherenceError(
+      "generation_drift",
+      `${method} answered generation ${pageGeneration} inside a session pinned at ` +
+        `${sessionGeneration}: the snapshot is not coherent and the mirror refuses to mix generations`,
+      sessionGeneration,
+      pageGeneration,
+    );
+  }
+
+  static shortWalk(
+    session: SnapshotSession,
+    entries: number,
+    notes: number,
+  ): HydrationCoherenceError {
+    return new HydrationCoherenceError(
+      "count_mismatch",
+      `snapshot ${session.snapshotId} promised ${session.promisedEntryCount} tree entries and ` +
+        `${session.promisedNoteCount} notes, but the walk had ${entries} and ${notes} when its ` +
+        "pages ran out: the mirror would be silently incomplete, so it is refused",
+      session.generation,
+      null,
+    );
+  }
+
+  static overWalk(session: SnapshotSession, kind: "tree" | "note"): HydrationCoherenceError {
+    const promised = kind === "tree" ? session.promisedEntryCount : session.promisedNoteCount;
+    const rows = kind === "tree" ? "tree entries" : "notes";
+    return new HydrationCoherenceError(
+      "count_mismatch",
+      `snapshot ${session.snapshotId} paged out more ${rows} than the ${promised} it promised: ` +
+        "the session is not serving one coherent view, and a walk that keeps paging never ends",
+      session.generation,
+      null,
+    );
   }
 }
 
@@ -161,17 +240,22 @@ export async function hydrateInto(
   const started = config.clock.now();
   const limit = pageLimit(config);
   let sessions = 0;
+  // Two budgets, counted separately, because the two failures they bound have
+  // nothing to do with each other.
+  let capRetriesLeft = config.snapshotCapRetries;
+  let restartsLeft = config.hydrationPinLossRestarts;
 
-  for (let attempt = 0; attempt < HYDRATION_ATTEMPTS; attempt += 1) {
-    const last = attempt + 1 === HYDRATION_ATTEMPTS;
+  for (;;) {
     let session: SnapshotSession;
     try {
       session = await openSession(client);
       sessions += 1;
     } catch (error) {
       // The cap is the daemon's, not a fault: wait and ask again.
-      if (!last && isCode(error, "too_many_snapshots")) {
-        await delay(config.clock, SNAPSHOT_RETRY_BACKOFF_MS[attempt]!);
+      if (capRetriesLeft > 0 && isCode(error, "too_many_snapshots")) {
+        const rung = config.snapshotCapRetries - capRetriesLeft;
+        capRetriesLeft -= 1;
+        await delay(config.clock, backoffFor(rung));
         continue;
       }
       throw error;
@@ -195,15 +279,22 @@ export async function hydrateInto(
       // Not awaited: the caller's failure must not wait on a daemon that is
       // already refusing. A close that fails is warned about, once, in
       // `releaseSession` — and a session that is already gone is not a failure.
+      //
+      // The *line* is already written, though: `VaultdClient.request` frames and
+      // writes it synchronously, and the daemon's stdio reader feeds one FIFO
+      // dispatch loop, so a stale close really does reach the daemon ahead of
+      // the reopen below. That ordering is load-bearing — a host that reopened
+      // without closing would burn one of the daemon's four session slots per
+      // lost pin — and it is an assumption about someone else's process, so it
+      // is written down rather than assumed.
       void releaseSession(client, session.snapshotId).catch(() => undefined);
-      if (!last && isSessionLost(error)) continue;
+      if (restartsLeft > 0 && isSessionLost(error)) {
+        restartsLeft -= 1;
+        continue;
+      }
       throw error;
     }
   }
-
-  // Unreachable: every arm above either returns, continues, or throws, and the
-  // last attempt never continues.
-  throw new Error("hydration exhausted its attempts without an outcome");
 }
 
 /**
@@ -253,10 +344,21 @@ export function mirrorEntry(dto: TreeEntryDto): MirrorEntry {
  * arrays keep their wire spelling, because they are wire types and re-spelling
  * them would mean re-declaring them.
  *
- * An absent facet becomes an empty array here, and only here: a hydration asked
- * for all five, so absence means the daemon did not serve what was asked. On
- * `get_note`, where `include` is a genuine choice, absent and empty stay
- * distinguishable and a consumer must test `=== undefined`.
+ * **`SnapshotNoteDto` only — the `get_note` path needs its own converter.**
+ * `GetNoteResponse.note` is a `NoteDto`, a different shape: the metadata fields
+ * are flat and top-level with no `metadata` wrapper, the outgoing references
+ * live under `outgoing` (there is no `references` key), there is a `source`,
+ * and `sections` / `list_items` are the only optional fields. This function
+ * cannot be handed one. Unlike `mirrorEntry`, which *is* reusable —
+ * `GetTreeEntriesResponse.entries` really is `TreeEntryDto[]`.
+ *
+ * And the difference matters beyond the field names: an absent facet becomes an
+ * empty array **here** because a hydration asked for every facet it mirrors, so
+ * absence means the daemon did not serve what was asked. On `get_note`,
+ * `include` is a genuine choice — it accepts only `sections` and `list_items`,
+ * and naming any other facet is `invalid_request` — so absent and empty stay
+ * distinguishable there and that converter must test `=== undefined` rather
+ * than defaulting.
  */
 export function mirrorNoteRow(dto: SnapshotNoteDto): MirrorNoteRow {
   const metadata = dto.metadata;
@@ -327,6 +429,9 @@ async function walk(
     requireGeneration("snapshot_tree", session, page.generation);
     pages += 1;
     entries += page.entries.length;
+    // Checked before the rows are handed over, so a runaway walk is refused
+    // rather than staged: this is the bound on the page loop.
+    if (entries > session.promisedEntryCount) throw HydrationCoherenceError.overWalk(session, "tree");
     sink.applyTreePage(page.entries.map(mirrorEntry), pages);
     cursor = page.next_cursor;
     if (cursor === null) break;
@@ -346,9 +451,17 @@ async function walk(
     requireGeneration("snapshot_notes", session, page.generation);
     pages += 1;
     notes += page.notes.length;
+    if (notes > session.promisedNoteCount) throw HydrationCoherenceError.overWalk(session, "note");
     sink.applyNotePage(page.notes.map(mirrorNoteRow), pages);
     cursor = page.next_cursor;
     if (cursor === null) break;
+  }
+
+  // The promise `open_snapshot` made, kept or not. Until this comparison
+  // existed, a walk that ended early produced a mirror silently missing notes
+  // that committed cleanly and reported a coherent generation.
+  if (entries !== session.promisedEntryCount || notes !== session.promisedNoteCount) {
+    throw HydrationCoherenceError.shortWalk(session, entries, notes);
   }
 
   return { entries, notes, count: pages };
@@ -359,8 +472,8 @@ async function openSession(client: VaultdClient): Promise<SnapshotSession> {
   return {
     snapshotId: response.snapshot_id,
     generation: response.generation,
-    noteCount: response.note_count,
-    entryCount: response.entry_count,
+    promisedNoteCount: response.note_count,
+    promisedEntryCount: response.entry_count,
   };
 }
 
@@ -393,7 +506,13 @@ function pageLimit(config: HydrationConfig): number {
 
 function requireGeneration(method: string, session: SnapshotSession, generation: number): void {
   if (generation === session.generation) return;
-  throw new HydrationCoherenceError(method, session.generation, generation);
+  throw HydrationCoherenceError.generationDrift(method, session.generation, generation);
+}
+
+/** The wait before retry `index`; a retry past the ladder reuses its last rung. */
+function backoffFor(index: number): number {
+  const rung = Math.min(index, SNAPSHOT_RETRY_BACKOFF_MS.length - 1);
+  return SNAPSHOT_RETRY_BACKOFF_MS[rung]!;
 }
 
 /** Both ways a session can stop existing under a walk that is still using it. */

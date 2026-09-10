@@ -73,6 +73,35 @@ export interface HostConfig {
   readonly overlapPollMs: number;
   readonly snapshotPageSize: number;
   readonly snapshotPageSizeMax: number;
+  /**
+   * How many times a hydration retries an `open_snapshot` the daemon refused
+   * with `too_many_snapshots`.
+   *
+   * **Retries, not attempts** — the name says which, and it is deliberately the
+   * opposite convention from {@link restartBackoffMs}, whose *length* is the
+   * attempt count. One attempt plus this many more, and retry `i` waits
+   * `SNAPSHOT_RETRY_BACKOFF_MS[i]` first, so every rung of that ladder is used.
+   *
+   * The daemon caps concurrent sessions at four, and the cap is external,
+   * transient, and cheap to wait out: several clients starting at once. A host
+   * that treated it as fatal could not start while any other client was paging.
+   */
+  readonly snapshotCapRetries: number;
+  /**
+   * How many times a hydration may restart its walk on a lost snapshot pin.
+   *
+   * Separate from {@link snapshotCapRetries} because the two failures have
+   * different physics. Cap contention is other clients; pin loss scales with
+   * walk duration times write rate, and a restart throws away a completed walk
+   * and starts again from the first page. Sharing one counter meant a couple of
+   * ordinary cap retries at startup could leave a long walk with no restarts
+   * left, and the host would fail to start with a raw `generation_mismatch` its
+   * caller could do nothing with.
+   *
+   * There is no wait on this arm: the pin is already gone, so there is nothing
+   * to wait for.
+   */
+  readonly hydrationPinLossRestarts: number;
   readonly writeFileCapBytes: number;
   readonly unloadBudgetMs: number;
   /**
@@ -157,6 +186,8 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     overlapPollMs: 60_000,
     snapshotPageSize: 500,
     snapshotPageSizeMax: 2_000,
+    snapshotCapRetries: 4,
+    hydrationPinLossRestarts: 3,
     writeFileCapBytes: 16 * 1024 * 1024,
     unloadBudgetMs: 5_000,
     restartBackoffMs: [250, 500, 1_000, 2_000, 5_000],

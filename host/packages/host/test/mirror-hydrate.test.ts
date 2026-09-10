@@ -35,8 +35,15 @@ function clientFor(daemon: FakeDaemon): VaultdClient {
   });
 }
 
-/** The five facets a hydration asks for, in the order it asks for them. */
-const INCLUDE = ["metadata", "references", "resolutions", "sections", "list_items"];
+/**
+ * The four facets a hydration asks for, in the order it asks for them.
+ *
+ * `resolutions` is **not** among them and must not come back: it is the
+ * answers-only projection of `references` (`vault-index/src/snapshot.rs` builds
+ * both from one load), every `ReferenceDto` already carries its own
+ * `resolution`, and `MirrorNoteRow` has no field for the copy.
+ */
+const INCLUDE = ["metadata", "references", "sections", "list_items"];
 
 const EMPTY_METADATA = {
   properties: [],
@@ -58,7 +65,7 @@ describe("hydrate", () => {
     daemon.respondOk(open.id, "open_snapshot", {
       snapshot_id: "snap-1",
       generation: 42,
-      note_count: 3,
+      note_count: 1,
       entry_count: 4,
     });
 
@@ -129,8 +136,20 @@ describe("hydrate", () => {
             ...EMPTY_METADATA,
             headings: [{ level: 1, text: "A", span: { start: 0, end: 3 } }],
           },
-          references: [],
-          resolutions: [],
+          references: [
+            {
+              source_path: "Folder/A.md",
+              kind: "wikilink",
+              origin: "body",
+              raw_target: "B",
+              file_target: "B",
+              subpath: null,
+              display: null,
+              span: { start: 4, end: 9 },
+              target_span: { start: 6, end: 7 },
+              resolution: { kind: "resolved", target: "B.md", subpath: null },
+            },
+          ],
           sections: [{ kind: "heading", span: { start: 0, end: 3 } }],
           list_items: [{ span: { start: 4, end: 9 }, list_start_line: 1, task: " " }],
         },
@@ -175,6 +194,13 @@ describe("hydrate", () => {
     // The one camelCase rename at the boundary: `list_items` → `listItems`.
     expect(row.listItems[0]?.list_start_line).toBe(1);
     expect(row.sections[0]?.kind).toBe("heading");
+    // The resolution answers survive the dropped `resolutions` facet, because
+    // they were never in it: every reference carries its own.
+    expect(row.outgoing[0]?.resolution).toEqual({
+      kind: "resolved",
+      target: "B.md",
+      subpath: null,
+    });
     expect(result.pages).toBe(3);
     expect(result.sessions).toBe(1);
   });
@@ -258,7 +284,7 @@ describe("hydrate", () => {
       snapshot_id: "snap-1",
       generation: 42,
       note_count: 1,
-      entry_count: 2,
+      entry_count: 3,
     });
     const treeA = (await daemon.received(2))[1]!;
     daemon.respondOk(treeA.id, "snapshot_tree", {
@@ -336,7 +362,6 @@ describe("hydrate", () => {
           revision: "blake3:new",
           metadata: EMPTY_METADATA,
           references: [],
-          resolutions: [],
           sections: [],
           list_items: [],
         },
@@ -405,25 +430,170 @@ describe("hydrate", () => {
     expect(clock.pending()).toBe(0);
   });
 
-  it("gives up after the backoff ladder is exhausted and reports the daemon's refusal", async () => {
+  it("gives up after the configured cap retries and reports the daemon's refusal", async () => {
     const daemon = new FakeDaemon();
     const client = clientFor(daemon);
     const clock = new FakeClock();
-    const pending = hydrate(client, configFor({ clock }));
+    const config = configFor({ clock });
+    const pending = hydrate(client, config);
     const settled = expect(pending).rejects.toThrow(/too_many_snapshots/);
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    // `snapshotCapRetries` counts **retries**, so the first attempt plus that
+    // many more, and every retry waits its own rung.
+    const attempts = config.snapshotCapRetries + 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       const open = (await daemon.received(attempt + 1))[attempt]!;
       daemon.respondErr(open.id, { code: "too_many_snapshots", message: "cap reached" });
-      if (attempt === 3) break;
+      if (attempt + 1 === attempts) break;
       await clock.armed(attempt + 1);
       clock.advance(SNAPSHOT_RETRY_BACKOFF_MS[attempt]!);
     }
 
     await settled;
-    // Four attempts means three waits: the last rung is never waited on,
-    // because no attempt follows it.
-    expect(clock.armedWaits()).toEqual(SNAPSHOT_RETRY_BACKOFF_MS.slice(0, 3));
+    expect(clock.armedWaits()).toEqual(
+      SNAPSHOT_RETRY_BACKOFF_MS.slice(0, config.snapshotCapRetries),
+    );
+  });
+
+  /**
+   * The count check. `open_snapshot` says how many rows the session **will**
+   * page out, and until this comparison existed nothing ever read that promise:
+   * a cursor bug, or a daemon that answers `next_cursor: null` one page early,
+   * produced a mirror silently missing notes that committed cleanly and
+   * reported a coherent generation. That is the same failure class the
+   * generation guard refuses by name, and it is one comparison away.
+   */
+  it("refuses a walk that pages out fewer rows than the session promised", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const pending = hydrate(client, configFor({ snapshotPageSize: 10 }));
+
+    const open = (await daemon.received(1))[0]!;
+    daemon.respondOk(open.id, "open_snapshot", {
+      snapshot_id: "snap-short",
+      generation: 11,
+      note_count: 2,
+      entry_count: 2,
+    });
+    const tree = (await daemon.received(2))[1]!;
+    // The page ends the walk one row early: `next_cursor` is null, and the
+    // second entry never arrives.
+    daemon.respondOk(tree.id, "snapshot_tree", {
+      snapshot_id: "snap-short",
+      generation: 11,
+      next_cursor: null,
+      entries: [
+        {
+          path: "Only.md",
+          kind: "note",
+          revision: "blake3:only",
+          size: 1,
+          ctime_unix_ms: 1,
+          mtime_unix_ms: 1,
+        },
+      ],
+    });
+    const notes = (await daemon.received(3))[2]!;
+    daemon.respondOk(notes.id, "snapshot_notes", {
+      snapshot_id: "snap-short",
+      generation: 11,
+      next_cursor: null,
+      notes: [
+        {
+          path: "Only.md",
+          revision: "blake3:only",
+          metadata: EMPTY_METADATA,
+          references: [],
+          sections: [],
+          list_items: [],
+        },
+      ],
+    });
+
+    await expect(pending).rejects.toThrow(
+      /promised 2 tree entries and 2 notes, but the walk had 1 and 1/,
+    );
+    const close = (await daemon.received(4))[3]!;
+    expect(close.request).toEqual({
+      method: "close_snapshot",
+      params: { snapshot_id: "snap-short" },
+    });
+  });
+
+  /**
+   * The same comparison from the other side, and the reason the page loop is
+   * bounded at all: a daemon that answers the same non-null cursor forever
+   * would otherwise page until the host died of memory rather than of an error.
+   */
+  it("refuses a walk that pages out more rows than the session promised", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const pending = hydrate(client, configFor({ snapshotPageSize: 1 }));
+
+    const open = (await daemon.received(1))[0]!;
+    daemon.respondOk(open.id, "open_snapshot", {
+      snapshot_id: "snap-loop",
+      generation: 12,
+      note_count: 0,
+      entry_count: 1,
+    });
+    for (let page = 0; page < 2; page += 1) {
+      const tree = (await daemon.received(page + 2))[page + 1]!;
+      daemon.respondOk(tree.id, "snapshot_tree", {
+        snapshot_id: "snap-loop",
+        generation: 12,
+        // The same cursor, forever.
+        next_cursor: "stuck",
+        entries: [
+          {
+            path: `Loop ${String(page)}.md`,
+            kind: "note",
+            revision: "blake3:loop",
+            size: 1,
+            ctime_unix_ms: 1,
+            mtime_unix_ms: 1,
+          },
+        ],
+      });
+    }
+
+    await expect(pending).rejects.toThrow(/more tree entries than the 1 it promised/);
+  });
+
+  /**
+   * The pin-loss budget is its own number now. Cap contention and pin loss have
+   * different physics — one is other clients starting together, the other
+   * scales with walk duration times write rate — and a shared counter meant a
+   * couple of ordinary cap retries at startup could leave a long walk with no
+   * restarts left.
+   */
+  it("gives up after the configured pin-loss restarts", async () => {
+    const daemon = new FakeDaemon();
+    const client = clientFor(daemon);
+    const config = configFor({ hydrationPinLossRestarts: 1, snapshotPageSize: 10 });
+    const pending = hydrate(client, config);
+    const settled = expect(pending).rejects.toThrow(/generation_mismatch/);
+
+    // One walk, one restart, and the second loss is the end of it.
+    for (let walk = 0; walk < config.hydrationPinLossRestarts + 1; walk += 1) {
+      const open = (await daemon.received(walk * 3 + 1))[walk * 3]!;
+      daemon.respondOk(open.id, "open_snapshot", {
+        snapshot_id: `snap-${String(walk)}`,
+        generation: 20 + walk,
+        note_count: 0,
+        entry_count: 0,
+      });
+      const tree = (await daemon.received(walk * 3 + 2))[walk * 3 + 1]!;
+      daemon.respondErr(tree.id, {
+        code: "generation_mismatch",
+        message: "snapshot session pin was lost",
+        current_generation: 21 + walk,
+      });
+      const close = (await daemon.received(walk * 3 + 3))[walk * 3 + 2]!;
+      daemon.respondOk(close.id, "close_snapshot", { snapshot_id: `snap-${String(walk)}` });
+    }
+
+    await settled;
   });
 
   /**
@@ -501,7 +671,6 @@ describe("hydrate", () => {
           revision: "blake3:n",
           metadata: EMPTY_METADATA,
           references: [],
-          resolutions: [],
           sections: [],
           list_items: [],
         },

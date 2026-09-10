@@ -133,14 +133,23 @@ export interface MirrorNoteRow {
   readonly outgoing: readonly ReferenceDto[];
 }
 
-/** The snapshot session one hydration walk is pinned to. */
+/**
+ * The snapshot session one hydration walk is pinned to.
+ *
+ * The two counts are **promises**, not measurements: `open_snapshot` says how
+ * many rows the session will page out, and the walk checks what it actually
+ * walked against them before committing. They are named `promised…` for that
+ * reason — a `HydrationSummary` carries the walked numbers under plain names,
+ * and one hop between two fields called `entryCount` meaning different things
+ * is how the comparison went unwritten in the first place.
+ */
 export interface SnapshotSession {
   readonly snapshotId: string;
   readonly generation: number;
-  /** How many notes the session will page out, as `open_snapshot` reported it. */
-  readonly noteCount: number;
-  /** How many tree entries it will page out. Always at least `noteCount`. */
-  readonly entryCount: number;
+  /** How many notes the session says it will page out. */
+  readonly promisedNoteCount: number;
+  /** How many tree entries it says it will page out. At least the note count. */
+  readonly promisedEntryCount: number;
 }
 
 /**
@@ -164,6 +173,19 @@ export interface SnapshotSession {
  *
  * `page` is the 1-based index of the page within its own walk, for a sink that
  * wants to report progress; a sink that does not care may ignore it.
+ *
+ * **There is no abort call, and that is a precondition rather than an
+ * omission.** A walk that dies — a lost pin past its restart budget, a refused
+ * page, a truncated one — tells the sink nothing directly: the only signal is
+ * `hydrateInto`'s rejection. So a sink that stages must be driven by a caller
+ * that awaits `hydrateInto` and treats a rejection as the abort. Calling it
+ * from somewhere that does not await would strand a half-applied walk with
+ * nothing to tell it so.
+ *
+ * **This is hydration's seam, not a delta surface.** Applying a
+ * `generation_committed` change set needs per-path upsert and remove, with a
+ * different atomicity story; that verb set belongs to Task 6's `Mirror` and
+ * must not be bolted onto these four calls.
  */
 export interface MirrorSink {
   begin(session: SnapshotSession): void;
