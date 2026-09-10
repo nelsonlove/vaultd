@@ -810,6 +810,204 @@ describe("Mirror deltas", () => {
     expect(harness.mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
   });
 
+  it("consults link text for every path under a deleted folder, not only the folder", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+        { path: "A", kind: "folder" },
+        { path: "A/Y.md", kind: "note", revision: "blake3:a1" },
+        { path: "B", kind: "folder" },
+        { path: "B/Y.md", kind: "note", revision: "blake3:b1" },
+      ],
+      notes: [
+        {
+          path: "X.md",
+          revision: "blake3:x1",
+          outgoing: [
+            {
+              ...harness_ref("X.md", "Y", "A/Y.md"),
+              resolution: { kind: "ambiguous", candidates: ["A/Y.md", "B/Y.md"] },
+            },
+          ],
+        },
+        { path: "A/Y.md", revision: "blake3:a1" },
+        { path: "B/Y.md", revision: "blake3:b1" },
+      ],
+    });
+    // The backlink index files an ambiguous link under the **first** candidate
+    // only, so it has nothing at all to say about `B/Y.md`.
+    expect(harness.mirror.backlinks("B/Y.md")).toHaveLength(0);
+
+    // The daemon names the **folder** and leaves the subtree implied. The
+    // referrer that only link text can find is `X.md`, and its key names
+    // `B/Y.md` — a path the change set never spells out.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: [], deleted: ["B"] },
+        affected_reference_count: 1,
+      }),
+    );
+    const asked = await harness.answerRefetch(6, [
+      { path: "X.md", revision: "blake3:x1", outgoing: [harness_ref("X.md", "Y", "A/Y.md")] },
+    ]);
+    await applying;
+
+    expect([...asked]).toEqual(["X.md"]);
+    expect(harness.mirror.entry("B/Y.md")).toBeUndefined();
+    // The resolution must not still name a path that no longer exists.
+    expect(harness.mirror.note("X.md")?.outgoing[0]?.resolution).toEqual({
+      kind: "resolved",
+      target: "A/Y.md",
+      subpath: null,
+    });
+  });
+
+  it("keeps the batch when a re-warm fails, and reports the failure instead", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+    const warming = harness.mirror.warmPositions();
+    await harness.answerWarm({ "A.md": "# A\n" });
+    await warming;
+    expect(harness.mirror.positions("A.md")).toBeDefined();
+
+    const batches: MirrorChangeBatch[] = [];
+    const failures: string[] = [];
+    harness.mirror.onBatch((batch) => batches.push(batch));
+    harness.mirror.onApplyError((error) => {
+      failures.push(error instanceof Error ? error.message : String(error));
+    });
+
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+      }),
+    );
+    await harness.answerRefetch(6, [{ path: "A.md", revision: "blake3:a2" }]);
+    // The re-warm is refused with something that is **not** an absence, so
+    // `warmOne` rightly rethrows it — and the apply must still finish. The row
+    // is already installed and `appliedThrough` already advanced by the time
+    // the warm runs; losing the batch here would mean the mirror knows about a
+    // change that no consumer is ever told about.
+    const read = await harness.expectRequest("read_file");
+    harness.respondErr(read.id, { code: "internal", message: "the reader fell over" });
+    await expect(applying).resolves.toBeUndefined();
+
+    expect(batches.map((batch) => [...batch.modified])).toEqual([["A.md"]]);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatch(/the reader fell over/);
+    // The note is current; only its byte-offset table is missing, which is a
+    // state Obsidian's own API has a word for.
+    expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a2");
+    expect(harness.mirror.positions("A.md")).toBeUndefined();
+  });
+
+  it("escalates when the referrer expansion pushes the refetch past the path limit", async () => {
+    const referrers = ["R1.md", "R2.md", "R3.md", "R4.md", "R5.md"];
+    const harness = await hydrated(
+      {
+        generation: 5,
+        entries: referrers.map((path) => ({ path, kind: "note" as const, revision: `blake3:${path}` })),
+        notes: referrers.map((path) => ({
+          path,
+          revision: `blake3:${path}`,
+          outgoing: [harness_ref(path, "Hub", null)],
+        })),
+      },
+      { mirrorDeltaPathLimit: 3 },
+    );
+
+    // The change set is one path — well under the limit, so the pre-queue check
+    // lets it through. The **refetch** is six: the created note plus every note
+    // that was waiting for that name. Past the limit the delta stops being the
+    // cheaper road, and a re-hydration has the better coherence story anyway.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: ["Hub.md"], modified: [], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 5,
+      }),
+    );
+    await harness.answerHydration({
+      generation: 6,
+      entries: [{ path: "Hub.md", kind: "note", revision: "blake3:h1" }],
+      notes: [{ path: "Hub.md", revision: "blake3:h1" }],
+    });
+    await applying;
+
+    expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
+    expect(harness.methodsSeen()[0]).toBe("open_snapshot");
+    expect(harness.methodsSeen()).not.toContain("get_tree_entries");
+    expect(harness.mirror.note("Hub.md")).toBeDefined();
+  });
+
+  it("consults link text for a path that turned out to be absent, not only backlinks", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+        { path: "A", kind: "folder" },
+        { path: "A/Y.md", kind: "note", revision: "blake3:a1" },
+        { path: "B", kind: "folder" },
+        { path: "B/Y.md", kind: "note", revision: "blake3:b1" },
+      ],
+      notes: [
+        {
+          path: "X.md",
+          revision: "blake3:x1",
+          outgoing: [
+            {
+              ...harness_ref("X.md", "Y", "A/Y.md"),
+              resolution: { kind: "ambiguous", candidates: ["A/Y.md", "B/Y.md"] },
+            },
+          ],
+        },
+        { path: "A/Y.md", revision: "blake3:a1" },
+        { path: "B/Y.md", revision: "blake3:b1" },
+      ],
+    });
+    expect(harness.mirror.backlinks("B/Y.md")).toHaveLength(0);
+
+    // A late removal whose referrer only link text can find: the backlink index
+    // filed the ambiguous link under the *other* candidate, so consulting it
+    // alone finds nobody — the same hole as the planned-removal road, on the
+    // road nothing planned.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["B/Y.md"], deleted: [] },
+        affected_note_count: 1,
+      }),
+    );
+    await harness.answerRefetch(6, [], {
+      absent: ["B/Y.md"],
+      entries: [{ path: "B", kind: "folder" }],
+    });
+    const second = await harness.answerRefetch(6, [
+      { path: "X.md", revision: "blake3:x1", outgoing: [harness_ref("X.md", "Y", "A/Y.md")] },
+    ]);
+    await applying;
+
+    expect([...second]).toEqual(["X.md"]);
+    expect(harness.mirror.entry("B/Y.md")).toBeUndefined();
+    expect(harness.mirror.note("X.md")?.outgoing[0]?.resolution).toEqual({
+      kind: "resolved",
+      target: "A/Y.md",
+      subpath: null,
+    });
+  });
+
   it("asks for the ancestors of a modified path, because an edit moves the folder", async () => {
     const harness = await hydrated({
       generation: 5,

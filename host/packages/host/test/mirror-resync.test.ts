@@ -496,11 +496,13 @@ describe("Mirror resync", () => {
       entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
       notes: [{ path: "A.md", revision: "blake3:a1" }],
     });
-    const failures: Array<{ message: string; eventType: string }> = [];
+    const failures: Array<{ message: string; eventType: string | null }> = [];
     harness.mirror.onApplyError((error, event) => {
       failures.push({
         message: error instanceof Error ? error.message : String(error),
-        eventType: event.type,
+        // Nullable: a failure raised by a re-warm after this host's own
+        // mutation is attributable to no event at all.
+        eventType: event?.type ?? null,
       });
     });
 
@@ -538,6 +540,98 @@ describe("Mirror resync", () => {
     expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a2");
     expect(harness.mirror.appliedThrough()).toBe(6);
     expect(harness.mirror.resyncing()).toBe(false);
+  });
+
+  it("keeps the synthetic batch when the re-warm fails, and reports the failure instead", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a1" },
+        { path: "B.md", kind: "note", revision: "blake3:b1" },
+      ],
+      notes: [
+        { path: "A.md", revision: "blake3:a1" },
+        { path: "B.md", revision: "blake3:b1" },
+      ],
+    });
+    const warming = harness.mirror.warmPositions();
+    await harness.answerWarm({ "A.md": "# A\n", "B.md": "# B\n" });
+    await warming;
+
+    const batches: Array<Record<string, unknown>> = [];
+    const failures: string[] = [];
+    harness.mirror.onBatch((batch) => batches.push(plain(batch)));
+    harness.mirror.onApplyError((error) => {
+      failures.push(error instanceof Error ? error.message : String(error));
+    });
+
+    const applying = harness.mirror.applyEvent(resync("watcher_overflow", 9));
+    await harness.answerHydration({
+      generation: 9,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a2" },
+        { path: "B.md", kind: "note", revision: "blake3:b1" },
+      ],
+      notes: [
+        { path: "A.md", revision: "blake3:a2" },
+        { path: "B.md", revision: "blake3:b1" },
+      ],
+    });
+    // The re-warm runs **after** the swap, so a throw here lands after the new
+    // state is live and before `emit` — and the synthetic batch is the only
+    // thing that will ever describe this re-hydration, because `previous` has
+    // been consumed and no later resync can reconstruct it. Losing it is
+    // permanent.
+    const read = await harness.expectRequest("read_file");
+    harness.respondErr(read.id, { code: "internal", message: "the reader fell over" });
+    await expect(applying).resolves.toBeUndefined();
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.modified).toEqual(["A.md"]);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatch(/the reader fell over/);
+    expect(harness.mirror.lastResyncReason()).toBe("watcher_overflow");
+  });
+
+  it("keeps the first resync reason when a second is raised before the run starts", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+
+    // A generation with a gap is enqueued first, so its continuity check runs
+    // **after** the daemon's own `resync_required` has already recorded its
+    // reason — the ordering the reviewer found. Both want the same
+    // re-hydration and exactly one runs; the question is which reason Task 22's
+    // compatibility report is told about, and the daemon's is worth more than
+    // this host's guess at it.
+    const gapped = harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 7,
+        generation: 9,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+    const asked = harness.mirror.applyEvent(resync("watcher_overflow", 12));
+
+    // One hydration answers both: the second run finds the request already
+    // consumed and returns.
+    await harness.answerHydration({
+      generation: 12,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a2" }],
+      notes: [{ path: "A.md", revision: "blake3:a2" }],
+    });
+    await gapped;
+    await asked;
+
+    expect(harness.mirror.lastResyncReason()).toBe("watcher_overflow");
+    expect(harness.mirror.appliedThrough()).toBe(12);
+    expect(harness.methodsSeen().filter((method) => method === "open_snapshot")).toHaveLength(1);
   });
 
   it("re-warms a note the delta path replaced, when it was warm before", async () => {

@@ -193,15 +193,28 @@ export type MirrorClientSource = () => VaultdClient;
  * — is either a protocol mistake by this host or a real fault, and swallowing
  * one would report a wrong `read_file` shape as "the whole vault is uncached".
  *
- * `parent_not_found` is in the list and was put there by the fuzz oracle rather
- * than by reasoning: a note whose whole folder was removed between the row and
- * the read answers that, not `not_found`, and it is the same fact.
+ * Three of the five were put here by measurement rather than by reasoning, and
+ * the list is only as good as that:
+ *
+ * - `parent_not_found` — the fuzz oracle. A note whose whole folder went
+ *   between the row and the read answers this, not `not_found`.
+ * - `payload_too_large` — `docs/protocol.md` §Mutations: `read_file` bounds a
+ *   file by its size on disk, and the cap is 16 MiB. **A file too big to read
+ *   is exactly "there are no bytes I can read at that path"**, which is the
+ *   same fact as `not_found` and must be treated the same way. Rethrowing it
+ *   made one oversized note reject the whole-vault warm-up and leave every
+ *   *other* note uncached — the precise symptom this narrowing exists to
+ *   prevent, caused by the narrowing.
+ * - `target_exists` — the same section: a `read_file` whose path is not a
+ *   regular file answers this. A directory has no bytes either.
  */
 const WARM_ABSENCE_CODES: ReadonlySet<string> = new Set([
   "not_found",
   "note_not_found",
   "parent_not_found",
   "zone_violation",
+  "payload_too_large",
+  "target_exists",
 ]);
 
 /** Why a refetch could not be turned into a row. */
@@ -754,7 +767,7 @@ export class Mirror implements MirrorQuery {
   private readonly batchListeners = new Set<(batch: MirrorChangeBatch) => void>();
   private readonly configListeners = new Set<(path: string) => void | Promise<void>>();
   private readonly applyErrorListeners = new Set<
-    (error: unknown, event: RuntimeEventDto) => void
+    (error: unknown, event: RuntimeEventDto | null) => void
   >();
 
   private constructor(clientSource: MirrorClientSource, config: HostConfig) {
@@ -1002,7 +1015,7 @@ export class Mirror implements MirrorQuery {
    * Without it every caller writes its own `.catch`, and Task 15's subscription
    * handler is a `(event) => void` with nowhere to put one.
    */
-  onApplyError(listener: (error: unknown, event: RuntimeEventDto) => void): () => void {
+  onApplyError(listener: (error: unknown, event: RuntimeEventDto | null) => void): () => void {
     this.applyErrorListeners.add(listener);
     return (): void => {
       this.applyErrorListeners.delete(listener);
@@ -1058,7 +1071,7 @@ export class Mirror implements MirrorQuery {
     if (!isKnownRuntimeEvent(event)) return Promise.resolve();
     switch (event.type) {
       case "generation_committed":
-        return this.onCommitted(event.value);
+        return this.onCommitted(event.value, event);
       case "resync_required":
         return this.requestResync(event.value.reason);
       case "config_changed": {
@@ -1091,7 +1104,13 @@ export class Mirror implements MirrorQuery {
    */
   applyMutation(generation: number, paths: readonly string[]): Promise<void> {
     return this.enqueue(async () => {
-      await this.applyChangeSet(generation, "mutation", [], paths, [], { guarded: false });
+      // `event: null` — a mutation is this host's own write, not a generation
+      // somebody told it about, so a warm failure here is attributable to no
+      // event.
+      await this.applyChangeSet(generation, "mutation", [], paths, [], {
+        guarded: false,
+        event: null,
+      });
     });
   }
 
@@ -1142,7 +1161,7 @@ export class Mirror implements MirrorQuery {
     return run;
   }
 
-  private onCommitted(value: GenerationCommittedEventDto): Promise<void> {
+  private onCommitted(value: GenerationCommittedEventDto, event: RuntimeEventDto): Promise<void> {
     // A cheap early exit for an event the chain would drop anyway. The real
     // guard is inside `applyChangeSet`, where `appliedThrough` is final.
     if (value.generation <= this.appliedThroughValue) return Promise.resolve();
@@ -1197,7 +1216,7 @@ export class Mirror implements MirrorQuery {
         changes.created,
         changes.modified,
         changes.deleted,
-        { guarded: true },
+        { guarded: true, event },
       );
     });
   }
@@ -1216,7 +1235,7 @@ export class Mirror implements MirrorQuery {
     created: readonly string[],
     modified: readonly string[],
     deleted: readonly string[],
-    options: { guarded: boolean },
+    options: { guarded: boolean; event: RuntimeEventDto | null },
   ): Promise<void> {
     if (options.guarded && generation <= this.appliedThroughValue) return;
 
@@ -1275,10 +1294,33 @@ export class Mirror implements MirrorQuery {
     // already-resolved link *ambiguous* by adding a second file of that name,
     // and a deletion of one candidate of an ambiguous link, which is filed
     // under the other one.
-    for (const path of [...created, ...deleted]) {
+    // **`doomed`, not `deleted`.** The daemon names a deleted *folder* alone
+    // and leaves the subtree implied, so iterating the change set's own list
+    // would never consult the link keys of anything inside it — and the shapes
+    // that reach only this index are exactly the ones the backlink index
+    // cannot answer, so nothing else would catch them. A folder delete would
+    // leave every ambiguous link naming a path inside it pointing at a path
+    // that no longer exists, permanently.
+    for (const path of [...created, ...doomed]) {
       for (const source of this.state.linkSourcesFor(path)) {
         if (!doomed.has(source)) wanted.add(source);
       }
+    }
+
+    // **The limit bounds the refetch, not the change set.** The pre-queue
+    // check in `onCommitted` sizes `created + modified`, which is the number
+    // the daemon sent; by here that number has grown by every referrer and
+    // every ancestor. Deleting or creating a note that a thousand others link
+    // to is a one-path change set and a thousand-path refetch, and past the
+    // measured crossover a re-hydration is both cheaper and more coherent.
+    // Checked after the expansion because that is the only place the real size
+    // is known.
+    if (wanted.size > this.config.mirrorDeltaPathLimit) {
+      // `runResync` directly: this method always runs inside a queued task, and
+      // enqueuing behind that task would wait forever.
+      this.markResync("refetch_oversized");
+      await this.runResync();
+      return;
     }
 
     let plan: RefetchPlan;
@@ -1301,7 +1343,10 @@ export class Mirror implements MirrorQuery {
         for (const ancestor of ancestorsOf(path)) late.add(ancestor);
         for (const gone of this.state.subtreePaths(path)) {
           doomed.add(gone);
+          // Both indexes here too, for the same reason the planned removal
+          // consults both: neither answers the whole question.
           for (const reference of this.state.backlinks(gone)) late.add(reference.source_path);
+          for (const source of this.state.linkSourcesFor(gone)) late.add(source);
         }
       }
       for (const path of doomed) late.delete(path);
@@ -1380,11 +1425,7 @@ export class Mirror implements MirrorQuery {
     this.generationValue = Math.max(this.generationValue, plan.generation, generation);
     this.appliedThroughValue = Math.max(this.appliedThroughValue, generation);
 
-    if (restale.length > 0) {
-      await mapConcurrent(restale, this.config.mirrorWarmConcurrency, async (row) => {
-        await this.warmOne(row);
-      });
-    }
+    await this.reWarm(restale, options.event);
 
     // **A batch reports a change, so an apply that changed nothing reports
     // nothing.** That is not a tidiness rule, it is what keeps a shim write to
@@ -1470,7 +1511,15 @@ export class Mirror implements MirrorQuery {
    * for it. That caller marks, then awaits {@link runResync} directly.
    */
   private markResync(reason: MirrorResyncReason): void {
-    this.pendingResync = { reason };
+    // **The first reason wins.** Two roads can ask for one re-hydration before
+    // it starts — the daemon's `resync_required` and this host's own
+    // continuity check — and exactly one run happens either way, so the only
+    // question is which reason Task 22's compatibility report is told about.
+    // The daemon's account of why it lost per-path detail is worth more than
+    // this host's guess at it, and the daemon's is always the earlier one:
+    // `requestResync` records synchronously on arrival, while the continuity
+    // check records from inside a task that was queued before it.
+    this.pendingResync ??= { reason };
     this.resyncingValue = true;
   }
 
@@ -1504,11 +1553,7 @@ export class Mirror implements MirrorQuery {
       // After the swap, because `warmOne` checks the row it is warming against
       // the live state. Before `emit`, so a listener that reads `positions` on
       // the batch finds them.
-      if (restale.length > 0) {
-        await mapConcurrent(restale, this.config.mirrorWarmConcurrency, async (row) => {
-          await this.warmOne(row);
-        });
-      }
+      await this.reWarm(restale, null);
       const batch = this.synthesizeDiff(previous, previousRevisions);
       // Same rule as the delta path: a re-hydration that found the vault
       // exactly as the mirror already held it has nothing to tell anyone.
@@ -1525,6 +1570,41 @@ export class Mirror implements MirrorQuery {
     } finally {
       this.resyncingValue = this.pendingResync !== null;
     }
+  }
+
+  /**
+   * Rebuild the position indexes an apply invalidated — and **never let a
+   * failure here cost a batch**.
+   *
+   * By the time this runs the rows are installed and `appliedThrough` has
+   * advanced, so a throw would leave the mirror holding a change that no
+   * consumer is ever told about. On the resync path it is worse than that: the
+   * synthetic batch is the only thing that will ever describe a re-hydration,
+   * and by then `previous` has been consumed, so no later resync can
+   * reconstruct it. Silent and permanent, which is the class of bug this whole
+   * task exists to remove.
+   *
+   * So every row is attempted, every failure is reported through
+   * {@link onApplyError}, and nothing propagates. {@link warmOne} keeps
+   * rethrowing what is not an absence — the distinction is worth having and is
+   * what {@link warmPositions} still surfaces to its caller — it simply stops
+   * being fatal *here*. A note without a byte-offset table is a state
+   * Obsidian's own API has a word for; a change nobody was told about is not.
+   */
+  private async reWarm(
+    rows: readonly MirrorNoteRow[],
+    event: RuntimeEventDto | null,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const failures: unknown[] = [];
+    await mapConcurrent(rows, this.config.mirrorWarmConcurrency, async (row) => {
+      try {
+        await this.warmOne(row);
+      } catch (error) {
+        failures.push(error);
+      }
+    });
+    for (const error of failures) this.fanOutApplyError(error, event);
   }
 
   private async warmOne(row: MirrorNoteRow): Promise<boolean> {
@@ -1569,7 +1649,7 @@ export class Mirror implements MirrorQuery {
   }
 
   /** Every apply-error listener, and a throw stays local. */
-  private fanOutApplyError(error: unknown, event: RuntimeEventDto): void {
+  private fanOutApplyError(error: unknown, event: RuntimeEventDto | null): void {
     for (const listener of [...this.applyErrorListeners]) {
       try {
         listener(error, event);

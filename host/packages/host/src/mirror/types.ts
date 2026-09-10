@@ -256,11 +256,26 @@ export interface MirrorQuery {
  *   generation this mirror had applied through, so a change set went missing.
  *   The daemon signals a lost event with `resync_required` rather than silence,
  *   so this is belt and braces against a daemon that misbehaves.
+ * - `refetch_oversized` — the paths the mirror worked out it had to refetch
+ *   outnumbered `HostConfig.mirrorDeltaPathLimit`. Distinct from the daemon's
+ *   own `oversized_change_set`, and deliberately so: that one means *the
+ *   daemon* could not send per-path detail, while this one means the change
+ *   set was small and the work it implied was not — a deleted note that a
+ *   thousand others link to is one path on the wire and a thousand refetches
+ *   here.
  *
  * `ResyncReasonDto` is open, so a reason a later daemon introduces lands here
  * as itself and is recorded rather than branched on.
+ *
+ * When two roads ask for one re-hydration before it starts, the **first**
+ * reason is the one kept — see `Mirror.markResync`. The daemon's account of
+ * why it lost per-path detail is worth more than this host's guess at it.
  */
-export type MirrorResyncReason = ResyncReasonDto | "apply_failed" | "generation_gap";
+export type MirrorResyncReason =
+  | ResyncReasonDto
+  | "apply_failed"
+  | "generation_gap"
+  | "refetch_oversized";
 
 /**
  * One applied change, as the shim's event layer consumes it.

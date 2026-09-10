@@ -103,8 +103,19 @@ export interface HostConfig {
    */
   readonly hydrationPinLossRestarts: number;
   /**
-   * How many changed paths a single `generation_committed` may carry before the
-   * mirror stops refetching them one by one and re-hydrates instead.
+   * How many paths a single delta may refetch before the mirror stops fetching
+   * them one by one and re-hydrates instead.
+   *
+   * **It bounds the refetch, not the change set.** The two are not the same
+   * number: the mirror adds the referrers of every created and deleted path
+   * (the notes whose links that path answers, orphans or makes ambiguous) and
+   * the ancestors of every changed path, so a one-path change set can imply a
+   * thousand-path refetch — deleting a note that a thousand others link to is
+   * exactly that. The limit is therefore tested twice: once on
+   * `created + modified` when the event arrives, which is free and rejects the
+   * obvious cases before any work is queued, and once on the assembled refetch
+   * set, which is the only place the real size is known. Passing it takes the
+   * resync road with the host-originated reason `refetch_oversized`.
    *
    * **Measured, not guessed.** Against the shipped daemon on a 1000-note vault
    * (1001 entries, each note carrying frontmatter, two wikilinks, two list

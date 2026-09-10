@@ -452,6 +452,60 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
     expect(failures).toEqual([]);
   }, 60_000);
 
+  it("survives a note too large to read, and still reports the generation that grew it", async () => {
+    const config = xLinksY();
+    // **Written straight to disk, not through `write_note`.** The payload cap
+    // and the read cap are the same 16 MiB, so a `write_note` large enough to
+    // produce an unreadable note is refused before it can create one —
+    // measured: 15 MiB writes, 16 MiB answers `payload_too_large`. The road
+    // that really produces one is the road this host does not control: an
+    // external editor, a sync client, an attachment someone dropped in.
+    const oversized = `# Huge\n\n${"x".repeat(17 * 1024 * 1024)}\n`;
+    writeFileSync(join(config.vaultRoot, "Huge.md"), oversized, "utf8");
+
+    const supervisor = await startedOn(config);
+    const mirror = await Mirror.open(() => supervisor.client(), config);
+    const failures: Error[] = [];
+    mirror.onApplyError((error) => {
+      failures.push(error instanceof Error ? error : new Error(String(error)));
+    });
+
+    // **One unreadable note must not cost the whole vault its cache.** This is
+    // the call Task 15 makes once at startup; a rejection here leaves every
+    // note uncached, which is the loudest possible symptom for the quietest
+    // possible cause.
+    await expect(mirror.warmPositions()).resolves.toMatchObject({ warmed: 2 });
+    expect(mirror.positions("X.md")).toBeDefined();
+    expect(mirror.positions("Y.md")).toBeDefined();
+    // The oversized note is simply uncached, which is a state Obsidian's own
+    // API has a word for.
+    expect(mirror.positions("Huge.md")).toBeUndefined();
+
+    const batches: MirrorChangeBatch[] = [];
+    mirror.onBatch((batch) => batches.push(batch));
+    await supervisor.subscribe((event) => {
+      void mirror.applyEvent(event).catch(() => undefined);
+    });
+
+    // Now grow a **warm** note past the cap. The delta drops its index, cannot
+    // rebuild it, and must still tell the consumer that the note changed.
+    writeFileSync(join(config.vaultRoot, "Y.md"), `# Y grown\n\n${"z".repeat(17 * 1024 * 1024)}\n`, "utf8");
+    await waitFor(
+      "a batch naming the note that grew past the cap",
+      () => batches.some((batch) => [...batch.created, ...batch.modified].includes("Y.md")),
+      () =>
+        `batches so far: ${JSON.stringify(batches.map((batch) => [...batch.modified]))}, ` +
+        `apply failures: ${failures.map((error) => error.message).join(" | ")}`,
+      30_000,
+    );
+
+    expect(mirror.positions("Y.md")).toBeUndefined();
+    expect(mirror.entry("Y.md")!.size).toBeGreaterThan(16 * 1024 * 1024);
+    // An oversized read is an absence, not a fault: nothing was escalated.
+    expect(failures).toEqual([]);
+    expect(mirror.lastResyncReason()).toBeNull();
+  }, 120_000);
+
   it("re-warms the position index of a note a re-hydration replaced", async () => {
     const config = xLinksY();
     const supervisor = await startedOn(config);
