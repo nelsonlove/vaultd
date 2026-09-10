@@ -20,19 +20,38 @@
  *   start at all.
  * - `die-after-health` — answers one `health` and exits 9: an engine that dies
  *   the instant it is declared ready.
+ * - `slow-health` — holds the `health` answer for `FAKE_VAULTD_HEALTH_DELAY_MS`
+ *   (default 400 ms), which is the only way to be *inside* a spawn when
+ *   something else happens to the supervisor.
+ * - `no-subscribe` — answers everything except `subscribe_events`, which it
+ *   refuses: an engine with no runtime to subscribe to, the shape a
+ *   health-only daemon has.
+ * - `no-vault-info` — answers `subscribe_events` and then refuses
+ *   `get_vault_info`: a subscription that half-opens.
  *
- * Two further steering doors, in every mode: the `die` method exits 9 on
- * demand (a crash at a moment a test chooses), and `FAKE_VAULTD_LIVE_STATE`
+ * Three further steering doors, in every mode: the `die` method exits 9 on
+ * demand (a crash at a moment a test chooses), `FAKE_VAULTD_LIVE_STATE`
  * decides whether the subscription opens already `watching` or opens
  * `catching_up` and then announces the move — which is the real daemon's own
- * startup shape and the thing the supervisor's readiness hangs on.
+ * startup shape and the thing the supervisor's readiness hangs on — and
+ * `FAKE_VAULTD_PIDFILE` names a file this process writes its pid into, so a
+ * test can ask the operating system whether an engine was orphaned rather than
+ * asking the supervisor, which is the thing under test.
  */
 const readline = require("node:readline");
+const { writeFileSync } = require("node:fs");
 
 const mode = process.env.FAKE_VAULTD_MODE ?? "ok";
 const generation = Number(process.env.FAKE_VAULTD_GENERATION ?? "1");
 const liveState = process.env.FAKE_VAULTD_LIVE_STATE ?? "catching_up";
-if (mode === "exit-immediately") process.exit(3);
+const healthDelayMs = Number(process.env.FAKE_VAULTD_HEALTH_DELAY_MS ?? "400");
+const pidfile = process.env.FAKE_VAULTD_PIDFILE;
+if (pidfile) writeFileSync(pidfile, String(process.pid), "utf8");
+if (mode === "exit-immediately") {
+  // Say why on stderr, the way the real daemon does when it refuses to start.
+  process.stderr.write("fake-vaultd: refusing to start\n");
+  process.exit(3);
+}
 
 let subscriptions = 0;
 
@@ -44,14 +63,30 @@ function ok(id, type, value) {
   send({ version: 1, id, outcome: { status: "ok", value: { type, value } } });
 }
 
+function refuse(id, message) {
+  send({
+    version: 1,
+    id,
+    outcome: { status: "err", value: { code: "invalid_request", message } },
+  });
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   if (!line.trim()) return;
   const envelope = JSON.parse(line);
   const method = envelope.request.method;
   if (method === "health") {
-    ok(envelope.id, "health", { service: "vaultd", status: "ok" });
-    if (mode === "die-after-health") process.exit(9);
+    const answer = () => {
+      ok(envelope.id, "health", { service: "vaultd", status: "ok" });
+      if (mode === "die-after-health") process.exit(9);
+    };
+    if (mode === "slow-health") setTimeout(answer, healthDelayMs);
+    else answer();
+    return;
+  }
+  if (method === "get_vault_info" && mode === "no-vault-info") {
+    refuse(envelope.id, "get_vault_info is refused in this mode");
     return;
   }
   if (method === "get_vault_info") {
@@ -66,6 +101,10 @@ rl.on("line", (line) => {
       refreshed_at_unix_ms: 0,
       live_state: "watching",
     });
+    return;
+  }
+  if (method === "subscribe_events" && mode === "no-subscribe") {
+    refuse(envelope.id, "this engine has no runtime to subscribe to");
     return;
   }
   if (method === "subscribe_events") {
@@ -103,14 +142,7 @@ rl.on("line", (line) => {
     // the request itself when the transport dies under it.
     process.exit(9);
   }
-  send({
-    version: 1,
-    id: envelope.id,
-    outcome: {
-      status: "err",
-      value: { code: "invalid_request", message: `unknown method ${method}` },
-    },
-  });
+  refuse(envelope.id, `unknown method ${method}`);
 });
 // The host owns this process's stdin. When the host goes, so does this.
 rl.on("close", () => process.exit(0));

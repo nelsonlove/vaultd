@@ -32,6 +32,81 @@ export interface EngineExit {
   readonly escalated: "none" | "sigterm" | "sigkill";
 }
 
+/** How much of the engine's stderr is kept for the error that reports its death. */
+const STDERR_TAIL_BYTES = 4096;
+
+/**
+ * The daemon's own words when the index's writer lease is held elsewhere.
+ *
+ * It refuses **at startup** — exit code 2, this line on stderr — rather than
+ * starting and answering `index_in_use` on the wire, so the host meets the
+ * lease as a start failure and there is no wire code to branch on. Matching the
+ * message is therefore the only signal available today; it is best-effort, and
+ * a daemon-side exit-code contract would be better. {@link EngineStartError.exit}
+ * carries the code either way.
+ */
+const LEASE_HELD = /already in use by another writer/i;
+
+/**
+ * An engine that could not be started.
+ *
+ * It carries the **exit**, not the transport symptom. When a child dies during
+ * its readiness round trip, the stream's `end` reaches the client before the
+ * process's `exit` reaches the supervisor, so the naive error says "daemon
+ * stdout closed" for what is really "the lease is held" or "the binary refused
+ * its arguments". The supervisor waits for the actual exit before building this,
+ * so `exit.code` and `stderrTail` are populated and a host can branch on them
+ * without parsing anything.
+ */
+export class EngineStartError extends Error {
+  readonly exit: EngineExit | null;
+  readonly stderrTail: string;
+  /** Best-effort, from the daemon's own stderr line — see {@link LEASE_HELD}. */
+  readonly leaseHeld: boolean;
+
+  constructor(message: string, exit: EngineExit | null, stderrTail: string, cause?: unknown) {
+    super(message);
+    this.name = "EngineStartError";
+    this.exit = exit;
+    this.stderrTail = stderrTail;
+    this.leaseHeld = LEASE_HELD.test(stderrTail);
+    // The transport error that arrived first is kept rather than discarded: it
+    // is the wrong headline but it is still evidence.
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
+/**
+ * The engine behind a request went away.
+ *
+ * One class from **both** doors — the stream ending and the process exiting —
+ * because which of the two wins is a race, and a caller must not have to
+ * distinguish "vaultd restarted" from "daemon stdout closed" to know it is the
+ * same event.
+ */
+export class EngineLostError extends Error {
+  readonly exit: EngineExit | null;
+
+  constructor(message: string, exit: EngineExit | null = null) {
+    super(message);
+    this.name = "EngineLostError";
+    this.exit = exit;
+  }
+}
+
+/** The engine kept dying as fast as it was started. See the flap ceiling. */
+export class EngineFlappingError extends Error {
+  readonly restarts: number;
+  readonly windowMs: number;
+
+  constructor(message: string, restarts: number, windowMs: number) {
+    super(message);
+    this.name = "EngineFlappingError";
+    this.restarts = restarts;
+    this.windowMs = windowMs;
+  }
+}
+
 /**
  * A subscription that outlives the engine it was opened on.
  *
@@ -59,14 +134,40 @@ interface Engine {
   readonly stdin: NodeJS.WritableStream;
   /** Resolves when this engine's runtime announces `watching`. */
   readonly watching: Deferred;
+  /** Resolves when the process has actually exited, so its code is knowable. */
+  readonly ended: Deferred;
+  /** True once this engine passed its readiness probe and was adopted. */
+  everReady: boolean;
+  /**
+   * True the moment this engine's transport is finished — set on the stream's
+   * `end`, which is strictly earlier than the process's `exit`. It is the
+   * question "is this engine still usable?", and the two events are far enough
+   * apart that asking `exited` instead gets the wrong answer.
+   */
+  lost: boolean;
   exited: boolean;
   exit: EngineExit | null;
   escalated: "none" | "sigterm" | "sigkill";
+  stderrTail: string;
   subscription: SubscriptionHandle | null;
-  subscribing: boolean;
+  /** The in-flight open, shared by every caller that asks while it runs. */
+  opening: Promise<void> | null;
+  /**
+   * True once an *event* has reported this engine's live state.
+   *
+   * The subscribe response's `live_state` is a snapshot taken when the daemon
+   * wrote it, and the client drains events buffered during the round trip
+   * **before** it returns that response — so an event carrying a newer state
+   * can be delivered first. Seeding from the response afterwards would then
+   * walk the state backwards, which is how `whenWatching()` resolved while
+   * `liveState()` still said `catching_up`.
+   */
+  sawLiveEvent: boolean;
   /** Events held back until the restart marker has been delivered. */
   queued: RuntimeEventDto[];
   buffering: boolean;
+  /** The in-flight shutdown, so `stop()` and `spawnOnce` cannot run two. */
+  shuttingDown: Promise<void> | null;
   failStartup: ((error: Error) => void) | null;
 }
 
@@ -109,7 +210,9 @@ function describeExit(exit: EngineExit | null): string {
  * index's writer lease. (Verified against the shipped binary: EOF on `stdin`
  * ends it with code 0 and no signal.) `stop()` uses the same door — close
  * `stdin`, wait — and escalates to `SIGTERM` after 2 s and `SIGKILL` after 5 s
- * only if the child does not take the hint.
+ * only if the child does not take the hint. A `stop()` that lands *inside* a
+ * spawn shuts that half-born engine down too, rather than letting the spawn
+ * finish and adopt it.
  *
  * **Readiness has two meanings and this class exposes both, because conflating
  * them is how a host starts driving a runtime that is still catching up.**
@@ -130,16 +233,29 @@ function describeExit(exit: EngineExit | null): string {
  * generation — the wire's own word for "a startup catch-up happened, re-read
  * current state", which is precisely what a restarted daemon does. No reason
  * the wire lacks is invented, and `current_generation` is a real generation
- * read from the new engine's `get_vault_info`, so the one client-synthesized
- * marker Task 3 documents (`subscriber_lag` with a null generation) keeps its
- * unambiguous signature.
+ * from the daemon (`get_vault_info`, or the subscribe response's own start
+ * point if that call fails), so the one client-synthesized marker Task 3
+ * documents (`subscriber_lag` with a null generation) keeps its unambiguous
+ * signature.
+ *
+ * **A restart is not free and the ceiling says so.** Reaching readiness clears
+ * the backoff ladder, so an engine that ran for hours and then crashed is not
+ * punished for a failure hours ago — but more than
+ * `config.restartFlapLimit` restarts inside `config.restartFlapWindowMs` stops
+ * the supervisor with an {@link EngineFlappingError}. Without it, an engine
+ * that answers `health` and then dies restarts forever, taking the writer lease
+ * every time.
  */
 export class Supervisor {
   private readonly config: HostConfig;
   private readonly events: SupervisorEvents;
   private currentState: SupervisorState = "stopped";
   private engine: Engine | null = null;
+  /** The engine between `spawn` and adoption. `stop()` must be able to see it. */
+  private spawning: Engine | null = null;
+  private starting: Promise<void> | null = null;
   private restarts = 0;
+  private restartTimes: number[] = [];
   private stopping = false;
   private lastExitValue: EngineExit | null = null;
   private lastErrorValue: Error | null = null;
@@ -159,14 +275,20 @@ export class Supervisor {
   /**
    * Start an engine, retrying up the backoff ladder until one answers.
    *
-   * Rejects when the ladder is exhausted; the supervisor is then `stopped` and
-   * {@link lastError} holds why.
+   * Concurrent calls **coalesce**: the second caller awaits the first call's
+   * engine rather than spawning a second one.
+   *
+   * Rejects with an {@link EngineStartError} when the ladder is exhausted; the
+   * supervisor is then `stopped` and {@link lastError} holds why. A `stop()`
+   * that lands mid-start **resolves** this instead, with no engine and
+   * `state() === "stopped"` — the stop was not a failure.
    */
-  async start(): Promise<void> {
-    if (this.engine) throw new Error("the supervisor already has an engine");
-    this.stopping = false;
-    this.setState("starting");
-    await this.climb();
+  start(): Promise<void> {
+    if (this.engine) return Promise.reject(new Error("the supervisor already has an engine"));
+    this.starting ??= this.runStart().finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
   }
 
   state(): SupervisorState {
@@ -199,7 +321,13 @@ export class Supervisor {
     return this.lastExitValue;
   }
 
-  /** The last failure this supervisor saw, whether or not it recovered from it. */
+  /**
+   * The last failure this supervisor saw **on the current engine**.
+   *
+   * Cleared when a new engine is adopted: an error about a process that no
+   * longer exists is worse than none, because the code that reads it cannot
+   * tell it is stale.
+   */
   lastError(): Error | null {
     return this.lastErrorValue;
   }
@@ -208,47 +336,59 @@ export class Supervisor {
    * Resolve when the current engine's runtime reaches `watching`.
    *
    * This is the readiness a host should gate real work on. Opening the
-   * subscription is what makes it observable, so the first call opens one; a
-   * runtime already `watching` when that subscription opens resolves from the
-   * subscribe response rather than waiting for a transition that has already
-   * happened. If the engine dies first, the promise rejects rather than hanging
-   * — a caller waiting on a dead engine is a caller waiting forever.
+   * subscription is what makes it observable, so this call opens one — and
+   * joins an open already in flight rather than racing it. A runtime already
+   * `watching` when that subscription opens resolves from the subscribe
+   * response rather than waiting for a transition that has already happened. If
+   * the engine dies first, the promise rejects rather than hanging; if the
+   * *subscription* is refused, this call rejects with the engine's own answer
+   * and a later call is a fresh attempt.
    */
   whenWatching(): Promise<void> {
     const engine = this.engine;
     if (!engine) return Promise.reject(new Error("no engine is running"));
-    this.wantSubscription(engine);
-    return engine.watching.promise;
+    return this.openSubscription(engine).then(() => engine.watching.promise);
   }
 
   /**
    * Subscribe to the engine's events for as long as this supervisor lives.
    *
    * One daemon-side subscription is opened per engine and fanned out here, so
-   * every handler sees the same stream in the same order. Across a restart the
-   * handler is re-attached to the new engine and receives one synthesized
+   * every handler sees the same stream in the same order. **A subscriber that
+   * arrives before there is an engine is honoured**: the next engine opens a
+   * subscription because somebody asked for one. Across a restart the handler
+   * is re-attached to the new engine and receives one synthesized
    * `resync_required { runtime_recovered }` **before** any event of the new
    * engine's — see the class doc for why that reason and not another.
    *
-   * A throw out of `handler` goes to `onError`, and with no `onError` it raises
-   * one warning per supervisor: one subscriber's bug must not take down the
-   * fan-out every other subscriber shares.
+   * This rejects only when *this* attempt failed — the engine refused the
+   * subscription, or died under it — never because another open happened to be
+   * in flight. A throw out of `handler` goes to `onError`, and with no
+   * `onError` it raises one warning per supervisor: one subscriber's bug must
+   * not take down the fan-out every other subscriber shares.
    */
   async subscribe(
     handler: SubscriptionHandler,
     onError?: SubscriptionErrorHandler,
   ): Promise<SupervisorSubscription> {
     const subscriber: DurableSubscriber = onError ? { handler, onError } : { handler };
+    // Before anything else, and whether or not an engine exists right now: this
+    // is what makes the *next* engine open a subscription.
+    this.subscriptionWanted = true;
     this.durable.add(subscriber);
     const engine = this.engine;
     if (engine) {
-      await this.openSubscription(engine);
-      // `openSubscription` swallows its failure on purpose — a restart must not
-      // die because one subscribe attempt did — but a caller subscribing right
-      // now is entitled to hear that it got nothing.
-      if (!engine.subscription && engine === this.engine) {
-        this.durable.delete(subscriber);
-        throw this.lastErrorValue ?? new Error("the engine refused a subscription");
+      try {
+        await this.openSubscription(engine);
+      } catch (thrown) {
+        // Only a **live** engine's refusal is this caller's problem. If the
+        // engine died under the attempt, the subscriber stays in the fan-out
+        // and the replacement opens for it — which is the whole point of a
+        // subscription that outlives its engine.
+        if (this.engine === engine && !engine.lost) {
+          this.durable.delete(subscriber);
+          throw asError(thrown);
+        }
       }
     }
     return {
@@ -265,17 +405,26 @@ export class Supervisor {
    * The child is ended by closing its `stdin`, which is the door that also
    * closes when the host process dies; `SIGTERM` at 2 s and `SIGKILL` at 5 s
    * are the escalation, and {@link lastExit} says which of the three actually
-   * ended it.
+   * ended it. An engine that is still being spawned is shut down the same way —
+   * it is exactly the engine nobody else can see, and leaving it alive is how a
+   * host that is told to quit during boot orphans a daemon on its own vault.
    */
   async stop(): Promise<void> {
     this.stopping = true;
     this.cancelBackoff();
-    const engine = this.engine;
+    const engine = this.engine ?? this.spawning;
     this.engine = null;
     this.liveStateValue = null;
     this.setState("stopped");
     if (!engine) return;
     await this.shutdown(engine);
+  }
+
+  private async runStart(): Promise<void> {
+    this.stopping = false;
+    this.restartTimes = [];
+    this.setState("starting");
+    await this.climb();
   }
 
   /** One attempt per rung; rung `i`'s wait precedes attempt `i + 1`. */
@@ -288,14 +437,20 @@ export class Supervisor {
         return;
       } catch (thrown) {
         const error = asError(thrown);
+        // A stop is not a loss: nobody is told an engine died when the host
+        // asked for it to go away.
+        if (this.stopping) return;
         this.lastErrorValue = error;
         await this.safely(() => this.events.onEngineLost(error), "onEngineLost");
         if (this.stopping) return;
         const wait = attempt + 1 < ladder.length ? ladder[attempt] : undefined;
         if (wait === undefined) {
           this.setState("stopped");
-          const fatal = new Error(
+          const detail = error instanceof EngineStartError ? error : null;
+          const fatal = new EngineStartError(
             `engine failed to start after ${attempt + 1} attempt(s): ${error.message}`,
+            detail?.exit ?? null,
+            detail?.stderrTail ?? "",
           );
           this.lastErrorValue = fatal;
           throw fatal;
@@ -310,23 +465,56 @@ export class Supervisor {
    * Spawn one engine and prove it answers.
    *
    * The readiness proof is a `health` round trip rather than a timer: a process
-   * that exists is not a daemon that speaks. It races the child's own death, so
-   * an engine that exits before answering fails this attempt with the exit code
-   * rather than leaving the request pending until something else notices.
+   * that exists is not a daemon that speaks. It races the child's own death,
+   * and when the child loses that race the error reports the **exit** — after
+   * waiting for the exit to actually happen, because the stream's `end` beats
+   * the process's `exit` and the exit code is the half a caller can act on.
    */
   private async spawnOnce(): Promise<void> {
     const child = spawn(this.config.vaultdBinary, [...this.config.vaultdArgs], {
       env: { ...process.env, ...this.config.env },
-      // stderr is inherited on purpose: the daemon's diagnostics are the host's
-      // diagnostics, and a pipe nobody drains is a pipe that eventually blocks
-      // the process writing to it.
-      stdio: ["pipe", "pipe", "inherit"],
+      // stderr is piped and forwarded verbatim to the host's own stderr rather
+      // than inherited: the diagnostics still reach the operator, and the tail
+      // is kept so the error that reports a start failure can carry the
+      // daemon's own words instead of pointing at the transport.
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    const { stdin, stdout } = child;
+    const { stdin, stdout, stderr } = child;
     if (!stdin || !stdout) {
       child.kill("SIGKILL");
       throw new Error("the engine was spawned without its stdio pipes");
     }
+    // **A write into a dead engine is expected, and must not be fatal.**
+    // `VaultdClient.request` writes synchronously, so a request that races the
+    // engine's death raises `EPIPE` on this pipe — asynchronously, with no
+    // listener, which in Node is an uncaught exception that takes the host
+    // down. The supervisor created the pipe, so the supervisor owns its
+    // errors: the request itself is already failed by the stream and exit
+    // doors with a typed `EngineLostError`, so there is nothing further to
+    // report for a broken pipe. Anything else is unexpected and is said out
+    // loud.
+    stdin.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") return;
+      this.warn(`the engine's stdin failed: ${error.message}`);
+    });
+    // Declared before the client so no callback can name `engine` in its own
+    // temporal dead zone; assigned in the same synchronous run, before any
+    // stream event can fire.
+    let self: Engine | null = null;
+    // Registered BEFORE the client's own `end` listener, so a typed
+    // `EngineLostError` reaches the pending caller instead of the client's
+    // generic transport message. Listener order is registration order.
+    stdout.once("end", () => {
+      const engine = self;
+      if (!engine) return;
+      engine.lost = true;
+      engine.client.failAllPending(
+        new EngineLostError(
+          engine.everReady ? "vaultd restarted" : "the engine ended before it was ready",
+          engine.exit,
+        ),
+      );
+    });
     const client = new VaultdClient({
       stdout,
       stdin,
@@ -337,7 +525,8 @@ export class Supervisor {
         this.warn(`a vaultd event handler threw: ${error.message}`);
       },
       onFatal: (error) => {
-        this.onTransportFatal(engine, error);
+        const engine = self;
+        if (engine) this.onTransportFatal(engine, error);
       },
     });
     const engine: Engine = {
@@ -345,98 +534,166 @@ export class Supervisor {
       client,
       stdin,
       watching: deferred(),
+      ended: deferred(),
+      everReady: false,
+      lost: false,
       exited: false,
       exit: null,
       escalated: "none",
+      stderrTail: "",
       subscription: null,
-      subscribing: false,
+      opening: null,
+      sawLiveEvent: false,
       queued: [],
       buffering: false,
+      shuttingDown: null,
       failStartup: null,
     };
+    self = engine;
+    if (stderr) {
+      stderr.setEncoding("utf8");
+      stderr.on("data", (chunk: string) => {
+        engine.stderrTail = (engine.stderrTail + chunk).slice(-STDERR_TAIL_BYTES);
+        process.stderr.write(chunk);
+      });
+    }
     child.on("error", (error: Error) => {
       // A spawn that never happened: no stdout, so nothing will ever end and
       // the readiness request has to be failed by hand.
       client.failAllPending(error);
       client.close();
+      engine.ended.resolve();
       engine.failStartup?.(error);
     });
     child.on("exit", (code, signal) => {
       engine.exited = true;
+      engine.lost = true;
       engine.exit = { code, signal, escalated: engine.escalated };
+      engine.ended.resolve();
       this.onChildExit(engine);
     });
 
     const failed = new Promise<never>((_resolve, reject) => {
       engine.failStartup = reject;
     });
+    this.spawning = engine;
     try {
       await Promise.race([client.request("health"), failed]);
     } catch (thrown) {
+      this.spawning = null;
       client.close();
       if (!engine.exited) child.kill("SIGKILL");
-      throw asError(thrown);
+      // The exit is the diagnosis, so wait for it rather than reporting the
+      // stream symptom that arrived first. A killed process always exits.
+      await engine.ended.promise;
+      throw new EngineStartError(
+        `the engine exited ${describeExit(engine.exit)}`,
+        engine.exit,
+        engine.stderrTail,
+        thrown,
+      );
+    }
+    if (this.stopping) {
+      // The host asked to stop while this engine was being born. Nobody else
+      // can see it, so nobody else can shut it down.
+      this.spawning = null;
+      await this.shutdown(engine);
+      throw new EngineStartError(
+        "the supervisor stopped while the engine was starting",
+        engine.exit,
+        engine.stderrTail,
+      );
     }
     engine.failStartup = null;
+    engine.everReady = true;
+    this.spawning = null;
     // From here the engine is the current one, and that identity — not a flag —
     // is what tells a later exit apart from a failed start attempt.
     this.engine = engine;
+    // A fresh engine is a fresh slate: the previous engine's death must not be
+    // handed to a caller asking about this one.
+    this.lastErrorValue = null;
     this.liveStateValue = null;
     this.setState("running");
     await this.safely(() => this.events.onClientReady(client), "onClientReady");
-    if (this.subscriptionWanted) await this.openSubscription(engine);
+    if (this.subscriptionWanted && this.engine === engine) {
+      // A refusal here is the subscription's problem, not the engine's: the
+      // engine is up and serving, and `subscribe`/`whenWatching` report the
+      // refusal to whoever actually asked for one.
+      await this.openSubscription(engine).catch((error: unknown) => {
+        this.warn(`the supervisor could not subscribe to the engine: ${asError(error).message}`);
+      });
+    }
   }
 
   /**
-   * Open this engine's one subscription, and settle the restart debt if there
-   * is one.
+   * Open this engine's one subscription, joining an open already in flight.
+   *
+   * Returning early on "somebody else is opening" is what made a healthy engine
+   * look like it was refusing: the caller then read a still-null
+   * `engine.subscription` as a refusal and dropped its own subscriber. Every
+   * caller now awaits the same attempt and sees the same outcome.
+   */
+  private openSubscription(engine: Engine): Promise<void> {
+    this.subscriptionWanted = true;
+    if (engine.subscription) return Promise.resolve();
+    engine.opening ??= this.runOpen(engine).finally(() => {
+      engine.opening = null;
+    });
+    return engine.opening;
+  }
+
+  /**
+   * One open attempt, and the restart debt if there is one.
    *
    * Order is the whole point. The subscription is installed first, so no event
    * of the new engine's is missed; the marker is delivered next, so the
    * consumer learns its view is stale before it sees anything built on the new
    * one; the events that arrived in between are released last, in order.
    */
-  private async openSubscription(engine: Engine): Promise<void> {
-    this.subscriptionWanted = true;
-    if (engine.subscription || engine.subscribing) return;
-    engine.subscribing = true;
-    const owed = this.resyncOwed;
+  private async runOpen(engine: Engine): Promise<void> {
+    // Recomputed here rather than trusted from restart time: a subscriber may
+    // have arrived or left since, and only a subscriber that existed across the
+    // restart is owed anything.
+    const owed = this.resyncOwed && this.durable.size > 0;
     engine.buffering = owed;
+    let handle: SubscriptionHandle;
     try {
-      const handle = await engine.client.subscribeEvents((event) => {
+      handle = await engine.client.subscribeEvents((event) => {
         this.onEngineEvent(engine, event);
       });
-      engine.subscription = handle;
-      this.noteLiveState(engine, handle.liveState);
-      if (!owed) return;
-      const info = await engine.client.request<GetVaultInfoResponse>("get_vault_info");
-      this.resyncOwed = false;
-      engine.buffering = false;
-      this.fanout({
-        type: "resync_required",
-        value: { current_generation: info.generation, reason: "runtime_recovered" },
-      });
-      const held = engine.queued;
-      engine.queued = [];
-      for (const event of held) this.fanout(event);
     } catch (thrown) {
-      const error = asError(thrown);
-      this.lastErrorValue = error;
+      // No subscription, so the debt is still owed to the next engine, and
+      // anything buffered belongs to nobody.
       engine.buffering = false;
-      engine.watching.reject(error);
-      this.warn(`the supervisor could not subscribe to the engine: ${error.message}`);
-    } finally {
-      engine.subscribing = false;
+      engine.queued = [];
+      throw asError(thrown);
     }
-  }
-
-  /** Ask for a subscription without waiting for it — {@link whenWatching}'s door. */
-  private wantSubscription(engine: Engine): void {
-    if (engine.subscription || engine.subscribing) {
-      this.subscriptionWanted = true;
-      return;
+    engine.subscription = handle;
+    this.noteLiveState(engine, handle.liveState, "response");
+    if (!owed) return;
+    // The subscribe response's own start point is a generation the daemon
+    // named, so the marker is honest even if the round trip below fails —
+    // which is what stops a half-open subscription from losing its buffered
+    // events and leaving the debt set for a restart that does not owe one.
+    let generation = handle.startGeneration;
+    try {
+      const info = await engine.client.request<GetVaultInfoResponse>("get_vault_info");
+      generation = info.generation;
+    } catch (thrown) {
+      this.warn(
+        `the supervisor could not read the new engine's generation: ${asError(thrown).message}`,
+      );
     }
-    void this.openSubscription(engine);
+    this.resyncOwed = false;
+    engine.buffering = false;
+    this.fanout({
+      type: "resync_required",
+      value: { current_generation: generation, reason: "runtime_recovered" },
+    });
+    const held = engine.queued;
+    engine.queued = [];
+    for (const event of held) this.fanout(event);
   }
 
   private onEngineEvent(engine: Engine, event: RuntimeEventDto): void {
@@ -444,14 +701,19 @@ export class Supervisor {
     // union is open, and its unknown member's `type` is an unconstrained
     // string, so a bare comparison leaves `value` as `unknown`.
     if (isKnownRuntimeEvent(event) && event.type === "runtime_state_changed") {
-      this.noteLiveState(engine, event.value.live_state);
+      this.noteLiveState(engine, event.value.live_state, "event");
     }
     if (engine.buffering) engine.queued.push(event);
     else this.fanout(event);
   }
 
-  private noteLiveState(engine: Engine, state: LiveStateDto): void {
+  private noteLiveState(engine: Engine, state: LiveStateDto, source: "event" | "response"): void {
     if (engine !== this.engine) return;
+    // The response never overwrites what an event already said — see
+    // `Engine.sawLiveEvent`. An event always wins, including one that reports
+    // the runtime falling back out of `watching`, which is real news.
+    if (source === "response" && engine.sawLiveEvent) return;
+    if (source === "event") engine.sawLiveEvent = true;
     this.liveStateValue = state;
     if (state === "watching") engine.watching.resolve();
   }
@@ -463,7 +725,6 @@ export class Supervisor {
         subscriber.handler(event);
       } catch (thrown) {
         const error = asError(thrown);
-        this.lastErrorValue = error;
         if (subscriber.onError) subscriber.onError(error, event);
         else this.warn(`a supervisor subscriber threw and named no onError: ${error.message}`);
       }
@@ -477,15 +738,21 @@ export class Supervisor {
    * two.
    */
   private onTransportFatal(engine: Engine, error: Error): void {
-    this.lastErrorValue = error;
     if (engine.exited || engine !== this.engine || this.stopping) return;
+    this.lastErrorValue = error;
     engine.child.kill("SIGKILL");
   }
 
   private onChildExit(engine: Engine): void {
-    // Never left hanging: a request whose engine is gone must fail, because a
-    // shim write that never settles is indistinguishable from a wedged plugin.
-    engine.client.failAllPending(new Error("vaultd restarted"));
+    // Never left hanging, and typed: a request whose engine is gone must fail,
+    // because a shim write that never settles is indistinguishable from a
+    // wedged plugin.
+    engine.client.failAllPending(
+      new EngineLostError(
+        engine.everReady ? "vaultd restarted" : "the engine ended before it was ready",
+        engine.exit,
+      ),
+    );
     engine.client.close();
     // Recorded for every engine, including one that died before it was ever
     // current: how the last process ended is diagnosis, and a failed start is
@@ -493,24 +760,29 @@ export class Supervisor {
     this.lastExitValue = engine.exit;
     if (engine !== this.engine) {
       engine.failStartup?.(
-        new Error(`the engine exited ${describeExit(engine.exit)} before it was ready`),
+        new EngineStartError(
+          `the engine exited ${describeExit(engine.exit)} before it was ready`,
+          engine.exit,
+          engine.stderrTail,
+        ),
       );
       return;
     }
     this.engine = null;
     this.liveStateValue = null;
-    engine.watching.reject(new Error(`the engine exited ${describeExit(engine.exit)}`));
+    engine.watching.reject(new EngineLostError(`the engine exited ${describeExit(engine.exit)}`));
     if (this.stopping) return;
     this.restarts += 1;
     void this.restart(engine);
   }
 
-  /** A running engine died. Report it, then climb the ladder from the bottom. */
+  /** A running engine died. Report it, check the ceiling, then climb the ladder. */
   private async restart(lost: Engine): Promise<void> {
-    const error = new Error(`vaultd exited ${describeExit(lost.exit)}`);
+    const error = new EngineLostError(`vaultd exited ${describeExit(lost.exit)}`, lost.exit);
     this.lastErrorValue = error;
     await this.safely(() => this.events.onEngineLost(error), "onEngineLost");
     if (this.stopping) return;
+    if (this.flapping()) return;
     this.setState("restarting");
     // The new engine owes every live subscriber a resync: their view was built
     // on a connection that no longer exists.
@@ -525,7 +797,39 @@ export class Supervisor {
     }
   }
 
+  /**
+   * Has the engine died more often than the ceiling allows?
+   *
+   * Readiness clears the *ladder* but not this window, because an engine that
+   * answers `health` and then dies would otherwise restart forever, taking the
+   * index's writer lease on every attempt. Tripping the ceiling stops the
+   * supervisor for good; only an explicit `start()` lifts it.
+   */
+  private flapping(): boolean {
+    const now = this.config.clock.now();
+    this.restartTimes.push(now);
+    this.restartTimes = this.restartTimes.filter(
+      (at) => now - at < this.config.restartFlapWindowMs,
+    );
+    if (this.restartTimes.length <= this.config.restartFlapLimit) return false;
+    const fatal = new EngineFlappingError(
+      `vaultd restarted ${String(this.restartTimes.length)} times in ${String(this.config.restartFlapWindowMs)}ms; the supervisor is giving up`,
+      this.restartTimes.length,
+      this.config.restartFlapWindowMs,
+    );
+    this.lastErrorValue = fatal;
+    this.stopping = true;
+    this.setState("stopped");
+    return true;
+  }
+
+  /** End one engine. Idempotent per engine: two callers await one shutdown. */
   private shutdown(engine: Engine): Promise<void> {
+    engine.shuttingDown ??= this.runShutdown(engine);
+    return engine.shuttingDown;
+  }
+
+  private runShutdown(engine: Engine): Promise<void> {
     return new Promise<void>((resolve) => {
       const finish = (): void => {
         for (const timer of timers) this.config.clock.clearTimeout(timer);

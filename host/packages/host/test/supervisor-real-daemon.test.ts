@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig } from "../src/config";
-import { Supervisor } from "../src/supervisor";
+import { EngineStartError, Supervisor } from "../src/supervisor";
 import type { SupervisorEvents } from "../src/supervisor";
 import type { HostConfig } from "../src/config";
 import type { GetNoteResponse, GetVaultInfoResponse, MutationResponse } from "../src/client/protocol";
@@ -165,7 +165,20 @@ describe.skipIf(!BINARY_EXISTS)("Supervisor against a real vaultd", () => {
       },
     );
     running.push(second);
-    await expect(second.start()).rejects.toThrow(/engine failed to start/);
+    const thrown: unknown = await second.start().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(thrown).toBeInstanceOf(EngineStartError);
+    const failure = thrown as EngineStartError;
+    expect(failure.message).toMatch(/engine failed to start/);
+    // Programmatically distinguishable, which is the point: the daemon refuses
+    // at startup with code 2 and says why on stderr, so the host can tell "the
+    // lease is held" from "the binary is missing" without parsing a message
+    // itself.
+    expect(failure.exit?.code).toBe(2);
+    expect(failure.leaseHeld).toBe(true);
+    expect(failure.stderrTail).toMatch(/already in use by another writer/);
     expect(second.state()).toBe("stopped");
     expect(lost).toBe(2);
     expect(() => second.client()).toThrow(/no engine/);

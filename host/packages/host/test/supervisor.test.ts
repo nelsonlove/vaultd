@@ -1,10 +1,10 @@
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig, systemClock } from "../src/config";
-import { Supervisor } from "../src/supervisor";
+import { EngineLostError, EngineStartError, Supervisor } from "../src/supervisor";
 import type { HostConfig } from "../src/config";
 import type { RuntimeEventDto } from "../src/client/events";
 import { FakeClock } from "./fake-clock";
@@ -26,8 +26,15 @@ const fake = join(__dirname, "fixtures", "fake-vaultd.js");
  * actually reaches the spawned child. Without it the modes below would all
  * spawn the same "ok" daemon and the cases would silently assert nothing.
  */
+const roots: string[] = [];
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 function configFor(mode: string, overrides: Partial<HostConfig> = {}): HostConfig {
   const root = mkdtempSync(join(tmpdir(), "vaultd-sup-"));
+  roots.push(root);
   return {
     ...defaultHostConfig(root),
     vaultdBinary: process.execPath,
@@ -244,5 +251,291 @@ describe("Supervisor", () => {
     await until(() => supervisor.state() === "stopped");
     expect(lost).toEqual([]);
     expect(supervisor.restartCount()).toBe(0);
+  });
+});
+
+/** Does the operating system still know this pid? The orphan question. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The error paths, which is where every finding of the first review lived.
+ *
+ * The happy path of `subscribe` was the only path the first cut covered, and
+ * all three blocking defects were one turn away from it: a second subscriber in
+ * the same turn, a subscriber that arrives before the engine, and a `stop()`
+ * that lands inside a spawn.
+ */
+describe("Supervisor error paths", () => {
+  it("attaches both subscribers when two subscribes overlap in one turn", async () => {
+    const first: RuntimeEventDto[] = [];
+    const second: RuntimeEventDto[] = [];
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    const handles = await Promise.all([
+      supervisor.subscribe((event) => first.push(event)),
+      supervisor.subscribe((event) => second.push(event)),
+    ]);
+    await supervisor.whenWatching();
+    await until(() => first.length > 0 && second.length > 0);
+    // One daemon-side subscription, two consumers of it.
+    expect(supervisor.client().subscriptionCount()).toBe(1);
+    await handles[0].close();
+    await supervisor.stop();
+  });
+
+  it("attaches a subscriber that arrives in the same turn as whenWatching", async () => {
+    const seen: RuntimeEventDto[] = [];
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    // The natural consumer order — ask for readiness, then subscribe — and the
+    // one the first cut rejected as "the engine refused a subscription".
+    const watching = supervisor.whenWatching();
+    await supervisor.subscribe((event) => seen.push(event));
+    await watching;
+    await until(() => seen.length > 0);
+    expect(supervisor.liveState()).toBe("watching");
+    await supervisor.stop();
+  });
+
+  it("attaches a subscriber that arrives before the engine does", async () => {
+    const seen: RuntimeEventDto[] = [];
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.subscribe((event) => seen.push(event));
+    await supervisor.start();
+    await supervisor.whenWatching();
+    await until(() => seen.length > 0);
+    await supervisor.stop();
+  });
+
+  it("attaches a subscriber that arrives during a restart with nobody else subscribed", async () => {
+    const seen: RuntimeEventDto[] = [];
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    await expect(supervisor.client().request("die")).rejects.toThrow();
+    // No engine exists at this instant, and no other subscriber owes a resync.
+    // The handle must still be live when the replacement arrives.
+    await supervisor.subscribe((event) => seen.push(event));
+    await until(() => seen.length > 0);
+    expect(supervisor.restartCount()).toBe(1);
+    await supervisor.stop();
+  });
+
+  it("attaches a subscriber that arrives while the restart is re-opening", async () => {
+    const late: RuntimeEventDto[] = [];
+    const early: RuntimeEventDto[] = [];
+    let ready = 0;
+    const pending: Array<Promise<unknown>> = [];
+    const supervisor = new Supervisor(configFor("ok"), {
+      ...silent,
+      onClientReady: () => {
+        ready += 1;
+        // Inside the very turn the restart declares the new engine ready — the
+        // window where an open is in flight and the first cut threw the dead
+        // engine's error at a live one.
+        if (ready === 2) pending.push(supervisor.subscribe((event) => late.push(event)));
+      },
+    });
+    await supervisor.start();
+    await supervisor.subscribe((event) => early.push(event));
+    await expect(supervisor.client().request("die")).rejects.toThrow();
+    await until(() => ready >= 2 && pending.length > 0);
+    await Promise.all(pending);
+    await until(() => late.length > 0 && early.length > 0);
+    await supervisor.stop();
+  });
+
+  it("kills the engine it was spawning when stop lands mid-spawn", async () => {
+    const pidfile = join(mkdtempSync(join(tmpdir(), "vaultd-sup-pid-")), "engine.pid");
+    roots.push(join(pidfile, ".."));
+    const states: string[] = [];
+    const supervisor = new Supervisor(
+      configFor("slow-health", {
+        env: {
+          FAKE_VAULTD_MODE: "slow-health",
+          FAKE_VAULTD_HEALTH_DELAY_MS: "400",
+          FAKE_VAULTD_PIDFILE: pidfile,
+        },
+      }),
+      {
+        ...silent,
+        onStateChange: (state) => states.push(state),
+      },
+    );
+    const started = supervisor.start();
+    await until(() => existsSync(pidfile) && readFileSync(pidfile, "utf8").length > 0);
+    const pid = Number(readFileSync(pidfile, "utf8"));
+    expect(alive(pid)).toBe(true);
+    await supervisor.stop();
+    await started;
+    expect(supervisor.state()).toBe("stopped");
+    // The orphan question asked of the operating system, not of the supervisor:
+    // a surviving child here would hold the index's writer lease for the life
+    // of the host.
+    await until(() => !alive(pid));
+    expect(states).not.toContain("running");
+  });
+
+  it("coalesces two concurrent start calls into one engine", async () => {
+    let ready = 0;
+    const supervisor = new Supervisor(configFor("ok"), {
+      ...silent,
+      onClientReady: () => {
+        ready += 1;
+      },
+    });
+    await Promise.all([supervisor.start(), supervisor.start()]);
+    expect(ready).toBe(1);
+    const pid = supervisor.pid();
+    expect(pid).toBeGreaterThan(0);
+    await supervisor.stop();
+    await until(() => !alive(pid!));
+    expect(ready).toBe(1);
+  });
+
+  it("names the engine's exit in the start failure, and carries its stderr", async () => {
+    const supervisor = new Supervisor(configFor("exit-immediately"), silent);
+    const thrown: unknown = await supervisor.start().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(thrown).toBeInstanceOf(EngineStartError);
+    const failure = thrown as EngineStartError;
+    // The exit is what the host needs — "the lease is held" and "the binary
+    // refused its arguments" are both exits, and neither is a transport fault.
+    expect(failure.message).toMatch(/engine failed to start/);
+    expect(failure.message).toMatch(/code 3/);
+    expect(failure.exit?.code).toBe(3);
+    expect(failure.stderrTail).toContain("refusing to start");
+    expect(failure.leaseHeld).toBe(false);
+  });
+
+  it("fails a request in flight across a crash with a typed engine-lost error", async () => {
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    const thrown: unknown = await supervisor
+      .client()
+      .request("die")
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    // Typed and deterministic: not whichever of the stream's end and the
+    // process's exit happened to win.
+    expect(thrown).toBeInstanceOf(EngineLostError);
+    expect((thrown as Error).message).toMatch(/vaultd restarted/);
+    await supervisor.stop();
+  });
+
+  it("stops when the engine flaps faster than the ceiling allows", async () => {
+    let ready = 0;
+    const supervisor = new Supervisor(
+      configFor("die-after-health", { restartFlapLimit: 3, restartFlapWindowMs: 60_000 }),
+      {
+        ...silent,
+        onClientReady: () => {
+          ready += 1;
+        },
+      },
+    );
+    await supervisor.start();
+    await supervisor.client().request("health").catch(() => undefined);
+    await until(() => supervisor.state() === "stopped");
+    // Three restarts are allowed inside the window; the fourth is the ceiling.
+    expect(supervisor.restartCount()).toBe(4);
+    expect(ready).toBe(4);
+    expect(supervisor.pid()).toBeNull();
+    expect(supervisor.lastError()?.message).toMatch(/restarted 4 times/);
+  });
+
+  it("keeps the buffered events and clears the debt when get_vault_info fails mid-open", async () => {
+    const seen: RuntimeEventDto[] = [];
+    const supervisor = new Supervisor(configFor("no-vault-info"), silent);
+    await supervisor.start();
+    await supervisor.subscribe((event) => seen.push(event));
+    // `whenWatching` resolves from inside the delivery of the event that
+    // announces it, so by here the first engine's one event is already in the
+    // list and clearing cannot race it.
+    await supervisor.whenWatching();
+    seen.length = 0;
+    await expect(supervisor.client().request("die")).rejects.toThrow();
+    await until(() => supervisor.restartCount() >= 1 && seen.length >= 2);
+    // The generation falls back to the subscribe response's own start point,
+    // which is a real generation the daemon named; nothing is invented and
+    // nothing that arrived during the round trip is dropped.
+    expect(seen[0]).toEqual({
+      type: "resync_required",
+      value: { current_generation: 1, reason: "runtime_recovered" },
+    });
+    expect(seen.some((event) => event.type === "runtime_state_changed")).toBe(true);
+    await supervisor.stop();
+  });
+
+  it("reports the engine's own refusal to subscribe, and stays usable after it", async () => {
+    const supervisor = new Supervisor(configFor("no-subscribe"), silent);
+    await supervisor.start();
+    await expect(supervisor.subscribe(() => undefined)).rejects.toThrow(/no runtime to subscribe/);
+    // Not poisoned: a second attempt is a real second attempt, and it fails
+    // with this engine's own answer rather than a remembered one.
+    await expect(supervisor.whenWatching()).rejects.toThrow(/no runtime to subscribe/);
+    await expect(supervisor.client().request("health")).resolves.toEqual({
+      service: "vaultd",
+      status: "ok",
+    });
+    expect(supervisor.state()).toBe("running");
+    await supervisor.stop();
+  });
+
+  it("settles every request that races an engine's death, and survives the writes", async () => {
+    const supervisor = new Supervisor(configFor("die-after-health"), silent);
+    await supervisor.start();
+    const client = supervisor.client();
+    // The engine exits as it answers the first of these, so the rest are
+    // written into a pipe whose reader is going away. Two invariants at once:
+    // nothing is left hanging, and the writes themselves are survivable —
+    // `EPIPE` arrives asynchronously on a stream the supervisor created, and
+    // with no listener there Node turns it into an uncaught exception that
+    // takes the host down. That is what the full suite caught before this was
+    // fixed: one unhandled error beside 128 passing tests. Provoking the
+    // `EPIPE` itself is a race by nature, which is why the assertions below
+    // are the invariants rather than the errno.
+    const results = await Promise.allSettled([
+      client.request("health"),
+      client.request("health"),
+      client.request("health"),
+    ]);
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(rejected.length).toBeGreaterThan(0);
+    for (const result of rejected) {
+      expect(result.reason).toBeInstanceOf(EngineLostError);
+    }
+    // And nothing about it damaged the supervisor: the replacement arrives.
+    await until(() => supervisor.restartCount() >= 1);
+    await supervisor.stop();
+  }, 15_000);
+
+  it("keeps one subscriber's throw off every other subscriber", async () => {
+    const errors: Error[] = [];
+    const quiet: RuntimeEventDto[] = [];
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    await supervisor.subscribe(
+      () => {
+        throw new Error("subscriber is broken");
+      },
+      (error) => errors.push(error),
+    );
+    await supervisor.subscribe((event) => quiet.push(event));
+    await supervisor.whenWatching();
+    await until(() => quiet.length > 0 && errors.length > 0);
+    expect(errors[0]?.message).toBe("subscriber is broken");
+    await expect(supervisor.client().request("health")).resolves.toBeTruthy();
+    await supervisor.stop();
   });
 });

@@ -86,6 +86,20 @@ export interface HostConfig {
    * means one attempt and no restart at all.
    */
   readonly restartBackoffMs: readonly number[];
+  /**
+   * The flap ceiling: more than {@link restartFlapLimit} restarts inside this
+   * many milliseconds and the supervisor stops instead of spawning again.
+   *
+   * The ladder alone does not bound this. Reaching readiness clears the ladder
+   * — deliberately, so an engine that ran for hours and then crashed is not
+   * punished for a failure hours ago — which means an engine that answers
+   * `health` and then dies restarts forever, taking the index's writer lease on
+   * every attempt. This is the engine-side twin of `quarantineWindowMs` /
+   * `quarantineFailures` on the plugin side, and it is measured with
+   * `clock.now()` like every other duration here.
+   */
+  readonly restartFlapWindowMs: number;
+  readonly restartFlapLimit: number;
   /** Ruling 7: an engine restart does not reload plugins. */
   readonly reloadPluginsOnEngineRestart: boolean;
   readonly momentLocale: string;
@@ -146,6 +160,8 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     writeFileCapBytes: 16 * 1024 * 1024,
     unloadBudgetMs: 5_000,
     restartBackoffMs: [250, 500, 1_000, 2_000, 5_000],
+    restartFlapWindowMs: 60_000,
+    restartFlapLimit: 5,
     reloadPluginsOnEngineRestart: false,
     momentLocale: "en",
     dryRun: false,
