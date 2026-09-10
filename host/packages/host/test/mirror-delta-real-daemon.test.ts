@@ -455,11 +455,26 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
   it("survives a note too large to read, and still reports the generation that grew it", async () => {
     const config = xLinksY();
     // **Written straight to disk, not through `write_note`.** The payload cap
-    // and the read cap are the same 16 MiB, so a `write_note` large enough to
-    // produce an unreadable note is refused before it can create one —
-    // measured: 15 MiB writes, 16 MiB answers `payload_too_large`. The road
-    // that really produces one is the road this host does not control: an
-    // external editor, a sync client, an attachment someone dropped in.
+    // and the read cap are the same 16 MiB, and both are a strict `>` against
+    // 16777216 bytes — measured against the shipped binary: a 16 MiB
+    // `write_note` succeeds and `read_file` still reads it back, a 17 MiB one
+    // answers `payload_too_large` and creates nothing. So the largest note
+    // `write_note` can put on disk sits exactly on the boundary, and since a
+    // JSON payload is never smaller than the bytes it decodes to, no
+    // `write_note` can create a note that `read_file` will then refuse. It
+    // holds by one byte, not by a megabyte.
+    //
+    // The road that really produces one is the road this host does not
+    // control: an external editor, a sync client, an attachment someone
+    // dropped in. (Not *quite* only those: `patch_frontmatter` weighs its
+    // edits rather than the resulting file, deliberately — capping the result
+    // would make a note already over the cap permanently unpatchable — so this
+    // host could in principle push a boundary-sized note over. Which is one
+    // more reason the warm-up must treat the refusal as an absence.)
+    //
+    // Written **before** `startedOn`, so the daemon's initial scan indexes it.
+    // Written after, the mirror would hydrate before the watcher noticed and
+    // this case would pass without ever reading the oversized note at all.
     const oversized = `# Huge\n\n${"x".repeat(17 * 1024 * 1024)}\n`;
     writeFileSync(join(config.vaultRoot, "Huge.md"), oversized, "utf8");
 

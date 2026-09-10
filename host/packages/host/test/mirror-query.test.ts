@@ -310,6 +310,42 @@ describe("Mirror positions", () => {
     expect(harness.mirror.positions("A.md")).toBeDefined();
     expect(harness.mirror.positions("B.md")).toBeUndefined();
   });
+
+  it("treats a path that is not a regular file as an absence, not a fault", async () => {
+    const harness = await hydrated({
+      generation: 4,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a1" },
+        { path: "B.md", kind: "note", revision: "blake3:b1" },
+      ],
+      notes: [
+        { path: "A.md", revision: "blake3:a1" },
+        { path: "B.md", revision: "blake3:b1" },
+      ],
+    });
+    const warming = harness.mirror.warmPositions();
+    for (let i = 0; i < 2; i += 1) {
+      const request = await harness.expectRequest("read_file");
+      const path = (request.request.params as { path: string }).path;
+      if (path === "A.md") harness.respondReadFile(request.id, "# A\n", "blake3:a1");
+      // `docs/protocol.md`: a `read_file` whose path is not a regular file — a
+      // directory, a fifo, a socket, a device — answers `target_exists`, the
+      // mutation taxonomy's "something else already occupies this name" read on
+      // the read path. A directory has no bytes, which is the same fact as
+      // `not_found` and must be swallowed the same way.
+      //
+      // Very close to unreachable, because `warmOne` only ever reads paths the
+      // index calls notes — it takes a note row that has become a directory
+      // between the row and the read. The entry stays anyway, because widening
+      // what the warm-up swallows can only ever be safe, and it is **tested**
+      // anyway, because this file's own standard is that a guard defended only
+      // by an argument is a guard a test cannot hold on to.
+      else harness.respondErr(request.id, { code: "target_exists", message: "not a regular file" });
+    }
+    expect(await warming).toMatchObject({ warmed: 1 });
+    expect(harness.mirror.positions("A.md")).toBeDefined();
+    expect(harness.mirror.positions("B.md")).toBeUndefined();
+  });
 });
 
 describe("Mirror revision stamps", () => {

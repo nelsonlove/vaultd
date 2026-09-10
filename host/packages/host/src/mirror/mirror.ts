@@ -1101,6 +1101,12 @@ export class Mirror implements MirrorQuery {
    * write that is still in progress, it is holding this promise, and a failure
    * is its answer to give to the plugin — not a background condition to
    * recover from behind its back.
+   *
+   * **A re-warm failure underneath it is the exception**, and it reaches the
+   * seam with a `null` event. Rebuilding a position index happens after the
+   * rows are installed, so it is no longer part of the answer this promise
+   * carries — the write succeeded — and it is attributable to no event,
+   * because there was none. See `reWarm`.
    */
   applyMutation(generation: number, paths: readonly string[]): Promise<void> {
     return this.enqueue(async () => {
