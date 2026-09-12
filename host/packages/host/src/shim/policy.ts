@@ -1,0 +1,163 @@
+/**
+ * The four-way API policy table, and the one way this host refuses a call.
+ *
+ * Every surface a plugin can touch is one of four things, and saying which is
+ * the whole point of the compatibility report: `implemented` (the host does the
+ * real thing), `harvested` (the call is recorded and answered rather than
+ * performed, because there is no GUI to perform it in), `safe_stub` (an inert
+ * value that lets the plugin keep going) and `absent` (a typed throw). Task 8
+ * and Task 11a/11b build the report out of {@link policyOf} and
+ * {@link declaredSymbols}, so the names here are the names that reach a human.
+ *
+ * **Module-level, deliberately.** A policy lookup happens inside a getter on a
+ * frozen barrel object, several layers below anything holding a reference to
+ * the host, so threading a table through every call site would mean every call
+ * site could be handed the wrong one — or none. There is one host per process
+ * (`main.ts` starts one), so one table per module is the same table.
+ *
+ * The two pieces of mutable state that are *not* the table — the recorder and
+ * the current plugin — are installed from outside: {@link setPolicyRecorder} by
+ * the assembler, {@link enterPlugin} by the dispatch queue. Both are restored
+ * on the way out, so a host torn down and rebuilt in one process (a test) does
+ * not inherit the previous one's.
+ */
+
+export type ApiPolicy = "implemented" | "harvested" | "safe_stub" | "absent";
+
+/**
+ * ONE constructor signature, used at every call site in this plan. `name` is
+ * derived, never passed; `message` always contains the symbol so a stack trace
+ * with no structured logging is still diagnosable; `policy` is a literal
+ * because an unsupported throw is by definition the `absent` policy.
+ *
+ * `detail` is where a subclass name goes (`Modal.open` naming the actual
+ * subclass) or a channel name (`ipcRenderer.invoke` naming the channel). It is
+ * appended to the message and never changes the shape.
+ */
+export class HeadlessUnsupported extends Error {
+  readonly code = "headless_unsupported";
+  readonly symbol: string;
+  readonly pluginId: string | null;
+  readonly policy = "absent" as const;
+  readonly detail: string | null;
+  constructor(symbol: string, pluginId: string | null, detail?: string) {
+    super(
+      detail === undefined
+        ? `${symbol} is not available headless`
+        : `${symbol} is not available headless (${detail})`,
+    );
+    this.name = "HeadlessUnsupported";
+    this.symbol = symbol;
+    this.pluginId = pluginId;
+    this.detail = detail ?? null;
+  }
+}
+
+/**
+ * The tally behind the compatibility report.
+ *
+ * An interface rather than a class because the host has exactly one ordinary
+ * implementation (`memoryPolicyRecorder`, beside the assembler) and every other
+ * one is a test's own. Counting per `(symbol, plugin)` rather than per call is
+ * what makes the report readable.
+ */
+export interface PolicyRecorder {
+  record(symbol: string, policy: ApiPolicy, pluginId: string | null): void;
+  entries(): readonly { symbol: string; policy: ApiPolicy; pluginId: string | null; hits: number }[];
+}
+
+const declarations = new Map<string, ApiPolicy>();
+let recorder: PolicyRecorder | null = null;
+let pluginId: string | null = null;
+
+/**
+ * Declare what a symbol is. Last declaration wins.
+ *
+ * Called from the barrel builder (Task 11b) as it binds each name, and from any
+ * surface that wants its own policy in the report. It is the **only** thing
+ * that puts a name in {@link declaredSymbols}: a recorded hit does not, because
+ * the table is the host's claim about its own surface and a hit is a plugin's
+ * behaviour. Task 11b asserts `declaredSymbols()` equals its table exactly, and
+ * a hit that quietly added a row would break that for no gain.
+ */
+export function declarePolicy(symbol: string, policy: ApiPolicy): void {
+  declarations.set(symbol, policy);
+}
+
+/**
+ * What a symbol is, defaulting to `absent`.
+ *
+ * Undeclared means absent on purpose: a name nobody bound is a name this host
+ * does not have, and the honest answer to "what is your policy for it" is the
+ * same as the answer for a name declared absent.
+ */
+export function policyOf(symbol: string): ApiPolicy {
+  return declarations.get(symbol) ?? "absent";
+}
+
+/** Every symbol in the table, in declaration order. */
+export function declaredSymbols(): readonly string[] {
+  return [...declarations.keys()];
+}
+
+/**
+ * Answer with an inert value and record that the plugin asked.
+ *
+ * The record is the point. A stub that answered silently would leave the
+ * compatibility report unable to say which plugins depend on the thing that is
+ * not really there — which is exactly what a reader of that report is asking.
+ */
+export function stub<T>(symbol: string, value: T): T {
+  recorder?.record(symbol, "safe_stub", pluginId);
+  return value;
+}
+
+/** Records the hit against the current plugin, then throws HeadlessUnsupported. */
+export function unsupported(symbol: string, detail?: string): never {
+  recorder?.record(symbol, "absent", pluginId);
+  throw new HeadlessUnsupported(symbol, pluginId, detail);
+}
+
+/**
+ * Record one ordinary use of a declared symbol, at whatever policy it declares.
+ *
+ * The counterpart to {@link stub} for surfaces that really do the work: the
+ * report is about what plugins reach for, and a surface that is `implemented`
+ * is still worth counting.
+ */
+export function recordUse(symbol: string): void {
+  recorder?.record(symbol, policyOf(symbol), pluginId);
+}
+
+/** The plugin whose call is running right now — set by the dispatch queue. */
+export function currentPluginId(): string | null {
+  return pluginId;
+}
+
+/** Install the tally every `stub`/`unsupported`/`recordUse` reports into. */
+export function setPolicyRecorder(next: PolicyRecorder | null): void {
+  recorder = next;
+}
+
+/**
+ * Run `body` with `id` as the current plugin, and restore whatever was current
+ * before — nesting included.
+ *
+ * Attribution is ambient rather than a parameter for the same reason the event
+ * bus's is: the surfaces that record hits are several layers below anything
+ * that knows which plugin is running. The dispatch queue is the one caller, and
+ * because it is a strict FIFO there is never a second plugin running inside the
+ * window this opens.
+ */
+export async function enterPlugin<T>(
+  id: string | null,
+  body: () => Promise<T> | T,
+): Promise<T> {
+  const previous = pluginId;
+  pluginId = id;
+  try {
+    return await body();
+  } finally {
+    pluginId = previous;
+  }
+}

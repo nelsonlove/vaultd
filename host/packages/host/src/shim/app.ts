@@ -17,11 +17,13 @@
  * of its own body.
  *
  * The fields land as their tasks build them, and this comment is the map:
- * Task 7 adds `vault`, Task 8 `metadataCache`, Task 10 `workspace`, Task 12
+ * Task 7 added `vault`, Task 8 adds `metadataCache`, Task 10 `workspace`, Task 12
  * `plugins`, `internalPlugins`, `commands`, `keymap`, `scope`, `setting` and
  * `foldManager`. Nothing here is re-decided later — a task adds its field and
  * the assembler's one assignment, and that is all.
  */
+import type { Vault } from "./vault";
+
 export class App {
   /**
    * Obsidian's own per-vault identifier: a 16-character hex string a plugin may
@@ -32,6 +34,17 @@ export class App {
    * derives it from the vault path — see `assembleShim`.
    */
   readonly appId: string;
+
+  /**
+   * `app.vault` — filled by `assembleShim`, exactly once.
+   *
+   * Definite-assignment rather than a constructor argument, because the vault
+   * holds surfaces that hold the app: there is no order in which both can be
+   * built with their fields final. `assignOnce` refuses a second assignment, so
+   * "assigned once by the assembler" is enforced rather than asserted, and no
+   * plugin bundle is loaded before it lands.
+   */
+  vault!: Vault;
 
   constructor(options: { appId: string }) {
     this.appId = options.appId;

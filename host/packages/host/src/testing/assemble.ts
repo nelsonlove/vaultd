@@ -26,19 +26,25 @@
  * takes the {@link forwardingWriteGate} default below.
  */
 
-import { registerElectronStub } from "../runtime/electron-registry";
 import { App } from "../shim/app";
 import { ShimEventBus } from "../shim/events";
-import { ObsidianApi } from "../shim/api";
 import { DispatchQueue } from "../runtime/queue";
-import { Harvest } from "../shim/harvest";
-import { NoticeLog } from "../shim/notice";
+import { setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
 import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
 import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
-import type { WriteGate } from "../dryrun/dry-run";
+import type { WriteGate } from "../shim/vault";
+// activated by Task 13:  import { registerElectronStub } from "../runtime/electron-registry";
+// activated by Task 11b: import { ObsidianApi } from "../shim/api";
+// activated by Task 10:  import { Harvest } from "../shim/harvest";
+// activated by Task 11b: import { NoticeLog } from "../shim/notice";
+//
+// `WriteGate` is declared in `../shim/vault` until Task 19 creates
+// `../dryrun/dry-run`, which owns the interface and the one implementation
+// (`DryRunGate`) that is not the forwarding default below. Nothing but this
+// import line moves when it does.
 
 /**
  * Everything one assembled shim consists of.
@@ -56,13 +62,13 @@ export interface HostAssembly {
   readonly mirror: Mirror;
   readonly events: ShimEventBus;
   readonly queue: DispatchQueue;
-  readonly harvest: Harvest;
   readonly policyRecorder: PolicyRecorder;
-  readonly noticeLog: NoticeLog;
   readonly app: App;
-  /** The Task 11b barrel: the module object a plugin bundle resolves to. */
-  readonly api: ObsidianApi;
   readonly writes: WriteGate;
+  // activated by Task 10:  readonly harvest: Harvest;
+  // activated by Task 11b: readonly noticeLog: NoticeLog;
+  // activated by Task 11b: readonly api: ObsidianApi;
+  //   The Task 11b barrel: the module object a plugin bundle resolves to.
 }
 
 /**
@@ -145,21 +151,28 @@ export function assembleShim(deps: {
   policyRecorder?: PolicyRecorder;
 }): HostAssembly {
   const { config, client, mirror, clock } = deps;
-  registerElectronStub();
+  // activated by Task 13: registerElectronStub(...). It is registered *first*,
+  // before anything that could load a plugin bundle, because a bundle that
+  // resolves `electron` before the stub is in place gets the real module or a
+  // throw — and either way the failure surfaces far from its cause.
 
   // Nothing below observes anything but its own arguments during construction,
   // which is what lets a cycle be wired at all: the vault holds the event bus,
   // the bus holds nobody, and every cross-surface read happens later, from a
   // method.
   const events = new ShimEventBus();
-  const noticeLog = new NoticeLog({ clock });
   const policyRecorder = deps.policyRecorder ?? memoryPolicyRecorder();
-  const harvest = new Harvest();
-  const queue = new DispatchQueue({ clock });
+  // The policy table is module-level — a lookup happens inside a getter on a
+  // frozen barrel, far below anything holding the host — so the recorder every
+  // `stub`/`unsupported` hit lands in is installed rather than passed.
+  setPolicyRecorder(policyRecorder);
+  const queue = new DispatchQueue();
   const writes = deps.writes ?? forwardingWriteGate(client);
   const app = new App({ appId: appIdFor(config.vaultRoot) });
-  const vault = new Vault({ app, config, mirror, events, writes, clock });
-  const api = new ObsidianApi({ app, config, harvest, noticeLog, policyRecorder, queue, clock });
+  const vault = new Vault({ config, client, mirror, events, writes, queue });
+  // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
+  // activated by Task 10:  const harvest = new Harvest();
+  // activated by Task 11b: const api = new ObsidianApi({ ... });
 
   // The assign-once step. `App` is a mutable container precisely so this can
   // happen after every surface exists; a plugin never sees the gap, because no
@@ -173,11 +186,8 @@ export function assembleShim(deps: {
     mirror,
     events,
     queue,
-    harvest,
     policyRecorder,
-    noticeLog,
     app,
-    api,
     writes,
   };
 }

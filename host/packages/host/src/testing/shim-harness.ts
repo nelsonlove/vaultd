@@ -1,19 +1,27 @@
 /**
  * A whole shim over a hydrated mirror: the harness Tasks 7–13 drive.
  *
- * **Not yet activated.** Written for `src/testing/shim-harness.ts`, with its
- * imports spelled for that home, and moved there by Task 7's Step 1 together
- * with `assemble.ts`:
+ * **Activated by Task 7**, together with `assemble.ts`, and reconciled against
+ * the surfaces that task actually built. The methods Task 7's own tests drive
+ * — `withEntries`, `withVault`, `app`, `vault`, `setFileContent`, `revisionOf`,
+ * `writeNote`, `emitBatch`, `settleProcess`, `flipLayoutReady` — are real. The
+ * rest were written against modules that do not exist yet (`shim/plugin.ts` and
+ * `shim/harvest.ts` in Task 10, `shim/notice.ts` and `shim/api.ts` in Task 11b)
+ * and are commented out below, each with the task that restores it. They are
+ * left in place rather than deleted so that the divergence between what a later
+ * task calls and what this harness offers stays visible.
  *
- * ```
- * git mv src/testing/pending/assemble.ts src/testing/assemble.ts
- * git mv src/testing/pending/shim-harness.ts src/testing/shim-harness.ts
- * ```
+ * Two behaviours are worth knowing before writing a case against it:
  *
- * Everything below is a method some later task calls. They are enumerated here,
- * with bodies, so a divergence between what a task calls and what the harness
- * offers is a compile error at activation rather than a surprise in the middle
- * of writing that task's tests.
+ * - **A fixture's own files are served automatically; anything else is
+ *   answered by hand.** `withVault` hands its sources to the auto-server, so a
+ *   `read_file` for one of them never reaches the request queue. A path the
+ *   fixture never had — `setFileContent` on an entries-only harness, say —
+ *   stays manual, which is what lets a `process` case answer the read and the
+ *   write in order and assert what each one carried.
+ * - **An entries-only harness does not warm positions.** Warming reads every
+ *   note's source, and an `entries` fixture has none to read, so a warm-up
+ *   there would issue reads nothing can answer.
  */
 
 import { assembleShim } from "./assemble";
@@ -22,19 +30,19 @@ import { MirrorHarness } from "./mirror-harness";
 import type { HostConfig } from "../config";
 import type { MirrorChangeBatch } from "../mirror/types";
 import type { App } from "../shim/app";
-import type { ObsidianApi } from "../shim/api";
-import type { AppliedBatch, Vault } from "../shim/vault";
-import type { Harvest, HarvestedMenuItem } from "../shim/harvest";
-import type { NoticeLog } from "../shim/notice";
-import type { Plugin, PluginManifest } from "../shim/plugin";
+import type { AppliedBatch } from "../shim/files";
 import type { PolicyRecorder } from "../shim/policy";
-import type { WriteGate } from "../dryrun/dry-run";
+import type { Vault, WriteGate } from "../shim/vault";
 import type { FixtureEntry } from "./mirror-harness";
+// activated by Task 10: import type { Plugin, PluginManifest } from "../shim/plugin";
+// activated by Task 10: import type { Harvest, HarvestedMenuItem } from "../shim/harvest";
+// activated by Task 11b: import type { ObsidianApi } from "../shim/api";
+// activated by Task 11b: import type { NoticeLog } from "../shim/notice";
 
 export interface ShimHarnessOptions {
   /** Default `true`: most tests want a shim that has finished starting. */
   layoutReady?: boolean;
-  /** Default `true`: warm the position index, so offsets answer. */
+  /** Default `true`, and ignored by a fixture with no note sources to read. */
   warm?: boolean;
   /** Served through `read_file`, for the config zone the host reads. */
   configFiles?: Record<string, string>;
@@ -53,17 +61,18 @@ export class ShimHarness extends MirrorHarness {
    */
   readonly app!: App;
   readonly vault!: Vault;
-  readonly api!: ObsidianApi;
-  readonly harvest!: Harvest;
   readonly policyRecorder!: PolicyRecorder;
-  readonly noticeLog!: NoticeLog;
   readonly writes!: WriteGate;
+  // activated by Task 11b: readonly api!: ObsidianApi;
+  // activated by Task 10:  readonly harvest!: Harvest;
+  // activated by Task 11b: readonly noticeLog!: NoticeLog;
   /** The specifiers a plugin bundle may resolve to the host's own modules. */
   readonly hostModulePaths: readonly string[] = ["obsidian", "electron", "@electron/remote"];
 
   private readonly configFiles = new Map<string, string>();
   private readonly sources = new Map<string, string>();
-  private readonly plugins = new Map<string, Plugin>();
+  /** The paths the auto-server answers. Everything else is answered by hand. */
+  private readonly autoServed = new Set<string>();
   private layoutReady: boolean;
 
   protected constructor(options: ShimHarnessOptions) {
@@ -83,15 +92,15 @@ export class ShimHarness extends MirrorHarness {
       clock: this.clock,
     });
     const mutable = this as {
-      -readonly [K in "app" | "vault" | "api" | "harvest" | "policyRecorder" | "noticeLog" | "writes"]: ShimHarness[K];
+      -readonly [K in "app" | "vault" | "policyRecorder" | "writes"]: ShimHarness[K];
     };
     mutable.app = assembly.app;
     mutable.vault = assembly.app.vault;
-    mutable.api = assembly.api;
-    mutable.harvest = assembly.harvest;
     mutable.policyRecorder = assembly.policyRecorder;
-    mutable.noticeLog = assembly.noticeLog;
     mutable.writes = assembly.writes;
+    // activated by Task 11b: mutable.api = assembly.api;
+    // activated by Task 10:  mutable.harvest = assembly.harvest;
+    // activated by Task 11b: mutable.noticeLog = assembly.noticeLog;
   }
 
   /** A shim over a tree with no note bodies — the cheapest useful fixture. */
@@ -129,11 +138,19 @@ export class ShimHarness extends MirrorHarness {
     options: ShimHarnessOptions,
   ): Promise<ShimHarness> {
     const harness = new ShimHarness(options);
-    for (const [path, source] of Object.entries(sources)) harness.sources.set(path, source);
+    for (const [path, source] of Object.entries(sources)) {
+      harness.sources.set(path, source);
+      harness.autoServed.add(path);
+    }
+    for (const path of harness.configFiles.keys()) harness.autoServed.add(path);
     harness.autoServeFiles({ ...sources, ...Object.fromEntries(harness.configFiles) });
     await harness.openMirror(spec);
     harness.assemble();
-    if (options.warm ?? true) await harness.mirror.warmPositions();
+    // A fixture with no note sources has nothing to warm from: every read the
+    // warm-up issued would sit unanswered, and the harness would never start.
+    if ((options.warm ?? true) && Object.keys(sources).length > 0) {
+      await harness.mirror.warmPositions();
+    }
     if (harness.layoutReady) await harness.flipLayoutReady();
     return harness;
   }
@@ -141,39 +158,13 @@ export class ShimHarness extends MirrorHarness {
   /** Replace a config-zone file's contents; the next `read_file` serves it. */
   setConfigFile(path: string, contents: string): void {
     this.configFiles.set(path, contents);
+    this.autoServed.add(path);
     this.autoServeFiles({ [path]: contents });
   }
 
-  manifestFor(id: string): PluginManifest {
-    return {
-      id,
-      name: id,
-      version: "0.0.1",
-      minAppVersion: "1.0.0",
-      author: "the harness",
-      description: `${id}, instantiated by ShimHarness`,
-    };
-  }
-
-  /** Construct a plugin against this shim's `App`, without loading it. */
-  instantiate<T extends Plugin>(id: string, ctor: new (app: App, m: PluginManifest) => T): T {
-    const plugin = new ctor(this.app, this.manifestFor(id));
-    this.plugins.set(id, plugin);
-    return plugin;
-  }
-
-  /** Load one plugin, with every registration it makes attributed to it. */
-  async load(plugin: Plugin): Promise<void> {
-    this.plugins.set(plugin.manifest.id, plugin);
-    await plugin.load();
-  }
-
-  async unload(id: string): Promise<void> {
-    const plugin = this.plugins.get(id);
-    if (plugin === undefined) throw new Error(`${id} was never loaded on this harness`);
-    await plugin.unload();
-    this.plugins.delete(id);
-  }
+  // activated by Task 10: manifestFor / instantiate / load / unload — every one
+  // of them names `Plugin` or `PluginManifest` from `../shim/plugin`, which
+  // that task creates.
 
   /**
    * Fire `layout-ready`, once.
@@ -184,14 +175,26 @@ export class ShimHarness extends MirrorHarness {
    */
   async flipLayoutReady(): Promise<void> {
     this.layoutReady = true;
-    this.app.workspace.markLayoutReady();
+    // activated by Task 10: this.app.workspace.markLayoutReady();
     await this.quiesce();
   }
 
-  /** Change what a `read_file` for `path` answers, without touching the mirror. */
+  /**
+   * Change what a `read_file` for `path` answers, without touching the mirror.
+   *
+   * A path the fixture supplied stays auto-served and simply answers the new
+   * bytes. A path it did not — an entries-only harness has no sources at all —
+   * is recorded here and answered by the case, which is what lets a `process`
+   * case see the read request itself.
+   */
   setFileContent(path: string, content: string): void {
     this.sources.set(path, content);
-    this.autoServeFiles({ [path]: content });
+    if (this.autoServed.has(path)) this.autoServeFiles({ [path]: content });
+  }
+
+  /** What a case last said `path` contains, or `undefined` if it never said. */
+  fileContent(path: string): string | undefined {
+    return this.sources.get(path);
   }
 
   revisionOf(path: string): string {
@@ -202,14 +205,22 @@ export class ShimHarness extends MirrorHarness {
     return revision;
   }
 
-  /** Drive a plugin-visible write all the way through the gate and the daemon. */
+  /**
+   * Drive a plugin-visible write all the way through the gate and the daemon.
+   *
+   * Three steps, because a shim write is three: the `write_file` the adapter
+   * sends, the answer, and the refetch `applyMutation` issues to make the
+   * mirror read-your-writes consistent. A helper that answered only the first
+   * would hand back a promise that never settles.
+   */
   async writeNote(path: string, content: string): Promise<void> {
     const writing = this.vault.adapter.write(path, content);
     const request = await this.expectRequest("write_file");
     const generation = this.mirror.generation() + 1;
     const revision = `blake3:written-${String(generation)}`;
-    this.respondOk(request.id, "write_file", { generation, revision, path });
+    this.respondOk(request.id, "write_file", { generation, revision, semantic: true });
     this.setFileContent(path, content);
+    await this.answerRefetch(generation, [{ path, revision }]);
     await writing;
   }
 
@@ -221,7 +232,7 @@ export class ShimHarness extends MirrorHarness {
    * the wire has no rename, so the pairing is the shim's own work and has to be
    * observable to be tested.
    */
-  emitBatch(batch: {
+  async emitBatch(batch: {
     generation: number;
     created?: string[];
     modified?: string[];
@@ -238,15 +249,19 @@ export class ShimHarness extends MirrorHarness {
       cause: null,
       synthetic: false,
     };
-    return this.vault.applyBatch(change, { sizes: batch.sizes ?? {} });
+    const applied = this.vault.applyBatch(change, { sizes: batch.sizes ?? {} });
+    await this.quiesce();
+    return applied;
   }
 
   /**
-   * Answer the read and the write one `vault.process()` issues, in that order.
+   * Answer the read, the write, and the refetch one `vault.process()` issues,
+   * in that order.
    *
-   * `process` is read-modify-write with a precondition, so a test that answered
-   * only the read would hang on the write and a test that answered them out of
-   * order would deadlock. One helper, one order, in one place.
+   * `process` is read-modify-write with a precondition and a read-your-writes
+   * refetch behind it, so a test that answered only the read would hang on the
+   * write and one that stopped at the write would hang on the refetch. One
+   * helper, one order, in one place.
    */
   async settleProcess(
     path: string,
@@ -257,49 +272,17 @@ export class ShimHarness extends MirrorHarness {
   ): Promise<void> {
     const reading = await this.expectRequest("read_file");
     this.respondReadFile(reading.id, read, readRevision);
-    const writing = await this.expectRequest("write_file");
-    this.respondOk(writing.id, "write_file", { generation, revision: newRevision, path });
+    const writing = await this.expectRequest("write_note");
+    this.respondOk(writing.id, "write_note", { generation, revision: newRevision });
+    await this.answerRefetch(generation, [{ path, revision: newRevision }]);
     await this.quiesce();
   }
 
-  /** Every menu item the loaded plugins contribute for `path`, in order. */
-  async listMenuItems(
-    context: "file-menu" | "editor-menu",
-    path: string,
-  ): Promise<HarvestedMenuItem[]> {
-    const items = await this.harvest.menuItems(context, path);
-    return [...items];
-  }
-
-  async invokeMenuItem(itemId: string, path: string): Promise<void> {
-    await this.harvest.invokeMenuItem(itemId, path);
-    await this.quiesce();
-  }
-
-  async invokeProtocol(action: string, params: Record<string, string>): Promise<void> {
-    await this.api.protocolHandlers.invoke(action, params);
-    await this.quiesce();
-  }
-
-  /** Every path a plugin asked the workspace to open, in order. */
-  openFileIntents(): readonly string[] {
-    return this.app.workspace.openFileIntents();
-  }
-
-  /**
-   * How many plugin-registered timers are armed.
-   *
-   * Not the {@link TestClock}'s count: plugin-facing timers deliberately use
-   * the real globals — a plugin observing a frozen clock is a plugin observing
-   * a lie — and are cleaned up by the component registry instead. This counts
-   * those, which is what an unload-leak test is actually asking about.
-   */
-  activeTimerCount(): number {
-    return this.api.components.activeTimerCount();
-  }
-
-  override async stop(): Promise<void> {
-    for (const id of [...this.plugins.keys()]) await this.unload(id);
-    await super.stop();
-  }
+  // activated by Task 10:  listMenuItems / invokeMenuItem — both go through
+  // `Harvest`, which that task creates.
+  // activated by Task 11b: invokeProtocol — `ObsidianApi.protocolHandlers`.
+  // activated by Task 10:  openFileIntents — `app.workspace`.
+  // activated by Task 11b: activeTimerCount — `ObsidianApi.components`. It
+  // counts plugin-registered timers, which deliberately use the real globals
+  // rather than the `TestClock`, and are cleaned up by the component registry.
 }
