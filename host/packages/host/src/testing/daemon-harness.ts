@@ -41,6 +41,9 @@ export class DaemonHarness {
   private readonly answered = new Set<string>();
   private readonly servers: RequestServer[] = [];
   private files: Record<string, string> = {};
+  /** Paths that must answer `not_found` — see {@link unserveFile}. */
+  private readonly absent = new Set<string>();
+  private serving = false;
   private stopped = false;
 
   protected constructor(overrides: Partial<HostConfig> = {}) {
@@ -131,13 +134,53 @@ export class DaemonHarness {
 
   /** Answer every `read_file` for a known fixture path automatically. */
   autoServeFiles(files: Record<string, string>): void {
-    const first = Object.keys(this.files).length === 0;
     this.files = { ...this.files, ...files };
-    if (!first) return;
+    for (const path of Object.keys(files)) this.absent.delete(path);
+    this.installFileServer();
+  }
+
+  /**
+   * Stop serving `path`, and answer `not_found` for it from now on.
+   *
+   * The counterpart {@link autoServeFiles} cannot be: that method **merges**, so
+   * once a path has been served there is no argument to it that un-serves one.
+   * And "absent" is a state a config-zone test genuinely needs — Obsidian
+   * having no `community-plugins.json` at all is not the same claim as Obsidian
+   * having one that enables nothing, and Task 14's coexistence cases turn on
+   * exactly that difference.
+   *
+   * It answers rather than falls silent on purpose. A path simply forgotten
+   * would drop through to the request queue, where nothing would answer it and
+   * the subject would wait forever; the daemon's own answer for a file that is
+   * not there is a `not_found` error, so that is what this gives.
+   */
+  unserveFile(path: string): void {
+    const remaining = { ...this.files };
+    delete remaining[path];
+    this.files = remaining;
+    this.absent.add(path);
+    this.installFileServer();
+  }
+
+  /**
+   * Install the `read_file` hook, once.
+   *
+   * Guarded by a flag rather than by "is the file map empty", which was wrong in
+   * two directions: a first call that passed no files left the flag unset, so
+   * the second call installed a second hook, and {@link unserveFile} emptying
+   * the map would have done the same.
+   */
+  private installFileServer(): void {
+    if (this.serving) return;
+    this.serving = true;
     this.serve((request) => {
       if (request.request.method !== "read_file") return false;
       const path = (request.request.params as { path?: string } | undefined)?.path;
       if (path === undefined) return false;
+      if (this.absent.has(path)) {
+        this.respondErr(request.id, { code: "not_found", message: `${path} does not exist` });
+        return true;
+      }
       const content = this.files[path];
       if (content === undefined) return false;
       this.respondReadFile(request.id, content, revisionOfSource(content));

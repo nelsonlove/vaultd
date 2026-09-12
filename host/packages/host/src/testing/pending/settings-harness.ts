@@ -19,9 +19,9 @@
 
 import { DaemonHarness } from "./daemon-harness";
 import { DataDir } from "../datadir";
-import { PluginConfigService } from "../shim/plugin-config";
-import { SchemaLadder } from "../shim/schema-ladder";
-import type { CachedSchema } from "../shim/schema-ladder";
+import { PluginConfigService } from "../settings/plugin-config";
+import { SchemaLadder } from "../settings/ladder";
+import type { CachedSchema } from "../settings/ladder";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 
 export interface SettingsTabSpec {

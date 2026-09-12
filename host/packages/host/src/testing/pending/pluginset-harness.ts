@@ -19,8 +19,8 @@
  */
 
 import { DaemonHarness } from "./daemon-harness";
-import { CoexistenceMonitor } from "../shim/coexistence";
-import { HeadlessConfigDir } from "../shim/config-dir";
+import { CoexistenceMonitor } from "../pluginset/coexistence";
+import { HeadlessConfigDir } from "../pluginset/config-dir";
 import type { PluginManifest } from "../shim/plugin";
 
 export interface PluginSetSpec {
@@ -58,8 +58,19 @@ export class PluginSetHarness extends DaemonHarness {
     return harness;
   }
 
+  /**
+   * What Obsidian's own config directory says — or that there is none.
+   *
+   * `null` is not an empty list. "Obsidian has no `community-plugins.json`" and
+   * "Obsidian has one that enables nothing" are different facts, and the
+   * monitor is required to treat them differently, so the harness has to be
+   * able to express both: the `null` arm un-serves the path through
+   * {@link DaemonHarness.unserveFile}, which makes the next read answer
+   * `not_found` the way the daemon would.
+   */
   setGuiEnabled(ids: string[] | null): void {
     this.guiEnabled = ids === null ? null : [...ids];
+    if (this.guiEnabled === null) this.unserveFile(".obsidian/community-plugins.json");
     this.serveConfigZone([]);
   }
 
@@ -83,11 +94,10 @@ export class PluginSetHarness extends DaemonHarness {
   /**
    * Answer every config-zone read from this harness's current state.
    *
-   * Re-registered on each change rather than mutated in place, because
-   * `autoServeFiles` merges: a path that must answer *absent* — Obsidian's
-   * `community-plugins.json` when `guiEnabled` is `null` — cannot be expressed
-   * by adding an entry, only by not having one and letting the `not_found`
-   * arm answer.
+   * This only ever *adds*: `autoServeFiles` merges, so the absent case —
+   * Obsidian's `community-plugins.json` when `guiEnabled` is `null` — cannot be
+   * expressed here at all. {@link setGuiEnabled} calls `unserveFile` for that,
+   * which is the only way to take a path back off the wire.
    */
   private serveConfigZone(installed: readonly PluginManifest[]): void {
     const files: Record<string, string> = {

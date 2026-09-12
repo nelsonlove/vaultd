@@ -25,10 +25,10 @@ import type { App } from "../shim/app";
 import type { ObsidianApi } from "../shim/api";
 import type { AppliedBatch, Vault } from "../shim/vault";
 import type { Harvest, HarvestedMenuItem } from "../shim/harvest";
-import type { NoticeLog } from "../shim/notice-log";
+import type { NoticeLog } from "../shim/notice";
 import type { Plugin, PluginManifest } from "../shim/plugin";
-import type { PolicyRecorder } from "../shim/policy-recorder";
-import type { WriteGate } from "../shim/write-gate";
+import type { PolicyRecorder } from "../shim/policy";
+import type { WriteGate } from "../dryrun/dry-run";
 import type { FixtureEntry } from "./mirror-harness";
 
 export interface ShimHarnessOptions {

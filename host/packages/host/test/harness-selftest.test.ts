@@ -13,7 +13,15 @@
  * `tsconfig.json` and `vitest.config.ts`.
  */
 
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,8 +30,26 @@ import { describe, expect, it } from "vitest";
 import { DataDir } from "../src/datadir";
 import { testClock } from "../src/testing/clock";
 import { DaemonHarness } from "../src/testing/daemon-harness";
-import { FixtureVault, parseFixtureRow } from "../src/testing/fixture-vault";
+import {
+  FixtureVault,
+  fixtureCacheDir,
+  fixtureGeneratorSpawns,
+  parseFixtureRow,
+} from "../src/testing/fixture-vault";
 import { MirrorHarness } from "../src/testing/mirror-harness";
+
+/**
+ * Every case that can reach the fixture generator gets this instead of vitest's
+ * five seconds.
+ *
+ * A cache miss shells out to `cargo run`, and a `cargo run` whose `target/` is
+ * cold links the daemon first — minutes, not seconds, and measured at 231 s on
+ * this machine after a toolchain switch invalidated the debug profile. The
+ * five-second default turns that into a test failure that says "timed out"
+ * rather than "your build is cold", which is the least useful sentence
+ * available. A warm cache answers these in single-digit milliseconds.
+ */
+const FIXTURE_TIMEOUT_MS = 600_000;
 
 describe("TestClock", () => {
   it("fires timers in due order and advances now()", async () => {
@@ -39,6 +65,33 @@ describe("TestClock", () => {
     expect(fired).toEqual(["early", "late"]);
     expect(clock.now()).toBe(1060);
     expect(clock.armed()).toBe(0);
+  });
+
+  it("fires two timers due inside one advance in due order, not registration order", async () => {
+    // The case above never exercises the comparator: each `advance` admits one
+    // candidate, so a clock that fired in registration order would pass it.
+    // This one arms in reverse due order and lets both come due at once, which
+    // is the only shape that can tell the two orderings apart.
+    const clock = testClock(1000);
+    const fired: string[] = [];
+    clock.setTimeout(() => fired.push("late"), 50);
+    clock.setTimeout(() => fired.push("early"), 10);
+    await clock.advance(100);
+    expect(fired).toEqual(["early", "late"]);
+    expect(clock.now()).toBe(1100);
+    expect(clock.armed()).toBe(0);
+  });
+
+  it("advances now() to each timer's due time as it fires it", async () => {
+    // The callback reads the clock, so an implementation that fired everything
+    // and then jumped to the target would be caught: a timer must observe the
+    // moment it was due, not the end of the window.
+    const clock = testClock(1000);
+    const seen: number[] = [];
+    clock.setTimeout(() => seen.push(clock.now()), 50);
+    clock.setTimeout(() => seen.push(clock.now()), 10);
+    await clock.advance(100);
+    expect(seen).toEqual([1010, 1050]);
   });
 
   it("re-arms an interval and stops when cleared", async () => {
@@ -93,6 +146,56 @@ describe("DaemonHarness", () => {
     expect(answer.revision).toBe("blake3:a1");
     await harness.stop();
   });
+
+  it("serves a file, then reports it absent once it is unserved", async () => {
+    // `autoServeFiles` merges, so it can never take a path away — and "the file
+    // is not there" is a state the config-zone tests need: Obsidian having no
+    // `community-plugins.json` is a different claim from Obsidian having one
+    // that enables nothing.
+    const harness = DaemonHarness.create();
+    harness.autoServeFiles({ ".obsidian/community-plugins.json": '["dataview"]' });
+
+    const served = harness.client.request<{ content_base64: string }>("read_file", {
+      path: ".obsidian/community-plugins.json",
+    });
+    await expect(served).resolves.toMatchObject({
+      content_base64: Buffer.from('["dataview"]', "utf8").toString("base64"),
+    });
+
+    harness.unserveFile(".obsidian/community-plugins.json");
+    // Answered, not forgotten: a path left unanswered would hang the subject
+    // rather than tell it the file is gone.
+    await expect(
+      harness.client.request("read_file", { path: ".obsidian/community-plugins.json" }),
+    ).rejects.toMatchObject({ code: "not_found" });
+
+    // And it can come back, because a file can.
+    harness.autoServeFiles({ ".obsidian/community-plugins.json": "[]" });
+    const again = await harness.client.request<{ content_base64: string }>("read_file", {
+      path: ".obsidian/community-plugins.json",
+    });
+    expect(Buffer.from(again.content_base64, "base64").toString("utf8")).toBe("[]");
+    await harness.stop();
+  });
+
+  it("installs one read_file hook however many times files are registered", async () => {
+    // The first call passed nothing, which under the old "is the map empty"
+    // guard left the hook uninstalled and let the second call add a second one.
+    const harness = DaemonHarness.create();
+    harness.autoServeFiles({});
+    harness.autoServeFiles({ "a.md": "one" });
+    harness.autoServeFiles({ "b.md": "two" });
+
+    const first = await harness.client.request<{ content_base64: string }>("read_file", {
+      path: "a.md",
+    });
+    expect(Buffer.from(first.content_base64, "base64").toString("utf8")).toBe("one");
+    // A duplicate hook would answer the same request twice, and the second
+    // answer would arrive for an id the client has already settled.
+    await harness.quiesce();
+    expect(harness.pendingRequests()).toEqual([]);
+    await harness.stop();
+  });
 });
 
 describe("MirrorHarness", () => {
@@ -122,7 +225,7 @@ describe("FixtureVault and the real parser", () => {
     // Structural extraction must be present, or the pre-task did not land and
     // the parity fixtures would silently compare empty arrays.
     expect(row.sections.length).toBeGreaterThan(0);
-  });
+  }, FIXTURE_TIMEOUT_MS);
 
   it("resolves links across the vault it was given", () => {
     const vault = new FixtureVault({ "A.md": "[[B]]\n", "B.md": "# B\n" });
@@ -130,7 +233,43 @@ describe("FixtureVault and the real parser", () => {
     expect(a?.outgoing?.map((reference) => reference.resolution)).toEqual([
       { kind: "resolved", target: "B.md", subpath: null },
     ]);
-  });
+  }, FIXTURE_TIMEOUT_MS);
+
+  it("parses a whole vault in one spawn, not one per file", () => {
+    // The claim is "one batch, one spawn", and a cold `cargo run` is seconds —
+    // Task 7 calls `withVault` in every shim test file, so three files costing
+    // three spawns instead of one is the difference between a suite that runs
+    // and a suite nobody waits for.
+    //
+    // The sources carry a per-run marker so this always misses the cache;
+    // without it a second run would hit and measure nothing. The three files it
+    // leaves behind are removed at the end — they are this case's own
+    // scratch, and they would otherwise accumulate one set per run.
+    const marker = `${String(process.pid)}-${String(Date.now())}`;
+    const before = readdirSync(fixtureCacheDir());
+    const spawnsBefore = fixtureGeneratorSpawns();
+
+    const vault = new FixtureVault({
+      "One.md": `# One ${marker}\n\n[[Two]]\n`,
+      "Two.md": `# Two ${marker}\n\n[[Three]]\n`,
+      "Three.md": `# Three ${marker}\n`,
+    });
+    expect(vault.notes().map((note) => note.path)).toEqual(["One.md", "Three.md", "Two.md"]);
+    expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
+
+    // And the batch really did write one cache file per note, together.
+    const after = readdirSync(fixtureCacheDir());
+    const fresh = after.filter((name) => !before.includes(name));
+    expect(fresh).toHaveLength(3);
+
+    // Reading the same vault again spawns nothing: the rows are memoized on the
+    // instance, and a second instance answers from those same cache files.
+    const again = new FixtureVault(vault.files);
+    expect(again.notes()).toHaveLength(3);
+    expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
+
+    for (const name of fresh) rmSync(join(fixtureCacheDir(), name));
+  }, FIXTURE_TIMEOUT_MS);
 
   it("synthesizes folders into the entry tree", () => {
     const vault = new FixtureVault({ "Folder/Sub/A.md": "x\n", "B.md": "y\n" });
@@ -140,7 +279,7 @@ describe("FixtureVault and the real parser", () => {
         .map((entry) => `${entry.kind}:${entry.path}`)
         .sort(),
     ).toEqual(["folder:Folder", "folder:Folder/Sub", "note:B.md", "note:Folder/Sub/A.md"]);
-  });
+  }, FIXTURE_TIMEOUT_MS);
 
   it("bumps a revision on write and serves the new source", () => {
     const vault = new FixtureVault({ "A.md": "one\n" });
@@ -148,7 +287,7 @@ describe("FixtureVault and the real parser", () => {
     vault.write("A.md", "two\n");
     expect(vault.source("A.md")).toBe("two\n");
     expect(vault.revisionOf("A.md")).not.toBe(before);
-  });
+  }, FIXTURE_TIMEOUT_MS);
 });
 
 describe("DataDir", () => {
@@ -166,6 +305,28 @@ describe("DataDir", () => {
     dir.writeSecret("nonce", "abcd");
     expect(readFileSync(join(root, "nonce"), "utf8")).toBe("abcd");
     expect(statSync(join(root, "nonce")).mode & 0o777).toBe(0o600);
+  });
+
+  it("narrows a secret rewritten over a world-readable file", () => {
+    // The half the write's own `mode` cannot do: `mode` is ignored for a file
+    // that already exists, so without the chmod a nonce written over anything
+    // left at 0644 would stay readable by everyone.
+    const root = mkdtempSync(join(tmpdir(), "vaultd-dd-"));
+    const dir = new DataDir(root);
+    writeFileSync(join(root, "nonce"), "stale", { encoding: "utf8", mode: 0o644 });
+    chmodSync(join(root, "nonce"), 0o644);
+    dir.writeSecret("nonce", "abcd");
+    expect(statSync(join(root, "nonce")).mode & 0o777).toBe(0o600);
+  });
+
+  it("reads a secret back as text, and answers null for one that is not there", () => {
+    // `readJson` would `JSON.parse` a raw nonce and throw; this is the reader
+    // that matches `writeSecret`.
+    const dir = new DataDir(mkdtempSync(join(tmpdir(), "vaultd-dd-")));
+    expect(dir.readText("nonce")).toBeNull();
+    dir.writeSecret("nonce", "9f2c1ab4");
+    expect(dir.readText("nonce")).toBe("9f2c1ab4");
+    expect(() => dir.readJson("nonce")).toThrow();
   });
 
   it("round-trips JSON and answers null for a file that is not there", () => {

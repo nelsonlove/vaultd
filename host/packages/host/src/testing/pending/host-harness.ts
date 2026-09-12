@@ -19,17 +19,17 @@ import type { Socket } from "node:net";
 
 import { ShimHarness } from "./shim-harness";
 import { FixtureVault } from "./fixture-vault";
-import { HostServer } from "../server/host-server";
-import { DryRunGate } from "../shim/dry-run";
-import { InteractionBroker } from "../shim/interaction-broker";
-import { LifecycleSequencer } from "../shim/lifecycle";
-import { QuarantineTracker } from "../shim/quarantine";
-import { Detector } from "../shim/detector";
+import { HostServer } from "../server/server";
+import { DryRunGate } from "../dryrun/dry-run";
+import { InteractionBroker } from "../interaction/broker";
+import { LifecycleSequencer } from "../runtime/lifecycle";
+import { QuarantineTracker } from "../runtime/quarantine";
+import { Detector } from "../detector/scanner";
 import { DataDir } from "../datadir";
 import { fs } from "../runtime/fs-access";
 import type { HostConfig } from "../config";
 import type { App } from "../shim/app";
-import type { CoexistenceMonitor } from "../shim/coexistence";
+import type { CoexistenceMonitor } from "../pluginset/coexistence";
 import type { ObsidianApi } from "../shim/api";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 import type { ShimHarnessOptions } from "./shim-harness";
@@ -62,6 +62,16 @@ export class HostHarness extends ShimHarness {
   readonly detector: Detector;
   readonly coexistence: CoexistenceMonitor;
 
+  /**
+   * The vault this harness is pretending to be the daemon for.
+   *
+   * Named `fixtures` rather than `vault` because `ShimHarness.vault` is the
+   * *shim's* `Vault` — the object a plugin holds — and the two are opposite
+   * sides of the same wire. This one is the daemon's side, and it is kept live
+   * rather than discarded after hydration so that a change set committed later
+   * can be answered from what the vault actually holds.
+   */
+  private fixtures: FixtureVault;
   private readonly clients: HostTestClient[] = [];
   private readonly handlerErrors = new Map<string, Error>();
   private readonly dataDir: DataDir;
@@ -149,6 +159,7 @@ export class HostHarness extends ShimHarness {
     if (spec.suppressLayoutReady === true) options.layoutReady = false;
     super(options);
     this.guiEnabled = spec.guiEnabled ?? null;
+    this.fixtures = new FixtureVault(spec.vault);
     this.dataDir = new DataDir(this.config.dataDir);
     this.lifecycle = new LifecycleSequencer({ config: this.config, clock: this.clock });
     this.quarantine = new QuarantineTracker({ config: this.config, clock: this.clock });
@@ -160,13 +171,12 @@ export class HostHarness extends ShimHarness {
   }
 
   static async create(spec: HostHarnessSpec): Promise<HostHarness> {
-    const vault = new FixtureVault(spec.vault);
     const harness = new HostHarness(spec);
     harness.seedConfigZone(spec);
     await harness.openMirror({
       generation: 1,
-      entries: vault.entries(),
-      notes: vault.notes(),
+      entries: harness.fixtures.entries(),
+      notes: harness.fixtures.notes(),
     });
     await harness.boot(spec);
     return harness;
@@ -223,6 +233,18 @@ export class HostHarness extends ShimHarness {
    * that is what this expands to, and the shim's pairing is what has to put
    * them back together. A helper that sent a rename event would be testing a
    * message the daemon never sends.
+   *
+   * **It answers its own refetch, and it has to.** A mirror handed a change set
+   * asks `get_tree_entries` and then one `get_note` per surviving note; nothing
+   * else in this harness answers those — `autoServeFiles` serves `read_file`
+   * and nothing more — so a version that only awaited `applyMutation` could
+   * never resolve. The answers come from {@link fixtures}, which is moved to
+   * match the change first, so what the harness tells the mirror is what the
+   * vault now holds rather than a second hand-written account of it.
+   *
+   * `sources` is where a created or modified path's new bytes come from. A
+   * created path named nowhere in it becomes an empty note, which is a real
+   * thing a vault can contain and not a placeholder.
    */
   async commitGeneration(change: {
     generation?: number;
@@ -230,15 +252,40 @@ export class HostHarness extends ShimHarness {
     modified?: string[];
     deleted?: string[];
     renamed?: Array<{ from: string; to: string }>;
+    sources?: Record<string, string>;
   }): Promise<void> {
+    const renamed = change.renamed ?? [];
     const generation = change.generation ?? this.mirror.generation() + 1;
-    const created = [...(change.created ?? []), ...(change.renamed ?? []).map((pair) => pair.to)];
-    const deleted = [...(change.deleted ?? []), ...(change.renamed ?? []).map((pair) => pair.from)];
-    await this.mirror.applyMutation(generation, [
-      ...created,
-      ...(change.modified ?? []),
-      ...deleted,
-    ]);
+    const created = [...(change.created ?? []), ...renamed.map((pair) => pair.to)];
+    const modified = [...(change.modified ?? [])];
+    const deleted = [...(change.deleted ?? []), ...renamed.map((pair) => pair.from)];
+
+    // Move the bytes the way the vault moved them, before answering anything
+    // about them. A rename carries its source across, which is what makes the
+    // new path's revision equal the old one's — and revision equality is how
+    // the shim pairs the delete with the create back into a rename.
+    for (const pair of renamed) {
+      this.fixtures.write(pair.to, this.fixtures.source(pair.from));
+      this.fixtures.remove(pair.from);
+    }
+    for (const [path, source] of Object.entries(change.sources ?? {})) {
+      this.fixtures.write(path, source);
+    }
+    for (const path of created) {
+      if (!(path in this.fixtures.files)) this.fixtures.write(path, "");
+    }
+    for (const path of deleted) this.fixtures.remove(path);
+
+    const applying = this.mirror.applyMutation(generation, [...created, ...modified, ...deleted]);
+    // The mirror asks for more paths than the change set named — the ancestors
+    // of everything created, the referrers of everything deleted — so the
+    // answer is the whole tree, filtered by what is still there, and
+    // `answerRefetch` picks out whichever of them it was actually asked about.
+    await this.answerRefetch(generation, this.fixtures.notes(), {
+      entries: this.fixtures.entries(),
+      absent: deleted,
+    });
+    await applying;
     await this.quiesce();
   }
 
@@ -250,7 +297,9 @@ export class HostHarness extends ShimHarness {
    * re-hydrates and publishes one synthetic batch; nothing calls `onunload`.
    */
   async restartEngine(spec: { generation: number; vault: Record<string, string> }): Promise<void> {
-    const vault = new FixtureVault(spec.vault);
+    // The new engine's vault replaces this harness's, so a change set committed
+    // after the restart is answered from what the engine now serves.
+    this.fixtures = new FixtureVault(spec.vault);
     // The daemon's own signal, not a method call: an engine that restarted
     // tells its clients `resync_required`, and the mirror's answer to that is
     // a fresh hydration walk plus one synthetic batch. Driving it any other way
@@ -261,8 +310,8 @@ export class HostHarness extends ShimHarness {
     } as never);
     await this.answerHydration({
       generation: spec.generation,
-      entries: vault.entries(),
-      notes: vault.notes(),
+      entries: this.fixtures.entries(),
+      notes: this.fixtures.notes(),
     });
     await this.quiesce();
   }
@@ -305,8 +354,15 @@ export class HostHarness extends ShimHarness {
     return this.dataDir.resolve("nonce");
   }
 
+  /**
+   * The nonce exactly as it sits on disk.
+   *
+   * Text, not JSON: `DataDir.writeSecret` writes its argument verbatim, so a
+   * nonce written as raw hex — the obvious thing for Task 21 to write — would
+   * make a `readJson` here throw on the first character.
+   */
   readNonce(): string {
-    const nonce = this.dataDir.readJson<string>("nonce");
+    const nonce = this.dataDir.readText("nonce");
     if (nonce === null) throw new Error("the host wrote no nonce");
     return nonce;
   }

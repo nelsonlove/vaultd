@@ -27,12 +27,13 @@ import type { ChildProcess } from "node:child_process";
 import { join } from "node:path";
 
 import { assembleShim } from "./assemble";
+import { workspaceRoot } from "./fixture-vault";
 import { fs } from "../runtime/fs-access";
 import { VaultdClient } from "../client/client";
 import { Mirror } from "../mirror/mirror";
 import { defaultHostConfig, systemClock } from "../config";
-import { HostServer } from "../server/host-server";
-import { QuarantineTracker } from "../shim/quarantine";
+import { HostServer } from "../server/server";
+import { QuarantineTracker } from "../runtime/quarantine";
 import type { HostConfig } from "../config";
 import type { App } from "../shim/app";
 import type { Harvest } from "../shim/harvest";
@@ -117,7 +118,9 @@ export class LiveHost {
     id: string,
     files: Record<string, string>,
   ): Promise<LiveHost> {
-    const root = fs.mkdtempSync(join(process.cwd(), "target", "tmp", "live-host-"));
+    const temporary = join(workspaceRoot(), "target", "tmp");
+    fs.mkdirSync(temporary, { recursive: true });
+    const root = fs.mkdtempSync(join(temporary, "live-host-"));
     for (const [path, contents] of Object.entries(files)) {
       const full = join(root, path);
       fs.mkdirSync(dirnameOf(full), { recursive: true });
@@ -184,9 +187,14 @@ export class LiveHost {
  * Named rather than resolved through `PATH`: a live test must exercise *this*
  * build, and a `vaultd` that happened to be installed elsewhere would make a
  * green run mean nothing.
+ *
+ * Anchored on {@link workspaceRoot}, never `process.cwd()`. Under vitest the
+ * working directory is `host/`, so `process.cwd()` would name
+ * `host/target/release/vaultd` — a path that does not exist, which is the worst
+ * available failure for a file whose whole point is running *this* build.
  */
 function liveBinary(): string {
-  return join(process.cwd(), "target", "release", "vaultd");
+  return join(workspaceRoot(), "target", "release", "vaultd");
 }
 
 function installPlugin(config: HostConfig, id: string, from: string): void {

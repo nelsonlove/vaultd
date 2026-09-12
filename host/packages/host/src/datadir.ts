@@ -44,11 +44,17 @@ export class DataDir {
   writeJson(relative: string, value: unknown, mode?: number): void {
     const full = this.resolve(relative);
     fs.mkdirSync(dirname(full), { recursive: true });
-    fs.writeFileSync(full, JSON.stringify(value, null, 2) + "\n", "utf8");
-    // Set separately rather than through the write's `mode` option, which is
-    // applied only when the file is created — a rewrite of an existing file
-    // would silently keep whatever mode it already had.
-    if (mode !== undefined) fs.chmodSync(full, mode);
+    const body = JSON.stringify(value, null, 2) + "\n";
+    // Both, and both are load-bearing. The `mode` option applies only when the
+    // file is *created*, so on its own it would leave a rewrite of an existing
+    // file at whatever mode that file already had. `chmod` on its own would
+    // create the file at `0666 & ~umask` first and narrow it one syscall
+    // later, which is a window in which the bytes are readable by anyone.
+    if (mode === undefined) fs.writeFileSync(full, body, "utf8");
+    else {
+      fs.writeFileSync(full, body, { encoding: "utf8", mode });
+      fs.chmodSync(full, mode);
+    }
   }
 
   /**
@@ -64,6 +70,20 @@ export class DataDir {
     return JSON.parse(fs.readFileSync(full, "utf8")) as T;
   }
 
+  /**
+   * The file's bytes as text, or `null` when it is not there.
+   *
+   * {@link writeSecret}'s counterpart. A secret is written verbatim — the
+   * host's connection nonce is raw hex, not a JSON document — so reading one
+   * back through {@link readJson} would `JSON.parse` it and throw. Task 21's
+   * watchdog reads the nonce through this.
+   */
+  readText(relative: string): string | null {
+    const full = this.resolve(relative);
+    if (!fs.existsSync(full)) return null;
+    return fs.readFileSync(full, "utf8");
+  }
+
   appendLine(relative: string, line: string): void {
     const full = this.resolve(relative);
     fs.mkdirSync(dirname(full), { recursive: true });
@@ -74,14 +94,18 @@ export class DataDir {
    * Write a file only this user may read, at mode `0600` — the host's
    * connection nonce is the one in tree.
    *
-   * The mode is applied after the write for the same reason `writeJson`'s is:
-   * a file that already existed keeps its old mode otherwise, so a nonce
-   * rewritten into a world-readable file would stay world-readable.
+   * The mode is set twice, on purpose, because the two halves close different
+   * holes. The write's own `mode` applies at **creation**, so the file is never
+   * observable at `0666 & ~umask`, not even for the one syscall between the
+   * write and a later `chmod` — and a secret readable for one syscall is a
+   * secret. The `chmod` then covers the **rewrite**: `mode` is ignored for a
+   * file that already exists, so a nonce written over a `0644` file left by
+   * anything else would otherwise stay world-readable.
    */
   writeSecret(relative: string, contents: string): void {
     const full = this.resolve(relative);
     fs.mkdirSync(dirname(full), { recursive: true });
-    fs.writeFileSync(full, contents, "utf8");
+    fs.writeFileSync(full, contents, { encoding: "utf8", mode: 0o600 });
     fs.chmodSync(full, 0o600);
   }
 }
