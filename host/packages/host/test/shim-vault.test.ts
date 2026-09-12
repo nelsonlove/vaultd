@@ -14,7 +14,7 @@ describe("Vault writes", () => {
       params: { path: "A.md", content: "# changed\n", expected: { revision: "blake3:a1" } },
     });
     harness.respondOk(sent.id, "write_note", { generation: 6, revision: "blake3:a2" });
-    void harness.answerRefetch(6, [{ path: "A.md", revision: "blake3:a2" }]);
+    await harness.answerRefetch(6, [{ path: "A.md", revision: "blake3:a2" }]);
     await pending;
     expect(harness.mirror.generation()).toBe(6);
     expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a2");
@@ -29,7 +29,7 @@ describe("Vault writes", () => {
       params: { path: "New.md", content: "body\n", expected: { absent: true } },
     });
     harness.respondOk(sent.id, "write_note", { generation: 2, revision: "blake3:n1" });
-    void harness.answerRefetch(2, [{ path: "New.md", revision: "blake3:n1" }]);
+    await harness.answerRefetch(2, [{ path: "New.md", revision: "blake3:n1" }]);
     const created = await pending;
     expect(created.path).toBe("New.md");
     expect(harness.vault.getFileByPath("New.md")).toBe(created);
@@ -61,7 +61,7 @@ describe("Vault writes", () => {
       path: "A.md", content: "one\nother\ntwo\n", expected: { revision: "blake3:a2" },
     });
     harness.respondOk(writeB.id, "write_note", { generation: 8, revision: "blake3:a3" });
-    void harness.answerRefetch(8, [{ path: "A.md", revision: "blake3:a3" }]);
+    await harness.answerRefetch(8, [{ path: "A.md", revision: "blake3:a3" }]);
 
     await expect(pending).resolves.toBe("one\nother\ntwo\n");
     expect(seen).toEqual(["one\n", "one\nother\n"]);
@@ -81,6 +81,127 @@ describe("Vault writes", () => {
     await harness.settleProcess("A.md", "x1", "blake3:a2", 7, "blake3:a3");
     await second;
     expect(order).toEqual(["first", "second"]);
+  });
+
+  it("renames a note with rename_note and a folder with rename_folder", async () => {
+    const harness = await ShimHarness.withEntries([
+      { path: "A.md", kind: "note", revision: "blake3:a1" },
+      { path: "Folder", kind: "folder" },
+      { path: "Folder/B.md", kind: "note", revision: "blake3:b1" },
+    ]);
+    void harness.vault.rename(harness.vault.getFileByPath("A.md")!, "Renamed.md");
+    const note = await harness.nextRequest();
+    expect(note.request).toEqual({
+      method: "rename_note",
+      params: { from: "A.md", to: "Renamed.md", rewrite_links: true },
+    });
+
+    void harness.vault.rename(harness.vault.getFolderByPath("Folder")!, "Moved");
+    const folder = await harness.nextRequest();
+    expect(folder.request).toEqual({
+      method: "rename_folder",
+      params: { from: "Folder", to: "Moved", rewrite_links: true },
+    });
+  });
+
+  it("refetches a renamed folder's whole subtree, at both ends", async () => {
+    const harness = await ShimHarness.withEntries([
+      { path: "Folder", kind: "folder" },
+      { path: "Folder/B.md", kind: "note", revision: "blake3:b1" },
+      { path: "Folder/Sub", kind: "folder" },
+      { path: "Folder/Sub/C.md", kind: "note", revision: "blake3:c1" },
+    ]);
+    const pending = harness.vault.rename(harness.vault.getFolderByPath("Folder")!, "Moved");
+    const sent = await harness.expectRequest("rename_folder");
+    harness.respondOk(sent.id, "rename_folder", {
+      generation: 9,
+      links_rewritten: 0,
+      link_rewrite_failures: [],
+    });
+    // The wire named two paths and moved six rows. Every one of them has to be
+    // in the refetch, or the destination subtree is lost for good.
+    const asked = await harness.answerRefetch(9, [
+      { path: "Moved/B.md", revision: "blake3:b1" },
+      { path: "Moved/Sub/C.md", revision: "blake3:c1" },
+    ], {
+      entries: [
+        { path: "Moved", kind: "folder" },
+        { path: "Moved/Sub", kind: "folder" },
+      ],
+    });
+    await pending;
+    expect([...asked].sort()).toEqual([
+      "Folder",
+      "Folder/B.md",
+      "Folder/Sub",
+      "Folder/Sub/C.md",
+      "Moved",
+      "Moved/B.md",
+      "Moved/Sub",
+      "Moved/Sub/C.md",
+    ]);
+    expect(harness.mirror.entries().map((entry) => entry.path).sort()).toEqual([
+      "Moved",
+      "Moved/B.md",
+      "Moved/Sub",
+      "Moved/Sub/C.md",
+    ]);
+  });
+
+  it("copies with if_exists error, so a copy never silently suffixes", async () => {
+    const harness = await ShimHarness.withEntries([
+      { path: "A.md", kind: "note", revision: "blake3:a1" },
+    ]);
+    void harness.vault.copy(harness.vault.getFileByPath("A.md")!, "B.md");
+    const sent = await harness.nextRequest();
+    expect(sent.request).toEqual({
+      method: "copy_file",
+      params: { from: "A.md", to: "B.md", if_exists: "error" },
+    });
+  });
+
+  it("refuses to delete a folder that has something in it without force", async () => {
+    const harness = await ShimHarness.withEntries([
+      { path: "Folder", kind: "folder" },
+      { path: "Folder/A.md", kind: "note", revision: "blake3:a1" },
+    ]);
+    const folder = harness.vault.getFolderByPath("Folder")!;
+    await expect(harness.vault.delete(folder)).rejects.toMatchObject({
+      code: "folder_not_empty",
+      path: "Folder",
+    });
+    // Nothing was sent: the refusal is this host's, before the wire.
+    await harness.quiesce();
+    expect(harness.pendingRequests()).toEqual([]);
+
+    void harness.vault.delete(folder, true);
+    const sent = await harness.nextRequest();
+    expect(sent.request).toEqual({
+      method: "delete_folder",
+      params: { path: "Folder", mode: "permanent", recursive: true },
+    });
+  });
+
+  it("reads getConfig from .obsidian/app.json when the host directory has none", async () => {
+    const harness = await ShimHarness.withEntries([], {
+      configFiles: { ".obsidian/app.json": '{"attachmentFolderPath":"Attachments"}' },
+    });
+    await harness.vault.configReady();
+    // Synchronous, and right on the first call: Obsidian's own signature has
+    // nowhere to await, so the prime happens at assembly.
+    expect(harness.vault.getConfig("attachmentFolderPath")).toBe("Attachments");
+    expect(harness.vault.getConfig("nothingIsHere")).toBeUndefined();
+  });
+
+  it("prefers the host directory's app.json over .obsidian's", async () => {
+    const harness = await ShimHarness.withEntries([], {
+      configFiles: {
+        ".obsidian-headless/app.json": '{"attachmentFolderPath":"Headless"}',
+        ".obsidian/app.json": '{"attachmentFolderPath":"Attachments"}',
+      },
+    });
+    await harness.vault.configReady();
+    expect(harness.vault.getConfig("attachmentFolderPath")).toBe("Headless");
   });
 
   it("maps the three deletion forms to the three modes", async () => {

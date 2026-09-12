@@ -1107,17 +1107,48 @@ export class Mirror implements MirrorQuery {
    * rows are installed, so it is no longer part of the answer this promise
    * carries — the write succeeded — and it is attributable to no event,
    * because there was none. See `reWarm`.
+   *
+   * **A folder named here is expanded into its subtree**, against the state
+   * this mirror holds at the moment the mutation runs. A caller that renames or
+   * deletes a folder knows one path; the rows that move are every row under it,
+   * and the wire's answer names none of them. Without the expansion the mirror
+   * advanced `appliedThrough` past the generation that moved them, the
+   * `generation_committed` describing it was then dropped by the staleness
+   * guard, and the descendants were gone from this host until a resync — a
+   * silent, permanent loss, found in review against the real daemon. The shim
+   * also names the destination paths it can compute; this closes the half the
+   * shim cannot, because a caller that names only a folder can never orphan
+   * what is under it.
    */
   applyMutation(generation: number, paths: readonly string[]): Promise<void> {
     return this.enqueue(async () => {
       // `event: null` — a mutation is this host's own write, not a generation
       // somebody told it about, so a warm failure here is attributable to no
       // event.
-      await this.applyChangeSet(generation, "mutation", [], paths, [], {
+      await this.applyChangeSet(generation, "mutation", [], this.expandFolders(paths), [], {
         guarded: false,
         event: null,
       });
     });
+  }
+
+  /**
+   * Every path in `paths`, plus the whole subtree of any of them this mirror
+   * currently holds as a folder.
+   *
+   * Read inside the queued task, so the state it walks is the state the
+   * refetch is about to correct. A destination folder that does not exist here
+   * yet expands to nothing, which is why the shim names the destination paths
+   * as well.
+   */
+  private expandFolders(paths: readonly string[]): string[] {
+    const expanded = new Set<string>();
+    for (const path of paths) {
+      expanded.add(path);
+      if (this.state.entries.get(path)?.kind !== "folder") continue;
+      for (const under of this.state.subtreePaths(path)) expanded.add(under);
+    }
+    return [...expanded];
   }
 
   /**

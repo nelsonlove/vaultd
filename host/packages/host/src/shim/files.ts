@@ -76,11 +76,15 @@ export class TFolder extends TAbstractFile {
   children: TAbstractFile[] = [];
 
   /**
-   * Obsidian's own test is a path test, and so is this one: the vault root is
-   * the only folder with no parent, and it is the folder `getRoot()` answers.
+   * Obsidian's own test is a path test, and so is this one.
+   *
+   * Not "has no parent": a folder the mirror will never hold — the config zone
+   * folder a plugin host creates for a plugin's own data — is handed back
+   * parentless because there is no tree to hang it in, and it is emphatically
+   * not the vault root.
    */
   isRoot(): boolean {
-    return this.parent === null;
+    return this.path === ROOT_PATH;
   }
 }
 
@@ -236,6 +240,19 @@ export class FileIndex {
     return this.install(entry);
   }
 
+  /**
+   * A `TFolder` for a path this index will never hold a row for.
+   *
+   * The config zone is not indexed, so `create_folder` there answers no
+   * generation and the mirror never learns of it — but a plugin host has to
+   * make `<configDir>/plugins/<id>/` and Obsidian hands back a `TFolder` when
+   * it does. This is that folder: real enough to carry a path and a name, not
+   * in the tree, and not the root (see {@link TFolder.isRoot}).
+   */
+  detachedFolder(path: string): TFolder {
+    return new TFolder(this.vault, path, basenameOf(path), null);
+  }
+
   get(path: string): TAbstractFile | undefined {
     if (path === ROOT_PATH || path === "") return this.rootFolder;
     return this.nodes.get(path);
@@ -388,12 +405,15 @@ function synthesizeEntry(
   options: ApplyBatchOptions,
 ): MirrorEntry {
   const stat = synthesizeStat(batch);
+  const revision = batch.revisions[path] ?? null;
   return {
     path,
-    kind: isNotePath(path) ? "note" : "file",
+    // A revision is the batch's own word for "this is a note": only a note has
+    // one. The extension is the fallback for a batch that carried none.
+    kind: revision !== null || isNotePath(path) ? "note" : "file",
     name: basenameOf(path),
     parent: parentOf(path),
-    revision: batch.revisions[path] ?? null,
+    revision,
     size: options.sizes?.[path] ?? 0,
     ctimeMs: stat.ctime,
     mtimeMs: stat.mtime,

@@ -85,6 +85,34 @@ export interface VaultDeps {
 /** How many times `process` re-reads and re-runs its callback before giving up. */
 const PROCESS_ATTEMPTS = 5;
 
+/**
+ * Obsidian's own config directory, which the host reads and never writes.
+ *
+ * The host writes into `HostConfig.configDirName` (`.obsidian-headless`) and
+ * reads config host-directory-first with a fallback to here — so a fresh
+ * headless config dir inherits the real settings, which is what makes rollover
+ * work on day one, while an explicit override wins.
+ */
+const OBSIDIAN_CONFIG_DIR = ".obsidian";
+
+/**
+ * `delete` refused because the folder has something in it.
+ *
+ * Typed rather than a bare `Error` because it is a refusal a plugin can
+ * reasonably handle — Obsidian's own `delete` refuses the same case without
+ * `force` — and because a destructive operation that fails should say which
+ * rule stopped it.
+ */
+export class FolderNotEmpty extends Error {
+  readonly code = "folder_not_empty";
+  readonly path: string;
+  constructor(path: string) {
+    super(`${path} is not empty; pass force to delete it`);
+    this.name = "FolderNotEmpty";
+    this.path = path;
+  }
+}
+
 export class Vault extends Events {
   /** The vault-relative config directory. `.obsidian-headless`, not `.obsidian`. */
   readonly configDir: string;
@@ -105,14 +133,22 @@ export class Vault extends Events {
     this.configDir = deps.config.configDirName;
     this.index = new FileIndex(deps.mirror, this);
     this.index.rebuild();
-    this.adapter = new DataAdapter(deps, () => this.index);
+    this.adapter = new DataAdapter(deps, () => this);
     // Wired, not assumed: a GUI or a plugin writing into the config zone drops
     // the cache, and the next `getConfig` re-reads. Without this the host would
     // serve a stale `attachmentFolderPath` for the rest of the session, which
     // is exactly the silent staleness `config_changed` exists to prevent.
+    // Only a path inside `.obsidian/` raises `config_changed` (Ruling W7), and
+    // `.obsidian/app.json` is exactly the file the fallback arm reads — so this
+    // listener is live rather than decorative. The host's own writes are caught
+    // by `configWritten`, because a write this host made raises no event for it.
     deps.mirror.onConfigChanged((path) => {
       if (path.endsWith("/app.json")) this.configCache = null;
     });
+    // Primed once, here, so the first synchronous `getConfig` answers. Both
+    // reads are for paths a harness serves or answers `not_found` for, so this
+    // never reaches a test's request queue.
+    void this.loadConfig();
   }
 
   getName(): string {
@@ -144,7 +180,10 @@ export class Vault extends Events {
   }
 
   getMarkdownFiles(): TFile[] {
-    return this.index.allFiles().filter((file) => file.extension === "md");
+    // Lower-cased, because `Note.MD` is a note to the daemon and to the rename
+    // pairing, and a vault where those three disagree is a vault with a file
+    // that is a note for some purposes and not others.
+    return this.index.allFiles().filter((file) => file.extension.toLowerCase() === "md");
   }
 
   getAllLoadedFiles(): TAbstractFile[] {
@@ -172,26 +211,51 @@ export class Vault extends Events {
   /**
    * Obsidian's private `getConfig`, answered from a cached `app.json`.
    *
+   * **Host directory first, `.obsidian/` second.** A fresh headless config dir
+   * inherits the real vault's settings — which is what makes rollover work on
+   * day one — while an explicit override in the host directory wins. Task 14's
+   * `HeadlessConfigDir.readConfigJson` is the same ladder for the same reason.
+   *
    * The load-bearing keys are `attachmentFolderPath` (folder-notes),
    * `newFileLocation`, `newFileFolderPath`, `alwaysUpdateLinks`,
    * `useMarkdownLinks`, `trashOption` and `userIgnoreFilters`. An unknown key
    * answers `undefined`, which is the private API's own behaviour, and is
    * recorded as a `safe_stub` hit so the report shows what plugins actually ask
-   * for.
+   * for. A key asked for before the prime has landed records nothing: the cache
+   * being cold is this host's state, not a fact about the plugin.
    *
-   * The first call starts the read and answers `undefined`, because Obsidian's
-   * own signature is synchronous and there is nowhere to await. Priming it
-   * eagerly in the constructor was the alternative and is worse: it would put a
-   * `read_file` on the wire before the host has a reason to.
+   * **Three ways the cache drops, and one gap.** A `config_changed` for an
+   * `.obsidian/` write; a write this host itself makes to either file, through
+   * {@link configWritten}; and an explicit re-prime. The gap is an external GUI
+   * edit of the *host* directory, which raises no event — Task 14's 60 s config
+   * poll is what closes it.
    */
   getConfig(key: string): unknown {
     const cache = this.configCache;
     if (cache === null) {
       void this.loadConfig();
-      return stub(`Vault.getConfig(${key})`, undefined);
+      return undefined;
     }
     if (!(key in cache)) return stub(`Vault.getConfig(${key})`, undefined);
     return cache[key];
+  }
+
+  /** Resolve once the config cache holds an answer. Primed in the constructor. */
+  async configReady(): Promise<void> {
+    if (this.configCache !== null) return;
+    await this.loadConfig();
+  }
+
+  /**
+   * Tell the config cache that this host wrote `path`.
+   *
+   * The daemon raises `config_changed` for a write into `.obsidian/` — but not
+   * for one into the host's own directory, and a host that wrote its own
+   * `app.json` and kept serving the old one would be stale about the one file
+   * it controls completely.
+   */
+  configWritten(path: string): void {
+    if (this.configFilePaths().includes(path)) this.configCache = null;
   }
 
   // --- Reads ----------------------------------------------------------------
@@ -253,12 +317,14 @@ export class Vault extends Events {
 
   async createFolder(path: string): Promise<TFolder> {
     const result = await this.deps.writes.send<GenerationResponse>("create_folder", { path });
-    // `generation` is absent — not zero — for a folder that landed somewhere
-    // nothing scans, which is the config zone and any hidden folder. There is
-    // then no generation to wait for.
-    if (result.generation !== undefined) {
-      await this.deps.mirror.applyMutation(result.generation, [path]);
-    }
+    // **`generation` absent is a success, not a failure.** It is absent — not
+    // zero — for a folder that landed somewhere nothing scans: the config zone,
+    // or any hidden folder. `docs/protocol.md` singles this case out because a
+    // plugin host has to make `<configDir>/plugins/<id>/`, and Obsidian answers
+    // a `TFolder` when it does. The mirror will never hold a row for it, so the
+    // answer is a folder that is not in the tree.
+    if (result.generation === undefined) return this.index.detachedFolder(path);
+    await this.deps.mirror.applyMutation(result.generation, [path]);
     const folder = this.index.sync(path);
     if (folder instanceof TFolder) return folder;
     throw new Error(`the daemon created ${path} but the mirror has no folder row for it`);
@@ -359,28 +425,64 @@ export class Vault extends Events {
   /**
    * Rename, with links rewritten by the daemon.
    *
-   * Neither path is synchronized into the tree here. The daemon models a move
-   * as a delete plus a create, `FileIndex.applyBatch` pairs those back into one
-   * rename by revision, and an index that had already moved the node would
-   * leave that pairing nothing to reuse — so the batch is what moves it.
+   * **A folder move names its whole subtree.** The wire answers one generation
+   * and nothing else: every descendant lands at a new path that no part of the
+   * answer mentions. Refetching only the two named paths advanced the mirror
+   * past the generation that moved them, so the `generation_committed` that
+   * would have described it was dropped by the staleness guard — and every file
+   * in that folder was gone from this host, silently and permanently, with no
+   * error and no event. So the old subtree is read out of the mirror *before*
+   * the send and its destination paths are computed here. `Mirror.applyMutation`
+   * expands the source folder again on its own side; this is the half that the
+   * mirror cannot do, because the destination rows do not exist there yet.
+   *
+   * A subtree larger than `mirrorDeltaPathLimit` escalates to a resync, which
+   * is the right answer for a move that big and not a failure.
+   *
+   * **Neither path is synchronized into the tree here.** The daemon models a
+   * move as a delete plus a create, `FileIndex.applyBatch` pairs those back into
+   * one rename by revision, and an index that had already moved the node would
+   * leave that pairing nothing to reuse — so the batch is what moves it. Until
+   * Task 15 subscribes the mirror to that batch, the tree keeps the old path
+   * until something replays the batch: `applyMutation` emits it as the last
+   * thing it does, inside the `await` this method holds, so a Task 15 subscriber
+   * closes the window entirely rather than narrowing it.
    */
   async rename(file: TAbstractFile, newPath: string): Promise<void> {
     const folder = file instanceof TFolder;
+    const affected = folder
+      ? this.movedPaths(file.path, newPath)
+      : [file.path, newPath];
     const result = await this.deps.writes.send<RenameResponse>(
       folder ? "rename_folder" : "rename_note",
       { from: file.path, to: newPath, rewrite_links: true },
     );
-    await this.deps.mirror.applyMutation(result.generation, [file.path, newPath]);
+    await this.deps.mirror.applyMutation(result.generation, affected);
   }
 
   /**
    * Permanent deletion.
    *
-   * `force` is Obsidian's "delete a folder that is not empty" flag, and it maps
-   * onto `delete_folder`'s `recursive`. It means nothing for a file.
+   * `force` is Obsidian's "delete a folder that is not empty" flag and maps onto
+   * `delete_folder`'s `recursive`. It **defaults to `false`**, as Obsidian's
+   * does: a plugin that calls `delete(folder)` on a folder full of notes gets a
+   * typed refusal rather than a recursive wipe. It means nothing for a file.
+   *
+   * The emptiness test reads the mirror rather than the tree, because the tree
+   * is the thing that can be behind: as with {@link rename}, the node stays in
+   * the tree until a batch removes it, and until Task 15 subscribes the mirror
+   * to those batches a plugin that deletes a note and immediately calls
+   * `getFiles()` still sees it. `applyMutation` emits the batch inside the
+   * `await` this method holds, so a Task 15 subscriber closes that window
+   * rather than narrowing it — the folder case is the one that could not wait,
+   * and it is closed here and in the mirror.
    */
   async delete(file: TAbstractFile, force?: boolean): Promise<void> {
-    await this.remove(file, "permanent", force ?? true);
+    const recursive = force ?? false;
+    if (file instanceof TFolder && !recursive && this.descendantsOf(file.path).length > 0) {
+      throw new FolderNotEmpty(file.path);
+    }
+    await this.remove(file, "permanent", recursive);
   }
 
   /**
@@ -427,7 +529,33 @@ export class Vault extends Events {
             mode,
           });
     if (result.generation === undefined) return;
-    await this.deps.mirror.applyMutation(result.generation, [file.path]);
+    // The same subtree rule as `rename`: a deleted folder's descendants are
+    // rows that moved and the wire names none of them. The mirror expands a
+    // folder it still holds on its own side too; naming them costs nothing and
+    // does not depend on the order the two sides see the removal in.
+    const affected =
+      file instanceof TFolder ? [file.path, ...this.descendantsOf(file.path)] : [file.path];
+    await this.deps.mirror.applyMutation(result.generation, affected);
+  }
+
+  /** Every path the mirror holds under `path`, `path` itself excluded. */
+  private descendantsOf(path: string): string[] {
+    const prefix = `${path}/`;
+    return this.deps.mirror
+      .entries()
+      .filter((entry) => entry.path.startsWith(prefix))
+      .map((entry) => entry.path);
+  }
+
+  /** Both ends of a folder move, and every row under both ends. */
+  private movedPaths(from: string, to: string): string[] {
+    const under = this.descendantsOf(from);
+    return [from, to, ...under, ...under.map((path) => `${to}${path.slice(from.length)}`)];
+  }
+
+  /** The two files `getConfig` reads, host directory first. */
+  private configFilePaths(): string[] {
+    return [`${this.configDir}/app.json`, `${OBSIDIAN_CONFIG_DIR}/app.json`];
   }
 
   /**
@@ -449,27 +577,45 @@ export class Vault extends Events {
     throw new Error(`the daemon accepted a write to ${path} but the mirror has no row for it`);
   }
 
-  private async loadConfig(): Promise<void> {
-    if (this.configLoading !== null) return this.configLoading;
-    const loading = (async (): Promise<void> => {
-      try {
-        const response = await this.deps.client.request<ReadFileResponse>("read_file", {
-          path: `${this.configDir}/app.json`,
-        });
-        const source = Buffer.from(response.content_base64, "base64").toString("utf8");
-        const parsed: unknown = JSON.parse(source);
-        this.configCache =
-          typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
-      } catch {
-        // No `app.json`, or one that is not JSON. A vault with no settings file
-        // is an ordinary vault, and every key then answers `undefined` — which
-        // is what `getConfig` would have answered for an absent key anyway.
-        this.configCache = {};
-      } finally {
-        this.configLoading = null;
-      }
-    })();
+  /**
+   * Fill the cache from the first `app.json` that answers, host directory first.
+   *
+   * Never rejects: a vault with no settings file is an ordinary vault, and every
+   * key then answers `undefined` — which is what `getConfig` would have answered
+   * for an absent key anyway. One load is in flight at a time; a second caller
+   * joins the first.
+   */
+  private loadConfig(): Promise<void> {
+    const existing = this.configLoading;
+    if (existing !== null) return existing;
+    const loading = this.readConfig().finally(() => {
+      this.configLoading = null;
+    });
     this.configLoading = loading;
     return loading;
+  }
+
+  private async readConfig(): Promise<void> {
+    for (const path of this.configFilePaths()) {
+      const parsed = await this.readConfigFile(path);
+      if (parsed === null) continue;
+      this.configCache = parsed;
+      return;
+    }
+    this.configCache = {};
+  }
+
+  /** One config file's object, or `null` for "not there, or not an object". */
+  private async readConfigFile(path: string): Promise<Record<string, unknown> | null> {
+    try {
+      const response = await this.deps.client.request<ReadFileResponse>("read_file", { path });
+      const source = Buffer.from(response.content_base64, "base64").toString("utf8");
+      const parsed: unknown = JSON.parse(source);
+      return typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
   }
 }

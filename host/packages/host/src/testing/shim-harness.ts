@@ -36,7 +36,7 @@ import type { Vault, WriteGate } from "../shim/vault";
 import type { FixtureEntry } from "./mirror-harness";
 // activated by Task 10: import type { Plugin, PluginManifest } from "../shim/plugin";
 // activated by Task 10: import type { Harvest, HarvestedMenuItem } from "../shim/harvest";
-// activated by Task 11b: import type { ObsidianApi } from "../shim/api";
+// activated by Task 10: import type { ObsidianApi } from "../shim/api";
 // activated by Task 11b: import type { NoticeLog } from "../shim/notice";
 
 export interface ShimHarnessOptions {
@@ -63,7 +63,10 @@ export class ShimHarness extends MirrorHarness {
   readonly vault!: Vault;
   readonly policyRecorder!: PolicyRecorder;
   readonly writes!: WriteGate;
-  // activated by Task 11b: readonly api!: ObsidianApi;
+  // activated by Task 10:  readonly api!: ObsidianApi;
+  //   Task 10's own cases write `class extends harness.api.Plugin`, so the
+  //   barrel `shim/api.ts` (Task 11b) has to be reachable by then — which is
+  //   why this says 10 and not 11b: it is the task that first calls it.
   // activated by Task 10:  readonly harvest!: Harvest;
   // activated by Task 11b: readonly noticeLog!: NoticeLog;
   /** The specifiers a plugin bundle may resolve to the host's own modules. */
@@ -98,7 +101,7 @@ export class ShimHarness extends MirrorHarness {
     mutable.vault = assembly.app.vault;
     mutable.policyRecorder = assembly.policyRecorder;
     mutable.writes = assembly.writes;
-    // activated by Task 11b: mutable.api = assembly.api;
+    // activated by Task 10:  mutable.api = assembly.api;
     // activated by Task 10:  mutable.harvest = assembly.harvest;
     // activated by Task 11b: mutable.noticeLog = assembly.noticeLog;
   }
@@ -144,6 +147,15 @@ export class ShimHarness extends MirrorHarness {
     }
     for (const path of harness.configFiles.keys()) harness.autoServed.add(path);
     harness.autoServeFiles({ ...sources, ...Object.fromEntries(harness.configFiles) });
+    // The `Vault` constructor primes `getConfig` from two files. A fixture that
+    // supplies neither must still *answer* both, or the prime's reads would sit
+    // in the request queue and the next `nextRequest()` — which a case expects
+    // to be its own write — would hand out a `read_file` instead. `not_found`
+    // is what the daemon says about a vault with no settings file, so that is
+    // what an unsupplied config path says here.
+    for (const path of configFilePathsFor(harness)) {
+      if (!harness.configFiles.has(path)) harness.unserveFile(path);
+    }
     await harness.openMirror(spec);
     harness.assemble();
     // A fixture with no note sources has nothing to warm from: every read the
@@ -175,7 +187,7 @@ export class ShimHarness extends MirrorHarness {
    */
   async flipLayoutReady(): Promise<void> {
     this.layoutReady = true;
-    // activated by Task 10: this.app.workspace.markLayoutReady();
+    // activated by Task 11a: this.app.workspace.markLayoutReady();
     await this.quiesce();
   }
 
@@ -208,19 +220,28 @@ export class ShimHarness extends MirrorHarness {
   /**
    * Drive a plugin-visible write all the way through the gate and the daemon.
    *
-   * Three steps, because a shim write is three: the `write_file` the adapter
-   * sends, the answer, and the refetch `applyMutation` issues to make the
-   * mirror read-your-writes consistent. A helper that answered only the first
-   * would hand back a promise that never settles.
+   * Three steps, because a shim write is three: the op the adapter sends, the
+   * answer, and the refetch `applyMutation` issues to make the mirror
+   * read-your-writes consistent. A helper that answered only the first would
+   * hand back a promise that never settles.
+   *
+   * The op is **`write_note`**, because the daemon refuses `write_file` for a
+   * Markdown note and this helper writes notes. A harness that answered the
+   * shape the daemon rejects would teach every later task to send it.
    */
   async writeNote(path: string, content: string): Promise<void> {
     const writing = this.vault.adapter.write(path, content);
-    const request = await this.expectRequest("write_file");
+    const request = await this.expectRequest("write_note");
     const generation = this.mirror.generation() + 1;
     const revision = `blake3:written-${String(generation)}`;
-    this.respondOk(request.id, "write_file", { generation, revision, semantic: true });
+    this.respondOk(request.id, "write_note", { generation, revision });
     this.setFileContent(path, content);
-    await this.answerRefetch(generation, [{ path, revision }]);
+    // The refetch asks for the ancestors too — a folder's `mtime` moves when a
+    // child is rewritten — and a path answered by nothing is answered as
+    // absent, which would delete the containing folder and everything under it.
+    await this.answerRefetch(generation, [{ path, revision }], {
+      entries: ancestorFoldersOf(path),
+    });
     await writing;
   }
 
@@ -280,9 +301,26 @@ export class ShimHarness extends MirrorHarness {
 
   // activated by Task 10:  listMenuItems / invokeMenuItem — both go through
   // `Harvest`, which that task creates.
-  // activated by Task 11b: invokeProtocol — `ObsidianApi.protocolHandlers`.
-  // activated by Task 10:  openFileIntents — `app.workspace`.
-  // activated by Task 11b: activeTimerCount — `ObsidianApi.components`. It
+  // activated by Task 10:  invokeProtocol — `ObsidianApi.protocolHandlers`.
+  // activated by Task 11a: openFileIntents — it reads state that exists only
+  // once Task 11a builds `WorkspaceLeaf.openFile`.
+  // activated by Task 10:  activeTimerCount — `ObsidianApi.components`. It
   // counts plugin-registered timers, which deliberately use the real globals
   // rather than the `TestClock`, and are cleaned up by the component registry.
+}
+
+/** Every folder above `path`, as a fixture row. */
+function ancestorFoldersOf(path: string): { path: string; kind: "folder" }[] {
+  const folders: { path: string; kind: "folder" }[] = [];
+  let cut = path.lastIndexOf("/");
+  while (cut !== -1) {
+    folders.push({ path: path.slice(0, cut), kind: "folder" });
+    cut = path.lastIndexOf("/", cut - 1);
+  }
+  return folders;
+}
+
+/** The two files `Vault.getConfig` reads, host directory first. */
+function configFilePathsFor(harness: ShimHarness): string[] {
+  return [`${harness.config.configDirName}/app.json`, ".obsidian/app.json"];
 }

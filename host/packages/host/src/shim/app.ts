@@ -17,9 +17,11 @@
  * of its own body.
  *
  * The fields land as their tasks build them, and this comment is the map:
- * Task 7 added `vault`, Task 8 adds `metadataCache`, Task 10 `workspace`, Task 12
- * `plugins`, `internalPlugins`, `commands`, `keymap`, `scope`, `setting` and
- * `foldManager`. Nothing here is re-decided later — a task adds its field and
+ * Task 7 added `vault`, Task 8 adds `metadataCache`, Task 9 `fileManager`,
+ * Task 11a `workspace` (it is Task 11a that builds `workspace.ts` and
+ * `WorkspaceLeaf`, not Task 10 — the old Task 11 split into 11a and 11b and
+ * this line did not follow), Task 12 `plugins`, `internalPlugins`, `commands`,
+ * `keymap`, `scope`, `setting` and `foldManager`. Nothing here is re-decided later — a task adds its field and
  * the assembler's one assignment, and that is all.
  */
 import type { Vault } from "./vault";
