@@ -1,19 +1,10 @@
 /**
  * One factory, one wiring order — for the harnesses and for production alike.
  *
- * **Not yet activated.** This file is written for `src/testing/assemble.ts` and
- * lives in `pending/` until Task 7, which builds the first shim surface it
- * refers to. Its imports are spelled for its activated home, which is why
- * `./daemon-harness` and `../shim/vault` are how they read here. Task 7's Step 1
- * moves it and `shim-harness.ts` up one directory in one motion:
- *
- * ```
- * git mv src/testing/pending/assemble.ts src/testing/assemble.ts
- * git mv src/testing/pending/shim-harness.ts src/testing/shim-harness.ts
- * ```
- *
- * and drops the `src/testing/pending` line from `tsconfig.json`'s and
- * `vitest.config.ts`'s excludes only when the last file leaves (Task 22).
+ * **Activated by Task 7**, which moved this file and `shim-harness.ts` up out of
+ * `src/testing/pending/` when it built the first shim surface they refer to. The
+ * `src/testing/pending` line stays in `tsconfig.json`'s and `vitest.config.ts`'s
+ * excludes until the last file leaves that directory (Task 22).
  *
  * **Why one factory.** The shim's surfaces refer to each other in a cycle, so
  * the order they are built in is a real decision with a real failure mode — a
@@ -28,6 +19,7 @@
 
 import { App } from "../shim/app";
 import { ShimEventBus } from "../shim/events";
+import { MetadataCache } from "../shim/metadata-cache";
 import { DispatchQueue } from "../runtime/queue";
 import { setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
@@ -170,6 +162,10 @@ export function assembleShim(deps: {
   const writes = deps.writes ?? forwardingWriteGate(client);
   const app = new App({ appId: appIdFor(config.vaultRoot) });
   const vault = new Vault({ config, client, mirror, events, writes, queue });
+  // After the vault, because it resolves link paths to the `TFile` instances
+  // the vault's index owns — and it reads that index rather than holding a
+  // copy, so a file the vault renames is the same object this answers with.
+  const metadataCache = new MetadataCache({ mirror, events, index: vault.index });
   // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
   // activated by Task 10:  const harvest = new Harvest();
   // activated by Task 11b: const api = new ObsidianApi({ ... });
@@ -178,6 +174,7 @@ export function assembleShim(deps: {
   // happen after every surface exists; a plugin never sees the gap, because no
   // bundle has been loaded yet.
   assignOnce(app, "vault", vault);
+  assignOnce(app, "metadataCache", metadataCache);
 
   return {
     config,

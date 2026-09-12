@@ -24,6 +24,7 @@
  * `keymap`, `scope`, `setting` and `foldManager`. Nothing here is re-decided later — a task adds its field and
  * the assembler's one assignment, and that is all.
  */
+import type { MetadataCache } from "./metadata-cache";
 import type { Vault } from "./vault";
 
 export class App {
@@ -47,6 +48,17 @@ export class App {
    * plugin bundle is loaded before it lands.
    */
   vault!: Vault;
+
+  /**
+   * `app.metadataCache` — filled by `assembleShim`, exactly once, straight
+   * after the vault.
+   *
+   * It is built second because it resolves links to the very `TFile` instances
+   * the vault's index hands out, and it is assigned rather than constructed
+   * into a `readonly` field for the same reason the vault is: the two surfaces
+   * refer to each other, so no construction order leaves both final.
+   */
+  metadataCache!: MetadataCache;
 
   constructor(options: { appId: string }) {
     this.appId = options.appId;

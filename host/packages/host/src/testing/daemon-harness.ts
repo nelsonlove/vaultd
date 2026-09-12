@@ -183,9 +183,25 @@ export class DaemonHarness {
       }
       const content = this.files[path];
       if (content === undefined) return false;
-      this.respondReadFile(request.id, content, revisionOfSource(content));
+      this.respondReadFile(request.id, content, this.revisionServedFor(path, content));
       return true;
     });
+  }
+
+  /**
+   * The revision the auto file server answers a `read_file` with.
+   *
+   * A seam rather than a constant because a harness that also holds a mirror
+   * has a **better** answer than a hash of the bytes: the revision the mirror's
+   * own row carries. `Mirror.warmPositions` deliberately skips a note whose read
+   * comes back at an unexpected revision — the bytes moved past the row, so an
+   * index built from them would put every span in that note slightly wrong —
+   * and a fixture that answered its own stand-in hash would trip that skip on
+   * every note and warm nothing at all. {@link MirrorHarness} overrides it.
+   */
+  protected revisionServedFor(path: string, content: string): string {
+    void path;
+    return revisionOfSource(content);
   }
 
   /** Register a hook that may answer a request before it is handed out. */

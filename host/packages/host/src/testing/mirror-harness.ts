@@ -114,6 +114,21 @@ export class MirrorHarness extends DaemonHarness {
     return this.mirrorValue;
   }
 
+  /**
+   * Answer an auto-served `read_file` at the revision the mirror's row carries.
+   *
+   * The same rule {@link answerWarm} states, applied to the automatic path: a
+   * warm-up that meets a revision it did not expect skips the note, so a
+   * fixture whose rows carry the real parser's revisions — every
+   * `ShimHarness.withVault` — would warm nothing if this answered the stand-in
+   * hash of the bytes instead. A path the mirror holds no note row for (an
+   * attachment, a config file) falls back to the stand-in, which is all there
+   * has ever been for one.
+   */
+  protected override revisionServedFor(path: string, content: string): string {
+    return this.mirrorValue?.note(path)?.revision ?? super.revisionServedFor(path, content);
+  }
+
   /** Answer a full hydration walk — open, tree, notes, close — from a spec. */
   answerHydration(spec: HydrationSpec): Promise<void> {
     return answerHydrationOn(this, spec);
