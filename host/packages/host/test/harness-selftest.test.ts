@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -50,6 +50,9 @@ import { MirrorHarness } from "../src/testing/mirror-harness";
  * available. A warm cache answers these in single-digit milliseconds.
  */
 const FIXTURE_TIMEOUT_MS = 600_000;
+
+/** The whole host source tree, `pending/` included. */
+const SRC_ROOT = resolve(__dirname, "..", "src");
 
 describe("TestClock", () => {
   it("fires timers in due order and advances now()", async () => {
@@ -242,33 +245,41 @@ describe("FixtureVault and the real parser", () => {
     // and a suite nobody waits for.
     //
     // The sources carry a per-run marker so this always misses the cache;
-    // without it a second run would hit and measure nothing. The three files it
-    // leaves behind are removed at the end — they are this case's own
-    // scratch, and they would otherwise accumulate one set per run.
+    // without it a second run would hit and measure nothing. Everything it
+    // leaves behind is removed in the `finally`, which is where the cleanup has
+    // to live: a failing assertion is exactly when the files would otherwise
+    // pile up, and this is the case whose whole subject is not piling up.
     const marker = `${String(process.pid)}-${String(Date.now())}`;
     const before = readdirSync(fixtureCacheDir());
     const spawnsBefore = fixtureGeneratorSpawns();
 
-    const vault = new FixtureVault({
-      "One.md": `# One ${marker}\n\n[[Two]]\n`,
-      "Two.md": `# Two ${marker}\n\n[[Three]]\n`,
-      "Three.md": `# Three ${marker}\n`,
-    });
-    expect(vault.notes().map((note) => note.path)).toEqual(["One.md", "Three.md", "Two.md"]);
-    expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
+    try {
+      const vault = new FixtureVault({
+        "One.md": `# One ${marker}\n\n[[Two]]\n`,
+        "Two.md": `# Two ${marker}\n\n[[Three]]\n`,
+        "Three.md": `# Three ${marker}\n`,
+      });
+      expect(vault.notes().map((note) => note.path)).toEqual(["One.md", "Three.md", "Two.md"]);
+      expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
 
-    // And the batch really did write one cache file per note, together.
-    const after = readdirSync(fixtureCacheDir());
-    const fresh = after.filter((name) => !before.includes(name));
-    expect(fresh).toHaveLength(3);
+      // And the batch really did write one cache file per note, together.
+      const after = readdirSync(fixtureCacheDir());
+      const fresh = after.filter((name) => !before.includes(name));
+      expect(fresh).toHaveLength(3);
 
-    // Reading the same vault again spawns nothing: the rows are memoized on the
-    // instance, and a second instance answers from those same cache files.
-    const again = new FixtureVault(vault.files);
-    expect(again.notes()).toHaveLength(3);
-    expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
-
-    for (const name of fresh) rmSync(join(fixtureCacheDir(), name));
+      // Reading the same vault again spawns nothing: the rows are memoized on
+      // the instance, and a second instance answers from those same cache files.
+      const again = new FixtureVault(vault.files);
+      expect(again.notes()).toHaveLength(3);
+      expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
+    } finally {
+      // Re-read rather than reusing `fresh`: a run that threw before that line
+      // may still have written cache files, and those are the ones most worth
+      // clearing.
+      for (const name of readdirSync(fixtureCacheDir())) {
+        if (!before.includes(name)) rmSync(join(fixtureCacheDir(), name));
+      }
+    }
   }, FIXTURE_TIMEOUT_MS);
 
   it("synthesizes folders into the entry tree", () => {
@@ -288,6 +299,30 @@ describe("FixtureVault and the real parser", () => {
     expect(vault.source("A.md")).toBe("two\n");
     expect(vault.revisionOf("A.md")).not.toBe(before);
   }, FIXTURE_TIMEOUT_MS);
+});
+
+describe("the source tree stays text", () => {
+  it("has no NUL byte in any file under src/", () => {
+    // A literal U+0000 inside a string literal is invisible on screen, compiles
+    // and runs correctly, and makes git classify the whole file as binary — so
+    // every later diff, blame and three-way merge on it is lost. It happened
+    // once in `fixture-vault.ts` (the review's Blocking finding) and again in
+    // `assemble.ts` while fixing it, which is twice more than a defect nobody
+    // can see should be allowed to happen. `"\0"` is the escape; this is the
+    // guard that says so.
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith(".ts") && readFileSync(full).includes(0)) {
+          offenders.push(relative(SRC_ROOT, full));
+        }
+      }
+    };
+    walk(SRC_ROOT);
+    expect(offenders, "write \\0 rather than a literal NUL byte").toEqual([]);
+  });
 });
 
 describe("DataDir", () => {
