@@ -359,7 +359,10 @@ export class DataAdapter {
     sync: string | null,
     paths?: readonly string[],
   ): Promise<void> {
-    if (sync !== null) this.vault().configWritten(sync);
+    // Awaited: a plugin that writes `app.json` and reads a key back must see
+    // its own bytes, and `getConfig` is synchronous, so the reload has to be
+    // inside the promise this write hands back.
+    if (sync !== null) await this.vault().configWritten(sync);
     if (generation === undefined) return;
     const affected = paths ?? (sync === null ? [] : [sync]);
     if (affected.length > 0) await this.deps.mirror.applyMutation(generation, affected);

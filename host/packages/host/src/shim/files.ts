@@ -33,6 +33,22 @@
  * Cross-batch pairs are never attempted; a move whose halves land in different
  * generations is a delete and a create, which is also what a user watching
  * Obsidian's own event stream would see under the same conditions.
+ *
+ * ## A folder move pairs its notes and not the folder
+ *
+ * Pairing is by content revision, and a folder has none — the index stores one
+ * for notes alone. So renaming `Folder` to `Folder2` pairs every note under it,
+ * each with the right `oldPath`, and reports the two folder rows themselves as
+ * a plain delete plus a plain create. Obsidian fires one `rename` for the
+ * folder, and folder-notes — the plugin this whole rename path exists for — is
+ * a folder plugin.
+ *
+ * **Task 15 decides what to do about it**, and this is the shape of the
+ * decision rather than the decision itself. Two facts it must not blur: for a
+ * **host-initiated** move the folder pair is known exactly, at the call site
+ * that sent `rename_folder`; for an **external** one it can only be inferred
+ * from the folder paths sitting in `AppliedBatch.created` and `deleted`. Those
+ * are different confidence levels and one rule must not produce both.
  */
 
 import type { MirrorChangeBatch, MirrorEntry, MirrorQuery } from "../mirror/types";

@@ -187,6 +187,41 @@ describe("DataAdapter op routing", () => {
     });
   });
 
+  it("refetches a renamed folder's whole subtree, at both ends", async () => {
+    const harness = await harnessWithTree();
+    const pending = harness.vault.adapter.rename("Folder", "Moved");
+    const sent = await harness.expectRequest("rename_folder");
+    harness.respondOk(sent.id, "rename_folder", {
+      generation: 9,
+      links_rewritten: 0,
+      link_rewrite_failures: [],
+    });
+    // The mirror can expand the *source* folder on its own, but not the
+    // destination: those rows do not exist there yet. So this half of the fix
+    // is load-bearing rather than defence in depth, and it is asserted here.
+    const asked = await harness.answerRefetch(9, [{ path: "Moved/B.md", revision: "blake3:b1" }], {
+      entries: [
+        { path: "Moved", kind: "folder" },
+        { path: "Moved/img.png", kind: "file", size: 40 },
+      ],
+    });
+    await pending;
+    expect([...asked].sort()).toEqual([
+      "Folder",
+      "Folder/B.md",
+      "Folder/img.png",
+      "Moved",
+      "Moved/B.md",
+      "Moved/img.png",
+    ]);
+    expect(harness.mirror.entries().map((entry) => entry.path).sort()).toEqual([
+      "A.md",
+      "Moved",
+      "Moved/B.md",
+      "Moved/img.png",
+    ]);
+  });
+
   it("drives a write all the way through the gate, the daemon and the mirror", async () => {
     const harness = await harnessWithTree();
     await harness.writeNote("Folder/B.md", "# B again\n");

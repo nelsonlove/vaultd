@@ -127,6 +127,8 @@ export class Vault extends Events {
 
   private configCache: Record<string, unknown> | null = null;
   private configLoading: Promise<void> | null = null;
+  /** Bumped by every invalidation, so a read in flight across one is discarded. */
+  private configEpoch = 0;
 
   constructor(private readonly deps: VaultDeps) {
     super(deps.events);
@@ -142,8 +144,15 @@ export class Vault extends Events {
     // `.obsidian/app.json` is exactly the file the fallback arm reads — so this
     // listener is live rather than decorative. The host's own writes are caught
     // by `configWritten`, because a write this host made raises no event for it.
+    //
+    // It **re-primes**, and returns the promise so the mirror's fan-out awaits
+    // it: dropping the cache alone would leave the next `getConfig` — the very
+    // call that discovers the change — answering `undefined` and merely
+    // starting the read. `getConfig` is synchronous, so "invalidated" has to
+    // mean "already reloaded" by the time the event settles.
     deps.mirror.onConfigChanged((path) => {
-      if (path.endsWith("/app.json")) this.configCache = null;
+      if (!path.endsWith("/app.json")) return;
+      return this.reprimeConfig();
     });
     // Primed once, here, so the first synchronous `getConfig` answers. Both
     // reads are for paths a harness serves or answers `not_found` for, so this
@@ -224,11 +233,14 @@ export class Vault extends Events {
    * for. A key asked for before the prime has landed records nothing: the cache
    * being cold is this host's state, not a fact about the plugin.
    *
-   * **Three ways the cache drops, and one gap.** A `config_changed` for an
+   * **Three ways the cache reloads, and one gap.** A `config_changed` for an
    * `.obsidian/` write; a write this host itself makes to either file, through
-   * {@link configWritten}; and an explicit re-prime. The gap is an external GUI
-   * edit of the *host* directory, which raises no event — Task 14's 60 s config
-   * poll is what closes it.
+   * {@link configWritten}; and {@link configReady} for an explicit prime. Each
+   * of them **re-reads** rather than merely dropping, and each is awaited by
+   * whatever triggered it, so the first synchronous `getConfig` after a change
+   * answers the new value. The gap is an external GUI edit of the *host*
+   * directory, which raises no event — Task 14's 60 s config poll is what
+   * closes it.
    */
   getConfig(key: string): unknown {
     const cache = this.configCache;
@@ -254,8 +266,9 @@ export class Vault extends Events {
    * `app.json` and kept serving the old one would be stale about the one file
    * it controls completely.
    */
-  configWritten(path: string): void {
-    if (this.configFilePaths().includes(path)) this.configCache = null;
+  configWritten(path: string): Promise<void> {
+    if (!this.configFilePaths().includes(path)) return Promise.resolve();
+    return this.reprimeConfig();
   }
 
   // --- Reads ----------------------------------------------------------------
@@ -530,9 +543,16 @@ export class Vault extends Events {
           });
     if (result.generation === undefined) return;
     // The same subtree rule as `rename`: a deleted folder's descendants are
-    // rows that moved and the wire names none of them. The mirror expands a
-    // folder it still holds on its own side too; naming them costs nothing and
-    // does not depend on the order the two sides see the removal in.
+    // rows that moved and the wire names none of them.
+    //
+    // **Defence in depth, and currently unreachable.** Unlike `rename` — whose
+    // destination rows the mirror cannot expand, because they do not exist there
+    // yet — a delete names a folder the mirror still holds, so
+    // `Mirror.applyMutation` expands it anyway and this list adds nothing. It is
+    // kept because the two sides are independent: a mutation that removed the
+    // row first, or a mirror that stopped expanding, would lose the subtree
+    // silently. A mutant that deletes these paths therefore survives the suite,
+    // and that is not a coverage gap.
     const affected =
       file instanceof TFolder ? [file.path, ...this.descendantsOf(file.path)] : [file.path];
     await this.deps.mirror.applyMutation(result.generation, affected);
@@ -588,20 +608,38 @@ export class Vault extends Events {
   private loadConfig(): Promise<void> {
     const existing = this.configLoading;
     if (existing !== null) return existing;
-    const loading = this.readConfig().finally(() => {
+    const loading = this.readConfig(this.configEpoch).finally(() => {
       this.configLoading = null;
     });
     this.configLoading = loading;
     return loading;
   }
 
-  private async readConfig(): Promise<void> {
+  /**
+   * Drop the cache and read it again, as one step.
+   *
+   * The epoch is what makes a read that was already in flight when the file
+   * changed harmless: it resolves, sees that its epoch is stale, and declines
+   * to install bytes that are known to be old. Without it the race is a cache
+   * holding the *previous* contents of a file that has just been rewritten,
+   * which is the exact staleness this whole path exists to prevent.
+   */
+  private reprimeConfig(): Promise<void> {
+    this.configEpoch += 1;
+    this.configCache = null;
+    this.configLoading = null;
+    return this.loadConfig();
+  }
+
+  private async readConfig(epoch: number): Promise<void> {
     for (const path of this.configFilePaths()) {
       const parsed = await this.readConfigFile(path);
       if (parsed === null) continue;
+      if (epoch !== this.configEpoch) return;
       this.configCache = parsed;
       return;
     }
+    if (epoch !== this.configEpoch) return;
     this.configCache = {};
   }
 

@@ -134,6 +134,37 @@ describe.skipIf(!BINARY_EXISTS)("the shim against a real vaultd", () => {
     expect(vault.getFiles().map((file) => file.path)).toEqual(["A.md"]);
   });
 
+  it("moves a folder with contents through the adapter, readable at the new paths", async () => {
+    const config = vaultFor({
+      "Keep.md": "# Keep\n",
+      "Outer/Top.md": "# Top\n",
+      "Outer/pic.png": "not really a png\n",
+      "Outer/Mid/Deep.md": "# Deep\n",
+    });
+    const { vault, mirror } = await shimOn(config);
+    await vault.adapter.rename("Outer", "Renamed");
+
+    expect(mirror.entries().map((entry) => entry.path).sort()).toEqual([
+      "Keep.md",
+      "Renamed",
+      "Renamed/Mid",
+      "Renamed/Mid/Deep.md",
+      "Renamed/Top.md",
+      "Renamed/pic.png",
+    ]);
+    // Present in the mirror is not the same claim as readable: every descendant
+    // answers through the adapter at its new path.
+    expect(await vault.adapter.read("Renamed/Top.md")).toBe("# Top\n");
+    expect(await vault.adapter.read("Renamed/Mid/Deep.md")).toBe("# Deep\n");
+    expect((await vault.adapter.readBinary("Renamed/pic.png")).byteLength).toBe(17);
+    expect(vault.getFiles().map((file) => file.path).sort()).toEqual([
+      "Keep.md",
+      "Renamed/Mid/Deep.md",
+      "Renamed/Top.md",
+      "Renamed/pic.png",
+    ]);
+  });
+
   it("routes an adapter write of a note to write_note and of a zone file to write_file", async () => {
     const config = vaultFor({ "A.md": "# A\n" });
     const { vault, mirror } = await shimOn(config);

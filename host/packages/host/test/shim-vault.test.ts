@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { DispatchQueue } from "../src/runtime/queue";
+import { ShimEventBus } from "../src/shim/events";
+import { Vault } from "../src/shim/vault";
+import { forwardingWriteGate } from "../src/testing/assemble";
 import { ShimHarness } from "../src/testing/shim-harness";
 
 describe("Vault writes", () => {
@@ -202,6 +206,92 @@ describe("Vault writes", () => {
     });
     await harness.vault.configReady();
     expect(harness.vault.getConfig("attachmentFolderPath")).toBe("Headless");
+  });
+
+  it("invalidates the getConfig cache when app.json is rewritten", async () => {
+    // `task-12-brief.md` L447-457, verbatim: this is the acceptance case for
+    // the invalidation contract, and it is a *synchronous* read-back — dropping
+    // the cache without re-priming satisfies the letter and fails this.
+    const harness = await ShimHarness.withVault({}, {
+      configFiles: { ".obsidian/app.json": JSON.stringify({ attachmentFolderPath: "Old" }) },
+    });
+    expect(harness.vault.getConfig("attachmentFolderPath")).toBe("Old");
+    harness.setConfigFile(".obsidian/app.json", JSON.stringify({ attachmentFolderPath: "New" }));
+    await harness.mirror.applyEvent({
+      type: "config_changed", value: { path: ".obsidian/app.json" },
+    });
+    expect(harness.vault.getConfig("attachmentFolderPath")).toBe("New");
+  });
+
+  it("re-primes after the host writes a config file itself", async () => {
+    // The other arm. A write into the host's own directory raises no
+    // `config_changed` — the daemon only raises one for `.obsidian/` — so this
+    // is the only thing that can tell the cache its own bytes moved.
+    const harness = await ShimHarness.withEntries([], {
+      configFiles: {
+        ".obsidian-headless/app.json": JSON.stringify({ attachmentFolderPath: "Old" }),
+      },
+    });
+    expect(harness.vault.getConfig("attachmentFolderPath")).toBe("Old");
+
+    const writing = harness.vault.adapter.write(
+      ".obsidian-headless/app.json",
+      JSON.stringify({ attachmentFolderPath: "New" }),
+    );
+    const sent = await harness.expectRequest("write_file");
+    harness.setConfigFile(
+      ".obsidian-headless/app.json",
+      JSON.stringify({ attachmentFolderPath: "New" }),
+    );
+    // No generation: nothing in the config zone is indexed.
+    harness.respondOk(sent.id, "write_file", { revision: "blake3:cfg", semantic: false });
+    await writing;
+    expect(harness.vault.getConfig("attachmentFolderPath")).toBe("New");
+  });
+
+  it("records nothing for a getConfig while the cache is still cold", async () => {
+    const harness = await ShimHarness.withEntries([], {
+      configFiles: { ".obsidian/app.json": JSON.stringify({ attachmentFolderPath: "Attachments" }) },
+    });
+    // A `Vault` of its own, so the prime really is still in flight: the
+    // harness's own vault was primed before the factory handed it back.
+    const cold = new Vault({
+      config: harness.config,
+      client: harness.client,
+      mirror: harness.mirror,
+      events: new ShimEventBus(),
+      writes: forwardingWriteGate(harness.client),
+      queue: new DispatchQueue(),
+    });
+    expect(cold.getConfig("attachmentFolderPath")).toBeUndefined();
+    // A cold cache is this host's state, not a fact about the plugin, so it is
+    // not a `safe_stub` hit against the plugin's name.
+    expect(
+      harness.policyRecorder.entries().filter((entry) => entry.symbol.startsWith("Vault.getConfig")),
+    ).toEqual([]);
+
+    await cold.configReady();
+    expect(cold.getConfig("attachmentFolderPath")).toBe("Attachments");
+    // A key the file really does not carry is a hit, because that is a fact
+    // about what the plugin asked for.
+    expect(cold.getConfig("nothingIsHere")).toBeUndefined();
+    expect(harness.policyRecorder.entries().map((entry) => entry.symbol)).toContain(
+      "Vault.getConfig(nothingIsHere)",
+    );
+  });
+
+  it("counts an upper-cased extension as markdown", async () => {
+    const harness = await ShimHarness.withEntries([
+      { path: "Lower.md", kind: "note", revision: "blake3:l" },
+      { path: "Upper.MD", kind: "note", revision: "blake3:u" },
+      { path: "img.png", kind: "file" },
+    ]);
+    // `Note.MD` is a note to the daemon and to the rename pairing; a vault where
+    // those three disagree has a file that is a note for some purposes only.
+    expect(harness.vault.getMarkdownFiles().map((file) => file.path).sort()).toEqual([
+      "Lower.md",
+      "Upper.MD",
+    ]);
   });
 
   it("maps the three deletion forms to the three modes", async () => {
