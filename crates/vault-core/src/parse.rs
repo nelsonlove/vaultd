@@ -1,6 +1,6 @@
 use crate::frontmatter::parse_frontmatter;
 use crate::markdown::parse_markdown;
-use crate::obsidian::{scan_property_wikilinks, scan_text_ranges};
+use crate::obsidian::{scan_property_references, scan_text_ranges};
 use crate::{BlockId, ParsedNote, Section, SectionKind, SourceDocument};
 
 /// Parse a document's frontmatter properties and nothing else.
@@ -21,7 +21,7 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     let markdown = parse_markdown(&source, frontmatter.body_start);
     let body = scan_text_ranges(&source, &markdown.text_ranges);
     let (property_references, property_diagnostics) =
-        scan_property_wikilinks(&source, &frontmatter.properties);
+        scan_property_references(&source, &frontmatter.properties);
 
     let mut note = ParsedNote::empty(source);
     note.properties = frontmatter.properties;
@@ -46,6 +46,7 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     }
     note.sections.extend(markdown.sections);
     attach_section_block_ids(&mut note.sections, &note.blocks);
+    fold_standalone_block_id_sections(&mut note.sections, note.source.text());
 
     note.list_items = markdown.list_items;
 
@@ -86,6 +87,69 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     note.diagnostics.dedup();
 
     note
+}
+
+/// Fold a `^id` written on a line of its own onto the block it names.
+///
+/// Obsidian attaches a standalone anchor to the **preceding** block and emits
+/// no section for the anchor line itself: `parity-blocks` captures
+/// `## Heading followed by a standalone id` (line 4, 79..117) carrying
+/// `id: "heading-standalone"` with nothing between it and the next paragraph,
+/// and `blocks["heading-standalone"]` reported at the heading's own position.
+/// This is the form Obsidian itself writes when a block link is copied from a
+/// heading, a table, or a list.
+///
+/// [`attach_section_block_ids`] already folds the no-blank-line form, where the
+/// anchor is a lazy continuation of the paragraph above it and mdast hands back
+/// one section covering both lines (`^para-block`, 140..190 in the same
+/// capture). The blank-line form reaches mdast as a paragraph of its own, which
+/// is the inconsistency this closes.
+///
+/// The anchor's own [`BlockId`] span is untouched — it still points at the
+/// `^id` text, which is where it was written — so a caller that wants the
+/// owning block's extent reads it off the section that now declares the id.
+///
+/// A `List` section is not a fold target: a block id is never attached to a
+/// list section (see [`attach_section_block_ids`]), so an anchor line after a
+/// list keeps its own section and its own id rather than moving onto a section
+/// that may not carry one. Nothing in either capture corpus covers that case.
+fn fold_standalone_block_id_sections(sections: &mut Vec<Section>, text: &str) {
+    let mut folded = Vec::with_capacity(sections.len());
+    for index in 0..sections.len() {
+        let Some(id) = sections[index].block_id.clone() else {
+            continue;
+        };
+        if !matches!(sections[index].kind, SectionKind::Paragraph) {
+            continue;
+        }
+        let Some(slice) = text.get(sections[index].span.start()..sections[index].span.end()) else {
+            continue;
+        };
+        if slice.trim_end() != format!("^{id}") {
+            continue;
+        }
+        let Some(previous) = index.checked_sub(1) else {
+            continue;
+        };
+        // Never fold onto a section that is itself being folded away: two
+        // anchor lines in a row would otherwise put the second id on a section
+        // that no longer exists, losing it.
+        if matches!(sections[previous].kind, SectionKind::List) || folded.last() == Some(&previous)
+        {
+            continue;
+        }
+        sections[previous].block_id = Some(id);
+        folded.push(index);
+    }
+    if folded.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    sections.retain(|_| {
+        let keep = !folded.contains(&index);
+        index += 1;
+        keep
+    });
 }
 
 /// Carry a trailing `^id` through to the owning top-level section, reusing

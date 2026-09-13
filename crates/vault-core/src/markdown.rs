@@ -326,14 +326,51 @@ fn extract_list_items(tree: &Node, body_start: usize, text: &str) -> Vec<ListIte
     items
 }
 
+/// A nested item's mdast span starts where the parent's content column is —
+/// the indent *left over* after the parent item's own marker is stripped is
+/// part of the child item. Obsidian keeps that leftover indent when it is two
+/// columns or more and drops it when it is a single space, so an item nested
+/// under an ordered parent starts on its marker.
+///
+/// `parity-list-nested-3deep` pins both halves against one file: under `- `
+/// (content column 2) a four-space indent leaves two columns and Obsidian
+/// reports cols 2 and 6 — which mdast already matches — while under `1. `
+/// (content column 3) the same four-space indent leaves one space and Obsidian
+/// reports cols 4 and 8, one past mdast. `14-mixed-deep` rules out the other
+/// reading: the item at its line 6 is *ordered* but nested under an unordered
+/// parent, leaving two columns, and Obsidian reports col 2 — so the rule is
+/// about the leftover indent, not about the child's own marker.
+///
+/// Every capture in both corpora has a leftover of exactly one or exactly two
+/// columns, so "drop a lone space" and "drop the leftover under an ordered
+/// parent" fit the evidence equally. The narrower, text-observable form is
+/// implemented here; a capture with, say, a three-space indent under `1. `
+/// would separate them.
+fn trim_lone_leftover_indent_space(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let lone_space =
+        bytes.get(start) == Some(&b' ') && !matches!(bytes.get(start + 1), None | Some(b' '));
+    if lone_space { start + 1 } else { start }
+}
+
 /// A `ListItem`'s own span, per Obsidian's convention: the item's marker
 /// through the end of its own direct (non-`List`) content, excluding any
 /// nested sublist. mdast's own `ListItem.position` covers the item *and*
 /// every nested sublist beneath it — Obsidian's `listItems[].position` does
 /// not (verified against `07-unordered-nested` and `14-mixed-deep`, where a
 /// naive `item.position` swallows the nested list that gets its own entries).
-fn item_span(body_start: usize, text: &str, item_node: &Node) -> Option<SourceSpan> {
+///
+/// `nested` says whether this item sits under a parent *item*, which is the
+/// only case where leftover indent exists at all; see
+/// [`trim_lone_leftover_indent_space`].
+fn item_span(body_start: usize, text: &str, item_node: &Node, nested: bool) -> Option<SourceSpan> {
     let whole = span_for(body_start, item_node)?;
+    let start = if nested {
+        trim_lone_leftover_indent_space(text, whole.start())
+    } else {
+        whole.start()
+    };
+    let whole = SourceSpan::new(start, whole.end()).unwrap_or(whole);
     let mut end = None;
     if let Some(children) = item_node.children() {
         for child in children {
@@ -369,7 +406,7 @@ fn walk_for_list_items(
             if !matches!(child, Node::ListItem(_)) {
                 continue;
             }
-            let item_position = item_span(body_start, text, child);
+            let item_position = item_span(body_start, text, child, parent_item_line.is_some());
             debug_assert!(
                 item_position.is_some(),
                 "a ListItem node produced by to_mdast from real source text always has a position"
@@ -641,7 +678,7 @@ fn destination_span(text: &str, span: SourceSpan) -> Option<SourceSpan> {
 
 /// Percent-decode a Markdown destination and split it into file and subpath
 /// portions. A recognized URI scheme yields no file target.
-fn split_markdown_target(raw: &str) -> (Option<String>, Option<Subpath>) {
+pub(crate) fn split_markdown_target(raw: &str) -> (Option<String>, Option<Subpath>) {
     if has_uri_scheme(raw) {
         return (None, None);
     }

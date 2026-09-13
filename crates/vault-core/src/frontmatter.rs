@@ -1,3 +1,6 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
 use saphyr::{LoadableYamlNode, MarkedYaml, Scalar, YamlData};
 
 use crate::{
@@ -213,14 +216,24 @@ fn convert_mapping(
     Ok(properties)
 }
 
+/// Whether a tag's text — everything after the `#`, or a `tags:` value in
+/// frontmatter — is one Obsidian accepts.
+///
+/// The character set is the one `obsidian::TAG_CANDIDATE` scans for, and the
+/// two must not drift: Obsidian's documented letters/numbers/`_`/`-`/`/`
+/// plus the Unicode Symbol categories, which is what keeps the emoji in
+/// `#tag-🙂` (captured in `parity-tags-nested-unicode`). A text that is only
+/// digits is not a tag, and no segment of a nested tag may be empty.
 pub(crate) fn is_valid_tag_text(text: &str) -> bool {
     !text.is_empty()
-        && text
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
+        && TAG_TEXT.is_match(text)
         && text.chars().any(|c| !c.is_numeric())
         && text.split('/').all(|segment| !segment.is_empty())
 }
+
+static TAG_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[\p{Alphabetic}\p{N}\p{S}_/-]+$").expect("tag text pattern compiles")
+});
 
 fn string_items(value: &Spanned<PropertyValue>) -> Result<Vec<(&str, SourceSpan)>, SourceSpan> {
     match &value.value {
