@@ -26,6 +26,13 @@
  *    `original`, optional `displayText`, and `key`. The body branch and the
  *    frontmatter branch are written separately below so they cannot drift back
  *    together; the frontmatter branch never calls {@link span} at all.
+ * 4. **`original` is the source, not a rendering of the parts.** It is read out
+ *    of {@link PositionIndex.originals}, the exact slice the warm step retained
+ *    for each reference span. Reconstructing it from `kind` + `raw_target` +
+ *    `display` looks total and is not: `[a](T.md "the title")`,
+ *    `[b](<Odd Name.md>)` and `[[Target|]]` all reconstruct short, and
+ *    `original` is the field a plugin uses to find and rewrite a link in the
+ *    body, so a short one is a find-and-replace that hits the wrong text.
  *
  * ## Where frontmatter keys and tag origins come from (Ruling W2)
  *
@@ -62,22 +69,10 @@
  * file, and a dot-prefixed *file* becoming a tree row — are about the tree, not
  * about this shape.
  *
- * Four further divergences were **found by this task's parity run** and are
- * upstream parse differences, not assembly bugs. Each is recorded in the parity
- * test as a named allowance so that it fails loudly if either side changes:
- *
- * - `parity-blocks`: a standalone `^id` line after a heading. Obsidian folds the
- *   id onto the preceding block and emits no section for the id line; `vaultd`
- *   emits an extra `paragraph` section carrying the id, so the section list is
- *   one longer and `blocks["heading-standalone"].position` names the id line
- *   rather than the heading.
- * - `parity-frontmatter-links`: `vaultd` extracts wikilinks from a property
- *   value but not Markdown links, so `related.1` has no reference to derive a
- *   `frontmatterLinks` entry from.
- * - `parity-list-nested-3deep`: a nested **ordered** list item's span starts one
- *   column earlier than Obsidian's. Nested unordered items agree.
- * - `parity-tags-nested-unicode`: a tag containing a non-BMP emoji ends at the
- *   emoji in `vaultd` (`#tag-`) and includes it in Obsidian (`#tag-🙂`).
+ * Beyond those two, the parity corpus is **exact** as of `vault-core` 734f500:
+ * all eighteen captures match field for field, and the four parser defects this
+ * task's first parity run found were fixed there rather than recorded as
+ * divergences.
  *
  * ## Fields this phase does not serve
  *
@@ -90,7 +85,7 @@
  * gap rather than assuming it is empty.
  */
 
-import { span } from "./positions";
+import { originalOf, span } from "./positions";
 import type { Pos, PositionIndex } from "./positions";
 import type {
   BlockDto,
@@ -130,6 +125,13 @@ export interface CachedMetadata {
    * — no empty arrays, no empty objects, and a `v` key no non-empty note in the
    * corpus carries. So it is emitted here under exactly that condition: the
    * assembled cache has no other key.
+   *
+   * **The condition is the assembled cache's emptiness, not the file's**, and
+   * the corpus cannot tell the two apart: it has one empty note and no
+   * whitespace-only one. A note of `"   \n"` or `"\n\n"` produces no sections
+   * in `vaultd` and would therefore be answered `{ v: 1 }` here, which is
+   * unverified rather than known-wrong. A whitespace-only capture would settle
+   * it.
    */
   v?: number;
   // Deliberately absent, with policy: `footnotes`, `footnoteRefs`, and
@@ -212,13 +214,16 @@ export function buildCachedMetadata(row: MirrorNoteRow, positions: PositionIndex
   for (const reference of row.outgoing) {
     if (reference.origin === "property") {
       // The frontmatter branch. It builds `{ link, original, displayText?, key }`
-      // and never touches the position index — see the module doc.
-      const key = frontmatterKeyOf(row.properties, reference.span);
-      if (key === null) continue;
-      frontmatterLinks.push({ ...referenceFields(reference), key });
+      // and never calls `span()` — see the module doc. It still reads the
+      // index, for the retained source slice `original` is.
+      const key = frontmatterKeyOf(row.path, row.properties, reference.span);
+      frontmatterLinks.push({ ...referenceFields(reference, positions, row.path), key });
       continue;
     }
-    const entry: ReferenceCache = { ...referenceFields(reference), position: at(reference.span) };
+    const entry: ReferenceCache = {
+      ...referenceFields(reference, positions, row.path),
+      position: at(reference.span),
+    };
     if (isEmbed(reference)) embeds.push(entry);
     else links.push(entry);
   }
@@ -310,7 +315,7 @@ export function referenceCacheOf(
   positions: PositionIndex,
 ): ReferenceCache {
   return {
-    ...referenceFields(reference),
+    ...referenceFields(reference, positions, reference.source_path),
     position: span(positions, reference.span.start, reference.span.end),
   };
 }
@@ -373,12 +378,40 @@ function isEmbed(reference: ReferenceDto): boolean {
  * the field stays optional on {@link Reference} because that is what
  * `obsidian.d.ts` declares.
  */
-function referenceFields(reference: ReferenceDto): Reference {
+function referenceFields(
+  reference: ReferenceDto,
+  positions: PositionIndex,
+  path: string,
+): Reference {
   return {
     link: linkTextOf(reference),
-    original: originalOf(reference),
+    original: sourceTextOf(reference, positions, path),
     displayText: displayTextOf(reference),
   };
+}
+
+/**
+ * `original`: the reference exactly as it was written, read out of the index.
+ *
+ * The slice was retained by the warm step, which is the one moment the host
+ * holds the note's bytes and its row at the same time. A missing slice is a
+ * **host bug**, not a data condition — an index built without the row's
+ * reference spans — and it throws rather than falling back to a reconstruction,
+ * because the whole reason the slice exists is that no reconstruction is
+ * faithful. Every caller of `buildCachedMetadata` builds its index from the
+ * same row's `outgoing`, so the throw is unreachable by design and loud if the
+ * design is ever broken.
+ */
+function sourceTextOf(reference: ReferenceDto, positions: PositionIndex, path: string): string {
+  const text = originalOf(positions, reference.span);
+  if (text === undefined) {
+    throw new Error(
+      `${path} has no retained source for the reference at bytes ` +
+        `${String(reference.span.start)}..${String(reference.span.end)}: the position index was ` +
+        `built without this row's outgoing spans, so \`original\` cannot be exact`,
+    );
+  }
+  return text;
 }
 
 /**
@@ -398,55 +431,46 @@ function linkTextOf(reference: ReferenceDto): string {
 }
 
 /**
- * `original`: the reference exactly as it was written.
- *
- * **Reconstructed from the reference's own parts rather than sliced out of the
- * source**, because this function is pure and holds no source — a
- * {@link PositionIndex} deliberately keeps line starts and wide characters and
- * not a single note body. The reconstruction is total for the four reference
- * kinds the daemon reports: a wikilink is `[[target]]` or `[[target|display]]`,
- * a Markdown link is `[display](target)`, and an embed is either of those with
- * a leading `!`. Every `original` in all eighteen captures comes out identical.
- */
-function originalOf(reference: ReferenceDto): string {
-  const bang = isEmbed(reference) ? "!" : "";
-  if (reference.kind === "wikilink" || reference.kind === "wiki_embed") {
-    const alias = reference.display === null ? "" : `|${reference.display}`;
-    return `${bang}[[${reference.raw_target}${alias}]]`;
-  }
-  return `${bang}[${reference.display ?? ""}](${reference.raw_target})`;
-}
-
-/**
  * `displayText`: what the reader sees.
  *
  * An explicit display text — the alias after a `|`, or a Markdown link's label
  * — is used as written. Without one, Obsidian shows the link text with its
- * subpath separator spelled out: `[[Parity target#Some heading]]` displays as
+ * subpath separators spelled out: `[[Parity target#Some heading]]` displays as
  * `Parity target > Some heading`, and `[[Parity target#^blockid]]` as
  * `Parity target > ^blockid`.
+ *
+ * **Every separator, not the first.** A heading path can nest —
+ * `[[Note#H1#H2]]` displays as `Note > H1 > H2` — and a string-pattern
+ * `replace` would have spelled only the first, leaving `Note > H1#H2`. No
+ * capture covers a multi-level subpath, so a case pins it directly.
  */
 function displayTextOf(reference: ReferenceDto): string {
   if (reference.display !== null) return reference.display;
-  return reference.raw_target.replace("#", " > ");
+  return reference.raw_target.replaceAll("#", " > ");
 }
 
 /**
- * The dotted frontmatter key a property-borne reference was written under, or
- * `null` when no property's value contains it.
+ * The dotted frontmatter key a property-borne reference was written under.
  *
  * Ruling W2's client-side derivation: find the one property whose `value_span`
  * contains the reference, then descend its value tree by the same test.
+ *
+ * **Throws rather than dropping the reference.** A reference the daemon marked
+ * `origin: "property"` came out of a property value by construction, so no
+ * containing property means the two sides disagree about where frontmatter
+ * ends — and the silent `continue` this replaced would have dropped a
+ * `frontmatterLinks` entry with no diagnostic anywhere, which is precisely the
+ * failure a future change to the property scanner would produce.
  */
-function frontmatterKeyOf(
-  properties: readonly PropertyDto[],
-  at: SpanDto,
-): string | null {
+function frontmatterKeyOf(path: string, properties: readonly PropertyDto[], at: SpanDto): string {
   for (const property of properties) {
     if (!contains(property.value_span, at)) continue;
     return property.key + descend(property.value, at);
   }
-  return null;
+  throw new Error(
+    `${path} has a property-origin reference at bytes ${String(at.start)}..${String(at.end)} ` +
+      `that lies inside no property's value span`,
+  );
 }
 
 /**

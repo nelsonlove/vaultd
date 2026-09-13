@@ -42,6 +42,27 @@ export interface PositionIndex {
   readonly byteLength: number;
   /** Total UTF-16 length of the same source. */
   readonly u16Length: number;
+  /**
+   * The **exact source text** of each span the caller asked to retain, keyed
+   * `"<byteStart>:<byteEnd>"`.
+   *
+   * Obsidian's `LinkCache.original` is the reference exactly as it was written,
+   * and a plugin uses it to find and rewrite a link in the note body — so a
+   * value that merely *reconstructs* the reference from its parts is a
+   * find-and-replace that silently misses. Three ordinary Markdown forms defeat
+   * any reconstruction: a link title (`[a](T.md "the title")`), an
+   * angle-bracket target (`[b](<Odd Name.md>)`), and an empty alias
+   * (`[[Target|]]`). The daemon's span is right in all three; only the
+   * reconstruction was short.
+   *
+   * So the warm step, which is holding the note's bytes anyway to build this
+   * table, keeps the slice for each **outgoing reference span** — and nothing
+   * else. A note with no links retains nothing; a note of ordinary prose
+   * retains a few dozen bytes. That is the whole cost of never being wrong
+   * about `original`, against the alternative of keeping every note's source in
+   * memory, which is the thing this class exists to avoid.
+   */
+  readonly originals: ReadonlyMap<string, string>;
 }
 
 /** Obsidian's own position shape: zero-based line, UTF-16 column and offset. */
@@ -57,6 +78,17 @@ export interface Pos {
   end: Loc;
 }
 
+/** A half-open byte range, structurally the wire's `SpanDto`. */
+export interface ByteSpan {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** The key one retained span is filed under. */
+function spanKey(start: number, end: number): string {
+  return `${String(start)}:${String(end)}`;
+}
+
 /**
  * Build the conversion table for one source, in a single pass.
  *
@@ -64,8 +96,18 @@ export interface Pos {
  * matching Obsidian's own line counting, and a `\r\n` therefore leaves the `\r`
  * as the last character of the preceding line — which is also where Obsidian
  * puts it.
+ *
+ * `retain` names the byte spans whose **exact source text** the index should
+ * keep — the note's outgoing reference spans, and nothing else. See
+ * {@link PositionIndex.originals} for why the alternative (reconstructing the
+ * text from the reference's parts) is wrong rather than merely approximate.
+ * Passing none keeps none, which is right for every caller that only wants
+ * positions.
  */
-export function buildPositionIndex(source: string): PositionIndex {
+export function buildPositionIndex(
+  source: string,
+  retain: readonly ByteSpan[] = [],
+): PositionIndex {
   const lineStarts: number[] = [0];
   const lineU16Starts: number[] = [0];
   const wide: number[] = [];
@@ -84,13 +126,36 @@ export function buildPositionIndex(source: string): PositionIndex {
       lineU16Starts.push(u16);
     }
   }
-  return {
+  const index: PositionIndex = {
     lineStarts: Uint32Array.from(lineStarts),
     lineU16Starts: Uint32Array.from(lineU16Starts),
     wide: Uint32Array.from(wide),
     byteLength: byte,
     u16Length: source.length,
+    originals: new Map<string, string>(),
   };
+  // After the table exists, because slicing a byte span out of a JS string
+  // means converting both ends through the very table being built.
+  const originals = index.originals as Map<string, string>;
+  for (const span of retain) {
+    const from = locate(index, span.start).offset;
+    const to = locate(index, span.end).offset;
+    originals.set(spanKey(span.start, span.end), source.slice(from, to));
+  }
+  return index;
+}
+
+/**
+ * The exact source text of a retained span, or `undefined` if it was not
+ * retained.
+ *
+ * `undefined` is not a value a caller may paper over: the point of retaining
+ * the slice is that no reconstruction is faithful, so a consumer that meets
+ * `undefined` has been handed an index built without the spans it needs, and
+ * saying so loudly is the only honest answer.
+ */
+export function originalOf(index: PositionIndex, span: ByteSpan): string | undefined {
+  return index.originals.get(spanKey(span.start, span.end));
 }
 
 /**

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   HeadlessUnsupported,
@@ -8,6 +8,7 @@ import {
   enterPlugin,
   policyOf,
   recordUse,
+  resetPolicyTable,
   setPolicyRecorder,
   stub,
   unsupported,
@@ -29,6 +30,17 @@ import type { PolicyRecorder } from "../src/shim/policy";
 function recorded(recorder: PolicyRecorder): string[] {
   return recorder.entries().map((entry) => `${entry.symbol}:${entry.policy}:${String(entry.hits)}`);
 }
+
+/**
+ * The table is module-scoped and every shim module declares into it at import,
+ * so this file inherits whatever its own import graph reached —
+ * `memoryPolicyRecorder` comes from `testing/assemble.ts`, which imports the
+ * whole shim. Emptying it before each case is what keeps "only what was
+ * declared" a statement about this file rather than about that graph.
+ */
+beforeEach(() => {
+  resetPolicyTable();
+});
 
 describe("the policy table", () => {
   it("answers absent for a symbol nobody declared", () => {

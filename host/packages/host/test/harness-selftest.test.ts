@@ -32,8 +32,10 @@ import { testClock } from "../src/testing/clock";
 import { DaemonHarness } from "../src/testing/daemon-harness";
 import {
   FixtureVault,
+  cacheKey,
   fixtureCacheDir,
   fixtureGeneratorSpawns,
+  overrideFixtureParserStamp,
   parseFixtureRow,
 } from "../src/testing/fixture-vault";
 import { MirrorHarness } from "../src/testing/mirror-harness";
@@ -216,6 +218,41 @@ describe("MirrorHarness", () => {
     expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a2");
     await harness.stop();
   });
+
+  it("serves a read_file at the mirror's own revision, so a warm-up warms", async () => {
+    const harness = await MirrorHarness.hydrated({
+      generation: 1,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+    harness.autoServeFiles({ "A.md": "# Title\n" });
+    // `Mirror.warmOne` skips a note whose read comes back at a revision it did
+    // not expect, so an auto server answering its own stand-in hash would warm
+    // nothing — which is exactly what it did until Task 8 needed an index.
+    expect((await harness.mirror.warmPositions()).warmed).toBe(1);
+    expect(harness.mirror.positions("A.md")).toBeDefined();
+    await harness.stop();
+  });
+
+  it("skips a note whose bytes have moved past its row", async () => {
+    const harness = await MirrorHarness.hydrated({
+      generation: 1,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+    harness.autoServeFiles({ "A.md": "# Title\n" });
+    // The production guard: an index built from newer bytes than the row would
+    // put every span in the note slightly wrong, silently. Nothing in the suite
+    // could reach it through the auto-served path once the harness started
+    // answering the row's own revision, so the harness can force a mismatch.
+    harness.forceServedRevision("A.md", "blake3:newer");
+    expect((await harness.mirror.warmPositions()).warmed).toBe(0);
+    expect(harness.mirror.positions("A.md")).toBeUndefined();
+    // And it is the revision doing it, not the path: put it back and it warms.
+    harness.forceServedRevision("A.md", null);
+    expect((await harness.mirror.warmPositions()).warmed).toBe(1);
+    await harness.stop();
+  });
 });
 
 describe("FixtureVault and the real parser", () => {
@@ -281,6 +318,38 @@ describe("FixtureVault and the real parser", () => {
       }
     }
   }, FIXTURE_TIMEOUT_MS);
+
+  it("keys a cached row on the parser that produced it", () => {
+    // The whole value of these rows is that they are what `vault-core` really
+    // answers, so a cache keyed on the fixture text alone keeps serving what the
+    // parser said *before* it was fixed — and every host parity test goes on
+    // comparing against the old answer, which is exactly where a parser fix most
+    // needs to be visible.
+    //
+    // Asserted on the key rather than by watching a spawn, so this costs no
+    // subprocess: two stamps over identical input must not collide, and one
+    // stamp over identical input must.
+    const documents = [{ path: "Stamp.md", source: "# Stamp\n" }];
+    const spawnsBefore = fixtureGeneratorSpawns();
+    try {
+      overrideFixtureParserStamp("parser-before-the-fix");
+      const before = cacheKey(documents, "Stamp.md");
+      expect(cacheKey(documents, "Stamp.md")).toBe(before);
+
+      overrideFixtureParserStamp("parser-after-the-fix");
+      const after = cacheKey(documents, "Stamp.md");
+      expect(after).not.toBe(before);
+
+      // And the input still matters: a different note under one parser is still
+      // a different key, so the stamp was added to the digest rather than
+      // replacing what was there.
+      expect(cacheKey([{ path: "Stamp.md", source: "# Other\n" }], "Stamp.md")).not.toBe(after);
+    } finally {
+      overrideFixtureParserStamp(null);
+    }
+    // The point of asserting on the key: nothing was generated.
+    expect(fixtureGeneratorSpawns()).toBe(spawnsBefore);
+  });
 
   it("synthesizes folders into the entry tree", () => {
     const vault = new FixtureVault({ "Folder/Sub/A.md": "x\n", "B.md": "y\n" });

@@ -74,6 +74,8 @@ export interface RefetchAnswer {
 
 export class MirrorHarness extends DaemonHarness {
   private mirrorValue: Mirror | null = null;
+  /** Paths whose auto-served revision a case has overridden. */
+  private readonly forcedRevisions = new Map<string, string>();
 
   /**
    * Protected rather than private so a subclass can exist: Task 6b's
@@ -126,7 +128,25 @@ export class MirrorHarness extends DaemonHarness {
    * has ever been for one.
    */
   protected override revisionServedFor(path: string, content: string): string {
+    const forced = this.forcedRevisions.get(path);
+    if (forced !== undefined) return forced;
     return this.mirrorValue?.note(path)?.revision ?? super.revisionServedFor(path, content);
+  }
+
+  /**
+   * Answer `path`'s auto-served `read_file` at a revision of the case's
+   * choosing, whatever the mirror holds.
+   *
+   * The only way to reach `Mirror.warmOne`'s revision-mismatch skip through the
+   * automatic path. That guard exists because an index built from bytes newer
+   * than the row puts every span in the note slightly wrong — silently — and
+   * once {@link revisionServedFor} started answering the row's own revision,
+   * nothing in the suite could drive it any more. Pass `null` to go back to the
+   * ordinary answer.
+   */
+  forceServedRevision(path: string, revision: string | null): void {
+    if (revision === null) this.forcedRevisions.delete(path);
+    else this.forcedRevisions.set(path, revision);
   }
 
   /** Answer a full hydration walk — open, tree, notes, close — from a spec. */

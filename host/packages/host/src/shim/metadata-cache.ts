@@ -115,18 +115,27 @@ export class CustomArrayDict<T> {
   }
 }
 
-/** One memoized build, and the revision that makes it still valid. */
-interface Memo {
+/**
+ * One note's **last assembled cache**, and the revision that makes it still
+ * valid.
+ *
+ * It serves two jobs at once, and both matter. While the revision still
+ * matches, it is the memo: `getFileCache` hands back the same object rather
+ * than rebuilding. Once the revision moves — or once the row is gone — it is
+ * the *last known* cache, which is the only thing left to hand a `deleted`
+ * handler that wants to un-index what was lost, because by then the mirror's
+ * row has been removed and nothing can rebuild it.
+ */
+interface Assembled {
   readonly revision: string;
   readonly cache: CachedMetadata;
 }
 
 export class MetadataCache extends Events {
-  private readonly memo = new Map<string, Memo>();
+  private readonly assembled = new Map<string, Assembled>();
 
   constructor(private readonly deps: MetadataCacheDeps) {
     super(deps.events);
-    declarePolicies();
   }
 
   // --- Reading the parse ----------------------------------------------------
@@ -213,6 +222,17 @@ export class MetadataCache extends Events {
    * full path when it does not because another file shares the name. The `.md`
    * extension is dropped unless the caller says otherwise, which is what
    * `omitMdExtension` defaulting to `true` means.
+   *
+   * **`newLinkFormat` is deliberately not read here.** The vault's `getConfig`
+   * already serves it, so the omission is a choice rather than a gap: this
+   * method answers "what is the shortest text that reaches this file", which is
+   * a question about the vault's contents, while `newLinkFormat`
+   * (`shortest` / `relative` / `absolute`) is a *preference* about how to spell
+   * a link the host is composing. The plan puts that on Task 9's
+   * `FileManager.generateMarkdownLink`, which is the surface a plugin calls to
+   * compose one. This host has no `obsidian.d.ts` checked in, so which of the
+   * two reads the setting in the real application is not verified here — if
+   * Task 9 finds that it belongs on both, this is where the second half goes.
    */
   fileToLinktext(file: TFile, sourcePath: string, omitMdExtension?: boolean): string {
     recordUse("MetadataCache.fileToLinktext");
@@ -227,9 +247,15 @@ export class MetadataCache extends Events {
    *
    * `obsidian.d.ts` declares these mutable and the application hands out its
    * own objects too, so a plugin that walks a vault-sized table pays nothing
-   * here either. The mirror rebuilds the table whenever its link epoch moves,
-   * so a plugin that scribbles on one is scribbling on a value that is about to
-   * be replaced rather than on the mirror's own indexes.
+   * here either.
+   *
+   * **The object is shared, and it is not about to be replaced.** The mirror
+   * caches it under its link epoch and hands the same object to every caller
+   * until the epoch moves, which in a vault nobody is editing is never. So a
+   * plugin that scribbles on it scribbles on what the next plugin reads. The
+   * hazard is exactly Obsidian's own, which is the reason for matching it
+   * rather than copying: a copy here would be a per-call allocation the size of
+   * the vault's link graph, to fix a thing the application does not fix.
    */
   get resolvedLinks(): Record<string, Record<string, number>> {
     recordUse("MetadataCache.resolvedLinks");
@@ -277,46 +303,68 @@ export class MetadataCache extends Events {
    *
    * `data` is the note's new source, which the mirror has already read to
    * rebuild the position index, so the event costs no extra round trip. The
-   * memo is dropped first, so a handler that calls `getFileCache` inside the
-   * event sees the same object the event carried rather than the previous one.
+   * retained entry is dropped first, so a handler that calls `getFileCache`
+   * inside the event sees the same object the event carried rather than the
+   * previous one.
    *
    * **Called by Task 15's lifecycle sequencer, not by a subscription here** —
    * see the module doc.
    */
   notifyChanged(file: TFile, data: string): void {
-    this.memo.delete(file.path);
+    this.assembled.delete(file.path);
     this.trigger("changed", ...([file, data, this.cacheFor(file.path)] as never[]));
   }
 
   /**
-   * Fire `deleted` for one note, carrying the cache it had before it went.
+   * Fire `deleted` for one note, carrying the cache it had before it went, and
+   * then forget it.
    *
    * Obsidian hands the handler the *previous* cache, which is the only thing
-   * left to identify what was lost; the mirror's row is already gone by then,
-   * so the value is taken from the memo before it is dropped.
+   * left to identify what was lost: by the time the sequencer calls this the
+   * mirror's row is gone, so the value cannot be rebuilt and has to come from
+   * what was last assembled for that path.
+   *
+   * **A note nothing ever read has nothing to carry, and answers `null`.** That
+   * is a real hole rather than a shrug — `CachedMetadata | null` is what
+   * Obsidian's own typing permits, but a handler that wants to un-index a note
+   * it never asked about gets nothing. Task 15 closes it, if it wants it closed,
+   * by reading the cache before it applies the delete; this surface cannot,
+   * because it is not told a note is about to go.
    */
   notifyDeleted(file: TFile): void {
-    const previous = this.memo.get(file.path)?.cache ?? null;
-    this.memo.delete(file.path);
+    const previous = this.assembled.get(file.path)?.cache ?? null;
+    this.assembled.delete(file.path);
     this.trigger("deleted", ...([file, previous] as never[]));
   }
 
-  /** Drop one path's memo without firing anything. */
+  /** Drop one path's retained cache without firing anything. */
   forget(path: string): void {
-    this.memo.delete(path);
+    this.assembled.delete(path);
+  }
+
+  /** How many paths this cache is holding an assembly for. */
+  retainedCount(): number {
+    return this.assembled.size;
   }
 
   // --- Internals ------------------------------------------------------------
 
   private cacheFor(path: string): CachedMetadata | null {
     const row = this.deps.mirror.note(path);
-    if (row === undefined) return null;
+    if (row === undefined) {
+      // The row is gone — deleted, or renamed out from under this path. Drop
+      // the retained assembly here rather than leaving it to accumulate for the
+      // life of the host: a rename fires no `deleted` for the old path, so this
+      // is the only place that ever asks about it again.
+      this.assembled.delete(path);
+      return null;
+    }
     const positions = this.deps.mirror.positions(path);
     if (positions === undefined) return null;
-    const memo = this.memo.get(path);
-    if (memo !== undefined && memo.revision === row.revision) return memo.cache;
+    const retained = this.assembled.get(path);
+    if (retained !== undefined && retained.revision === row.revision) return retained.cache;
     const cache = buildCachedMetadata(row, positions);
-    this.memo.set(path, { revision: row.revision, cache });
+    this.assembled.set(path, { revision: row.revision, cache });
     return cache;
   }
 }
@@ -330,24 +378,23 @@ export class MetadataCache extends Events {
  * really implements, listed whether or not a plugin ever calls one — the report
  * is a claim about the host, not a trace of one session.
  *
- * **Called from the constructor, not at module load**, because the policy table
- * is module-level process-wide state: declaring on import would put these rows
- * in the table of every test whose import graph happens to reach this file,
- * including `policy.test.ts`, which pins `declaredSymbols()` to exactly what it
- * declared itself. Declaring when a `MetadataCache` is built ties the rows to a
- * host that really has this surface, and `assembleShim` builds exactly one.
+ * **Declared at import, not in the constructor.** The table is the host's
+ * statement about its own surface, so it must not be a function of what has
+ * been constructed in this process: a report path that builds the barrel
+ * without assembling a host would otherwise omit these twelve rows and say
+ * nothing about it. The cost is that the table is process-wide state a test
+ * cannot un-import, which is what `resetPolicyTable()` in `shim/policy.ts`
+ * exists for — test isolation only, never production.
  */
-function declarePolicies(): void {
-  declarePolicy("MetadataCache.getFileCache", "implemented");
-  declarePolicy("MetadataCache.getCache", "implemented");
-  declarePolicy("MetadataCache.getCachedFiles", "implemented");
-  declarePolicy("MetadataCache.getTags", "implemented");
-  declarePolicy("MetadataCache.getFirstLinkpathDest", "implemented");
-  declarePolicy("MetadataCache.fileToLinktext", "implemented");
-  declarePolicy("MetadataCache.resolvedLinks", "implemented");
-  declarePolicy("MetadataCache.unresolvedLinks", "implemented");
-  declarePolicy("MetadataCache.getBacklinksForFile", "implemented");
-  declarePolicy("CachedMetadata.footnotes", "absent");
-  declarePolicy("CachedMetadata.footnoteRefs", "absent");
-  declarePolicy("CachedMetadata.referenceLinks", "absent");
-}
+declarePolicy("MetadataCache.getFileCache", "implemented");
+declarePolicy("MetadataCache.getCache", "implemented");
+declarePolicy("MetadataCache.getCachedFiles", "implemented");
+declarePolicy("MetadataCache.getTags", "implemented");
+declarePolicy("MetadataCache.getFirstLinkpathDest", "implemented");
+declarePolicy("MetadataCache.fileToLinktext", "implemented");
+declarePolicy("MetadataCache.resolvedLinks", "implemented");
+declarePolicy("MetadataCache.unresolvedLinks", "implemented");
+declarePolicy("MetadataCache.getBacklinksForFile", "implemented");
+declarePolicy("CachedMetadata.footnotes", "absent");
+declarePolicy("CachedMetadata.footnoteRefs", "absent");
+declarePolicy("CachedMetadata.referenceLinks", "absent");

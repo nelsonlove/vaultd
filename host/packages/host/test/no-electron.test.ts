@@ -7,6 +7,18 @@ import { describe, expect, it } from "vitest";
 // modules as well, so the same line works in both places.
 const workspaceRoot = resolve(__dirname, "..", "..", "..");
 
+/**
+ * `npm ls --all --json` walks the whole installed tree, and on a loaded machine
+ * that is slower than vitest's five-second default by a wide margin — measured
+ * at 9.4 s wall for 0.88 s of user CPU (13 % CPU, pure contention) while the
+ * Rust suite was running in the same worktree. A shell-out to another package
+ * manager is not a five-second operation, and a timeout here reports "test
+ * failed" for what is actually "the machine is busy", which is the same
+ * least-useful sentence `FIXTURE_TIMEOUT_MS` exists to avoid in the harness
+ * self-test. The assertion is unchanged; only the budget is.
+ */
+const NPM_LS_TIMEOUT_MS = 120_000;
+
 describe("dependency tree", () => {
   it("contains no real electron package", () => {
     const tree = execFileSync("npm", ["ls", "--all", "--json"], {
@@ -19,7 +31,7 @@ describe("dependency tree", () => {
     // of red the day the workspace layout stopped linking the stub.
     expect(parsed.dependencies?.["electron"]?.version).toBe("0.0.0-headless");
     expect(tree).not.toContain("electron.zip");
-  });
+  }, NPM_LS_TIMEOUT_MS);
 
   it("declares electron nowhere in any package.json dependency block", () => {
     for (const pkg of ["package.json", "packages/host/package.json", "packages/obsidian/package.json"]) {

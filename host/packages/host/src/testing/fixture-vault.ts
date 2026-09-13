@@ -21,6 +21,19 @@
  * — never a hand-written fallback, which would be shape 1 wearing shape 3's
  * clothes.
  *
+ * **The cache key names the parser, not just the input.** The whole value of
+ * shape 3 is that these rows are what `vault-core` really answers, and a cache
+ * keyed on the fixture text alone quietly keeps answering what it answered
+ * before the parser changed — so a parser fix lands and the host's parity tests
+ * never see it. {@link fixtureParserStamp} therefore hashes the generator
+ * binary into every key.
+ *
+ * One consequence, stated rather than discovered: **a machine with no
+ * `target/debug/fixture-row` has a cold cache**, because there is no parser
+ * identity to key on and a row of unknown provenance is worth less than a
+ * rebuild. The "runs from the cache with no Rust toolchain" path therefore
+ * needs the binary present, not merely the cache directory.
+ *
  * **Resolution is a whole-vault question**, so a `FixtureVault` parses all of
  * its notes in one request and the binary resolves each note's links against
  * every other. {@link parseFixtureRow}, which is handed one note and no vault,
@@ -103,17 +116,68 @@ function regenerateCommand(): string {
   return "cargo run -q -p vault-server --bin fixture-row";
 }
 
+/** The generator binary a `cargo run` of `fixture-row` produces. */
+function fixtureRowBinary(): string {
+  return join(workspaceRoot(), "target", "debug", "fixture-row");
+}
+
+let parserStamp: string | null = null;
+let stampOverride: string | null = null;
+/**
+ * A per-process nonce for the no-binary case, so every key misses.
+ *
+ * Random rather than a constant: a constant would make "no parser" a cache
+ * partition that persists across runs, which is exactly the "rows of unknown
+ * provenance" the stamp exists to refuse.
+ */
+const absentStamp = `absent-${createHash("sha256").update(String(Math.random())).digest("hex").slice(0, 16)}`;
+
+/**
+ * Which parser produced a cached row: a short digest of the generator binary.
+ *
+ * Not memoized while the binary is missing, so a process that builds it — a
+ * `cargo run` does — starts keying on the real hash from the next call, rather
+ * than staying on the nonce for its whole life. Once a hash is computed it
+ * **is** memoized, so one run keys consistently even if a concurrent build
+ * replaces the binary underneath it; the next run picks the new one up.
+ */
+export function fixtureParserStamp(): string {
+  if (stampOverride !== null) return stampOverride;
+  if (parserStamp !== null) return parserStamp;
+  const binary = fixtureRowBinary();
+  if (!fs.existsSync(binary)) return absentStamp;
+  parserStamp = createHash("sha256").update(fs.readFileSync(binary)).digest("hex").slice(0, 16);
+  return parserStamp;
+}
+
+/**
+ * Force the stamp to a value. **Tests only**, and restore it with `null`.
+ *
+ * The seam that makes "a parser change invalidates the cache" a measurement
+ * rather than a claim: a case sets two different stamps over identical input
+ * and asserts {@link cacheKey} does not collide. Asserting on the key rather
+ * than on a re-spawn is deliberate — it proves the same property and costs no
+ * `cargo run`, which matters in a suite where a miss can block on a build lock
+ * for minutes.
+ */
+export function overrideFixtureParserStamp(value: string | null): void {
+  stampOverride = value;
+}
+
 /**
  * The cache key for one note inside one document set.
  *
- * The whole set is in the digest, not just this note's own bytes: a link out of
- * `A.md` resolves differently depending on what else is in the vault, so a key
- * that named only `A.md` would serve a two-note vault's answer to a one-note
- * vault. Adding a file to a fixture invalidates every note in it, which is
- * correct and costs one subprocess.
+ * Three things are in the digest. The whole document set, not just this note's
+ * own bytes: a link out of `A.md` resolves differently depending on what else
+ * is in the vault, so a key that named only `A.md` would serve a two-note
+ * vault's answer to a one-note vault. The note's path. And the **parser**, so
+ * that a change to `vault-core` invalidates every row rather than being
+ * invisible to every test that reads one.
  */
-function cacheKey(documents: readonly FixtureRequest[], path: string): string {
+export function cacheKey(documents: readonly FixtureRequest[], path: string): string {
   const digest = createHash("sha256");
+  digest.update(fixtureParserStamp());
+  digest.update("\0parser\0");
   for (const document of documents) {
     digest.update(document.path);
     digest.update("\0");

@@ -1,11 +1,13 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { buildCachedMetadata } from "../src/mirror/metadata";
 import { buildPositionIndex } from "../src/mirror/positions";
 import { parseFixtureRow } from "../src/testing/fixture-vault";
-import type { BlockCache, SectionCache, TagCache } from "../src/mirror/metadata";
+import type { CachedMetadata, ReferenceCache, SectionCache } from "../src/mirror/metadata";
+import type { MirrorNoteRow } from "../src/mirror/types";
+import type { PositionIndex } from "../src/mirror/positions";
 
 /**
  * `buildCachedMetadata` against eighteen `CachedMetadata` objects captured from
@@ -18,6 +20,27 @@ import type { BlockCache, SectionCache, TagCache } from "../src/mirror/metadata"
  *
  * It is data-driven over the capture directory, so a new fixture needs no new
  * test code.
+ *
+ * ## The corpus is exact, and it did not start that way
+ *
+ * All eighteen fixtures now match field for field. The first parity run found
+ * four places where `vault-core` parsed a note differently from Obsidian — a
+ * standalone `^id` line not folded onto a preceding heading, Markdown links
+ * inside property values never scanned, nested **ordered** list item spans one
+ * byte early, and a tag character class that admitted no Unicode symbol. None
+ * was a compatibility *divergence*: Tier 1's contract is "match documented
+ * Obsidian behavior", and the four divergences `VAULTD-COMPATIBILITY.md`
+ * records are all things `vaultd` does not model at all, while these were
+ * things it modelled and got wrong. So they were carried here as known-failing
+ * expectations until `vault-core` 734f500 fixed all four, and this file went
+ * back to one exact comparison per fixture.
+ *
+ * Two things that bought, worth keeping in mind before anyone loosens a
+ * comparison again. A test that edits the capture into the daemon's shape —
+ * which is what the first draft of this file did — passes, and retires the
+ * defect. And the fixture cache key names the generator binary, so a parser fix
+ * invalidates every cached row rather than leaving these cases comparing
+ * against the answer that was wrong.
  */
 const dir = join(__dirname, "..", "..", "..", "fixtures", "metadata-parity");
 const cases = readdirSync(dir)
@@ -44,125 +67,66 @@ const without = (cache: Record<string, unknown>): Record<string, unknown> => {
  * "comparisons filter zero-width sections". Dropping them from Obsidian's side
  * is the documented allowance; inventing them in `buildCachedMetadata` would be
  * fabricating a shape the daemon never reported.
+ *
+ * Returns the count it removed, so the corpus-wide filter can be held to the
+ * same non-vacuity discipline as everything else here: it must fire exactly
+ * where the corpus says it should, and nowhere else, or it could quietly start
+ * masking a section `vaultd` simply failed to report.
  */
-const withoutPhantomSections = (cache: Record<string, unknown>): Record<string, unknown> => {
-  const sections = cache.sections;
-  if (!Array.isArray(sections)) return cache;
-  return {
-    ...cache,
-    sections: (sections as SectionCache[]).filter(
-      (section) => section.position.start.offset !== section.position.end.offset,
-    ),
-  };
-};
+const PHANTOM_SECTIONS: Readonly<Record<string, number>> = { "parity-footnotes": 2 };
 
-/**
- * The parse divergences this task's parity run **found**, one named allowance
- * each.
- *
- * None of these is an assembly bug: each is a place where `vaultd`'s parser and
- * Obsidian's disagree about the source, which no amount of reshaping in
- * `buildCachedMetadata` could reconcile without re-parsing the note. So rather
- * than loosening the comparison — which would stop measuring the rest of the
- * fixture — each entry edits **Obsidian's captured cache** into the shape
- * `vaultd`'s parse can actually produce, in full, with the reason stated. Every
- * other field of every one of these fixtures is still compared exactly, and if
- * either side changes the edit stops applying and the case fails.
- *
- * Fixing any of them means changing `crates/`, not this file; when one is fixed,
- * its entry is deleted and the fixture goes back to matching outright.
- */
-interface Divergence {
-  readonly why: string;
-  readonly apply: (cache: Record<string, unknown>) => Record<string, unknown>;
+function withoutPhantomSections(cache: Record<string, unknown>): {
+  cache: Record<string, unknown>;
+  removed: number;
+} {
+  const sections = cache.sections;
+  if (!Array.isArray(sections)) return { cache, removed: 0 };
+  const kept = (sections as SectionCache[]).filter(
+    (section) => section.position.start.offset !== section.position.end.offset,
+  );
+  return { cache: { ...cache, sections: kept }, removed: sections.length - kept.length };
 }
 
-const DIVERGENCES: Readonly<Record<string, Divergence>> = {
-  "parity-blocks": {
-    why:
-      "A standalone `^id` line after a heading. Obsidian folds the id onto the " +
-      "preceding heading section and emits no section for the id line; vaultd " +
-      "parses the line as its own paragraph and hangs the id there. So the " +
-      "section list is one longer and blocks['heading-standalone'] names the id " +
-      "line rather than the heading.",
-    apply: (cache) => {
-      const sections = [...(cache.sections as SectionCache[])].map((section) => ({ ...section }));
-      const idLine = {
-        start: { line: 6, col: 0, offset: 119 },
-        end: { line: 6, col: 19, offset: 138 },
-      };
-      // The heading at line 4 keeps no id in vaultd's parse …
-      const heading = sections[2];
-      if (heading === undefined || heading.id !== "heading-standalone") {
-        throw new Error("parity-blocks no longer has the standalone id on its second heading");
-      }
-      delete heading.id;
-      // … and the `^heading-standalone` line becomes a paragraph of its own.
-      sections.splice(3, 0, { type: "paragraph", position: idLine, id: "heading-standalone" });
-      const blocks = { ...(cache.blocks as Record<string, BlockCache>) };
-      blocks["heading-standalone"] = { id: "heading-standalone", position: idLine };
-      return { ...cache, sections, blocks };
-    },
-  },
-  "parity-frontmatter-links": {
-    why:
-      "vaultd extracts wikilinks from a property value but not Markdown links, " +
-      "so `related.1` — `[Markdown target](Parity%20target.md)` — produces no " +
-      "reference and therefore no frontmatterLinks entry to derive a key from.",
-    apply: (cache) => {
-      const entries = cache.frontmatterLinks as Array<{ key: string }>;
-      const kept = entries.filter((entry) => entry.key !== "related.1");
-      if (kept.length !== entries.length - 1) {
-        throw new Error("parity-frontmatter-links no longer carries a Markdown link at related.1");
-      }
-      return { ...cache, frontmatterLinks: kept };
-    },
-  },
-  "parity-list-nested-3deep": {
-    why:
-      "A nested **ordered** list item's span starts one column earlier in vaultd " +
-      "than in Obsidian (lines 10 and 11 of the fixture). Nested unordered items " +
-      "agree exactly, so this is specific to the ordered marker.",
-    apply: (cache) => {
-      const items = [...(cache.listItems as Array<{ position: { start: { line: number; col: number; offset: number } } }>)];
-      for (const index of [7, 8]) {
-        const item = items[index];
-        if (item === undefined) throw new Error("parity-list-nested-3deep lost its ordered list");
-        items[index] = {
-          ...item,
-          position: {
-            ...item.position,
-            start: {
-              ...item.position.start,
-              col: item.position.start.col - 1,
-              offset: item.position.start.offset - 1,
-            },
-          },
-        };
-      }
-      return { ...cache, listItems: items };
-    },
-  },
-  "parity-tags-nested-unicode": {
-    why:
-      "A tag containing a non-BMP emoji: vaultd ends the tag before the emoji " +
-      "(`#tag-`), Obsidian includes it (`#tag-🙂`). The four BMP cases — accented " +
-      "Latin, CJK, and a nested CJK tag — match exactly, so this is the astral " +
-      "plane rather than Unicode in general.",
-    apply: (cache) => {
-      const tags = [...(cache.tags as TagCache[])];
-      const last = tags[5];
-      if (last?.tag !== "#tag-🙂") {
-        throw new Error("parity-tags-nested-unicode no longer ends with the emoji tag");
-      }
-      tags[5] = {
-        tag: "#tag-",
-        position: { start: last.position.start, end: { line: 6, col: 12, offset: 104 } },
-      };
-      return { ...cache, tags };
-    },
-  },
-};
+/** The row and the index a case drives the assembler with. */
+function parseCase(name: string): { row: MirrorNoteRow; positions: PositionIndex } {
+  const source = readFileSync(join(dir, `${name}.md`), "utf8");
+  const row = parseFixtureRow(`${name}.md`, source);
+  return {
+    row,
+    positions: buildPositionIndex(
+      source,
+      row.outgoing.map((reference) => reference.span),
+    ),
+  };
+}
+
+function build(name: string): Record<string, unknown> {
+  const { row, positions } = parseCase(name);
+  return JSON.parse(JSON.stringify(buildCachedMetadata(row, positions))) as Record<string, unknown>;
+}
+
+function captured(name: string): Record<string, unknown> {
+  const parsed = JSON.parse(readFileSync(join(dir, `${name}.expected.json`), "utf8")) as {
+    obsidianVersion: string;
+    cache: Record<string, unknown>;
+  };
+  return withoutPhantomSections(without(parsed.cache)).cache;
+}
+
+/**
+ * Parse every fixture once, before the first case, on a budget measured in
+ * minutes rather than the default five seconds.
+ *
+ * Each case is a one-note vault with its own cache key, so a cold corpus is
+ * eighteen `cargo run` spawns — and the cache key now names the parser binary,
+ * so a `vault-core` change makes the whole corpus cold at once. That is the
+ * point of the key, but it must not arrive as eighteen mysterious five-second
+ * timeouts: doing the work here puts it in one place with one budget, and every
+ * case below is then a cache hit.
+ */
+beforeAll(() => {
+  for (const name of cases) parseCase(name);
+}, 900_000);
 
 describe("CachedMetadata parity", () => {
   it("covers every captured fixture", () => {
@@ -176,52 +140,56 @@ describe("CachedMetadata parity", () => {
   });
 
   it("measures the unserved fields rather than assuming they are always empty", () => {
-    const captured = JSON.parse(
+    const parsed = JSON.parse(
       readFileSync(join(dir, "parity-footnotes.expected.json"), "utf8"),
     ) as { cache: Record<string, unknown> };
     // If this fails, the footnote fixture does not actually exercise the gap
     // and UNSERVED is hiding nothing — fix the fixture, not this test.
-    expect(UNSERVED.some((key) => captured.cache[key] !== undefined)).toBe(true);
+    expect(UNSERVED.some((key) => parsed.cache[key] !== undefined)).toBe(true);
   });
 
-  it("names every divergence it allows", () => {
-    // The allowance table is the record, so it may not grow a silent entry: a
-    // fixture named here must exist, and the reason must be written down.
-    for (const [name, divergence] of Object.entries(DIVERGENCES)) {
-      expect(cases).toContain(name);
-      expect(divergence.why.length).toBeGreaterThan(40);
+  it("drops zero-width sections only where the corpus has them", () => {
+    const removedBy: Record<string, number> = {};
+    for (const name of cases) {
+      const parsed = JSON.parse(readFileSync(join(dir, `${name}.expected.json`), "utf8")) as {
+        cache: Record<string, unknown>;
+      };
+      const { removed } = withoutPhantomSections(parsed.cache);
+      if (removed > 0) removedBy[name] = removed;
     }
-    expect(Object.keys(DIVERGENCES).sort()).toEqual([
-      "parity-blocks",
-      "parity-frontmatter-links",
-      "parity-list-nested-3deep",
-      "parity-tags-nested-unicode",
-    ]);
+    // A filter that started firing somewhere new would be masking a section
+    // vaultd failed to report, which is the opposite of what it is for.
+    expect(removedBy).toEqual(PHANTOM_SECTIONS);
   });
 
   for (const name of cases) {
     it(`matches real Obsidian for ${name}`, () => {
-      const source = readFileSync(join(dir, `${name}.md`), "utf8");
-      const captured = JSON.parse(readFileSync(join(dir, `${name}.expected.json`), "utf8")) as {
-        obsidianVersion: string;
-        cache: Record<string, unknown>;
-      };
-      const row = parseFixtureRow(`${name}.md`, source);
-      const built = buildCachedMetadata(row, buildPositionIndex(source));
-      const allowance = DIVERGENCES[name];
-      const expected = withoutPhantomSections(without(captured.cache));
-      expect(JSON.parse(JSON.stringify(built))).toEqual(
-        allowance === undefined ? expected : allowance.apply(expected),
-      );
+      expect(build(name)).toEqual(captured(name));
     });
   }
 
+  it("gives every reference an original that is exactly its own source span", () => {
+    // `original` is what a plugin searches the note body for, so a value one
+    // character short is a find-and-replace that hits the wrong text. The span
+    // is the daemon's and is right; this asserts the slice is the span's own
+    // width in the units `position` is measured in.
+    let checked = 0;
+    for (const name of cases) {
+      const built = build(name) as { links?: ReferenceCache[]; embeds?: ReferenceCache[] };
+      for (const entry of [...(built.links ?? []), ...(built.embeds ?? [])]) {
+        expect(entry.original.length).toBe(
+          entry.position.end.offset - entry.position.start.offset,
+        );
+        checked += 1;
+      }
+    }
+    // Non-vacuity: the corpus really does carry references to check.
+    expect(checked).toBeGreaterThanOrEqual(20);
+  });
+
   it("emits frontmatter links with no position field", () => {
-    const source = readFileSync(join(dir, "parity-frontmatter-links.md"), "utf8");
-    const built = buildCachedMetadata(
-      parseFixtureRow("parity-frontmatter-links.md", source),
-      buildPositionIndex(source),
-    );
+    const { row, positions } = parseCase("parity-frontmatter-links");
+    const built = buildCachedMetadata(row, positions);
     expect(built.frontmatterLinks?.length).toBeGreaterThan(0);
     for (const entry of built.frontmatterLinks ?? []) {
       expect(Object.keys(entry).sort()).toEqual(
@@ -233,41 +201,51 @@ describe("CachedMetadata parity", () => {
   });
 
   it("numbers a frontmatter list element and leaves a scalar bare", () => {
-    const source = readFileSync(join(dir, "parity-frontmatter-links.md"), "utf8");
-    const built = buildCachedMetadata(
-      parseFixtureRow("parity-frontmatter-links.md", source),
-      buildPositionIndex(source),
-    );
-    expect(built.frontmatterLinks?.map((entry) => entry.key)).toEqual(["related.0", "single"]);
+    const { row, positions } = parseCase("parity-frontmatter-links");
+    const built = buildCachedMetadata(row, positions);
+    // Both list elements and the scalar: `related.1` is the Markdown link, which
+    // is where the W2 derivation has to descend into a sequence rather than stop
+    // at the property's own key.
+    expect(built.frontmatterLinks?.map((entry) => entry.key)).toEqual([
+      "related.0",
+      "related.1",
+      "single",
+    ]);
+    expect(built.frontmatterLinks?.map((entry) => entry.link)).toEqual([
+      "Parity target",
+      "Parity target.md",
+      "Parity target",
+    ]);
   });
 
   it("reads a float back as a number, not the string the wire carries", () => {
-    const source = readFileSync(join(dir, "parity-frontmatter.md"), "utf8");
-    const built = buildCachedMetadata(
-      parseFixtureRow("parity-frontmatter.md", source),
-      buildPositionIndex(source),
-    );
+    const { row, positions } = parseCase("parity-frontmatter");
+    const built: CachedMetadata = buildCachedMetadata(row, positions);
     expect(built.frontmatter?.ratio).toBe(3.14);
     expect(built.frontmatter?.count).toBe(42);
     expect(built.frontmatter?.missing).toBeNull();
   });
 
   it("keeps frontmatter tags out of cache.tags", () => {
-    const source = readFileSync(join(dir, "parity-tags-frontmatter.md"), "utf8");
-    const built = buildCachedMetadata(
-      parseFixtureRow("parity-tags-frontmatter.md", source),
-      buildPositionIndex(source),
-    );
+    const { row, positions } = parseCase("parity-tags-frontmatter");
+    const built = buildCachedMetadata(row, positions);
     expect(built.tags).toBeUndefined();
     expect(built.frontmatter?.tags).toEqual(["alpha", "beta/gamma", "Tag_With-Chars"]);
   });
 
   it("answers the empty note with Obsidian's bare version marker", () => {
-    const source = readFileSync(join(dir, "parity-empty.md"), "utf8");
-    const built = buildCachedMetadata(
-      parseFixtureRow("parity-empty.md", source),
-      buildPositionIndex(source),
+    const { row, positions } = parseCase("parity-empty");
+    expect(buildCachedMetadata(row, positions)).toEqual({ v: 1 });
+  });
+
+  it("refuses to guess an original the index did not retain", () => {
+    const source = readFileSync(join(dir, "parity-links.md"), "utf8");
+    const row = parseFixtureRow("parity-links.md", source);
+    // An index built without the row's reference spans cannot answer `original`
+    // exactly, and a reconstruction would be wrong for ordinary Markdown — so
+    // the assembler says so rather than inventing one.
+    expect(() => buildCachedMetadata(row, buildPositionIndex(source))).toThrow(
+      /has no retained source for the reference/,
     );
-    expect(built).toEqual({ v: 1 });
   });
 });

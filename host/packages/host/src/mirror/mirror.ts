@@ -1667,7 +1667,19 @@ export class Mirror implements MirrorQuery {
     const current = this.state.notes.get(row.path);
     if (!current || current.revision !== row.revision) return false;
     const source = Buffer.from(response.content_base64, "base64").toString("utf8");
-    this.state.positionIndexes.set(row.path, buildPositionIndex(source));
+    // The reference spans are retained with the table, because this is the one
+    // moment the host holds both the row and the bytes. Task 8's `original` has
+    // to be the **exact** source slice — a reconstruction from the reference's
+    // parts is short for a link title, an angle-bracket target, or an empty
+    // alias — and nothing downstream ever sees the source again. Spans only,
+    // never the whole note: see `PositionIndex.originals`.
+    this.state.positionIndexes.set(
+      row.path,
+      buildPositionIndex(
+        source,
+        row.outgoing.map((reference) => reference.span),
+      ),
+    );
     return true;
   }
 
