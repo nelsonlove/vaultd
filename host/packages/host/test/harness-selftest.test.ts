@@ -35,6 +35,7 @@ import {
   cacheKey,
   fixtureCacheDir,
   fixtureGeneratorSpawns,
+  overrideFixtureCacheDir,
   overrideFixtureParserStamp,
   parseFixtureRow,
 } from "../src/testing/fixture-vault";
@@ -275,34 +276,41 @@ describe("FixtureVault and the real parser", () => {
     ]);
   }, FIXTURE_TIMEOUT_MS);
 
-  it("parses a whole vault in one spawn, not one per file", () => {
-    // The claim is "one batch, one spawn", and a cold `cargo run` is seconds —
-    // Task 7 calls `withVault` in every shim test file, so three files costing
-    // three spawns instead of one is the difference between a suite that runs
-    // and a suite nobody waits for.
+  it("parses a whole vault in one spawn, and writes nowhere but its own cache", () => {
+    // Two claims, and the second is what makes the first safe to measure.
     //
-    // The sources carry a per-run marker so this always misses the cache;
-    // without it a second run would hit and measure nothing. Everything it
-    // leaves behind is removed in the `finally`, which is where the cleanup has
-    // to live: a failing assertion is exactly when the files would otherwise
-    // pile up, and this is the case whose whole subject is not piling up.
-    const marker = `${String(process.pid)}-${String(Date.now())}`;
-    const before = readdirSync(fixtureCacheDir());
+    // "One batch, one spawn" is the point: Task 7 calls `withVault` in every
+    // shim test file, and three files costing three spawns instead of one is the
+    // difference between a suite that runs and a suite nobody waits for.
+    //
+    // The second claim is that measuring it touches nobody else's rows. This
+    // case used to diff the **shared** cache directory and delete every file it
+    // had not seen before. Once the cache key started naming the parser binary
+    // that became destructive: `metadata-parity` and `shim-metadata-cache`
+    // regenerate their corpora in sibling processes at exactly the same moment
+    // — the first run after any `crates/` change — so this case saw their files,
+    // failed its count, and then deleted them. The run that most needed a warm
+    // cache was the one throwing the regeneration away. So it now gets a cache
+    // directory of its own through the seam, and asserts the shared one came out
+    // exactly as it went in.
+    const isolated = mkdtempSync(join(tmpdir(), "vaultd-fixture-cache-"));
+    const shared = readdirSync(fixtureCacheDir()).sort();
     const spawnsBefore = fixtureGeneratorSpawns();
 
     try {
+      overrideFixtureCacheDir(isolated);
+      // No per-run marker needed any more: an empty private directory is a
+      // guaranteed miss, which is what the marker was faking.
       const vault = new FixtureVault({
-        "One.md": `# One ${marker}\n\n[[Two]]\n`,
-        "Two.md": `# Two ${marker}\n\n[[Three]]\n`,
-        "Three.md": `# Three ${marker}\n`,
+        "One.md": "# One\n\n[[Two]]\n",
+        "Two.md": "# Two\n\n[[Three]]\n",
+        "Three.md": "# Three\n",
       });
       expect(vault.notes().map((note) => note.path)).toEqual(["One.md", "Three.md", "Two.md"]);
       expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
 
-      // And the batch really did write one cache file per note, together.
-      const after = readdirSync(fixtureCacheDir());
-      const fresh = after.filter((name) => !before.includes(name));
-      expect(fresh).toHaveLength(3);
+      // The batch really did write one cache file per note, together.
+      expect(readdirSync(isolated)).toHaveLength(3);
 
       // Reading the same vault again spawns nothing: the rows are memoized on
       // the instance, and a second instance answers from those same cache files.
@@ -310,13 +318,12 @@ describe("FixtureVault and the real parser", () => {
       expect(again.notes()).toHaveLength(3);
       expect(fixtureGeneratorSpawns() - spawnsBefore).toBe(1);
     } finally {
-      // Re-read rather than reusing `fresh`: a run that threw before that line
-      // may still have written cache files, and those are the ones most worth
-      // clearing.
-      for (const name of readdirSync(fixtureCacheDir())) {
-        if (!before.includes(name)) rmSync(join(fixtureCacheDir(), name));
-      }
+      overrideFixtureCacheDir(null);
+      // Only what this case created, and all of it: the directory is its own.
+      rmSync(isolated, { recursive: true, force: true });
     }
+
+    expect(readdirSync(fixtureCacheDir()).sort()).toEqual(shared);
   }, FIXTURE_TIMEOUT_MS);
 
   it("keys a cached row on the parser that produced it", () => {

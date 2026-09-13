@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { buildCachedMetadata } from "../src/mirror/metadata";
+import { CachedMetadataError, buildCachedMetadata } from "../src/mirror/metadata";
 import { buildPositionIndex } from "../src/mirror/positions";
 import { parseFixtureRow } from "../src/testing/fixture-vault";
 import type { CachedMetadata, ReferenceCache, SectionCache } from "../src/mirror/metadata";
@@ -114,19 +114,36 @@ function captured(name: string): Record<string, unknown> {
 }
 
 /**
- * Parse every fixture once, before the first case, on a budget measured in
- * minutes rather than the default five seconds.
+ * Read every fixture once, before the first case, from a cache the pre-test
+ * warm-up has already filled.
  *
- * Each case is a one-note vault with its own cache key, so a cold corpus is
- * eighteen `cargo run` spawns — and the cache key now names the parser binary,
- * so a `vault-core` change makes the whole corpus cold at once. That is the
- * point of the key, but it must not arrive as eighteen mysterious five-second
- * timeouts: doing the work here puts it in one place with one budget, and every
- * case below is then a cache hit.
+ * `host/scripts/warm-fixtures.js` runs as npm's `pretest`, so by the time vitest
+ * starts, all eighteen rows exist and this hook is a series of file reads. The
+ * budget is therefore five minutes rather than the fifteen it carried while the
+ * regeneration happened here — and five minutes now means "something is wrong",
+ * not "the machine is busy".
+ *
+ * Regenerating inside this hook was the old shape and it failed badly: a cold
+ * standalone run took 1188 s, blew a 900 s hook budget, and reported `28
+ * skipped` — a parity suite failing with no failing assertion. Raising the
+ * number again would only move it. If this hook ever does go slow, the cache is
+ * cold and the warm-up did not run; the message below says so.
  */
 beforeAll(() => {
-  for (const name of cases) parseCase(name);
-}, 900_000);
+  for (const name of cases) {
+    try {
+      parseCase(name);
+    } catch (error) {
+      throw new Error(
+        `${name} is not in the fixture cache and could not be generated: ` +
+          `${error instanceof Error ? error.message : String(error)}. ` +
+          `Run \`node host/scripts/warm-fixtures.js\` (npm's pretest does this ` +
+          `automatically) — it rebuilds the generator and refills the corpus ` +
+          `outside any test timeout.`,
+      );
+    }
+  }
+}, 300_000);
 
 describe("CachedMetadata parity", () => {
   it("covers every captured fixture", () => {
@@ -173,6 +190,18 @@ describe("CachedMetadata parity", () => {
     // character short is a find-and-replace that hits the wrong text. The span
     // is the daemon's and is right; this asserts the slice is the span's own
     // width in the units `position` is measured in.
+    //
+    // **This is a forward invariant, not B2's protection**, and the difference
+    // matters. Every one of the twenty-one references in this corpus is a plain
+    // `[[link]]`, `[text](target)` or embed, and all of those reconstruct
+    // exactly — so restoring the old reconstruction leaves this guard green
+    // (measured: it did). What actually catches the defect is
+    // `AWKWARD_LINKS_VAULT` in `shim-metadata-cache.test.ts` — a link title, an
+    // angle-bracket target and an empty alias, none of which the corpus holds —
+    // together with the "refuses to guess" case below. Keep this one because it
+    // catches a *future* fixture whose `original` and span disagree, which the
+    // awkward-link cases cannot see; do not mistake it for the thing standing
+    // between a plugin and a wrong find-and-replace.
     let checked = 0;
     for (const name of cases) {
       const built = build(name) as { links?: ReferenceCache[]; embeds?: ReferenceCache[] };
@@ -183,8 +212,11 @@ describe("CachedMetadata parity", () => {
         checked += 1;
       }
     }
-    // Non-vacuity: the corpus really does carry references to check.
-    expect(checked).toBeGreaterThanOrEqual(20);
+    // Non-vacuity, at the corpus's exact total rather than under it. Removing a
+    // link from any fixture reds this line rather than quietly shrinking what
+    // the guard covers — which is the point: the corpus changing is a decision,
+    // and this makes it a conscious one.
+    expect(checked).toBe(21);
   });
 
   it("emits frontmatter links with no position field", () => {
@@ -244,8 +276,25 @@ describe("CachedMetadata parity", () => {
     // An index built without the row's reference spans cannot answer `original`
     // exactly, and a reconstruction would be wrong for ordinary Markdown — so
     // the assembler says so rather than inventing one.
-    expect(() => buildCachedMetadata(row, buildPositionIndex(source))).toThrow(
-      /has no retained source for the reference/,
-    );
+    //
+    // The refusal is **typed**, because `buildCachedMetadata` is reached from
+    // the plugin-facing `getFileCache`: a host has to be able to tell this apart
+    // from a plugin's own failure, and a bare `Error` in a stack trace is not
+    // that. The fields say which note and which span, which is what a report
+    // would need to name the defect.
+    let refusal: unknown;
+    try {
+      buildCachedMetadata(row, buildPositionIndex(source));
+      expect.unreachable("an index with no retained spans must refuse");
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(CachedMetadataError);
+    const typed = refusal as CachedMetadataError;
+    expect(typed.code).toBe("cached_metadata_assembly");
+    expect(typed.name).toBe("CachedMetadataError");
+    expect(typed.path).toBe("parity-links.md");
+    expect(typed.span).toEqual(row.outgoing[0]?.span);
+    expect(typed.message).toMatch(/has no retained source for the reference/);
   });
 });

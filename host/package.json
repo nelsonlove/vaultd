@@ -7,6 +7,7 @@
     "build": "tsc --build packages/host",
     "typecheck": "tsc --noEmit -p packages/host && tsc --noEmit -p packages/host/tsconfig.test.json",
     "lint": "eslint packages",
+    "pretest": "node scripts/warm-fixtures.js",
     "test": "vitest run"
   },
   "devDependencies": {

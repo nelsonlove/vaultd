@@ -32,15 +32,22 @@ function recorded(recorder: PolicyRecorder): string[] {
 }
 
 /**
- * The table is module-scoped and every shim module declares into it at import,
- * so this file inherits whatever its own import graph reached —
- * `memoryPolicyRecorder` comes from `testing/assemble.ts`, which imports the
- * whole shim. Emptying it before each case is what keeps "only what was
- * declared" a statement about this file rather than about that graph.
+ * The table is module-scoped, so a shim module's rows land the moment anything
+ * imports it — and this file imports plenty, transitively:
+ * `memoryPolicyRecorder` comes from `testing/assemble.ts`, which pulls in the
+ * whole shim. Resetting before each case puts the table back to exactly that
+ * import-time set, so a case's own declarations are the only difference between
+ * what it finds and what it left.
  */
 beforeEach(() => {
   resetPolicyTable();
 });
+
+/** What a freshly imported process holds, before any case declares anything. */
+function importTimeSymbols(): string[] {
+  resetPolicyTable();
+  return [...declaredSymbols()].sort();
+}
 
 describe("the policy table", () => {
   it("answers absent for a symbol nobody declared", () => {
@@ -49,11 +56,34 @@ describe("the policy table", () => {
   });
 
   it("remembers what was declared, and only what was declared", () => {
+    const base = importTimeSymbols();
     declarePolicy("Vault.read", "implemented");
     declarePolicy("Menu.showAtMouseEvent", "harvested");
     expect(policyOf("Vault.read")).toBe("implemented");
     expect(policyOf("Menu.showAtMouseEvent")).toBe("harvested");
-    expect([...declaredSymbols()].sort()).toEqual(["Menu.showAtMouseEvent", "Vault.read"]);
+    // Exactly the import-time set plus these two, so a row appearing from
+    // anywhere else still fails this.
+    expect([...declaredSymbols()].sort()).toEqual(
+      [...base, "Menu.showAtMouseEvent", "Vault.read"].sort(),
+    );
+  });
+
+  it("restores the import-time declarations on reset rather than emptying", () => {
+    // Task 11b's compatibility report asserts the table IS the host's surface.
+    // A reset that emptied the table would leave that assertion looking at
+    // whatever the previous case had hollowed out; restoring makes "after a
+    // reset the table is what a fresh process holds" true by construction.
+    const base = importTimeSymbols();
+    expect(base).toContain("MetadataCache.getFileCache");
+    declarePolicy("Invented.forThisCase", "harvested");
+    expect(declaredSymbols()).toContain("Invented.forThisCase");
+
+    resetPolicyTable();
+    expect([...declaredSymbols()].sort()).toEqual(base);
+    expect(declaredSymbols()).not.toContain("Invented.forThisCase");
+    // Restored with their policies, not merely their names.
+    expect(policyOf("MetadataCache.getFileCache")).toBe("implemented");
+    expect(policyOf("CachedMetadata.footnotes")).toBe("absent");
   });
 
   it("does not declare a symbol merely because a plugin touched it", () => {

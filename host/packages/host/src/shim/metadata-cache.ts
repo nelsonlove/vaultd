@@ -309,6 +309,9 @@ export class MetadataCache extends Events {
    *
    * **Called by Task 15's lifecycle sequencer, not by a subscription here** —
    * see the module doc.
+   *
+   * @internal Host seam. Not part of Obsidian's `MetadataCache`; a plugin that
+   * calls it is faking an event the sequencer owns.
    */
   notifyChanged(file: TFile, data: string): void {
     this.assembled.delete(file.path);
@@ -330,19 +333,43 @@ export class MetadataCache extends Events {
    * it never asked about gets nothing. Task 15 closes it, if it wants it closed,
    * by reading the cache before it applies the delete; this surface cannot,
    * because it is not told a note is about to go.
+   *
+   * **The read happens before any eviction, and nothing else evicts.** A reader
+   * meeting a gone row leaves the retained assembly alone (see `cacheFor`), so a
+   * plugin asking "what was in that file?" between the removal and this call
+   * cannot erase what this call is about to hand over.
+   *
+   * @internal Host seam. Not part of Obsidian's `MetadataCache`; Task 15's
+   * lifecycle sequencer is the only caller.
    */
   notifyDeleted(file: TFile): void {
+    // Read first, evict second. The order is the contract — see above.
     const previous = this.assembled.get(file.path)?.cache ?? null;
     this.assembled.delete(file.path);
     this.trigger("deleted", ...([file, previous] as never[]));
   }
 
-  /** Drop one path's retained cache without firing anything. */
+  /**
+   * Drop one path's retained cache without firing anything.
+   *
+   * With `cacheFor` no longer evicting, this and {@link notifyDeleted} are the
+   * only two places an entry ever goes. Task 15 calls it for the **old** path
+   * of a rename, which fires no `deleted` and would otherwise retain an entry
+   * nothing can reach.
+   *
+   * @internal Host seam. Not part of Obsidian's `MetadataCache`.
+   */
   forget(path: string): void {
     this.assembled.delete(path);
   }
 
-  /** How many paths this cache is holding an assembly for. */
+  /**
+   * How many paths this cache is holding an assembly for.
+   *
+   * @internal Test and host accessor, so "the entry was evicted" and "the
+   * rename did not leak" are assertions rather than claims. Not part of
+   * Obsidian's `MetadataCache`.
+   */
   retainedCount(): number {
     return this.assembled.size;
   }
@@ -352,11 +379,20 @@ export class MetadataCache extends Events {
   private cacheFor(path: string): CachedMetadata | null {
     const row = this.deps.mirror.note(path);
     if (row === undefined) {
-      // The row is gone — deleted, or renamed out from under this path. Drop
-      // the retained assembly here rather than leaving it to accumulate for the
-      // life of the host: a rename fires no `deleted` for the old path, so this
-      // is the only place that ever asks about it again.
-      this.assembled.delete(path);
+      // **A gone row does NOT evict the retained assembly**, and that ordering
+      // is the whole contract between this method and `notifyDeleted`.
+      //
+      // The tempting version — drop the entry here, since a rename fires no
+      // `deleted` for the old path and something should reclaim it — destroys
+      // the payload `deleted` exists to carry. Between the mirror removing a
+      // row and Task 15 calling `notifyDeleted`, the obvious thing for a plugin
+      // to do is ask what was in the file that just went; that read would then
+      // wipe the last copy and the event would fire with `null`. A reader must
+      // never be able to erase what a later event is going to hand over.
+      //
+      // So eviction lives in `notifyDeleted` and `forget` alone, and Task 15
+      // owns calling `forget` for the old path of a rename. `retainedCount()`
+      // is there so that is assertable rather than assumed.
       return null;
     }
     const positions = this.deps.mirror.positions(path);

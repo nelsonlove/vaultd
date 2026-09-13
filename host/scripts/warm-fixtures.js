@@ -1,0 +1,127 @@
+"use strict";
+
+/**
+ * Fill the fixture-row cache before vitest starts, so no test ever pays for a
+ * cold corpus inside its own timeout.
+ *
+ * Wired as npm's `pretest`, so `npm test` warms first and then runs.
+ *
+ * ## Why this is a script and not a bigger `beforeAll` budget
+ *
+ * The parity rows are produced by `vault-core` itself (`cargo run --bin
+ * fixture-row`), and the cache key names the generator binary — so any change
+ * under `crates/` makes all eighteen parity rows and every shim fixture cold at
+ * once. That is deliberate: without it the host would go on comparing against
+ * the answer the parser gave before it was fixed.
+ *
+ * The cost lands in one burst, and it lands under exactly the conditions that
+ * make it slowest: a `crates/` change means a Rust session is probably holding
+ * the cargo build lock, so every spawn queues behind it. A measured cold
+ * standalone run took **1188 s** and died on a 900 s hook budget, reporting
+ * "28 skipped" — a parity suite failing with no failing assertion, which is the
+ * least useful shape available. Raising the budget again only moves the number.
+ *
+ * Taking the work out of the test process fixes the shape instead: warming
+ * fails here, loudly, naming what it was doing, with no timeout involved; and
+ * vitest then only ever reads a cache that is already warm, so its hooks can
+ * keep a budget that means "something is wrong" rather than "the machine is
+ * busy".
+ *
+ * ## What it does
+ *
+ * 1. Builds `fixture-row` when `cargo` is on `PATH`. A machine with no Rust
+ *    toolchain skips this and runs from whatever the cache already holds.
+ * 2. Compiles the host (`tsc --build`, incremental) so this plain-JS script can
+ *    require the **real** `warmFixtureCache`. Re-implementing the cache key here
+ *    would be a second copy of it, and a second copy is a thing to keep in step
+ *    with the first.
+ * 3. Warms the eighteen parity fixtures, each as the one-note vault the parity
+ *    test parses it as.
+ *
+ * Set `VAULTD_SKIP_FIXTURE_WARM=1` to skip the whole thing — for a machine with
+ * no toolchain, or while someone else is mid-edit in `crates/` and a build would
+ * fail on their half-written code.
+ */
+
+const { spawnSync } = require("node:child_process");
+const { existsSync, readFileSync, readdirSync } = require("node:fs");
+const { join, resolve } = require("node:path");
+
+const hostRoot = resolve(__dirname, "..");
+const workspaceRoot = resolve(hostRoot, "..");
+const fixturesDir = join(hostRoot, "fixtures", "metadata-parity");
+
+function note(message) {
+  process.stdout.write(`warm-fixtures: ${message}\n`);
+}
+
+function die(message) {
+  process.stderr.write(`warm-fixtures: ${message}\n`);
+  process.exit(1);
+}
+
+if (process.env.VAULTD_SKIP_FIXTURE_WARM) {
+  note("skipped (VAULTD_SKIP_FIXTURE_WARM is set); tests will run against whatever the cache holds");
+  process.exit(0);
+}
+
+/**
+ * Is `cargo` runnable?
+ *
+ * Asked by running it, not by a shell lookup: `spawnSync(..., { shell: true })`
+ * concatenates rather than escapes its arguments, which Node deprecates for
+ * exactly the reason it sounds like.
+ */
+function hasCargo() {
+  const probe = spawnSync("cargo", ["--version"], { stdio: "ignore" });
+  return probe.error === undefined && probe.status === 0;
+}
+
+function run(command, args, what, cwd) {
+  const result = spawnSync(command, args, { cwd, stdio: "inherit" });
+  if (result.error) die(`${what} could not start: ${result.error.message}`);
+  if (result.status !== 0) die(`${what} exited ${String(result.status)}`);
+}
+
+if (hasCargo()) {
+  note("building the fixture generator");
+  // Debug, never release: this binary is a test fixture, and a release build of
+  // the workspace is minutes of work for no difference in what it prints.
+  run(
+    "cargo",
+    ["build", "-q", "-p", "vault-server", "--bin", "fixture-row", "--manifest-path", join(workspaceRoot, "Cargo.toml")],
+    "cargo build",
+    workspaceRoot,
+  );
+} else {
+  note("no cargo on PATH; running from the cache as it stands");
+}
+
+note("compiling the host so the warm-up can use the real cache key");
+// From `host/`, not the workspace root: the build script lives in this
+// package's own manifest.
+run("npm", ["run", "--silent", "build"], "tsc --build", hostRoot);
+
+const compiled = join(hostRoot, "packages", "host", "dist", "testing", "fixture-vault.js");
+if (!existsSync(compiled)) die(`the build produced no ${compiled}`);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { warmFixtureCache, fixtureCacheDir } = require(compiled);
+
+const cases = readdirSync(fixturesDir)
+  .filter((name) => name.endsWith(".expected.json"))
+  .map((name) => name.replace(".expected.json", ""));
+if (cases.length === 0) die(`no parity fixtures under ${fixturesDir}`);
+
+note(`warming ${String(cases.length)} parity fixtures into ${fixtureCacheDir()}`);
+for (const name of cases) {
+  // One note per request, because that is exactly how `metadata-parity` parses
+  // each fixture — a different document set is a different cache key and would
+  // warm nothing the test then reads.
+  const source = readFileSync(join(fixturesDir, `${name}.md`), "utf8");
+  try {
+    warmFixtureCache([{ path: `${name}.md`, source }]);
+  } catch (error) {
+    die(`${name} could not be parsed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+note("warm");

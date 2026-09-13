@@ -88,13 +88,38 @@ export function workspaceRoot(): string {
   }
 }
 
+let cacheDirOverride: string | null = null;
+
 function cacheDir(): string {
-  return join(workspaceRoot(), "host", "fixtures", "cache");
+  return cacheDirOverride ?? join(workspaceRoot(), "host", "fixtures", "cache");
 }
 
 /** Where the memoized rows live. Exported so a test can see what a run wrote. */
 export function fixtureCacheDir(): string {
   return cacheDir();
+}
+
+/**
+ * Point the cache at a directory of this caller's own. **Tests only**, and
+ * restore it with `null`.
+ *
+ * The shared cache is exactly that — shared, across every vitest worker at
+ * once. A case that wants to *measure* caching (a miss, a spawn, the files a
+ * batch wrote) cannot do it by diffing the shared directory: vitest runs one
+ * process per file in parallel, and since the cache key started naming the
+ * parser binary, `metadata-parity` and `shim-metadata-cache` regenerate their
+ * whole corpora simultaneously on the first run after any `crates/` change. A
+ * case diffing the shared directory then sees their rows, and a case cleaning
+ * up by "delete what I did not see before" deletes them — which is how the run
+ * that most needs a warm cache became the one that throws the regeneration
+ * away.
+ *
+ * So a measuring case takes a private directory instead: an empty one is a
+ * guaranteed miss, its contents are entirely the case's own, and removing it
+ * wholesale can harm nobody.
+ */
+export function overrideFixtureCacheDir(dir: string | null): void {
+  cacheDirOverride = dir;
 }
 
 /**

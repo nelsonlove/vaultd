@@ -288,6 +288,38 @@ describe("MetadataCache", () => {
     expect(seen[1]).toBeNull();
   });
 
+  it("keeps the payload when a reader asks about a note whose row is already gone", async () => {
+    // The interaction between two separately-right fixes. `notifyDeleted` hands
+    // over the last assembled cache; a reader meeting a gone row must therefore
+    // not evict it. A `vault.on("delete")` handler asking "what was in that
+    // file?" is the obvious way to be that reader, and if the read wiped the
+    // entry the event would then fire with `null`.
+    const harness = await ShimHarness.withVault(ONE_HEADING_VAULT);
+    const cache = harness.app.metadataCache;
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    const before = cache.getFileCache(file);
+    expect(before?.headings?.[0]?.heading).toBe("One");
+
+    // Take the row out of the mirror, as a delete does.
+    const removing = harness.mirror.applyMutation(2, ["A.md"]);
+    await harness.answerRefetch(2, [], { absent: ["A.md"] });
+    await removing;
+    expect(harness.mirror.note("A.md")).toBeUndefined();
+
+    // The reader. Answers null — there is no row — and must leave the retained
+    // assembly alone.
+    expect(cache.getFileCache(file)).toBeNull();
+    expect(cache.retainedCount()).toBe(1);
+
+    const seen: Array<CachedMetadata | null> = [];
+    cache.on("deleted", (...args) => {
+      seen.push((args as unknown as [TFile, CachedMetadata | null])[1]);
+    });
+    cache.notifyDeleted(file);
+    expect(seen[0]).toBe(before);
+    expect(cache.retainedCount()).toBe(0);
+  });
+
   it("carries null for a note nothing ever read", async () => {
     // The hole named on `notifyDeleted`: this surface is not told a note is
     // about to go, so it can only hand over what somebody already asked for.

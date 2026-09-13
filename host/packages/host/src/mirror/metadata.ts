@@ -34,6 +34,16 @@
  *    `original` is the field a plugin uses to find and rewrite a link in the
  *    body, so a short one is a find-and-replace that hits the wrong text.
  *
+ *    **Those three forms are what guards this, and the parity corpus is not.**
+ *    Every reference in the eighteen captures is a plain wikilink, Markdown
+ *    link or embed, and all of them reconstruct exactly — so the corpus-wide
+ *    "original width equals span width" check in `metadata-parity.test.ts`
+ *    stays green even with the reconstruction restored (measured). The cases
+ *    that red are `AWKWARD_LINKS_VAULT` in `shim-metadata-cache.test.ts` and
+ *    the "refuses to guess" throw case. Capturing a titled, angle-bracketed or
+ *    empty-alias link from a live Obsidian would put the forms in the corpus
+ *    itself; until then they live in a `withVault` fixture.
+ *
  * ## Where frontmatter keys and tag origins come from (Ruling W2)
  *
  * The wire carries no `property_path` on a reference and no `origin` on a tag,
@@ -141,6 +151,30 @@ export interface CachedMetadata {
   // so a plugin reading them cannot tell "no footnotes" from "not served".
   // They are registered `absent` in the policy table, they appear in the
   // compatibility report, and `parity-footnotes` measures the gap.
+}
+
+/**
+ * The assembler's own refusal: a row and an index that cannot be turned into a
+ * `CachedMetadata` between them.
+ *
+ * Typed rather than a bare `Error` because it is **plugin-reachable**.
+ * `buildCachedMetadata` is called from `getFileCache`, so anything thrown here
+ * surfaces inside whatever a plugin was doing, and a host that wants to
+ * quarantine the plugin, or log the note, or serve `null` and carry on, needs
+ * to be able to tell this apart from the plugin's own failures. Both cases that
+ * raise it are host bugs rather than data conditions — see the two call sites —
+ * so the right response is to fix the caller, not to catch it in a loop.
+ */
+export class CachedMetadataError extends Error {
+  readonly code = "cached_metadata_assembly";
+  readonly path: string;
+  readonly span: SpanDto;
+  constructor(message: string, path: string, span: SpanDto) {
+    super(message);
+    this.name = "CachedMetadataError";
+    this.path = path;
+    this.span = span;
+  }
 }
 
 /** Mirrors obsidian.d.ts `Reference`. Note: NO position. */
@@ -405,10 +439,12 @@ function referenceFields(
 function sourceTextOf(reference: ReferenceDto, positions: PositionIndex, path: string): string {
   const text = originalOf(positions, reference.span);
   if (text === undefined) {
-    throw new Error(
+    throw new CachedMetadataError(
       `${path} has no retained source for the reference at bytes ` +
         `${String(reference.span.start)}..${String(reference.span.end)}: the position index was ` +
         `built without this row's outgoing spans, so \`original\` cannot be exact`,
+      path,
+      reference.span,
     );
   }
   return text;
@@ -455,21 +491,32 @@ function displayTextOf(reference: ReferenceDto): string {
  * Ruling W2's client-side derivation: find the one property whose `value_span`
  * contains the reference, then descend its value tree by the same test.
  *
- * **Throws rather than dropping the reference.** A reference the daemon marked
+ * **Refuses rather than dropping the reference.** A reference the daemon marked
  * `origin: "property"` came out of a property value by construction, so no
  * containing property means the two sides disagree about where frontmatter
  * ends — and the silent `continue` this replaced would have dropped a
  * `frontmatterLinks` entry with no diagnostic anywhere, which is precisely the
  * failure a future change to the property scanner would produce.
+ *
+ * **Know the blast radius before changing the property scanner.** This runs
+ * inside `buildCachedMetadata`, which `getFileCache` calls, so a daemon that
+ * started emitting a property-origin reference outside every value span would
+ * turn one missing key into a {@link CachedMetadataError} on **every**
+ * `getFileCache` for that note — loud, which is the point, but loud in a
+ * plugin's hot path rather than in a log. The refusal is typed so a host can
+ * tell it apart from a plugin's own failure and decide what to do; it is still
+ * a bug to be fixed at the source rather than caught.
  */
 function frontmatterKeyOf(path: string, properties: readonly PropertyDto[], at: SpanDto): string {
   for (const property of properties) {
     if (!contains(property.value_span, at)) continue;
     return property.key + descend(property.value, at);
   }
-  throw new Error(
+  throw new CachedMetadataError(
     `${path} has a property-origin reference at bytes ${String(at.start)}..${String(at.end)} ` +
       `that lies inside no property's value span`,
+    path,
+    at,
   );
 }
 
