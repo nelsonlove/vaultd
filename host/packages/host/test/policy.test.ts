@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   HeadlessUnsupported,
@@ -39,8 +39,29 @@ function recorded(recorder: PolicyRecorder): string[] {
  * import-time set, so a case's own declarations are the only difference between
  * what it finds and what it left.
  */
+// **Here, at module scope, and not in a hook.** The first `resetPolicyTable()`
+// call is what captures the import-time set, and this line is the one moment
+// that is provably right: this file's own imports have finished evaluating, so
+// every module-scope `declarePolicy` has run, and no hook or case has started.
+// `policy.ts` cannot take the snapshot for itself — Vite awaits every import,
+// so nothing inside that module can observe "the graph is loaded". Moving this
+// into `beforeAll` or `beforeEach` reds the last case in this block.
+resetPolicyTable();
+
 beforeEach(() => {
   resetPolicyTable();
+});
+
+/**
+ * Declared exactly where a later capture would swallow it.
+ *
+ * `beforeAll` runs after module scope and before the first `beforeEach`, so if
+ * the capture above were moved into a hook this symbol would be taken for an
+ * import-time row and restored for the rest of the process. The case at the end
+ * of the block is what turns that into a failure rather than a surprise.
+ */
+beforeAll(() => {
+  declarePolicy("Invented.inABeforeAll", "harvested");
 });
 
 /** What a freshly imported process holds, before any case declares anything. */
@@ -84,6 +105,26 @@ describe("the policy table", () => {
     // Restored with their policies, not merely their names.
     expect(policyOf("MetadataCache.getFileCache")).toBe("implemented");
     expect(policyOf("CachedMetadata.footnotes")).toBe("absent");
+  });
+
+  it("captures the import-time set at module scope, before any hook", () => {
+    // The `beforeAll` above declared `Invented.inABeforeAll`, which is exactly
+    // the shape a late capture swallows: it runs before the first `beforeEach`,
+    // so a first `resetPolicyTable()` call from inside a hook would take it for
+    // an import-time row and restore it forever. The capture at this file's
+    // module scope puts the boundary where it belongs — after every
+    // module-scope declaration, before any hook — so the symbol is test-local
+    // and a reset drops it like any other.
+    //
+    // This is the case that enforces that placement: move the module-scope
+    // `resetPolicyTable()` into a hook and this line fails.
+    expect(declaredSymbols()).not.toContain("Invented.inABeforeAll");
+    declarePolicy("Invented.inABeforeAll", "harvested");
+    expect(declaredSymbols()).toContain("Invented.inABeforeAll");
+    resetPolicyTable();
+    expect(declaredSymbols()).not.toContain("Invented.inABeforeAll");
+    // And the real rows are still there, so this is not just an empty table.
+    expect(declaredSymbols()).toContain("MetadataCache.getFileCache");
   });
 
   it("does not declare a symbol merely because a plugin touched it", () => {

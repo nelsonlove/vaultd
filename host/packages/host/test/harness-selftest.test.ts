@@ -323,7 +323,18 @@ describe("FixtureVault and the real parser", () => {
       rmSync(isolated, { recursive: true, force: true });
     }
 
-    expect(readdirSync(fixtureCacheDir()).sort()).toEqual(shared);
+    // **Nothing disappeared** — not "nothing changed". The shared directory is
+    // written by every vitest worker at once, and this case spawns the
+    // generator by design (an empty private directory is a guaranteed miss), so
+    // its window is seconds wide and a sibling warming its own corpus inside it
+    // is ordinary work rather than a fault. An equality here made the first
+    // `npm test` on a clean checkout red for exactly that reason — the same
+    // gate defect the destructive `finally` caused, wearing the opposite sign.
+    //
+    // The real claim is that this case destroyed nothing, and that is what this
+    // asserts. Bypassing the seam still reds: the three rows would land in the
+    // shared directory and `readdirSync(isolated)` would count zero first.
+    expect(readdirSync(fixtureCacheDir())).toEqual(expect.arrayContaining(shared));
   }, FIXTURE_TIMEOUT_MS);
 
   it("keys a cached row on the parser that produced it", () => {

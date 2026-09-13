@@ -72,3 +72,5 @@ VAULTD_SKIP_FIXTURE_WARM=1 npm --prefix host test
 ```
 
 A test that needs to **measure** caching — a miss, a spawn, the files one batch wrote — must not diff the shared cache directory: vitest runs one process per file in parallel, so a sibling regenerating its corpus is writing there at the same moment. Take a private directory instead, through `overrideFixtureCacheDir()`.
+
+Two limits of the warm-up, both deliberate and both worth knowing before timing a clean checkout. **It covers the parity corpus only** — the shim `withVault` fixtures are inline in TypeScript rather than on disk, so on a cold cache those are still generated inside their own test processes, which is most of the cache by row count. And the isolated-cache self-test is a guaranteed miss by construction, so **every** run pays exactly one generator spawn for it; that case cannot be served from cache and so cannot run on a machine with no `cargo`, whatever `VAULTD_SKIP_FIXTURE_WARM` is set to.

@@ -110,12 +110,26 @@ export function declaredSymbols(): readonly string[] {
 }
 
 /**
- * The rows that were declared at import, captured the first time
- * {@link resetPolicyTable} is called.
+ * The rows the imports declared, captured by the **first** call to
+ * {@link resetPolicyTable}.
  *
- * `null` until then, so the snapshot is taken before any test-local
- * `declarePolicy` has had a chance to run — which is why the reset belongs in a
- * `beforeEach` rather than at the end of a case.
+ * **This module cannot capture it on its own, and that is a fact about the
+ * loader rather than a shortcut.** "At load" cannot mean *this* file's load:
+ * `shim/metadata-cache.ts` declares its twelve rows at its own module scope and
+ * reaches them by importing this file, so this body runs first with the table
+ * empty. Nor can a microtask queued here stand in for "when the graph has
+ * finished" — Vite's SSR transform awaits every import, so the graph is loaded
+ * asynchronously and a microtask queued during this body fires long before
+ * `testing/assemble.ts` has pulled in the module that declares. Measured: the
+ * snapshot came out empty and the restore produced `[]`.
+ *
+ * So the capture is where a caller can put it at a moment that provably works:
+ * **call {@link resetPolicyTable} once at your test file's module scope**,
+ * which runs after that file's own imports have evaluated and before any hook
+ * or case. `policy.test.ts` does exactly that, and pins it with a case that
+ * declares a symbol in a `beforeAll` and asserts the reset drops it — so a
+ * future file that moves the first call later fails loudly instead of baking an
+ * invented symbol into the set for the rest of the process.
  */
 let importTimeDeclarations: ReadonlyArray<readonly [string, ApiPolicy]> | null = null;
 
@@ -133,12 +147,18 @@ let importTimeDeclarations: ReadonlyArray<readonly [string, ApiPolicy]> | null =
  *
  * Restoring to the import-time set satisfies both by construction: after a
  * reset the table is exactly what a freshly imported process would hold, which
- * is the only state either kind of test can reason about.
+ * is the only state either kind of test can reason about — and the set itself
+ * is captured by {@link importTimeDeclarations}'s own microtask rather than by
+ * whoever calls this first, so it does not matter where in a file's lifecycle
+ * the reset lands.
  *
  * Nothing in production may call it. A host that reset its own policy table
  * mid-run would discard every row a later module had added.
  */
 export function resetPolicyTable(): void {
+  // The first call is the capture — see {@link importTimeDeclarations} for why
+  // this module cannot take the snapshot itself, and why that first call
+  // belongs at a test file's module scope rather than in a hook.
   importTimeDeclarations ??= [...declarations.entries()];
   declarations.clear();
   for (const [symbol, policy] of importTimeDeclarations) declarations.set(symbol, policy);
