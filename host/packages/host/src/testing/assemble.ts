@@ -18,6 +18,7 @@
  */
 
 import { App } from "../shim/app";
+import { FileManager } from "../shim/file-manager";
 import { ShimEventBus } from "../shim/events";
 import { MetadataCache } from "../shim/metadata-cache";
 import { DispatchQueue } from "../runtime/queue";
@@ -166,6 +167,9 @@ export function assembleShim(deps: {
   // the vault's index owns — and it reads that index rather than holding a
   // copy, so a file the vault renames is the same object this answers with.
   const metadataCache = new MetadataCache({ mirror, events, index: vault.index });
+  // Third, because it reads both of the others: the vault's index for the files
+  // it moves and the metadata cache's resolver for the links it composes.
+  const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
   // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
   // activated by Task 10:  const harvest = new Harvest();
   // activated by Task 11b: const api = new ObsidianApi({ ... });
@@ -175,6 +179,7 @@ export function assembleShim(deps: {
   // bundle has been loaded yet.
   assignOnce(app, "vault", vault);
   assignOnce(app, "metadataCache", metadataCache);
+  assignOnce(app, "fileManager", fileManager);
 
   return {
     config,

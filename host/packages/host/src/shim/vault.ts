@@ -558,8 +558,15 @@ export class Vault extends Events {
     await this.deps.mirror.applyMutation(result.generation, affected);
   }
 
-  /** Every path the mirror holds under `path`, `path` itself excluded. */
-  private descendantsOf(path: string): string[] {
+  /**
+   * Every path the mirror holds under `path`, `path` itself excluded.
+   *
+   * @internal Host seam, public so Task 9's `FileManager` can ask the same
+   * question this class asks — a folder move or delete has to name its subtree,
+   * and two implementations of "what is under this folder" would be two chances
+   * to orphan it.
+   */
+  descendantsOf(path: string): string[] {
     const prefix = `${path}/`;
     return this.deps.mirror
       .entries()
@@ -567,8 +574,14 @@ export class Vault extends Events {
       .map((entry) => entry.path);
   }
 
-  /** Both ends of a folder move, and every row under both ends. */
-  private movedPaths(from: string, to: string): string[] {
+  /**
+   * Both ends of a folder move, and every row under both ends.
+   *
+   * @internal Host seam, public for the same reason as {@link descendantsOf}:
+   * `FileManager.renameFile` moves folders too, and the destination rows it has
+   * to name are exactly the ones the mirror cannot expand on its own.
+   */
+  movedPaths(from: string, to: string): string[] {
     const under = this.descendantsOf(from);
     return [from, to, ...under, ...under.map((path) => `${to}${path.slice(from.length)}`)];
   }
@@ -585,8 +598,13 @@ export class Vault extends Events {
    * or a path outside the index — is written unconditionally. `{ any: true }`
    * rather than an omitted field, because saying it out loud is the shape the
    * daemon documents for "I mean this to be unconditional".
+   *
+   * @internal Host seam, public so every write in the shim states its
+   * precondition the same way — Task 9's `patch_frontmatter` and `rename_note`
+   * carry one too, and a second implementation would be a second answer to
+   * "what does this host consider unconditional".
    */
-  private expectedFor(path: string): { revision: string } | { any: true } {
+  expectedFor(path: string): { revision: string } | { any: true } {
     const revision = this.deps.mirror.entry(path)?.revision;
     return revision === null || revision === undefined ? { any: true } : { revision };
   }

@@ -24,6 +24,7 @@
  * `keymap`, `scope`, `setting` and `foldManager`. Nothing here is re-decided later — a task adds its field and
  * the assembler's one assignment, and that is all.
  */
+import type { FileManager } from "./file-manager";
 import type { MetadataCache } from "./metadata-cache";
 import type { Vault } from "./vault";
 
@@ -59,6 +60,19 @@ export class App {
    * refer to each other, so no construction order leaves both final.
    */
   metadataCache!: MetadataCache;
+
+  /**
+   * `app.fileManager` — filled by `assembleShim`, exactly once, after the
+   * metadata cache.
+   *
+   * Third because it reads both of the others: it patches frontmatter the
+   * mirror's rows describe, it moves the files the vault's index hands out, and
+   * it composes links through the metadata cache's resolver. Assigned rather
+   * than constructed into a `readonly` field for the same reason as its two
+   * peers — the surfaces refer to each other, so no construction order leaves
+   * them all final.
+   */
+  fileManager!: FileManager;
 
   constructor(options: { appId: string }) {
     this.appId = options.appId;
