@@ -220,10 +220,13 @@ fn convert_mapping(
 /// frontmatter — is one Obsidian accepts.
 ///
 /// The character set is the one `obsidian::TAG_CANDIDATE` scans for, and the
-/// two must not drift: Obsidian's documented letters/numbers/`_`/`-`/`/`
-/// plus the Unicode Symbol categories, which is what keeps the emoji in
-/// `#tag-🙂` (captured in `parity-tags-nested-unicode`). A text that is only
-/// digits is not a tag, and no segment of a nested tag may be empty.
+/// two must not drift: Obsidian's documented letters/numbers/`_`/`-`/`/` plus
+/// the Unicode Symbol categories **outside ASCII**, which is what keeps the
+/// emoji in `#tag-🙂` (captured in `parity-tags-nested-unicode`) while leaving
+/// `#tag+more` truncating as it always did. That module doc carries the
+/// reasoning and names the capture that would settle the ASCII question. A
+/// text that is only digits is not a tag, and no segment of a nested tag may
+/// be empty.
 pub(crate) fn is_valid_tag_text(text: &str) -> bool {
     !text.is_empty()
         && TAG_TEXT.is_match(text)
@@ -231,8 +234,13 @@ pub(crate) fn is_valid_tag_text(text: &str) -> bool {
         && text.split('/').all(|segment| !segment.is_empty())
 }
 
+/// The anchored twin of `obsidian::TAG_CANDIDATE`'s class. Kept character for
+/// character identical to it: the scanner validates every candidate through
+/// [`is_valid_tag_text`], so a disagreement here would silently drop body tags
+/// the scan already matched.
 static TAG_TEXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[\p{Alphabetic}\p{N}\p{S}_/-]+$").expect("tag text pattern compiles")
+    Regex::new(r"^[\p{Alphabetic}\p{N}_/\-[\p{S}&&[^\x00-\x7F]]]+$")
+        .expect("tag text pattern compiles")
 });
 
 fn string_items(value: &Spanned<PropertyValue>) -> Result<Vec<(&str, SourceSpan)>, SourceSpan> {

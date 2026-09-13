@@ -275,29 +275,104 @@ fn tag_values_keep_unicode_symbols() {
 /// The character set the tag scanner accepts, stated as a test so the ruling
 /// is visible where it is enforced.
 ///
-/// The capture pins exactly one symbol — U+1F642 inside `#tag-🙂` — so the set
-/// is Obsidian's documented one (letters, numbers, `_`, `-`, `/`) **plus the
-/// Unicode Symbol categories**, which is the smallest class containing the
-/// captured character without admitting a category no evidence supports. It is
-/// a category question and not an astral-plane one: `#tag-☺` (U+263A, BMP,
-/// category `So`) and `#tag-🙂` (U+1F642, astral, `So`) must behave alike,
-/// while `#tag-𝐀` (U+1D400, astral, `Lu`) was always accepted.
+/// The capture pins exactly one thing: a **non-ASCII** symbol stays inside a
+/// tag value — U+1F642 in `#tag-🙂`. So the set is Obsidian's documented one
+/// (letters, numbers, `_`, `-`, `/`) plus the Unicode Symbol categories
+/// **outside ASCII**. It is a category question and not an astral-plane one:
+/// `#tag-☺` (U+263A, BMP, `So`) and `#tag-🙂` (U+1F642, astral, `So`) must
+/// behave alike, while `#tag-𝐀` (U+1D400, astral, `Lu`) was always accepted.
 ///
-/// Punctuation stays out: the captured `#parent/child/grandchild.` ends before
-/// its full stop, and a tag must not swallow ordinary sentence punctuation.
+/// ASCII symbols stay **out**, which is what keeps `#tag+more`, `#a=b`,
+/// `#c^d` and `#p$` truncating exactly where they truncated before this fix.
+/// Admitting them would explain nothing the capture shows and would invent
+/// tag values Obsidian never reported; excluding them can only preserve a
+/// visible truncation. The module doc on `obsidian::TAG_CANDIDATE` names the
+/// capture that would settle it.
+///
+/// Punctuation stays out too: the captured `#parent/child/grandchild.` ends
+/// before its full stop, and a tag must not swallow sentence punctuation.
 #[test]
-fn tag_character_set_is_the_documented_set_plus_unicode_symbols() {
+fn tag_character_set_is_the_documented_set_plus_non_ascii_symbols() {
     let parsed = parse(
         "Tags.md",
-        "#tag-☺ #tag-🙂 #tag-𝐀 #tag-a, #tag-b. #tag-c! #tag-d?\n",
+        "#tag-☺ #tag-🙂 #tag-𝐀 #tag+more #a=b #c^d #p$ #tag-a, #tag-b. #tag-c! #tag-d?\n",
     );
     let values: Vec<&str> = parsed.tags.iter().map(|tag| tag.value.as_str()).collect();
 
     assert_eq!(
         values,
         vec![
-            "tag-☺", "tag-🙂", "tag-𝐀", "tag-a", "tag-b", "tag-c", "tag-d"
+            "tag-☺", "tag-🙂", "tag-𝐀", "tag", "a", "c", "p", "tag-a", "tag-b", "tag-c", "tag-d"
         ],
-        "symbols join a tag value; sentence punctuation ends it"
+        "a non-ASCII symbol joins a tag value; an ASCII symbol and sentence punctuation end it"
+    );
+}
+
+/// A standalone `^id` as the first body block keeps its own paragraph.
+///
+/// No capture in either corpus ever shows an `id` on a `yaml` section, and
+/// folding one there would report the block at the frontmatter's own span.
+/// The fold declines, so the anchor stays the section it was before the fold
+/// existed (finding 3 of the Task 1d review).
+#[test]
+fn a_standalone_block_id_after_frontmatter_keeps_its_own_paragraph() {
+    let source = "---\ntitle: T\n---\n\n^after-yaml\n";
+    let parsed = parse("After yaml.md", source);
+
+    let sections: Vec<(SectionKind, usize, usize, Option<&str>)> = parsed
+        .sections
+        .iter()
+        .map(|section| {
+            (
+                section.kind.clone(),
+                section.span.start(),
+                section.span.end(),
+                section.block_id.as_deref(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        sections,
+        vec![
+            (SectionKind::Yaml, 0, 16, None),
+            (SectionKind::Paragraph, 18, 29, Some("after-yaml")),
+        ],
+        "a yaml section never carries a block id"
+    );
+}
+
+/// A standalone `^id` after a block that **already** declares one keeps its
+/// own paragraph and its own id.
+///
+/// Folding it would overwrite the inline id on the section above and leave
+/// that id with no declaring section. No capture covers two ids this close
+/// together, so the fold declines and both stay reachable, exactly as they
+/// were before the fold existed (finding 4 of the Task 1d review).
+#[test]
+fn a_standalone_block_id_after_a_declared_id_keeps_its_own_paragraph() {
+    let source = "Para one. ^inline-id\n\n^standalone-id\n";
+    let parsed = parse("Two ids.md", source);
+
+    let sections: Vec<(SectionKind, usize, usize, Option<&str>)> = parsed
+        .sections
+        .iter()
+        .map(|section| {
+            (
+                section.kind.clone(),
+                section.span.start(),
+                section.span.end(),
+                section.block_id.as_deref(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        sections,
+        vec![
+            (SectionKind::Paragraph, 0, 20, Some("inline-id")),
+            (SectionKind::Paragraph, 22, 36, Some("standalone-id")),
+        ],
+        "neither id loses its declaring section"
     );
 }

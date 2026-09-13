@@ -20,18 +20,40 @@ use crate::{
 /// truncated the same way, while `#tag-𝐀` (U+1D400) is astral and never did,
 /// because it is a letter.
 ///
-/// So the class is the documented set plus `\p{S}` (`Sm`, `Sc`, `Sk`, `So`) —
-/// the smallest Unicode category containing the one symbol the capture pins,
-/// without admitting a category no capture supports. Punctuation stays out,
-/// which is what ends `#parent/child/grandchild.` before its full stop in the
-/// same capture. Characters a symbol sequence can carry but no capture shows —
-/// a variation selector (`Mn`), a zero-width joiner (`Cf`) — are still outside
-/// the class; a capture that exhibits one is what should widen it.
+/// So the class is the documented set plus the Unicode Symbol categories
+/// **outside ASCII** — `[\p{S}&&[^\x00-\x7F]]`. Punctuation stays out, which
+/// is what ends `#parent/child/grandchild.` before its full stop in the same
+/// capture.
+///
+/// **Why the ASCII symbols are excluded, though `\p{S}` would cover them.**
+/// The capture demonstrates one thing: a *non-ASCII* symbol stays inside a tag
+/// value. Admitting non-ASCII symbols explains that completely; admitting
+/// `+ = ^ $ ~ < > |` and the backtick as well explains nothing further and
+/// changes what nine characters that appear constantly in ASCII prose mean.
+/// The two errors are not symmetric. Too narrow truncates a tag exactly where
+/// this scanner already truncated it before the fix — no regression, and the
+/// damage is visible as a short tag. Too wide silently **invents** tag values
+/// Obsidian never reported: new rows in the tag index, changed values and end
+/// offsets, and tag searches that disagree with Obsidian over the same vault.
+/// Widening later on a new capture is a one-character edit; unwinding a wrong
+/// widening means re-indexing. Accepting U+1F642 is equally consistent with
+/// "stop at ASCII punctuation and ASCII symbols, keep everything else", which
+/// is what Obsidian's own documentation describes for the ASCII range.
+///
+/// ASCII-versus-non-ASCII is not a principled Unicode boundary, so this is a
+/// holding position, not a finding. **The capture that settles it** is
+/// `#tag+more #a=b #c^d #p$ #tag-☺` written into a scratch note and read back
+/// through `app.metadataCache.getFileCache` on a live Obsidian 1.13.4 — a
+/// minute's work for whoever next has the app open, and it belongs in the
+/// corpus before this reaches a real vault. Characters a symbol sequence can
+/// carry but no capture shows — a variation selector (`Mn`), a zero-width
+/// joiner (`Cf`) — are outside the class for the same reason.
 ///
 /// [`crate::frontmatter::is_valid_tag_text`] validates the same set, for tags
 /// that arrive through frontmatter rather than through this scan.
 static TAG_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"#[\p{Alphabetic}\p{N}\p{S}_/-]+").expect("tag candidate pattern compiles")
+    Regex::new(r"#[\p{Alphabetic}\p{N}_/\-[\p{S}&&[^\x00-\x7F]]]+")
+        .expect("tag candidate pattern compiles")
 });
 
 pub(crate) struct ObsidianScan {
@@ -82,6 +104,17 @@ pub(crate) fn scan_text_ranges(document: &SourceDocument, ranges: &[SourceSpan])
 /// wikilink scan runs first and the Markdown scan sees only what it did not
 /// consume, which is what keeps `[[Target]]` from also reading as a Markdown
 /// label.
+///
+/// **Known gap: a `"…"` link title inside a double-quoted YAML scalar.** The
+/// scan reads the *raw source* deliberately, so that a span stays correct for
+/// a quoted scalar; the cost is that YAML's own escapes are still in the text
+/// it reads. `t: "[Label](Target.md \"A title\")"` therefore finds `\"` where
+/// a closing quote belongs, fails the closing-paren check, and yields no
+/// reference. The single-quoted spellings — `t: '[Label](Target.md "A
+/// title")'` and a `'…'` title — both work, as does the same link in the body.
+/// This is the same raw-source-versus-YAML-escape tension the wikilink scan
+/// already lives with rather than a new one, and no capture covers it;
+/// unescaping would have to keep a byte-exact map back to the raw span.
 pub(crate) fn scan_property_references(
     document: &SourceDocument,
     properties: &[Property],
@@ -261,10 +294,17 @@ fn scan_markdown_links(
     origin: ReferenceOrigin,
     references: &mut Vec<Reference>,
 ) {
-    let mut index = 0;
-    while index < slice.len() {
+    let mut search = 0;
+    while let Some(offset) = slice[search..].find('[') {
+        let index = search + offset;
         let Some(found) = parse_markdown_link(slice, index) else {
-            index += 1;
+            // With no `]` left after this bracket, no later `[` can close
+            // either — so a run of unmatched brackets ends the scan here
+            // instead of rescanning the tail once per bracket.
+            if !slice[index + 1..].contains(']') {
+                return;
+            }
+            search = index + 1;
             continue;
         };
         let raw_target = slice[found.destination.clone()].to_string();
@@ -284,7 +324,7 @@ fn scan_markdown_links(
                 .expect("reference span is ordered"),
             target_span,
         });
-        index = found.whole.end;
+        search = found.whole.end;
     }
 }
 
@@ -293,6 +333,11 @@ fn scan_markdown_links(
 ///
 /// Byte scanning is safe over UTF-8: every position this function stops at is
 /// an ASCII delimiter, and a continuation byte matches no arm.
+///
+/// Escaping is [`is_escaped`]'s, which reads one byte back and so treats `\\[`
+/// — an escaped backslash *before* a bracket — as an escaped bracket. That is
+/// pre-existing and shared with [`scan_wikilinks`]; the two stay consistent
+/// rather than one of them being quietly stricter.
 fn parse_markdown_link(slice: &str, index: usize) -> Option<MarkdownLinkMatch> {
     let bytes = slice.as_bytes();
     if bytes.get(index) != Some(&b'[') || is_escaped(bytes, index) {

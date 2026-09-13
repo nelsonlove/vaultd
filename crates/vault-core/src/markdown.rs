@@ -341,11 +341,30 @@ fn extract_list_items(tree: &Node, body_start: usize, text: &str) -> Vec<ListIte
 /// parent, leaving two columns, and Obsidian reports col 2 — so the rule is
 /// about the leftover indent, not about the child's own marker.
 ///
-/// Every capture in both corpora has a leftover of exactly one or exactly two
-/// columns, so "drop a lone space" and "drop the leftover under an ordered
-/// parent" fit the evidence equally. The narrower, text-observable form is
-/// implemented here; a capture with, say, a three-space indent under `1. `
-/// would separate them.
+/// Every captured leftover is 0, 1 or 2 columns, so **three** readings fit the
+/// whole corpus and disagree only off it:
+///
+/// 1. drop a lone leftover space (implemented here);
+/// 2. drop the leftover indent under an *ordered* parent;
+/// 3. the parent's content column rounded up to an even number (2→2, 6→6,
+///    3→4, 7→8).
+///
+/// Two experiments separate them, and a three-space indent under `1. ` is
+/// **not** one of them — `1. ` has content column 3, so three spaces leave
+/// zero leftover and every reading already answers "the marker". What does
+/// decide:
+///
+/// - **a three-space indent under `- `** (leftover 1, *unordered* parent):
+///   `- x\n   - y\n`. Reading 1 (and 3) answer col 3, the marker; reading 2
+///   answers col 2.
+/// - **a five- or six-space indent under `1. `** (leftover ≥ 2, *ordered*
+///   parent): `1. x\n     1. y\n`. Reading 1 answers col 3; reading 2 answers
+///   col 5; reading 3 answers col 4.
+///
+/// The narrowest, text-observable form is implemented because it is the one
+/// that moves the fewest spans: it only ever touches a leftover of exactly one
+/// column. A capture of either experiment above, read back from a live
+/// Obsidian, is what should settle it.
 fn trim_lone_leftover_indent_space(text: &str, start: usize) -> usize {
     let bytes = text.as_bytes();
     let lone_space =

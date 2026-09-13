@@ -109,12 +109,29 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
 /// `^id` text, which is where it was written — so a caller that wants the
 /// owning block's extent reads it off the section that now declares the id.
 ///
-/// A `List` section is not a fold target: a block id is never attached to a
-/// list section (see [`attach_section_block_ids`]), so an anchor line after a
-/// list keeps its own section and its own id rather than moving onto a section
-/// that may not carry one. Nothing in either capture corpus covers that case.
+/// Three shapes decline the fold, and **no capture covers any of them**. Each
+/// is left exactly as it parsed before this pass existed, which is the
+/// conservative choice where there is no evidence either way:
+///
+/// - **After a `List`.** A list section never carries a block id — an id
+///   written inside a list item surfaces on the `ListItem`
+///   (`13-block-ids`) — so folding here would hand the id to a section that
+///   cannot declare one. Note that `13-block-ids` settles only the *inline*
+///   form; a standalone anchor line after a list is a different shape, and
+///   the corpus is silent on it. Both branches are guesses; this one keeps
+///   the id reachable on a section of its own.
+/// - **After the `yaml` section.** No capture ever shows an `id` on `yaml`,
+///   and folding there would report the block at the frontmatter's own span.
+/// - **Onto a section that already declares an id.** `Para one. ^inline-id`
+///   followed by a standalone `^standalone-id` would otherwise overwrite the
+///   inline id and leave it with no declaring section. Both ids keep theirs.
+///
+/// A section already folded away is never a fold target either: two anchor
+/// lines in a row would otherwise put the second id on a section that no
+/// longer exists, losing it.
 fn fold_standalone_block_id_sections(sections: &mut Vec<Section>, text: &str) {
-    let mut folded = Vec::with_capacity(sections.len());
+    let mut folded = vec![false; sections.len()];
+    let mut any = false;
     for index in 0..sections.len() {
         let Some(id) = sections[index].block_id.clone() else {
             continue;
@@ -125,28 +142,31 @@ fn fold_standalone_block_id_sections(sections: &mut Vec<Section>, text: &str) {
         let Some(slice) = text.get(sections[index].span.start()..sections[index].span.end()) else {
             continue;
         };
-        if slice.trim_end() != format!("^{id}") {
+        // The whole section is this one anchor and nothing else.
+        if slice.trim_end().strip_prefix('^') != Some(id.as_str()) {
             continue;
         }
         let Some(previous) = index.checked_sub(1) else {
             continue;
         };
-        // Never fold onto a section that is itself being folded away: two
-        // anchor lines in a row would otherwise put the second id on a section
-        // that no longer exists, losing it.
-        if matches!(sections[previous].kind, SectionKind::List) || folded.last() == Some(&previous)
+        if matches!(
+            sections[previous].kind,
+            SectionKind::List | SectionKind::Yaml
+        ) || sections[previous].block_id.is_some()
+            || folded[previous]
         {
             continue;
         }
         sections[previous].block_id = Some(id);
-        folded.push(index);
+        folded[index] = true;
+        any = true;
     }
-    if folded.is_empty() {
+    if !any {
         return;
     }
     let mut index = 0;
     sections.retain(|_| {
-        let keep = !folded.contains(&index);
+        let keep = !folded[index];
         index += 1;
         keep
     });
