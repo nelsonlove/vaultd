@@ -25,7 +25,7 @@
  *    instead, and every registration made inside it is owned by that plugin.
  */
 
-import { stub } from "./policy";
+import { declarePolicy, stub } from "./policy";
 
 /** Anything a shim event hands its listeners. Obsidian's own signature is untyped. */
 export type EventCallback = (...data: never[]) => unknown;
@@ -416,3 +416,11 @@ export class Menu {
     return [...this.entries];
   }
 }
+
+// The two surfaces in this file a plugin can reach that do not do what they
+// say. Declared at module scope, so the compatibility report knows about them
+// with nothing constructed: a surface that is really a `safe_stub` and answers
+// `absent` to `policyOf` would be mis-stated in the one report a reader
+// consults to find out what this host does not do.
+declarePolicy("Menu.showAtMouseEvent", "safe_stub");
+declarePolicy("Menu.showAtPosition", "safe_stub");

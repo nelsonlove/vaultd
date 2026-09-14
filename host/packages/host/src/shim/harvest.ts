@@ -91,7 +91,13 @@ export interface HarvestedRibbonIcon {
 
 export interface HarvestedTimer {
   readonly pluginId: string;
-  readonly intervalMs: number;
+  /**
+   * The cadence, or `null` when the timer was armed outside the shim's own
+   * `window` and there is none to read back. `null` rather than `0`, which
+   * would read as a timer firing as fast as the loop allows — the one shape the
+   * idle-cost census must not invent.
+   */
+  readonly intervalMs: number | null;
   readonly createdAt: number;
 }
 
@@ -161,9 +167,14 @@ export class Harvest {
   /**
    * The next ordinal for each `<pluginId>:<context>` pair.
    *
-   * Monotonic rather than "however many hooks are registered right now": a
-   * plugin that detaches a hook and registers another would otherwise get an id
-   * that a caller still holding the old one would follow to the new hook.
+   * Monotonic **within one plugin's lifetime** rather than "however many hooks
+   * are registered right now": a plugin that detaches a hook and registers
+   * another would otherwise get an id that a caller still holding the old one
+   * would follow to the new hook. {@link forgetPlugin} drops the counter with
+   * everything else, so a plugin loaded again starts at `0` — deliberately: a
+   * forgotten plugin's ids are not addressable by anything any more, and a
+   * counter that survived a quarantine would make a reloaded plugin's ids
+   * depend on how many times it had been reloaded.
    */
   private readonly hookOrdinals = new Map<string, number>();
   private readonly ribbonOrdinals = new Map<string, number>();

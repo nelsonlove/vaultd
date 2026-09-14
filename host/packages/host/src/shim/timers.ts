@@ -42,6 +42,13 @@ interface TimerEntry {
  * need nothing but the number a plugin held on to.
  */
 let nextTimerId = 1;
+/**
+ * Entries leave on a clear and when a one-shot fires, so a host that unloads
+ * its plugins leaves nothing behind. A host torn down *without* unloading them
+ * leaks one entry per armed interval for the life of the process — bounded by
+ * the number of timers that host's plugins armed, and only reachable by a
+ * caller that skipped the teardown it owns.
+ */
 const liveTimers = new Map<number, TimerEntry>();
 
 /** The cadence `setInterval` was called with, or `null` for an id nobody armed here. */
@@ -52,14 +59,21 @@ export function intervalMsOf(id: number): number | null {
 /**
  * Disarm a timer by the id a plugin holds.
  *
- * An id this host never handed out is left alone rather than passed to the
- * global `clearInterval`: nothing in the host arms a global timer, so an
- * unknown id can only have come from a bundle that reached around the shim, and
- * guessing at its handle type would be the more dangerous of the two mistakes.
+ * An id this table never handed out is still cleared, through `fallback` — the
+ * component's injected clock — because such an id can only have come from a
+ * bundle that reached around the shim for its timer, and a timer that goes on
+ * firing after its plugin has been unloaded is the exact idle cost this module
+ * exists to make visible. `Clock.clearInterval` takes the handle Node's own
+ * `setInterval` returns, which is what a bundle doing that would be holding;
+ * a handle from some third source is simply not found, and clearing it is a
+ * no-op rather than a throw.
  */
-export function clearTimerById(id: number): void {
+export function clearTimerById(id: number, fallback: Clock | null = null): void {
   const entry = liveTimers.get(id);
-  if (entry === undefined) return;
+  if (entry === undefined) {
+    fallback?.clearInterval(id as unknown as NodeJS.Timeout);
+    return;
+  }
   liveTimers.delete(id);
   entry.clear();
 }

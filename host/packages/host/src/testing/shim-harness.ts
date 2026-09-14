@@ -37,6 +37,8 @@ import type { FixtureEntry } from "./mirror-harness";
 import type { HostAssembly } from "./assemble";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 import type { Harvest, HarvestedMenuItem, MenuContext } from "../shim/harvest";
+import type { HostErrorEntry } from "../shim/errors";
+import type { ShimEventBus } from "../shim/events";
 import type { ObsidianApi } from "../shim/api";
 // activated by Task 11b: import type { NoticeLog } from "../shim/notice";
 
@@ -73,6 +75,16 @@ export class ShimHarness extends MirrorHarness {
    */
   readonly api!: ObsidianApi;
   readonly harvest!: Harvest;
+  /**
+   * Every failure the host had nobody to hand back to, in order.
+   *
+   * Collected rather than merely available: a harness that registered no
+   * listener would send each one to the process's error stream, so a case about
+   * a throwing `onunload` would pass while printing a stack trace. Assert on
+   * this instead — and assert on it, rather than on the absence of a throw,
+   * because "swallowed" and "reported" look identical from outside.
+   */
+  readonly hostErrors: HostErrorEntry[] = [];
   // activated by Task 11b: readonly noticeLog!: NoticeLog;
   /** The specifiers a plugin bundle may resolve to the host's own modules. */
   readonly hostModulePaths: readonly string[] = ["obsidian", "electron", "@electron/remote"];
@@ -118,6 +130,9 @@ export class ShimHarness extends MirrorHarness {
     mutable.writes = assembly.writes;
     mutable.api = assembly.api;
     mutable.harvest = assembly.harvest;
+    assembly.errors.onError((error, pluginId, phase) => {
+      this.hostErrors.push({ error, pluginId, phase });
+    });
     // activated by Task 11b: mutable.noticeLog = assembly.noticeLog;
   }
 
@@ -189,6 +204,16 @@ export class ShimHarness extends MirrorHarness {
     this.autoServeFiles({ [path]: contents });
   }
 
+  /**
+   * The one event bus every shim surface shares.
+   *
+   * Exposed so a case can count listeners — the only way to tell a plugin that
+   * detached its own registrations from one the harness detached for it.
+   */
+  get bus(): ShimEventBus {
+    return this.assembly.events;
+  }
+
   /** A manifest for a plugin that has no `manifest.json`, as most cases do. */
   manifestFor(id: string): PluginManifest {
     return {
@@ -249,14 +274,15 @@ export class ShimHarness extends MirrorHarness {
    * last two could still be invoked, or still be woken by a vault change, after
    * the host had decided it was gone.
    *
-   * Unloading a plugin this harness does not hold is a no-op rather than a
-   * throw: a second unload is ordinary, and `Component.unload` is idempotent
-   * for the same reason.
+   * Unloading a plugin this harness never instantiated is a no-op rather than a
+   * throw. A plugin it **has** instantiated is kept in the map and unloaded
+   * again on a second call, deliberately: the idempotence that matters lives in
+   * `Component.unload`, and a harness that short-circuited here would hide a
+   * host that had lost it.
    */
   async unload(id: string): Promise<void> {
     const plugin = this.plugins.get(id);
     if (plugin === undefined) return;
-    this.plugins.delete(id);
     await this.assembly.queue.run(id, `${id}:onunload`, () => {
       plugin.unload();
     });

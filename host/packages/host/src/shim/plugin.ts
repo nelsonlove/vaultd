@@ -41,6 +41,7 @@ import { VaultdError } from "../client/errors";
 import type { App } from "./app";
 import type { EventRef, ShimEventBus } from "./events";
 import type { Harvest } from "./harvest";
+import type { HostErrorPhase, HostErrors } from "./errors";
 import type { ReadFileResponse, WriteFileResponse } from "../client/protocol";
 import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
@@ -131,6 +132,8 @@ export interface PluginHostContext {
   readonly events: ShimEventBus;
   readonly queue: DispatchQueue;
   readonly clock: Clock;
+  /** Where a failure with nobody waiting on it goes — see `shim/errors.ts`. */
+  readonly errors: HostErrors;
 }
 
 /**
@@ -155,19 +158,50 @@ export function pluginHostFor(app: App): PluginHostContext {
 }
 
 /**
- * Obsidian's `Component`: a lifecycle and a list of things to undo.
+ * What a component needs from the host when something goes wrong on the way
+ * out, and when it has to disarm a timer the shim did not arm.
  *
- * `unload()` runs `onunload()` first and then drains the teardown list in
- * reverse registration order — the order that lets a later registration depend
- * on an earlier one — and marks itself unloaded so a second `unload()` does
- * nothing. Unloading twice is ordinary (a plugin unloaded during a quarantine
- * that is then unloaded again at shutdown), and a teardown that ran twice would
- * hand a plugin's `onunload` a world it had already dismantled.
+ * A bare `Component` has neither — `new SomeComponent()` names no plugin and no
+ * host — so the context arrives from above: a {@link Plugin} builds it in its
+ * constructor, and {@link Component.addChild} hands its own down. A component
+ * with no context still tears down; it just has nowhere to report to.
+ */
+interface ComponentContext {
+  readonly clock: Clock;
+  report(error: unknown, phase: HostErrorPhase): void;
+}
+
+/**
+ * `Component`: a lifecycle and four lists of things to undo.
+ *
+ * **Teardown order, fixed by the Task 10 fix-round-1 ruling:** children unload,
+ * then the `register()` callbacks in reverse, then the event refs, then the
+ * timers, and `onunload()` **last**. Last is the point of it — a plugin's
+ * `onunload` that touches the vault would otherwise re-enter its own listeners
+ * and its own intervals, which are still live if `onunload` runs first. (Task
+ * 10 shipped it first, pinned by the brief's fourth case; the ruling reversed
+ * both.)
+ *
+ * **Nothing thrown on the unload path escapes.** Every step runs inside a guard
+ * that reports through {@link ComponentContext.report} and carries on: the
+ * plugin most likely to throw while being torn down is exactly the one a
+ * quarantine is trying to remove, and a throw that escaped would leave its
+ * listeners attached, its timers armed, and its harvest un-forgotten.
+ *
+ * **`unload()` is idempotent for real.** The flag is set before any of the work,
+ * so a second call is a no-op even when the first one threw — and the lists are
+ * drained rather than iterated, so nothing can run twice.
  */
 export abstract class Component {
   private loadedFlag = false;
   private unloadedFlag = false;
-  private readonly teardown: (() => unknown)[] = [];
+  private context: ComponentContext | null = null;
+  /** `register(cb)` — the plugin's own undo callbacks. */
+  private readonly registered: (() => unknown)[] = [];
+  /** `registerEvent(ref)` — detached after the callbacks above have run. */
+  private readonly eventRefs: EventRef[] = [];
+  /** `registerInterval(id)` — disarmed last, so nothing can re-arm behind it. */
+  private readonly timerIds: number[] = [];
   private readonly children: Component[] = [];
 
   /** Whether `load()` has run and `unload()` has not. */
@@ -178,10 +212,9 @@ export abstract class Component {
   /**
    * Run `onload`, once.
    *
-   * Returns whatever `onload` returns so an `async onload` can be awaited. That
-   * is a real departure from Obsidian, whose `load()` is `void` — but plugins
-   * write `async onload` constantly, and a host that did not await it would run
-   * the first request against a plugin whose registrations had not landed yet.
+   * Returns whatever `onload` returns so an `async onload` can be awaited: a
+   * host that did not await it would run its first request against a plugin
+   * whose registrations had not landed yet.
    */
   load(): void | Promise<void> {
     if (this.loadedFlag) return;
@@ -193,29 +226,53 @@ export abstract class Component {
     // A plugin overrides this. The base does nothing on purpose.
   }
 
+  /**
+   * Tear this component down, in the ruled order, without ever throwing.
+   *
+   * A component that was never loaded has nothing registered and no `onunload`
+   * worth running, so it is marked and left alone.
+   */
   unload(): void {
     if (this.unloadedFlag) return;
     this.unloadedFlag = true;
-    this.onunload();
-    for (const child of this.children.splice(0).reverse()) child.unload();
-    for (const undo of this.teardown.splice(0).reverse()) {
-      try {
-        undo();
-      } catch {
-        // A teardown that throws must not strand the ones behind it: the
-        // remaining undos are what keep a quarantined plugin from leaving
-        // listeners and timers behind.
-      }
+    if (!this.loadedFlag) return;
+    for (const child of this.children.splice(0).reverse()) {
+      this.guard("teardown", () => {
+        child.unload();
+      });
     }
+    for (const undo of this.registered.splice(0).reverse()) {
+      this.guard("teardown", undo);
+    }
+    for (const ref of this.eventRefs.splice(0).reverse()) {
+      this.guard("teardown", () => {
+        ref.detach();
+      });
+    }
+    for (const id of this.timerIds.splice(0).reverse()) {
+      this.guard("teardown", () => {
+        clearTimerById(id, this.context?.clock ?? null);
+      });
+    }
+    this.guard("onunload", () => {
+      this.onunload();
+    });
   }
 
   onunload(): void {
     // A plugin overrides this. The base does nothing on purpose.
   }
 
+  /**
+   * Adopt a child, and load it if this component is itself loaded.
+   *
+   * The child inherits this component's context, so a failure inside a child's
+   * teardown is still attributed to the plugin that owns the tree.
+   */
   addChild<T extends Component>(child: T): T {
     this.children.push(child);
-    void child.load();
+    child.adoptContext(this.context);
+    if (this.loadedFlag && !this.unloadedFlag) void child.load();
     return child;
   }
 
@@ -227,23 +284,21 @@ export abstract class Component {
   }
 
   register(callback: () => unknown): void {
-    this.teardown.push(callback);
+    this.registered.push(callback);
   }
 
   registerEvent(ref: EventRef): void {
-    this.teardown.push(() => {
-      ref.detach();
-    });
+    this.eventRefs.push(ref);
   }
 
   /**
    * Accepted and discarded: there is no DOM to attach a listener to.
    *
    * Recorded as a `safe_stub` hit rather than as an unreachable row, because
-   * the plugin has not told the host what the listener was *for*. The ten
-   * delegated listeners tag-wrangler installs are recorded as
-   * `dom_delegated_menu` by Task 14's bundle scan, which can see what this call
-   * cannot.
+   * the plugin has not told the host what the listener was *for*. The
+   * `dom_delegated_menu` rows belong to Task 14's bundle scan, which can see
+   * what this call cannot: nine of tag-wrangler's ten delegated listeners never
+   * reach this method at all.
    */
   registerDomEvent(...args: unknown[]): void {
     void args;
@@ -258,12 +313,33 @@ export abstract class Component {
    * timer registry the host's `window.setInterval` writes to — the call itself
    * carries only an id — and {@link Plugin.registerInterval} is what puts it in
    * the harvest, because the id alone does not say whose timer it is.
+   *
+   * An id the shim's own `window` did not arm is still cleared, through this
+   * component's injected clock. A plugin that reached around the shim for its
+   * timer would otherwise keep firing after it was unloaded.
    */
   registerInterval(id: number): number {
-    this.teardown.push(() => {
-      clearTimerById(id);
-    });
+    this.timerIds.push(id);
     return id;
+  }
+
+  /** Install the host wiring a `Plugin` has and a bare `Component` does not. */
+  protected adoptContext(context: ComponentContext | null): void {
+    this.context = context;
+  }
+
+  /** What this component reports failures through, for a subclass to pass on. */
+  protected componentContext(): ComponentContext | null {
+    return this.context;
+  }
+
+  /** Run one teardown step; report whatever it throws and carry on. */
+  private guard(phase: HostErrorPhase, step: () => void): void {
+    try {
+      step();
+    } catch (error) {
+      this.context?.report(error, phase);
+    }
   }
 }
 
@@ -295,22 +371,45 @@ export abstract class Plugin extends Component {
     this.app = app;
     this.manifest = manifest;
     this.host = pluginHostFor(app);
+    // Every failure this plugin's teardown produces — its own, and any child
+    // component's — carries its id from here.
+    this.adoptContext({
+      clock: this.host.clock,
+      report: (error, phase) => {
+        this.host.errors.report(error, manifest.id, phase);
+      },
+    });
   }
 
   // --- Harvested registrations ----------------------------------------------
 
   /**
-   * Namespace the id, record the row, and hand the command to the registry.
+   * Namespace the id, record the row, hand the command to the registry, and
+   * register its withdrawal.
    *
-   * Obsidian prefixes a plugin's command ids with the plugin id, and everything
-   * that addresses a command later — the palette, a hotkey, the host's own
-   * `invoke_command` — uses the prefixed form. Returning the namespaced command
-   * is Obsidian's behaviour too.
+   * A plugin's command ids are prefixed with the plugin id, and everything that
+   * addresses a command later — the palette, a hotkey, the host's own
+   * `invoke_command` — uses the prefixed form.
+   *
+   * **The teardown is half the delegation.** Without it an unloaded or
+   * quarantined plugin's commands would stay in `app.commands` and stay
+   * executable: the harvest forgets them, the registry would not. Today
+   * `app.commands` is absent and the seam is inert; it starts working the
+   * moment Task 12 assigns the field, which is why it is written now rather
+   * than there.
+   *
+   * Two differences from the GUI worth recording for Task 16a/22, both of which
+   * the brief pins: the command object is **copied** rather than rewritten in
+   * place, and `name` is stored as the plugin wrote it rather than prefixed
+   * with the plugin's display name.
    */
   addCommand(command: Command): Command {
     recordUse("Plugin.addCommand");
     const pluginId = this.manifest.id;
     const namespaced: Command = { ...command, id: `${pluginId}:${command.id}` };
+    this.register(() => {
+      commandSinkOf(this.app)?.removeCommand?.(namespaced.id);
+    });
     this.host.harvest.recordCommand({
       pluginId,
       id: namespaced.id,
@@ -329,7 +428,8 @@ export abstract class Plugin extends Component {
 
   /**
    * Forget a command, by the **local** id — the one the plugin passed to
-   * `addCommand` — as Obsidian's own `removeCommand` takes it.
+   * `addCommand`. A qualified id is accepted too, since half the corpus passes
+   * back what `addCommand` returned.
    */
   removeCommand(id: string): void {
     recordUse("Plugin.removeCommand");
@@ -435,10 +535,10 @@ export abstract class Plugin extends Component {
     this.host.harvest.recordTimer({
       pluginId: this.manifest.id,
       // A timer armed through something other than the host's own
-      // `window.setInterval` has no cadence to read back. It is still recorded,
-      // with `0` standing for "unknown", because a timer nobody can see is
-      // exactly what the idle-cost census exists to surface.
-      intervalMs: intervalMsOf(id) ?? 0,
+      // `window.setInterval` has no cadence to read back, and `null` says that
+      // out loud. `0` would have been a lie the idle-cost census could not spot
+      // — it reads as a timer that fires as fast as the loop will let it.
+      intervalMs: intervalMsOf(id),
       createdAt: this.host.clock.now(),
     });
     return super.registerInterval(id);
@@ -449,9 +549,16 @@ export abstract class Plugin extends Component {
   /**
    * Read `<hostConfigDir>/plugins/<id>/data.json`, or `null` if it is not there.
    *
-   * `null` rather than `{}` because that is what Obsidian answers for a plugin
-   * with no saved data, and fifty plugins in the corpus branch on it to install
-   * their defaults. Malformed JSON still throws, also as Obsidian does.
+   * `null` rather than `{}`: a plugin with no saved data is the ordinary case,
+   * and fifty plugins in the corpus branch on a falsy answer to install their
+   * defaults.
+   *
+   * **A file that is not JSON is reported and answered `null` too** — the
+   * least-harm choice pending a runtime capture of what the GUI really does
+   * with one. The alternative is a throw inside `onload`, which kills the whole
+   * plugin over one bad byte in a settings file; answering `null` puts it on
+   * the path every one of those fifty plugins already handles, and the failure
+   * still reaches the host's error sink rather than disappearing.
    *
    * It stays inside the **host's** config directory, so the GUI copy's
    * `data.json` is structurally untouchable rather than merely left alone by
@@ -470,7 +577,12 @@ export abstract class Plugin extends Component {
       throw error;
     }
     if (source.trim() === "") return null;
-    return JSON.parse(source) as unknown;
+    try {
+      return JSON.parse(source) as unknown;
+    } catch (error) {
+      this.host.errors.report(error, this.manifest.id, "plugin-data");
+      return null;
+    }
   }
 
   /**
@@ -537,12 +649,19 @@ function commandSinkOf(app: App): CommandSink | null {
   return typeof candidate.addCommand === "function" ? (commands as CommandSink) : null;
 }
 
-/** A name for something a plugin registered, for the unreachable row's detail. */
+/**
+ * A name for something a plugin registered, for the unreachable row's detail.
+ *
+ * `constructor?.name` rather than `constructor.name`: an object made with
+ * `Object.create(null)` has no constructor, and a `TypeError` raised here would
+ * escape from inside the one set of methods whose whole purpose is never to
+ * throw during `onload`.
+ */
 function describeRegistration(value: unknown, fallback: string): string {
   if (typeof value === "function") return value.name === "" ? fallback : value.name;
   if (typeof value === "object" && value !== null) {
-    const name = value.constructor.name;
-    return name === "" || name === "Object" ? fallback : name;
+    const name = value.constructor?.name;
+    return name === undefined || name === "" || name === "Object" ? fallback : name;
   }
   return fallback;
 }

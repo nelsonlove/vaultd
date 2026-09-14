@@ -78,14 +78,19 @@ describe("the policy table", () => {
 
   it("remembers what was declared, and only what was declared", () => {
     const base = importTimeSymbols();
-    declarePolicy("Vault.read", "implemented");
-    declarePolicy("Menu.showAtMouseEvent", "harvested");
-    expect(policyOf("Vault.read")).toBe("implemented");
-    expect(policyOf("Menu.showAtMouseEvent")).toBe("harvested");
+    // Both names are **invented**, and have to be: this case asserts the table
+    // is the import-time set *plus these two*, so a symbol a shim module really
+    // declares at import would appear twice in the expectation and once in the
+    // table. (`Menu.showAtMouseEvent` stood here until Task 10 declared it for
+    // real, which is exactly the collision this comment now prevents.)
+    declarePolicy("Vault.invented", "implemented");
+    declarePolicy("Menu.invented", "harvested");
+    expect(policyOf("Vault.invented")).toBe("implemented");
+    expect(policyOf("Menu.invented")).toBe("harvested");
     // Exactly the import-time set plus these two, so a row appearing from
     // anywhere else still fails this.
     expect([...declaredSymbols()].sort()).toEqual(
-      [...base, "Menu.showAtMouseEvent", "Vault.read"].sort(),
+      [...base, "Menu.invented", "Vault.invented"].sort(),
     );
   });
 

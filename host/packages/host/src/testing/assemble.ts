@@ -25,6 +25,7 @@ import { DispatchQueue } from "../runtime/queue";
 import { setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
 import { Harvest } from "../shim/harvest";
+import { HostErrors } from "../shim/errors";
 import { Workspace } from "../shim/workspace";
 import { createObsidianApi } from "../shim/api";
 import { installPluginHost } from "../shim/plugin";
@@ -62,6 +63,12 @@ export interface HostAssembly {
   readonly app: App;
   readonly writes: WriteGate;
   readonly harvest: Harvest;
+  /**
+   * Where a failure nobody is waiting on goes: a plugin's `onunload` throwing,
+   * a teardown throwing, a menu hook throwing, a `data.json` that is not JSON.
+   * Task 14b's quarantine listens here.
+   */
+  readonly errors: HostErrors;
   // activated by Task 11b: readonly noticeLog: NoticeLog;
   /**
    * The module object a plugin bundle resolves `obsidian` to.
@@ -183,7 +190,17 @@ export function assembleShim(deps: {
   // The harvest holds nothing but its own rows, so it is built before the
   // surfaces that write into it. The workspace needs it at construction — its
   // `on` records menu hooks — which is why it comes first of the two.
-  const harvest = new Harvest();
+  //
+  // A menu hook that throws is reported to the same sink a plugin's teardown
+  // failures go to. Without the wiring the `Harvest` would catch the throw and
+  // hand it nowhere, which is how a quarantine ends up unable to name the
+  // plugin whose handler is broken.
+  const errors = new HostErrors();
+  const harvest = new Harvest({
+    onHookError: (failure) => {
+      errors.report(failure.error, failure.pluginId, "menu-hook");
+    },
+  });
   const workspace = new Workspace({ events, harvest });
 
   // The assign-once step. `App` is a mutable container precisely so this can
@@ -197,7 +214,7 @@ export function assembleShim(deps: {
   // Everything a `Plugin` needs that its two constructor arguments cannot
   // carry. Installed against the `App`, keyed by it, so two hosts in one
   // process never read each other's wiring — see `shim/plugin.ts`.
-  installPluginHost(app, { config, client, writes, harvest, events, queue, clock });
+  installPluginHost(app, { config, client, writes, harvest, events, queue, clock, errors });
 
   const assembled = {
     config,
@@ -210,6 +227,7 @@ export function assembleShim(deps: {
     app,
     writes,
     harvest,
+    errors,
   };
   // Last, and built from the assembly itself: the barrel binds this host's
   // clock into the timer functions a plugin calls, so a test advancing its own

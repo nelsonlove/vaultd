@@ -19,7 +19,7 @@
 
 import { Events } from "./events";
 import type { EventCallback, EventRef, ShimEventBus } from "./events";
-import type { Harvest, MenuContext, MenuHookCallback } from "./harvest";
+import type { Harvest, MenuContext, MenuHookCallback, MenuHookRegistration } from "./harvest";
 
 export interface WorkspaceDeps {
   readonly events: ShimEventBus;
@@ -28,7 +28,24 @@ export interface WorkspaceDeps {
 
 const MENU_EVENTS = new Set<string>(["file-menu", "editor-menu"]);
 
+/** One harvested hook, and the callback `off(name, callback)` will name it by. */
+interface HookEntry {
+  readonly callback: EventCallback;
+  readonly registration: MenuHookRegistration;
+}
+
 export class Workspace extends Events {
+  /**
+   * The harvested hooks, by event name.
+   *
+   * Kept here because a plugin has three ways to withdraw a listener — the ref
+   * it was given, `offref(ref)`, and `off(name, callback)` — and only the first
+   * two carry anything that knows about the harvest. Without this map the third
+   * one would leave the host holding a menu hook the plugin had withdrawn: the
+   * harvest would report it, and a menu build would invoke it.
+   */
+  private readonly hooks = new Map<string, HookEntry[]>();
+
   constructor(private readonly deps: WorkspaceDeps) {
     super(deps.events);
   }
@@ -58,15 +75,52 @@ export class Workspace extends Events {
       // place the shim states that.
       callback as unknown as MenuHookCallback,
     );
+    const entry: HookEntry = { callback, registration };
+    this.entriesFor(name).push(entry);
     return {
       detach: (): void => {
         ref.detach();
-        registration.detach();
+        this.withdraw(name, entry);
       },
     };
   }
 
+  /**
+   * Detach every listener of `callback` for `name`, and withdraw the hooks with
+   * them.
+   *
+   * By callback, and therefore possibly several at once — which is what the bus
+   * does, and what a plugin that registered the same function twice is asking
+   * for.
+   */
+  override off(name: string, callback: EventCallback): void {
+    super.off(name, callback);
+    const entries = this.hooks.get(name);
+    if (entries === undefined) return;
+    for (const entry of [...entries]) {
+      if (entry.callback === callback) this.withdraw(name, entry);
+    }
+  }
+
   protected override prefix(): string {
     return "workspace";
+  }
+
+  private entriesFor(name: string): HookEntry[] {
+    const existing = this.hooks.get(name);
+    if (existing !== undefined) return existing;
+    const created: HookEntry[] = [];
+    this.hooks.set(name, created);
+    return created;
+  }
+
+  /** Drop one hook from the harvest and from this map. Safe to call twice. */
+  private withdraw(name: string, entry: HookEntry): void {
+    entry.registration.detach();
+    const entries = this.hooks.get(name);
+    if (entries === undefined) return;
+    const at = entries.indexOf(entry);
+    if (at !== -1) entries.splice(at, 1);
+    if (entries.length === 0) this.hooks.delete(name);
   }
 }
