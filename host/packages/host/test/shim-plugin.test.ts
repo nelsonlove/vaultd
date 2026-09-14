@@ -220,6 +220,64 @@ describe("Plugin base", () => {
     expect(harness.hostErrors).toHaveLength(1);
   });
 
+  it("reports a child whose load rejects rather than leaving it unhandled", async () => {
+    const harness = await ShimHarness.withVault({});
+    const unhandled: unknown[] = [];
+    const watch = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    // The whole point of the case: an unguarded `void child.load()` makes this
+    // fire, and under Node's default `--unhandled-rejections=throw` that is one
+    // plugin's child component killing the host — with no plugin id, no phase,
+    // and nothing for a quarantine to act on.
+    process.on("unhandledRejection", watch);
+    try {
+      class Child extends harness.api.Component {
+        override async onload(): Promise<void> {
+          throw new Error("child load blew up");
+        }
+      }
+      const plugin = harness.instantiate(
+        "kid",
+        class extends harness.api.Plugin {
+          override async onload(): Promise<void> {
+            this.addChild(new Child());
+          }
+        },
+      );
+      await harness.load(plugin);
+      await harness.quiesce();
+      expect(unhandled).toEqual([]);
+      expect(harness.hostErrors.map((entry) => [entry.pluginId, entry.phase])).toEqual([
+        ["kid", "onload"],
+      ]);
+    } finally {
+      process.off("unhandledRejection", watch);
+    }
+  });
+
+  it("holds a child added before its parent loads, and loads one added after", async () => {
+    const harness = await ShimHarness.withVault({});
+    const loaded: string[] = [];
+    class Child extends harness.api.Component {
+      constructor(private readonly label: string) {
+        super();
+      }
+      override onload(): void {
+        loaded.push(this.label);
+      }
+    }
+    const plugin = harness.instantiate("parent", class extends harness.api.Plugin {});
+    // Before the parent's own load: held, not loaded. A component that loaded
+    // its children eagerly would run a plugin's code before the host had
+    // decided the plugin was loading at all.
+    plugin.addChild(new Child("early"));
+    expect(loaded).toEqual([]);
+    await harness.load(plugin);
+    plugin.addChild(new Child("late"));
+    expect(loaded).toEqual(["late"]);
+  });
+
   it("withdraws its commands from the registry when it unloads", async () => {
     const harness = await ShimHarness.withVault({});
     // Task 12 builds the real `CommandRegistry`; what the delegation needs is

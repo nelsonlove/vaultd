@@ -247,6 +247,29 @@ describe("Harvest", () => {
     ]);
   });
 
+  it("leaves no hook entry behind when a plugin's listeners are detached by owner", async () => {
+    const harness = await ShimHarness.withVault(MENU_VAULT);
+    const plugin = harness.instantiate(
+      "leaky",
+      class extends harness.api.Plugin {
+        override async onload(): Promise<void> {
+          // Deliberately **not** through `registerEvent`: with no ref kept,
+          // nothing in the plugin's own teardown withdraws the hook, so the
+          // only thing that can is the owner-wide detach the quarantine uses.
+          this.app.workspace.on("file-menu", (menu) => {
+            addItem(menu, "leaky", () => {});
+          });
+        }
+      },
+    );
+    await harness.load(plugin);
+    expect(harness.app.workspace.hookEntryCount()).toBe(1);
+    await harness.unload("leaky");
+    expect(harness.app.workspace.hookEntryCount()).toBe(0);
+    expect(harness.harvest.menuHooks()).toEqual([]);
+    expect(await harness.listMenuItems("file-menu", "A.md")).toEqual([]);
+  });
+
   it("harvests a protocol handler and invokes it with its params", async () => {
     const harness = await ShimHarness.withVault({});
     const received: Array<Record<string, string>> = [];

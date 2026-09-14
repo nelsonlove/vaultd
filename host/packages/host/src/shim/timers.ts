@@ -67,6 +67,14 @@ export function intervalMsOf(id: number): number | null {
  * `setInterval` returns, which is what a bundle doing that would be holding;
  * a handle from some third source is simply not found, and clearing it is a
  * no-op rather than a throw.
+ *
+ * **Only observable under `systemClock`.** The fallback really disarms a Node
+ * interval, and that is the case it exists for — production. A `TestClock`
+ * cannot resolve a handle Node armed, so no in-process test can watch a real
+ * one stop; the committed case pins the reachable half instead, a timer armed
+ * on the harness's own clock and passed to `registerInterval` as if it had come
+ * from elsewhere. Second limit, implied by the same mechanism: a browser-style
+ * numeric id from some third source resolves to nothing and stays a no-op.
  */
 export function clearTimerById(id: number, fallback: Clock | null = null): void {
   const entry = liveTimers.get(id);

@@ -229,8 +229,13 @@ export abstract class Component {
   /**
    * Tear this component down, in the ruled order, without ever throwing.
    *
-   * A component that was never loaded has nothing registered and no `onunload`
-   * worth running, so it is marked and left alone.
+   * A component that was never loaded has no `onunload` worth running, so it is
+   * marked and left alone. The exposure that follows from that, for the next
+   * reader: a registration made in a **constructor** rather than in `onload` is
+   * not undone when a plugin that never loaded is unloaded. A plugin whose
+   * `onload` threw is unaffected — the flag is set before `onload` runs — so
+   * the only way to reach it is to register before the host has decided to load
+   * you at all.
    */
   unload(): void {
     if (this.unloadedFlag) return;
@@ -269,10 +274,33 @@ export abstract class Component {
    * The child inherits this component's context, so a failure inside a child's
    * teardown is still attributed to the plugin that owns the tree.
    */
+  /**
+   * Adopt a child, and load it if this component is itself loaded.
+   *
+   * The child inherits this component's context, so a failure inside a child's
+   * teardown — or inside its `onload` — is still attributed to the plugin that
+   * owns the tree.
+   *
+   * **The load is not awaited, and its rejection is caught.** Not awaited
+   * because what a parent's `load()` should do about a child's is a question
+   * this host has no capture to answer, and inventing an aggregation here would
+   * be inventing behaviour. Caught because the two are separate questions: an
+   * unguarded `void child.load()` turns one plugin's async `onload` throwing
+   * into an unhandled rejection on the process — host-killing under Node's
+   * default, with no plugin id and no phase attached to it.
+   *
+   * A child added before its parent loads is held rather than loaded, and the
+   * parent's own `load()` does not sweep the list; that sweep is the same
+   * uncaptured question.
+   */
   addChild<T extends Component>(child: T): T {
     this.children.push(child);
     child.adoptContext(this.context);
-    if (this.loadedFlag && !this.unloadedFlag) void child.load();
+    if (this.loadedFlag && !this.unloadedFlag) {
+      void Promise.resolve(child.load()).catch((error: unknown) => {
+        this.context?.report(error, "onload");
+      });
+    }
     return child;
   }
 

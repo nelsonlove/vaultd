@@ -48,6 +48,35 @@ export class Workspace extends Events {
 
   constructor(private readonly deps: WorkspaceDeps) {
     super(deps.events);
+    // A hook registered without `registerEvent` has no ref teardown to run, so
+    // an owner-wide detach — what a quarantine does — is the only thing that
+    // can withdraw it. Without this the map would keep one dead entry per
+    // quarantined plugin for the life of the host.
+    deps.events.onOwnerDetached((pluginId) => {
+      this.forgetPlugin(pluginId);
+    });
+  }
+
+  /** Drop every hook one plugin registered, listener refs or not. */
+  forgetPlugin(pluginId: string): void {
+    for (const [name, entries] of [...this.hooks]) {
+      for (const entry of [...entries]) {
+        if (entry.registration.hook.pluginId === pluginId) this.withdraw(name, entry);
+      }
+    }
+  }
+
+  /**
+   * How many hook entries this workspace is holding.
+   *
+   * Public so a case can assert the map is empty after a plugin is forgotten:
+   * a leak of one entry per plugin lifetime is invisible to every other
+   * assertion, which is exactly why it needs one of its own.
+   */
+  hookEntryCount(): number {
+    let total = 0;
+    for (const entries of this.hooks.values()) total += entries.length;
+    return total;
   }
 
   /**

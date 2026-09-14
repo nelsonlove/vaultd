@@ -61,6 +61,7 @@ export interface HandlerFailure {
 export class ShimEventBus {
   private readonly registrations = new Map<string, Set<Registration>>();
   private readonly failureListeners = new Set<(failure: HandlerFailure) => void>();
+  private readonly ownerListeners = new Set<(pluginId: string) => void>();
   /** The plugin every registration made right now belongs to. */
   private owner: string | null = null;
 
@@ -138,7 +139,15 @@ export class ShimEventBus {
     }
   }
 
-  /** Every listener a plugin registered, dropped in one call. */
+  /**
+   * Every listener a plugin registered, dropped in one call.
+   *
+   * Surfaces that keep their own record of a registration — the workspace keeps
+   * one per menu hook, so it can withdraw the harvested hook with the listener
+   * — are told afterwards, through {@link onOwnerDetached}. Without that, a
+   * hook registered outside `registerEvent` (so with no ref teardown to run)
+   * would leave a dead entry behind every time a plugin was quarantined.
+   */
   detachOwner(pluginId: string): number {
     let detached = 0;
     for (const [name, set] of [...this.registrations]) {
@@ -149,7 +158,23 @@ export class ShimEventBus {
       }
       if (set.size === 0) this.registrations.delete(name);
     }
+    for (const listener of [...this.ownerListeners]) {
+      try {
+        listener(pluginId);
+      } catch {
+        // A surface that throws while forgetting a plugin must not stop the
+        // other surfaces from forgetting it.
+      }
+    }
     return detached;
+  }
+
+  /** Learn when a plugin's listeners were dropped wholesale. Returns the detach. */
+  onOwnerDetached(listener: (pluginId: string) => void): () => void {
+    this.ownerListeners.add(listener);
+    return (): void => {
+      this.ownerListeners.delete(listener);
+    };
   }
 
   /** How many listeners are attached — to `name`, or to everything. */
