@@ -17,10 +17,10 @@ pub use events::{
 };
 pub use mutations::{
     CopyConflictDto, CopyFileParams, DeleteFolderParams, DeleteModeDto, DeleteNoteParams,
-    ExpectedDto, FolderParams, FrontmatterEditDto, GenerationResponse, LinkRewriteFailureDto,
-    MutationResponse, PatchFrontmatterParams, PatchValueDto, ReadFileParams, ReadFileResponse,
-    RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams, WriteFileResponse,
-    WriteNoteParams,
+    ExpectedDto, FolderParams, FrontmatterEditDto, GenerationResponse, KeyPathDto,
+    LinkRewriteFailureDto, MutationResponse, PatchFrontmatterParams, PatchValueDto, ReadFileParams,
+    ReadFileResponse, RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams,
+    WriteFileResponse, WriteNoteParams,
 };
 pub use operations::{
     GetDiagnosticsParams, GetNoteResponse, GetTreeEntriesParams, GetTreeEntriesResponse,

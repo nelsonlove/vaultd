@@ -333,12 +333,16 @@ Deletes a folder. A non-empty folder without `recursive: true` is `target_exists
 
 ### `patch_frontmatter`
 
-Edits addressed frontmatter keys in place. `patch` is a list of `{ key_path, value }` entries; `key_path` is a dot-path (`a.b.c`) addressing nested keys, and an explicit JSON `value: null` deletes the key. A missing `value` key is a decode error rather than a deletion, so "forgot to set a value" never becomes "delete this key".
+Edits addressed frontmatter keys in place. `patch` is a list of `{ key_path, value }` entries; `key_path` addresses the key, and an explicit JSON `value: null` deletes it. A missing `value` key is a decode error rather than a deletion, so "forgot to set a value" never becomes "delete this key".
 
-Bytes outside the addressed spans are preserved exactly. An edit at or above a stored key's granularity rewrites only that key's span; an edit *below* it — a leaf inside a nested object, which the index does not store a span for — re-serializes the smallest enclosing stored value span and touches nothing outside that property. Key order, comments, whitespace, and the body survive either way.
+**`key_path` has two spellings, and they address differently.** A **string** is a dot-path: every `.` starts a new segment, so `"a.b.c"` means `c` inside `b` inside `a`. An **array of strings** is the segments themselves, each one a literal key — `["my.key","sub"]` addresses `sub` inside the single key named `my.key`. The array form is the only way to reach a key whose own name contains a dot; sending `"my.key"` for such a key addresses a *different* place and grows a nested `my` mapping beside it. Neither form is rewritten into the other in transit, an empty array is `invalid_request`, and a path with an empty segment is `invalid_request` in either form.
+
+**`set_null: true`, carried instead of `value`, writes a YAML null** for the addressed key, creating the key when it is absent. It is the third action, and it exists because the other two cannot express it: a JSON `value: null` deletes, so without this a plugin's `fm.key = null` — which Obsidian's `processFrontMatter` writes as `key: null` — would have removed the key instead. An entry carrying both `set_null` and `value` says two contradictory things about one key and is refused with `invalid_request`, the explicit `value: null` spelling included; `set_null: false` says nothing, so an omitted `value` beside it is still a decode error.
+
+Bytes outside the addressed spans are preserved exactly, and the span is as narrow as the parse allows. An edit at or above a stored key's granularity rewrites only that key's value span. An edit *below* it — into a nested object, which the index stores no span for — rewrites only the addressed **scalar's** own span when it is setting a scalar that is already there, so the layout around it (the `- ` item it sits in, that item's sibling keys, the indentation) does not move. In every other case below the stored granularity — a deletion, a new value that is a sequence or a mapping, a target that is itself a sequence or a mapping, a target that does not exist yet, or a leaf addressed as a sequence element such as `tags.0` — the smallest enclosing stored value span is re-serialized, which re-emits that one property in the document's addition dialect and touches nothing outside it. Key order, comments outside the re-emitted property, whitespace, and the body survive every case.
 
 ```json
-{"version":1,"id":"pf","request":{"method":"patch_frontmatter","params":{"path":"Folder/Note.md","patch":[{"key_path":"title","value":"Renamed"},{"key_path":"draft","value":null}],"expected":{"any":true}}}}
+{"version":1,"id":"pf","request":{"method":"patch_frontmatter","params":{"path":"Folder/Note.md","patch":[{"key_path":"title","value":"Renamed"},{"key_path":["my.key","sub"],"value":7},{"key_path":"reviewed","set_null":true},{"key_path":"draft","value":null}],"expected":{"any":true}}}}
 ```
 
 ```json

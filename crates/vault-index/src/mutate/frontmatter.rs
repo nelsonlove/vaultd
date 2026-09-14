@@ -35,15 +35,21 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use vault_core::{Property, PropertyValue, SourceDocument, VaultPath, parse_properties};
+use vault_core::{Property, PropertyValue, SourceDocument, Spanned, VaultPath, parse_properties};
 
 use super::MutationError;
 
-/// One frontmatter value a patch sets. No null variant: a JSON `null` in
-/// `value` is the deletion spelling, and arrives as `FrontmatterEdit::value
-/// == None`.
+/// One frontmatter value a patch sets.
+///
+/// [`PatchValue::Null`] is the value a caller asked for *explicitly* — the
+/// wire's `set_null: true` — and it writes a YAML null. It is not the
+/// deletion spelling: a JSON `null` in `value` still deletes, and arrives as
+/// `FrontmatterEdit::value == None`. The two have to stay distinguishable,
+/// because `processFrontMatter` parity turns on exactly that difference:
+/// `fm.key = null` leaves a null-valued key behind, `delete fm.key` does not.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PatchValue {
+    Null,
     Boolean(bool),
     Integer(i64),
     Float(f64),
@@ -75,7 +81,14 @@ struct Splice {
 /// through the caller's type would corrupt it.
 #[derive(Clone, Debug, PartialEq)]
 enum Yaml {
+    /// A null the document already spells for itself, which in this vault's
+    /// dialect is the bare `key:` the linter writes. Round-tripping one back
+    /// through a re-serialization must not respell it.
     Null,
+    /// A null the caller just asked for, spelled `null` — what Obsidian's own
+    /// `stringifyYaml` emits for `fm.key = null`, and what a reader of the
+    /// note sees as a deliberate null rather than an empty property.
+    ExplicitNull,
     Boolean(bool),
     Integer(i64),
     Float(f64),
@@ -87,6 +100,7 @@ enum Yaml {
 impl From<&PatchValue> for Yaml {
     fn from(value: &PatchValue) -> Self {
         match value {
+            PatchValue::Null => Self::ExplicitNull,
             PatchValue::Boolean(value) => Self::Boolean(*value),
             PatchValue::Integer(value) => Self::Integer(*value),
             PatchValue::Float(value) => Self::Float(*value),
@@ -318,6 +332,15 @@ fn plan_existing(
         return Err(MutationError::OverlappingPatch);
     }
 
+    // Below the stored granularity, but still addressing one scalar: the
+    // parse carries a span for that scalar too, so it can be spliced on its
+    // own and the layout around it — the `- ` item it sits in, its sibling
+    // keys, its indentation — never moves. Only when this declines does the
+    // enclosing property get re-emitted.
+    if let Some(splice) = plan_nested_scalar(source, property, group, &entry, newline) {
+        return Ok(Some(splice));
+    }
+
     // Below the stored granularity: deserialize, apply, re-emit.
     let mut root = Yaml::from(&property.value.value);
     for edit in group {
@@ -339,6 +362,115 @@ fn plan_existing(
             after_key(&root, indent, newline)
         ),
     }))
+}
+
+/// The splice for one edit that sets a **scalar that is already there**,
+/// below the stored granularity — or `None` when this narrowing does not
+/// apply and the enclosing property must be re-emitted after all.
+///
+/// The index stores spans per top-level key, but `vault-core`'s parse carries
+/// a span for every nested key and value inside one. This reads the addressed
+/// leaf's own span out of that parse and splices exactly it, so the bytes
+/// around it — the `- ` that opens its map item, the sibling keys of that
+/// item, the block indentation — are not rewritten at all. Re-emitting the
+/// property instead is correct YAML but reflows it: a block-style list of
+/// maps comes back as `- {name: a, value: 9}`, which is a whole-property diff
+/// for a one-scalar edit.
+///
+/// It declines — and today's re-serialization takes over — in every case
+/// where the narrow splice would not be obviously right:
+///
+/// * more than one edit under the same top-level key (they may address
+///   overlapping subtrees, and one re-emit is the defined answer for that);
+/// * a **deletion**, which has to remove a key from its mapping rather than
+///   replace a value;
+/// * a new value that is a sequence or a mapping, whose block layout depends
+///   on the indentation of the place it lands;
+/// * an addressed target that does not exist yet, or is itself a sequence or
+///   mapping;
+/// * a leaf addressed as a **sequence element** (`tags.0`) rather than as a
+///   mapping key: there is no key span to take the separator from, and a
+///   `- ` item's own geometry is not the same splice.
+///
+/// `VAULTD-COMPATIBILITY.md` records what is left reflowing.
+fn plan_nested_scalar(
+    source: &str,
+    property: &Property,
+    group: &[&FrontmatterEdit],
+    entry: &Range<usize>,
+    newline: &str,
+) -> Option<Splice> {
+    if group.len() != 1 {
+        return None;
+    }
+    let edit = group[0];
+    let value = edit.value.as_ref()?;
+    if !matches!(
+        value,
+        PatchValue::Null
+            | PatchValue::Boolean(_)
+            | PatchValue::Integer(_)
+            | PatchValue::Float(_)
+            | PatchValue::String(_)
+    ) {
+        return None;
+    }
+    let (key, target) = locate_scalar(&property.value, &edit.key_path[1..])?;
+    let start = after_colon(source, key.span.end());
+    // `after_colon` answers the key's own end when it finds no `:` at all.
+    // Nothing sensible can be spliced then, so fall back rather than guess.
+    if start <= key.span.end() {
+        return None;
+    }
+    let range = start..value_end(source, start, target.span.end());
+    // The splice must stay inside the property it belongs to. A span that
+    // escaped it would be a parse this code does not understand, and the
+    // conservative answer is to re-emit instead.
+    if range.start < entry.start || range.end > entry.end {
+        return None;
+    }
+    Some(Splice {
+        range,
+        replacement: after_key(
+            &Yaml::from(value),
+            indent_of(source, key.span.start()),
+            newline,
+        ),
+    })
+}
+
+/// The addressed entry inside one parsed property — its key and its value —
+/// when every segment resolves and the value it lands on is a scalar.
+///
+/// `None` for everything else: a missing segment, a non-numeric index into a
+/// sequence, an index past its end, a target that is a collection, and the
+/// sequence-element case, which has a value span but no key span.
+fn locate_scalar<'a>(
+    value: &'a Spanned<PropertyValue>,
+    segments: &[String],
+) -> Option<(&'a Spanned<String>, &'a Spanned<PropertyValue>)> {
+    let (segment, rest) = segments.split_first()?;
+    match &value.value {
+        PropertyValue::Mapping(entries) => {
+            let (key, child) = entries.iter().find(|(key, _)| &key.value == segment)?;
+            if !rest.is_empty() {
+                return locate_scalar(child, rest);
+            }
+            match child.value {
+                PropertyValue::Sequence(_) | PropertyValue::Mapping(_) => None,
+                _ => Some((key, child)),
+            }
+        }
+        PropertyValue::Sequence(items) => {
+            let index = segment.parse::<usize>().ok()?;
+            let child = items.get(index)?;
+            if rest.is_empty() {
+                return None;
+            }
+            locate_scalar(child, rest)
+        }
+        _ => None,
+    }
 }
 
 /// The new line for one top-level key that is **not** in the document.
@@ -735,7 +867,10 @@ pub(crate) fn patch_weight(edits: &[FrontmatterEdit]) -> u64 {
 
 fn value_weight(value: &PatchValue) -> u64 {
     match value {
-        PatchValue::Boolean(_) | PatchValue::Integer(_) | PatchValue::Float(_) => 8,
+        PatchValue::Null
+        | PatchValue::Boolean(_)
+        | PatchValue::Integer(_)
+        | PatchValue::Float(_) => 8,
         PatchValue::String(text) => text.len() as u64,
         PatchValue::Sequence(items) => {
             items.iter().map(value_weight).sum::<u64>() + items.len() as u64
@@ -757,6 +892,9 @@ fn after_key(value: &Yaml, indent: usize, newline: &str) -> String {
         // A bare `key:` — the linter's empty-value style, and what a document
         // that already held one round-trips back to.
         Yaml::Null => String::new(),
+        // A null the caller asked for is spelled out, so the note says what
+        // the plugin meant. Both forms read back as null.
+        Yaml::ExplicitNull => " null".to_string(),
         Yaml::Boolean(value) => format!(" {value}"),
         Yaml::Integer(value) => format!(" {value}"),
         Yaml::Float(value) => format!(" {}", float(*value)),
@@ -809,7 +947,7 @@ enum Style {
 /// style, which keeps the block form to one level and stays unambiguous.
 fn one_line(value: &Yaml, style: Style) -> String {
     match value {
-        Yaml::Null => "null".to_string(),
+        Yaml::Null | Yaml::ExplicitNull => "null".to_string(),
         Yaml::Boolean(value) => value.to_string(),
         Yaml::Integer(value) => value.to_string(),
         Yaml::Float(value) => float(*value),

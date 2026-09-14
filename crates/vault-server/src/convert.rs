@@ -603,23 +603,40 @@ pub(crate) fn patch_value(value: &PatchValueDto) -> PatchValue {
     }
 }
 
-/// Split each wire dot-path into segments. An empty path, or a path with an
-/// empty segment, is a client bug rather than a key named "".
+/// Resolve each wire `key_path` into segments: a dot-string splits on every
+/// `.`, an array is already its own segments and splits on nothing — which is
+/// the only way to address a key whose *name* holds a dot. An empty path, or
+/// a path with an empty segment, is a client bug rather than a key named "".
+///
+/// `set_null` becomes [`PatchValue::Null`], which writes a YAML null and is
+/// deliberately not the deletion `None`: the wire's explicit JSON `value:
+/// null` keeps that meaning. The two arriving together has no defined result
+/// and never decodes, so nothing here has to choose between them.
 pub(crate) fn frontmatter_edits(
     edits: &[FrontmatterEditDto],
 ) -> Result<Vec<FrontmatterEdit>, ProtocolError> {
     let mut converted = Vec::with_capacity(edits.len());
     for edit in edits {
-        let segments: Vec<String> = edit.key_path.split('.').map(str::to_string).collect();
-        if segments.iter().any(String::is_empty) {
+        let segments: Vec<String> = edit
+            .key_path
+            .segments()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if segments.is_empty() || segments.iter().any(String::is_empty) {
             return Err(invalid_request(&format!(
                 "invalid frontmatter key path: {:?}",
-                edit.key_path
+                edit.key_path.display()
             )));
         }
+        let value = if edit.set_null {
+            Some(PatchValue::Null)
+        } else {
+            edit.value.as_ref().map(patch_value)
+        };
         converted.push(FrontmatterEdit {
             key_path: segments,
-            value: edit.value.as_ref().map(patch_value),
+            value,
         });
     }
     Ok(converted)

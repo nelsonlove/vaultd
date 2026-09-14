@@ -400,6 +400,204 @@ fn deleting_a_nested_leaf_reserializes_its_property_without_it() {
     );
 }
 
+/// One edit whose segments are given literally rather than dot-split — the
+/// wire's array `key_path` form, which is the only way to address a key whose
+/// own name carries a `.`.
+fn segments(key_path: &[&str], value: Option<PatchValue>) -> FrontmatterEdit {
+    FrontmatterEdit {
+        key_path: key_path
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect(),
+        value,
+    }
+}
+
+const DOTTED_KEY_DOCUMENT: &str =
+    "---\ntitle: Original\nmy.key: old\ncount: 3\n---\n# Body\n\nProse.\n";
+
+/// Task 1e (a): a literal dot in a key name is addressable by segment, and a
+/// set, a create, and a delete each touch that key alone.
+#[test]
+fn a_literal_dot_segment_edits_creates_and_deletes_that_key() {
+    let set = patch_source(
+        &path(),
+        DOTTED_KEY_DOCUMENT,
+        &[segments(
+            &["my.key"],
+            Some(PatchValue::String("new".into())),
+        )],
+    )
+    .expect("set a key whose name holds a dot");
+    assert_eq!(
+        set, "---\ntitle: Original\nmy.key: new\ncount: 3\n---\n# Body\n\nProse.\n",
+        "every other byte survives"
+    );
+
+    let created = patch_source(
+        &path(),
+        DOTTED_KEY_DOCUMENT,
+        &[segments(
+            &["other.key"],
+            Some(PatchValue::String("fresh".into())),
+        )],
+    )
+    .expect("create a key whose name holds a dot");
+    assert_eq!(
+        created,
+        "---\ntitle: Original\nmy.key: old\ncount: 3\nother.key: fresh\n---\n# Body\n\nProse.\n"
+    );
+
+    let deleted = patch_source(&path(), DOTTED_KEY_DOCUMENT, &[segments(&["my.key"], None)])
+        .expect("delete a key whose name holds a dot");
+    assert_eq!(
+        deleted,
+        "---\ntitle: Original\ncount: 3\n---\n# Body\n\nProse.\n"
+    );
+}
+
+/// With no dot in play, the two forms address the same key: one segment
+/// spelled literally is the dot-path of the same name.
+#[test]
+fn a_single_segment_and_a_dot_free_dot_path_address_the_same_key() {
+    let by_segment = patch_source(
+        &path(),
+        DOCUMENT,
+        &[segments(
+            &["title"],
+            Some(PatchValue::String("Same".into())),
+        )],
+    )
+    .expect("segment form");
+    let by_dot_path = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit("title", Some(PatchValue::String("Same".into())))],
+    )
+    .expect("dot-path form");
+    assert_eq!(by_segment, by_dot_path);
+
+    let nested_by_segment = patch_source(
+        &path(),
+        DOCUMENT,
+        &[segments(
+            &["nested", "inner", "leaf"],
+            Some(PatchValue::String("same".into())),
+        )],
+    )
+    .expect("nested segment form");
+    let nested_by_dot_path = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit(
+            "nested.inner.leaf",
+            Some(PatchValue::String("same".into())),
+        )],
+    )
+    .expect("nested dot-path form");
+    assert_eq!(nested_by_segment, nested_by_dot_path);
+}
+
+/// Task 1e (b): [`PatchValue::Null`] writes a YAML null rather than deleting
+/// the key — the `fm.key = null` case `processFrontMatter` writes as
+/// `key: null`. Deletion keeps its own spelling (`value: None`).
+#[test]
+fn an_explicit_null_writes_a_yaml_null_rather_than_deleting_the_key() {
+    let overwritten = patch_source(&path(), DOCUMENT, &[edit("title", Some(PatchValue::Null))])
+        .expect("overwrite a scalar with a null");
+    assert!(overwritten.contains("title: null\n"), "{overwritten}");
+    assert_eq!(read_back(&overwritten, "title"), PropertyValue::Null);
+    assert_eq!(
+        outside_property(&overwritten, "title"),
+        outside_property(DOCUMENT, "title"),
+        "only the addressed key's line changed"
+    );
+    assert_eq!(body(&overwritten), body(DOCUMENT));
+
+    let created = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit("reviewed", Some(PatchValue::Null))],
+    )
+    .expect("create a key holding a null");
+    assert!(created.contains("reviewed: null\n"), "{created}");
+    assert_eq!(read_back(&created, "reviewed"), PropertyValue::Null);
+    assert_eq!(body(&created), body(DOCUMENT));
+
+    let deleted =
+        patch_source(&path(), DOCUMENT, &[edit("title", None)]).expect("deletion still deletes");
+    assert!(!deleted.contains("title"), "{deleted}");
+}
+
+const LIST_OF_MAPS: &str = "---\ntitle: Original\nitems:\n  - name: a\n    value: 9\n  - name: b\n    value: 10\nouter:\n  desc: |\n    line one\n    line two\n  other: kept\n---\n# Body\n";
+
+/// Task 1e (c): a scalar leaf has a span of its own, so setting one splices
+/// that scalar and leaves the item's block layout alone. Before this, the
+/// whole `items` property was re-emitted and each map item collapsed into
+/// `- {name: a, value: 9}`.
+#[test]
+fn patching_a_leaf_inside_a_block_list_of_maps_keeps_the_item_layout() {
+    let patched = patch_source(
+        &path(),
+        LIST_OF_MAPS,
+        &[segments(
+            &["items", "0", "value"],
+            Some(PatchValue::Integer(99)),
+        )],
+    )
+    .expect("patch one leaf inside a list of maps");
+    assert_eq!(
+        patched,
+        LIST_OF_MAPS.replace("    value: 9\n", "    value: 99\n"),
+        "only the addressed scalar's own bytes moved"
+    );
+}
+
+/// The same narrowing for a multi-line block scalar: it is a scalar, so a
+/// plain scalar replaces exactly its span — the `|` and its indented lines —
+/// and the sibling key below keeps its bytes. The block form is gone because
+/// the caller replaced the value, not because the property was reflowed.
+#[test]
+fn replacing_a_block_scalar_leaf_with_a_plain_scalar_leaves_its_sibling_alone() {
+    let patched = patch_source(
+        &path(),
+        LIST_OF_MAPS,
+        &[segments(
+            &["outer", "desc"],
+            Some(PatchValue::String("short".into())),
+        )],
+    )
+    .expect("replace a nested block scalar");
+    assert_eq!(
+        patched,
+        LIST_OF_MAPS.replace("  desc: |\n    line one\n    line two\n", "  desc: short\n"),
+        "the block scalar's own span, and nothing else"
+    );
+}
+
+/// The boundary the narrowing deliberately stops at, pinned so a later change
+/// to it is a decision rather than a surprise: a **non-scalar** new value
+/// still re-serializes the whole enclosing top-level property, and the block
+/// items reflow into flow style. `VAULTD-COMPATIBILITY.md` records this.
+#[test]
+fn a_non_scalar_value_still_reserializes_the_enclosing_property() {
+    let patched = patch_source(
+        &path(),
+        LIST_OF_MAPS,
+        &[segments(
+            &["items", "0", "value"],
+            Some(PatchValue::Sequence(vec![PatchValue::Integer(9)])),
+        )],
+    )
+    .expect("set a nested leaf to a sequence");
+    assert!(
+        patched.contains("items:\n  - {name: a, value: [9]}\n  - {name: b, value: 10}\n"),
+        "{patched}"
+    );
+    assert!(patched.contains("title: Original\n"), "{patched}");
+    assert!(patched.contains("  other: kept\n"), "{patched}");
+}
+
 /// The value `key` holds once `vault-core` has read `document` back. This is
 /// the only honest test of the serializer: what matters is not what bytes it
 /// emitted but what the parser makes of them.

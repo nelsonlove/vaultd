@@ -3,9 +3,10 @@
 //! break, not a refactor.
 
 use vault_protocol::{
-    CopyConflictDto, DeleteModeDto, ExpectedDto, GenerationResponse, LinkRewriteFailureDto,
-    MutationResponse, PatchValueDto, ReadFileResponse, RenameResponse, Request, RequestEnvelope,
-    Response, ResponseEnvelope, ResponseOutcome, WriteFileResponse, WriteNoteParams,
+    CopyConflictDto, DeleteModeDto, ExpectedDto, GenerationResponse, KeyPathDto,
+    LinkRewriteFailureDto, MutationResponse, PatchValueDto, ReadFileResponse, RenameResponse,
+    Request, RequestEnvelope, Response, ResponseEnvelope, ResponseOutcome, WriteFileResponse,
+    WriteNoteParams,
 };
 
 #[test]
@@ -391,4 +392,94 @@ fn a_revision_conflict_carries_both_the_current_revision_and_generation() {
         }
         other => panic!("expected an error outcome, got {other:?}"),
     }
+}
+
+/// Task 1e (a): `key_path` also accepts an **array of literal segments**, so a
+/// key whose own name carries a `.` can be addressed at all. The dot-string
+/// form is unchanged and still splits on every `.`; the array form splits on
+/// nothing.
+#[test]
+fn a_key_path_may_be_an_array_of_literal_segments() {
+    let line = r#"{"version":1,"id":"p2","request":{"method":"patch_frontmatter","params":{"path":"One.md","patch":[{"key_path":["my.key","sub"],"value":"set"}],"expected":{"any":true}}}}"#;
+    let envelope: RequestEnvelope = serde_json::from_str(line).expect("decode an array key path");
+    match &envelope.request {
+        Request::PatchFrontmatter(params) => {
+            assert_eq!(
+                params.patch[0].key_path,
+                KeyPathDto::Segments(vec!["my.key".into(), "sub".into()]),
+                "each element is one literal key, dots included"
+            );
+            assert_eq!(
+                params.patch[0].key_path.segments(),
+                vec!["my.key", "sub"],
+                "the array form splits on nothing"
+            );
+        }
+        other => panic!("expected patch_frontmatter, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_string(&envelope).expect("re-encode"),
+        line,
+        "the array form round-trips as an array"
+    );
+}
+
+/// The dot-string form keeps its meaning exactly: every `.` starts a new
+/// segment, which is why the array form had to exist.
+#[test]
+fn the_dot_string_key_path_still_splits_on_every_dot() {
+    let dotted: vault_protocol::FrontmatterEditDto =
+        serde_json::from_str(r#"{"key_path":"my.key","value":"set"}"#).expect("decode a dot path");
+    assert_eq!(dotted.key_path, KeyPathDto::Dotted("my.key".into()));
+    assert_eq!(dotted.key_path.segments(), vec!["my", "key"]);
+}
+
+/// Task 1e (b): `set_null: true` with **no** `value` key writes a YAML null
+/// for the addressed key. It is the one action that is neither a set nor a
+/// deletion, and `processFrontMatter` parity needs it: a plugin setting
+/// `fm.key = null` must not delete the key.
+#[test]
+fn set_null_decodes_as_its_own_action_without_a_value_key() {
+    let line = r#"{"version":1,"id":"p3","request":{"method":"patch_frontmatter","params":{"path":"One.md","patch":[{"key_path":"reviewed","set_null":true}],"expected":{"any":true}}}}"#;
+    let envelope: RequestEnvelope = serde_json::from_str(line).expect("decode set_null");
+    match &envelope.request {
+        Request::PatchFrontmatter(params) => {
+            assert!(params.patch[0].set_null);
+            assert_eq!(params.patch[0].value, None);
+        }
+        other => panic!("expected patch_frontmatter, got {other:?}"),
+    }
+    assert_eq!(serde_json::to_string(&envelope).expect("re-encode"), line);
+}
+
+/// `set_null` and `value` say contradictory things about one key — write a
+/// null, or set/delete it — so the pair is refused rather than silently
+/// resolved. Both spellings of `value` are covered, the explicit `null`
+/// (deletion) included; over the transport either is `invalid_request`.
+#[test]
+fn set_null_together_with_value_is_refused_rather_than_ordered() {
+    for spelling in [
+        r#"{"key_path":"a","value":"set","set_null":true}"#,
+        r#"{"key_path":"a","value":null,"set_null":true}"#,
+    ] {
+        let error = serde_json::from_str::<vault_protocol::FrontmatterEditDto>(spelling)
+            .expect_err("`set_null` with a `value` has no defined meaning");
+        assert!(
+            error.to_string().contains("set_null"),
+            "error should name the conflict: {error}"
+        );
+    }
+}
+
+/// `set_null: false` says nothing, so an omitted `value` beside it is the
+/// same decode error it was before (b) existed.
+#[test]
+fn an_omitted_value_beside_a_false_set_null_is_still_a_decode_error() {
+    let spelling = r#"{"key_path":"a","set_null":false}"#;
+    let error = serde_json::from_str::<vault_protocol::FrontmatterEditDto>(spelling)
+        .expect_err("an omitted `value` must not silently mean deletion");
+    assert!(
+        error.to_string().contains("value"),
+        "error should name the missing field: {error}"
+    );
 }
