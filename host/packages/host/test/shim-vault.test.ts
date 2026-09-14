@@ -1,9 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { DispatchQueue } from "../src/runtime/queue";
 import { ShimEventBus } from "../src/shim/events";
 import { Vault } from "../src/shim/vault";
 import { forwardingWriteGate } from "../src/testing/assemble";
+import { warmFixtureCache } from "../src/testing/fixture-vault";
 import { ShimHarness } from "../src/testing/shim-harness";
+
+/** The one fixture in this file whose notes have to be really parsed. */
+const LINKED_VAULT = { "A.md": "x\n", "B.md": "[[A]]\n" };
+
+beforeAll(() => {
+  warmFixtureCache(
+    Object.keys(LINKED_VAULT)
+      .sort()
+      .map((path) => ({ path, source: LINKED_VAULT[path as keyof typeof LINKED_VAULT] })),
+  );
+}, 300_000);
 
 describe("Vault writes", () => {
   it("routes modify to write_note with the mirror revision as the precondition", async () => {
@@ -106,6 +118,34 @@ describe("Vault writes", () => {
       method: "rename_folder",
       params: { from: "Folder", to: "Moved", rewrite_links: true },
     });
+  });
+
+  it("refetches the referrers of a renamed note, which the wire never names", async () => {
+    // The same affected-set helper `FileManager.renameFile` uses. Before it was
+    // shared, this surface refetched `from` and `to` and stopped — leaving
+    // every note whose links the daemon had just rewritten stale in the mirror,
+    // with wrong `resolvedLinks`, wrong `backlinks` and wrong resolutions, all
+    // of them handed straight to plugin code.
+    const harness = await ShimHarness.withVault(LINKED_VAULT);
+    const pending = harness.vault.rename(harness.vault.getFileByPath("A.md")!, "Renamed.md");
+    const sent = await harness.expectRequest("rename_note");
+    harness.respondOk(sent.id, "rename_note", {
+      generation: 4,
+      revision: "blake3:r",
+      links_rewritten: 1,
+      link_rewrite_failures: [],
+    });
+    const refetching = harness.answerRefetch(
+      4,
+      [
+        { path: "Renamed.md", revision: "blake3:r" },
+        { path: "B.md", revision: "blake3:b2" },
+      ],
+      { absent: ["A.md"] },
+    );
+    await pending;
+    expect([...(await refetching)].sort()).toEqual(["A.md", "B.md", "Renamed.md"]);
+    expect(harness.mirror.note("B.md")?.revision).toBe("blake3:b2");
   });
 
   it("refetches a renamed folder's whole subtree, at both ends", async () => {

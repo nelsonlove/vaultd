@@ -7,6 +7,8 @@ import { defaultHostConfig, systemClock } from "../src/config";
 import { assembleShim } from "../src/testing/assemble";
 import type { HostConfig } from "../src/config";
 import type { MirrorChangeBatch } from "../src/mirror/types";
+import type { App } from "../src/shim/app";
+import type { TFile } from "../src/shim/files";
 import type { Vault } from "../src/shim/vault";
 import { BINARY, BINARY_EXISTS, cleanupRealDaemons, scratchRoot, startedOn } from "./real-daemon";
 
@@ -64,7 +66,7 @@ function vaultFor(files: Record<string, string>): HostConfig {
  * actually holds — which is the half of the folder-rename bug that lived in the
  * shim rather than in the mirror.
  */
-async function shimOn(config: HostConfig): Promise<{ vault: Vault; mirror: Mirror }> {
+async function shimOn(config: HostConfig): Promise<{ app: App; vault: Vault; mirror: Mirror }> {
   const supervisor = await startedOn(config);
   const mirror = await Mirror.open(() => supervisor.client(), config);
   const assembly = assembleShim({
@@ -77,7 +79,7 @@ async function shimOn(config: HostConfig): Promise<{ vault: Vault; mirror: Mirro
   mirror.onBatch((batch: MirrorChangeBatch) => {
     vault.applyBatch(batch);
   });
-  return { vault, mirror };
+  return { app: assembly.app, vault, mirror };
 }
 
 afterEach(cleanupRealDaemons);
@@ -201,6 +203,106 @@ describe.skipIf(!BINARY_EXISTS)("the shim against a real vaultd", () => {
     expect(await vault.adapter.read(`${config.configDirName}/plugins/sample/data.json`)).toBe(
       "{}\n",
     );
+  });
+
+  it("writes Markdown links the daemon's own parser resolves, subpath and all", async () => {
+    // A fake daemon agrees with whatever spelling this host invents, so the one
+    // thing it cannot check is the thing that matters: does vaultd read the
+    // link back? `encodeURI` alone leaves `#` and a space untouched, which made
+    // `[Solo](Solo.md#My Heading)` unresolved and `[Hash #1](Hash %231.md)` not
+    // a link at all.
+    const config = vaultFor({
+      "Solo.md": "# My Heading\n\ntext ^blockid\n",
+      "Hash #1.md": "body\n",
+      "Note.md": "placeholder\n",
+      ".obsidian/app.json": '{"useMarkdownLinks":true}\n',
+    });
+    const { app, vault, mirror } = await shimOn(config);
+    await vault.configReady();
+    const solo = vault.getFileByPath("Solo.md") as TFile;
+    const hash = vault.getFileByPath("Hash #1.md") as TFile;
+    const links = [
+      app.fileManager.generateMarkdownLink(solo, "Note.md", "#My Heading"),
+      app.fileManager.generateMarkdownLink(solo, "Note.md", "#^blockid"),
+      app.fileManager.generateMarkdownLink(hash, "Note.md"),
+    ];
+    expect(links).toEqual([
+      "[Solo](Solo.md#My%20Heading)",
+      "[Solo](Solo.md#^blockid)",
+      "[Hash #1](Hash%20%231.md)",
+    ]);
+
+    // Write them into a note and ask the daemon what it made of them.
+    await vault.modify(vault.getFileByPath("Note.md") as TFile, `${links.join("\n\n")}\n`);
+    const outgoing = mirror.note("Note.md")?.outgoing ?? [];
+    expect(
+      outgoing.map((reference) => ({
+        target: reference.resolution.kind === "resolved" ? reference.resolution.target : null,
+        subpath: reference.subpath,
+      })),
+    ).toEqual([
+      { target: "Solo.md", subpath: { kind: "heading", value: "My Heading" } },
+      { target: "Solo.md", subpath: { kind: "block", value: "blockid" } },
+      { target: "Hash #1.md", subpath: null },
+    ]);
+  });
+
+  /**
+   * The two patch shapes that need the daemon's additive wire forms.
+   *
+   * Both are **written now and skipped until the release binary carries them**:
+   * the array `key_path` (so a key whose name contains a dot is addressable at
+   * all) and `set_null` (so `fm.key = null` writes a YAML null instead of
+   * deleting). Against the current build every `patch_frontmatter` this shim
+   * sends is refused `invalid_request` at decode — loud, and incapable of
+   * corrupting a note, which is the property that made shipping the array form
+   * first the safe order. Unskip this block, and flip
+   * `DOTTED_KEYS_ADDRESSABLE` in `shim/file-manager.ts`, together.
+   */
+  describe.skip("patching frontmatter through the additive wire forms", () => {
+    it("addresses a key whose name contains a dot, and deletes and adds one", async () => {
+      const config = vaultFor({
+        "A.md": "---\nmy.key: dotted\nplain: kept\n---\nbody\n",
+      });
+      const { app, vault, mirror } = await shimOn(config);
+      const file = vault.getFileByPath("A.md") as TFile;
+
+      await app.fileManager.processFrontMatter(file, (fm) => {
+        expect(fm["my.key"]).toBe("dotted");
+        fm["my.key"] = "changed";
+      });
+      expect(mirror.note("A.md")?.properties.map((p) => p.key)).toEqual(["my.key", "plain"]);
+      expect(await vault.adapter.read("A.md")).toBe(
+        "---\nmy.key: changed\nplain: kept\n---\nbody\n",
+      );
+
+      await app.fileManager.processFrontMatter(file, (fm) => {
+        fm["other.key"] = "added";
+      });
+      expect(await vault.adapter.read("A.md")).toBe(
+        "---\nmy.key: changed\nplain: kept\nother.key: added\n---\nbody\n",
+      );
+
+      await app.fileManager.processFrontMatter(file, (fm) => {
+        delete fm["my.key"];
+      });
+      // Gone, and nothing phantom left behind: the old dotted spelling created
+      // a `my:` mapping and left the real key exactly where it was.
+      expect(await vault.adapter.read("A.md")).toBe(
+        "---\nplain: kept\nother.key: added\n---\nbody\n",
+      );
+    });
+
+    it("writes a YAML null with set_null and removes the key with value null", async () => {
+      const config = vaultFor({ "A.md": "---\ntitle: Old\nkeep: yes\n---\nbody\n" });
+      const { app, vault } = await shimOn(config);
+      const file = vault.getFileByPath("A.md") as TFile;
+      await app.fileManager.processFrontMatter(file, (fm) => {
+        fm["title"] = null;
+        delete fm["keep"];
+      });
+      expect(await vault.adapter.read("A.md")).toBe("---\ntitle: null\n---\nbody\n");
+    });
   });
 
   it("answers getConfig from .obsidian/app.json when the host directory has none", async () => {

@@ -14,24 +14,50 @@
  * So this reads the note's **current frontmatter as a plain object out of the
  * mirror's row**, hands that to the callback, diffs the object before and
  * after, and sends `patch_frontmatter` carrying only the keys the callback
- * actually changed. The daemon edits the addressed spans and preserves every
- * byte outside them. A callback that changes nothing sends nothing at all.
+ * actually changed. A callback that changes nothing sends nothing at all.
  *
- * Three rules decide what a diff emits, and each exists because the alternative
+ * **What "preserves the bytes" does and does not promise.** Everything outside
+ * the addressed *top-level key* survives exactly — key order, comments,
+ * quoting, the block scalar three keys down, and the body — which is measured
+ * rather than hoped. Inside an addressed key the daemon re-emits that key's
+ * whole subtree, so a leaf changed inside a list of maps reflows its siblings
+ * to flow style (`- {name: a, value: 1}`) and a rewritten block scalar comes
+ * back as a quoted one-liner. That is still **narrower than Obsidian**, which
+ * re-serializes the entire frontmatter block on every `processFrontMatter`
+ * call; a later daemon change may narrow it to the addressed scalar, at which
+ * point this paragraph gets shorter.
+ *
+ * Four rules decide what a diff emits, and each exists because the alternative
  * is wrong rather than merely different:
  *
  * - A key present before and absent after — deleted, or set to `undefined` —
  *   becomes `{ key_path, value: null }`, which is the mutation spec's deletion
- *   form. An explicit `null` from the callback is therefore also a deletion:
- *   `null` has exactly one meaning on this wire, and it is "remove this key".
+ *   form.
+ * - A key the callback set to **`null`** becomes `{ key_path, set_null: true }`,
+ *   the additive entry that writes a YAML `null` into the key rather than
+ *   removing it — which is what Obsidian does with `fm.key = null`. The two
+ *   outcomes need two spellings because `value: null` is already spoken for as
+ *   the deletion marker and `PatchValueDto` has no null variant of its own.
  * - A **branch that changed shape** goes whole: an object that became a scalar,
  *   a scalar that became an object, or a new key whose value is a subtree. A
- *   dot-path into a branch that no longer has that shape addresses a span that
+ *   key path into a branch that no longer has that shape addresses a span that
  *   does not exist.
- * - An **array goes whole whenever it differs at all**. `key_path` is a path of
- *   *keys* (`docs/protocol.md`: "a dot-path (`a.b.c`) addressing nested keys"),
- *   so there is no spelling for "element 2 of this list" to send even when only
- *   one element moved.
+ * - An **array goes whole whenever it differs at all**. The daemon does address
+ *   sequence elements by index — `["maps", "0", "value"]` is accepted — so this
+ *   is a choice rather than a limit: the indexed form produces the *identical*
+ *   re-emission of the enclosing key that the whole-array send produces, so it
+ *   buys nothing and leans on a capability `docs/protocol.md` does not
+ *   document.
+ *
+ * **Key paths go out as segment arrays, never as a dotted string.** The dotted
+ * spelling is unusable for a key whose own name contains a dot: the daemon
+ * splits on `.` with no escaping, so `my.key` addresses `my` → `key`, finds no
+ * `my`, creates one, and leaves the real key stale — a silent wrong-target
+ * write in the one method whose whole point is not to disturb a note. Measured
+ * against the shipped daemon in review. The array form has no such ambiguity,
+ * and until the release binary carries it a key containing a dot is refused
+ * with {@link UnaddressableFrontmatterKey} rather than sent — see
+ * {@link DOTTED_KEYS_ADDRESSABLE}.
  *
  * The whole read-diff-send loop holds the path's lock through
  * `DispatchQueue.runExclusivePath`, the same serialization `Vault.process`
@@ -41,6 +67,12 @@
  * the callback again against the new frontmatter** — an edit computed from
  * bytes that no longer exist is the lost update the precondition exists to
  * prevent. Three attempts, then the typed error reaches the plugin.
+ *
+ * Read-your-writes holds at the **mirror**: the row carries the patched
+ * frontmatter before this resolves. `app.metadataCache.getFileCache` answers
+ * with it once that note's position index is warm, and answers `null` while it
+ * is cold — `MetadataCache.cacheFor`'s documented contract, not a gap this
+ * method can close.
  *
  * ## A rename refetches more than the wire names
  *
@@ -52,26 +84,22 @@
  * is leaving the mirror wrong.
  *
  * It does not invent path-level knowledge it was not given. Before the request
- * goes out it asks the mirror for what the mirror already tracks — the
- * referrers of the path about to move — and refetches `from`, `to` and every
- * one of them. The referrer set comes from the same resolved-link index
- * `vaultd` used to find the links it rewrote, so it is a superset of what
- * changed and never a subset; a superset only costs a refetch. Failed rewrites
- * are refetched too, because "the daemon could not rewrite `Busy.md`" and
- * "`Busy.md` is unchanged" are the same statement only if nothing else touched
- * it, which the mirror cannot know without asking.
+ * goes out it asks {@link affectedPathsForRename} — the one answer this shim
+ * has, shared with `Vault.rename` — for both ends of the move, every row under
+ * both ends of a folder move, and every note the mirror knew was linking to any
+ * of them. `from` is in that set and has to be: after the move it holds
+ * nothing, the refetch answers it absent, and that is what takes the row out of
+ * the mirror. The capture happens **before** the send for the same reason:
+ * afterwards the backlink entry is gone and the set would be silently emptier.
  *
- * `from` is in that set, and has to be: after the move it holds nothing, the
- * refetch answers it absent, and that is what takes the row out of the mirror.
- * A set that named only the destination would leave a ghost row at the old path
- * until a resync.
- *
- * For a folder the subtree expansion is `Vault`'s — {@link Vault.movedPaths},
- * which Task 7 already built for the same reason — and the referrer set is the
- * union over every note under the folder, computed the same way before the
- * request goes out. `rename_folder` carries **no `expected`**: a folder has no
- * bytes and therefore no revision, and the daemon rejects the field itself with
- * `invalid_request`.
+ * **Neither kind of rename carries an `expected`.** `rename_folder` rejects the
+ * field outright — a folder has no bytes and therefore no revision — and the
+ * note form deliberately omits it too: Obsidian's `renameFile` has no
+ * compare-and-swap failure mode, the mirror's revision lags the filesystem by a
+ * watcher round trip, and a move does not depend on the bytes it is moving. A
+ * precondition here made a rename fail with `revision_conflict` whenever
+ * anything had touched the note a moment earlier, which `Vault.rename` never
+ * did.
  *
  * ## The one place `trashOption` is read
  *
@@ -86,6 +114,7 @@
 import { VaultdError } from "../client/errors";
 import { HeadlessUnsupported, currentPluginId, declarePolicy, recordUse, stub } from "./policy";
 import { TFolder } from "./files";
+import { affectedPathsForRename } from "./rename-paths";
 import type { DispatchQueue } from "../runtime/queue";
 import type { Mirror } from "../mirror/mirror";
 import type { MetadataCache } from "./metadata-cache";
@@ -146,6 +175,70 @@ const PATCH_ATTEMPTS = 3;
 /** Obsidian's own name for a folder made with no name given. */
 const UNTITLED_FOLDER = "Untitled";
 
+/**
+ * Whether the daemon on the other end understands an array `key_path`.
+ *
+ * **`false` until the release binary carries the additive form.** While it is
+ * false a frontmatter key whose name contains a literal dot is refused by this
+ * host with {@link UnaddressableFrontmatterKey} instead of being sent: the old
+ * daemon would split the name and write to the wrong place, and a loud refusal
+ * naming the key is the only honest answer a host that cannot address it can
+ * give. Flip it to `true` — and delete nothing else — once the build in use
+ * accepts segment arrays; the only thing it gates is the refusal.
+ *
+ * Every patch entry carries the array form either way. A daemon that does not
+ * understand it refuses the whole request with `invalid_request`, which is
+ * loud, immediate, and incapable of corrupting a note.
+ */
+const DOTTED_KEYS_ADDRESSABLE = false;
+
+/**
+ * A frontmatter key this host will not address until the wire can.
+ *
+ * Typed, and carrying the key and the note, because the plugin that asked has
+ * to be able to tell this apart from "the write failed" — nothing was written,
+ * nothing was corrupted, and the key it named is the reason.
+ */
+export class UnaddressableFrontmatterKey extends Error {
+  readonly code = "unaddressable_frontmatter_key";
+  readonly path: string;
+  readonly keyPath: readonly string[];
+  constructor(path: string, keyPath: readonly string[]) {
+    super(
+      `${path}: the frontmatter key ${JSON.stringify(keyPath.join(" › "))} contains a "." and ` +
+        `this daemon build addresses keys by splitting on it, so patching it would write to the ` +
+        `wrong key and leave the real one stale`,
+    );
+    this.name = "UnaddressableFrontmatterKey";
+    this.path = path;
+    this.keyPath = [...keyPath];
+  }
+}
+
+/**
+ * A value a callback produced that cannot survive the trip.
+ *
+ * `NaN` and `Infinity` are the ones that matter: `JSON.stringify` turns both
+ * into `null`, and `null` on this wire means *delete this key*. A plugin that
+ * divided by zero would silently lose the property it was setting, so it gets
+ * a typed refusal instead and the note is not touched.
+ */
+export class UnrepresentableFrontmatterValue extends Error {
+  readonly code = "unrepresentable_frontmatter_value";
+  readonly path: string;
+  readonly keyPath: readonly string[];
+  constructor(path: string, keyPath: readonly string[], value: number) {
+    super(
+      `${path}: the frontmatter key ${JSON.stringify(keyPath.join(" › "))} was set to ` +
+        `${String(value)}, which JSON cannot carry — it would reach the daemon as null and ` +
+        `delete the key`,
+    );
+    this.name = "UnrepresentableFrontmatterValue";
+    this.path = path;
+    this.keyPath = [...keyPath];
+  }
+}
+
 /** `newLinkFormat`'s three values, as `app.json` spells them. */
 type LinkFormat = "shortest" | "relative" | "absolute";
 
@@ -179,7 +272,7 @@ export class FileManager {
         const before = this.frontmatterOf(file.path);
         const after = this.frontmatterOf(file.path);
         fn(after);
-        const patch = diffFrontMatter(before, after);
+        const patch = diffFrontMatter(before, after, file.path);
         if (patch.length === 0) return;
         try {
           const result = await this.deps.writes.send<MutationResponse>("patch_frontmatter", {
@@ -217,31 +310,16 @@ export class FileManager {
    */
   async renameFile(file: TAbstractFile, newPath: string): Promise<void> {
     recordUse("FileManager.renameFile");
-    const from = file.path;
-    const folder = file instanceof TFolder;
     // Captured BEFORE the mutation: once it lands, `from` no longer exists and
-    // its backlink entry is gone with it.
-    const moved = folder ? this.deps.vault.movedPaths(from, newPath) : [from, newPath];
-    const sources = folder ? [from, ...this.deps.vault.descendantsOf(from)] : [from];
-    const affected = new Set<string>(moved);
-    for (const source of sources) {
-      for (const reference of this.deps.mirror.backlinks(source)) {
-        affected.add(reference.source_path);
-      }
-    }
+    // its backlink entry is gone with it, so a set computed afterwards would be
+    // silently emptier.
+    const affected = affectedPathsForRename(this.deps.vault, this.deps.mirror, file, newPath);
     const result = await this.deps.writes.send<RenameResponse>(
-      folder ? "rename_folder" : "rename_note",
-      folder
-        ? { from, to: newPath, rewrite_links: true }
-        : {
-            from,
-            to: newPath,
-            expected: this.deps.vault.expectedFor(from),
-            rewrite_links: true,
-          },
+      file instanceof TFolder ? "rename_folder" : "rename_note",
+      { from: file.path, to: newPath, rewrite_links: true },
     );
     this.lastFailures = result.link_rewrite_failures;
-    await this.deps.mirror.applyMutation(result.generation, [...affected]);
+    await this.deps.mirror.applyMutation(result.generation, affected);
   }
 
   /**
@@ -251,6 +329,12 @@ export class FileManager {
    * surface a partial repair; nothing swallows them. Empty after a rename that
    * repaired everything, which is the affirmative answer the protocol's empty
    * list means.
+   *
+   * **One slot, shared by every caller.** `renameFile` is not serialized by the
+   * dispatch queue, so two renames in flight at once overwrite each other here
+   * and a reader can be told about somebody else's rename. It is a diagnostic
+   * for a report, and a caller that needs to branch on a specific rename's
+   * failures needs a per-call return value rather than this.
    */
   lastRenameFailures(): readonly LinkRewriteFailureDto[] {
     return [...this.lastFailures];
@@ -271,19 +355,25 @@ export class FileManager {
    * a link the daemon rewrites look identical.
    *
    * A Markdown destination is a URL, so it keeps the `.md` extension and
-   * percent-encodes what a URL must; the display text does neither.
+   * percent-encodes what a URL must — **the subpath included**, which is where
+   * the naive version broke: `encodeURI` leaves `#` and a space alone, so
+   * `[Solo](Solo.md#My Heading)` came out unresolvable and `[Hash #1](Hash
+   * %231.md)` was not a link at all. Measured against this repo's own parser:
+   * `Solo.md#My%20Heading` resolves with its heading subpath and
+   * `Hash%20%231.md` resolves to `Hash #1.md`. The display text is encoded
+   * nowhere, because a reader reads it.
    */
   generateMarkdownLink(file: TFile, sourcePath: string, subpath?: string, alias?: string): string {
     recordUse("FileManager.generateMarkdownLink");
     const format = this.linkFormat();
-    const tail = subpath ?? "";
     const text = this.linktextFor(file, sourcePath, format, true);
     if (this.deps.vault.getConfig("useMarkdownLinks") !== true) {
       const display = alias === undefined || alias === "" ? "" : `|${alias}`;
-      return `[[${text}${tail}${display}]]`;
+      return `[[${text}${subpath ?? ""}${display}]]`;
     }
-    const target = encodeURI(this.linktextFor(file, sourcePath, format, false));
-    return `[${alias === undefined || alias === "" ? text : alias}](${target}${tail})`;
+    const target = encodeLinkPart(this.linktextFor(file, sourcePath, format, false));
+    const fragment = encodeSubpath(subpath);
+    return `[${alias === undefined || alias === "" ? text : alias}](${target}${fragment})`;
   }
 
   // --- Where things go ------------------------------------------------------
@@ -494,7 +584,16 @@ export class FileManager {
     return setting;
   }
 
-  /** `path` if nothing holds it, else `path` with Obsidian's ` N` suffix. */
+  /**
+   * `path` if nothing holds it, else `path` with Obsidian's ` N` suffix.
+   *
+   * **It asks the mirror, which is this host's idea of the vault.** A path the
+   * daemon holds but the mirror has not seen yet — a file created outside this
+   * host a moment ago — is reported free, and the write that follows meets
+   * `target_exists`. The same is true of every other "does this exist" read in
+   * the shim; the alternative is a synchronous round trip Obsidian's API has
+   * nowhere to await.
+   */
   private availablePath(path: string): string {
     if (this.deps.mirror.entry(path) === undefined) return path;
     const cut = path.lastIndexOf("/");
@@ -597,37 +696,81 @@ function plainValue(value: PropertyValueDto): unknown {
  * Changes and additions come first, in the callback's own key order, and
  * deletions last in the document's order — a deleted key no longer has a place
  * in the new object, so the old one is the only order left to give it. See the
- * module doc for what goes whole and why.
+ * module doc for the four emission rules, why every `key_path` is a segment
+ * array, and why a dotted key is refused rather than sent.
+ *
+ * `path` is the note, and is here only so a refusal can name it: a plugin told
+ * "this key cannot be addressed" needs to know which note it was writing.
  */
 export function diffFrontMatter(
   before: Record<string, unknown>,
   after: Record<string, unknown>,
+  path: string,
 ): FrontmatterEditDto[] {
   const edits: FrontmatterEditDto[] = [];
-  collect("", before, after, edits);
+  collect([], before, after, edits, path);
   return edits;
 }
 
 function collect(
-  prefix: string,
+  prefix: readonly string[],
   before: Record<string, unknown>,
   after: Record<string, unknown>,
   edits: FrontmatterEditDto[],
+  path: string,
 ): void {
   for (const [key, value] of Object.entries(after)) {
     if (value === undefined) continue;
-    const keyPath = prefix === "" ? key : `${prefix}.${key}`;
+    const keyPath = [...prefix, key];
     const previous = Object.hasOwn(before, key) ? before[key] : undefined;
     if (isBranch(value) && isBranch(previous)) {
-      collect(keyPath, previous, value, edits);
+      collect(keyPath, previous, value, edits, path);
       continue;
     }
-    if (!sameValue(previous, value)) edits.push({ key_path: keyPath, value: value as PatchValueDto });
+    if (sameValue(previous, value)) continue;
+    guardKeyPath(keyPath, path);
+    // A YAML null, written *into* the key. `value: null` would have removed it.
+    if (value === null) {
+      edits.push({ key_path: keyPath, set_null: true });
+      continue;
+    }
+    guardValue(value, keyPath, path);
+    edits.push({ key_path: keyPath, value: value as PatchValueDto });
   }
   for (const key of Object.keys(before)) {
     const stillThere = Object.hasOwn(after, key) && after[key] !== undefined;
     if (stillThere) continue;
-    edits.push({ key_path: prefix === "" ? key : `${prefix}.${key}`, value: null });
+    const keyPath = [...prefix, key];
+    guardKeyPath(keyPath, path);
+    edits.push({ key_path: keyPath, value: null });
+  }
+}
+
+/** Refuse a key this host cannot address on the wire it is talking to. */
+function guardKeyPath(keyPath: readonly string[], path: string): void {
+  if (DOTTED_KEYS_ADDRESSABLE) return;
+  if (!keyPath.some((segment) => segment.includes("."))) return;
+  throw new UnaddressableFrontmatterKey(path, keyPath);
+}
+
+/**
+ * Refuse a number JSON cannot carry, at whatever depth it sits.
+ *
+ * The walk is the point: `fm.stats = { mean: NaN }` sends the whole `stats`
+ * subtree, and the `NaN` inside it would reach the daemon as `null` — a
+ * perfectly well-formed mapping with a silently emptied field.
+ */
+function guardValue(value: unknown, keyPath: readonly string[], path: string): void {
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return;
+    throw new UnrepresentableFrontmatterValue(path, keyPath, value);
+  }
+  if (Array.isArray(value)) {
+    for (const element of value) guardValue(element, keyPath, path);
+    return;
+  }
+  if (isBranch(value)) {
+    for (const nested of Object.values(value)) guardValue(nested, keyPath, path);
   }
 }
 
@@ -648,6 +791,34 @@ function sameValue(left: unknown, right: unknown): boolean {
     return keys.every((key) => Object.hasOwn(right, key) && sameValue(left[key], right[key]));
   }
   return false;
+}
+
+/**
+ * One piece of a Markdown destination, percent-encoded.
+ *
+ * `encodeURI` handles the spaces and the non-ASCII, and leaves `#` and `?`
+ * alone because in a URL they are delimiters — which is exactly the problem
+ * here, since both are ordinary characters in a vault path. A file literally
+ * named `Hash #1.md` produced no reference at all until they were escaped.
+ */
+function encodeLinkPart(part: string): string {
+  return encodeURI(part).replaceAll("#", "%23").replaceAll("?", "%3F");
+}
+
+/**
+ * A subpath as a URL fragment: one `#`, then the encoded heading or block id.
+ *
+ * **The block marker `^` is left literal**, and that is measured rather than
+ * chosen: `encodeURI` turns it into `%5E`, and while vaultd decodes that back
+ * to `^` it then reads the subpath as a *heading* named `^blockid` and answers
+ * `missing_subpath`. Written plainly — `Note.md#^blockid`, file part encoded or
+ * not — it resolves as a block. Obsidian writes the caret plainly too.
+ */
+function encodeSubpath(subpath?: string): string {
+  if (subpath === undefined || subpath === "") return "";
+  const body = subpath.startsWith("#") ? subpath.slice(1) : subpath;
+  const block = body.startsWith("^");
+  return `#${block ? "^" : ""}${encodeLinkPart(block ? body.slice(1) : body)}`;
 }
 
 /** The path of `target` as written from inside `sourceFolder`. */

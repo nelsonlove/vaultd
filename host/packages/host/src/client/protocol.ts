@@ -395,15 +395,36 @@ export type PatchValueDto =
   | { [key: string]: PatchValueDto };
 
 /**
- * One addressed key and what becomes of it. `value` is **required**: an
+ * How a patch entry addresses a key.
+ *
+ * Two spellings, and the array one is **additive** — the daemon accepts both.
+ * The dotted string (`"a.b.c"`) is version 1's original, and it is unusable for
+ * a key whose own name contains a dot: the daemon splits on `.` with no
+ * escaping mechanism of any kind, so `my.key` addresses `my` → `key`, finds no
+ * `my`, and *creates* one while leaving the real key untouched. The array form
+ * (`["my.key"]`) says what each segment is, so a dot inside a name is an
+ * ordinary character.
+ *
+ * This host emits the array form exclusively: there is no key a segment list
+ * cannot address, so there is no reason to keep a second spelling alive at the
+ * call sites.
+ */
+export type FrontmatterKeyPathDto = string | string[];
+
+/**
+ * One addressed key and what becomes of it.
+ *
+ * Three outcomes, two shapes. `value` is **required** in the ordinary shape: an
  * explicit `null` deletes, and an absent `value` key is a decode error on the
  * daemon rather than a deletion, so "forgot to set a value" never becomes
- * "delete this key".
+ * "delete this key". The `set_null` shape is the **additive** third outcome —
+ * write a YAML `null` *into* the key rather than removing it — which the
+ * ordinary shape cannot express, because `PatchValueDto` has no null variant
+ * and `value: null` is already spoken for.
  */
-export interface FrontmatterEditDto {
-  key_path: string;
-  value: PatchValueDto | null;
-}
+export type FrontmatterEditDto =
+  | { key_path: FrontmatterKeyPathDto; value: PatchValueDto | null; set_null?: never }
+  | { key_path: FrontmatterKeyPathDto; set_null: true; value?: never };
 
 /** One referencing note a rename could not rewrite, and why. */
 export interface LinkRewriteFailureDto {

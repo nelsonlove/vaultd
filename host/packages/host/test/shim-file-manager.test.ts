@@ -1,5 +1,9 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
+import {
+  UnaddressableFrontmatterKey,
+  UnrepresentableFrontmatterValue,
+} from "../src/shim/file-manager";
 import { HeadlessUnsupported, declaredSymbols, policyOf } from "../src/shim/policy";
 import { parseFixtureRow, warmFixtureCache } from "../src/testing/fixture-vault";
 import { ShimHarness } from "../src/testing/shim-harness";
@@ -40,6 +44,8 @@ const PATCHED_SOURCE = "---\ntitle: New\nnested:\n  inner: 2\n---\nbody\n";
 /** What a competing writer left behind, for the conflict cases. */
 const CONFLICTED_SOURCE = "---\ntitle: Other\nkeep: yes\nnested:\n  inner: 1\n---\nbody\n";
 const UNCHANGED_VAULT = { "A.md": "---\ntitle: Same\n---\nbody\n" };
+/** A key whose own name contains a dot, which the dotted wire form cannot reach. */
+const DOTTED_VAULT = { "A.md": "---\nmy.key: dotted\nplain: kept\n---\nbody\n" };
 const SHAPED_VAULT = {
   "A.md": "---\nlist:\n  - one\n  - two\nbranch:\n  leaf: 1\nplain: text\n---\nbody\n",
 };
@@ -52,6 +58,7 @@ const LINK_VAULT = {
   "Other/Target.md": "x\n",
   "Solo.md": "x\n",
   "My File.md": "x\n",
+  "Hash #1.md": "x\n",
 };
 const ATTACHMENT_VAULT = { "Notes/Note.md": "x\n", "Attachments/img.png": "not markdown\n" };
 const TRASH_VAULT = { "A.md": "x\n", "Folder/B.md": "x\n" };
@@ -60,6 +67,7 @@ const UNTITLED_VAULT = { "Untitled/kept.md": "x\n" };
 const VAULTS = [
   FRONTMATTER_VAULT,
   UNCHANGED_VAULT,
+  DOTTED_VAULT,
   SHAPED_VAULT,
   ONE_REFERRER_VAULT,
   TWO_REFERRERS_VAULT,
@@ -127,11 +135,12 @@ describe("FileManager.processFrontMatter", () => {
         path: "A.md",
         // Changes and additions in the callback's own key order, deletions
         // last: a deleted key no longer has a place in the new object, so the
-        // document's order is the only one left to give it.
+        // document's order is the only one left to give it. Every `key_path` is
+        // a segment array, never a dotted string — see the dotted-key case.
         patch: [
-          { key_path: "title", value: "New" },
-          { key_path: "nested.inner", value: 2 },
-          { key_path: "keep", value: null },
+          { key_path: ["title"], value: "New" },
+          { key_path: ["nested", "inner"], value: 2 },
+          { key_path: ["keep"], value: null },
         ],
         expected: { revision: harness.revisionOf("A.md") },
       },
@@ -170,13 +179,93 @@ describe("FileManager.processFrontMatter", () => {
     });
     const sent = await harness.nextRequest();
     expect((sent.request.params as { patch: unknown[] }).patch).toEqual([
-      { key_path: "list", value: ["one", "two", "three"] },
-      { key_path: "branch", value: "flattened" },
-      { key_path: "added", value: { deep: true } },
+      { key_path: ["list"], value: ["one", "two", "three"] },
+      { key_path: ["branch"], value: "flattened" },
+      { key_path: ["added"], value: { deep: true } },
     ]);
     harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:shaped" });
     await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:shaped" }]);
     await pending;
+  });
+
+  it("writes a YAML null through set_null, and deletes only on delete", async () => {
+    // Two different outcomes that both look like "null" in JavaScript, and the
+    // wire needs two spellings for them: `value: null` is the deletion marker,
+    // so writing `key: null` into the note takes the additive `set_null` entry.
+    // Obsidian's `fm.key = null` writes the null; it does not remove the key.
+    const harness = await ShimHarness.withVault(FRONTMATTER_VAULT);
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    const pending = harness.app.fileManager.processFrontMatter(file, (fm) => {
+      fm["title"] = null;
+      fm["nested"] = undefined;
+    });
+    const sent = await harness.nextRequest();
+    expect((sent.request.params as { patch: unknown[] }).patch).toEqual([
+      { key_path: ["title"], set_null: true },
+      { key_path: ["nested"], value: null },
+    ]);
+    harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:nulled" });
+    await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:nulled" }]);
+    await pending;
+  });
+
+  it("refuses a key containing a dot rather than writing to the wrong one", async () => {
+    // The daemon build in use splits `key_path` on `.` with no escaping, so
+    // `my.key` addresses `my` → `key`, finds no `my`, creates one, and leaves
+    // the real key stale — measured in review. Nothing is sent and nothing is
+    // written; the plugin is told which key it was.
+    const harness = await ShimHarness.withVault(DOTTED_VAULT);
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    const handed: Record<string, unknown>[] = [];
+    await expect(
+      harness.app.fileManager.processFrontMatter(file, (fm) => {
+        handed.push({ ...fm });
+        fm["my.key"] = "changed";
+      }),
+    ).rejects.toBeInstanceOf(UnaddressableFrontmatterKey);
+    // The callback still *saw* the key: reading one has never been the problem.
+    expect(handed[0]).toEqual({ "my.key": "dotted", plain: "kept" });
+    await harness.quiesce();
+    expect(harness.pendingRequests()).toHaveLength(0);
+
+    // A deletion is refused the same way. The old daemon treated it as "delete
+    // a key that is not there", which is a no-op the plugin never hears about.
+    await expect(
+      harness.app.fileManager.processFrontMatter(file, (fm) => {
+        delete fm["my.key"];
+      }),
+    ).rejects.toMatchObject({ code: "unaddressable_frontmatter_key", path: "A.md" });
+    // A neighbouring key with no dot in it is unaffected.
+    const pending = harness.app.fileManager.processFrontMatter(file, (fm) => {
+      fm["plain"] = "moved";
+    });
+    const sent = await harness.nextRequest();
+    expect((sent.request.params as { patch: unknown[] }).patch).toEqual([
+      { key_path: ["plain"], value: "moved" },
+    ]);
+    harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:plain" });
+    await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:plain" }]);
+    await pending;
+  });
+
+  it("refuses a number JSON cannot carry, at any depth", async () => {
+    // `NaN` and `Infinity` serialize to JSON `null`, and `null` on this wire
+    // means *delete this key* — so the silent outcome is a property that
+    // vanishes instead of being set.
+    const harness = await ShimHarness.withVault(UNCHANGED_VAULT);
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    await expect(
+      harness.app.fileManager.processFrontMatter(file, (fm) => {
+        fm["count"] = Number.NaN;
+      }),
+    ).rejects.toBeInstanceOf(UnrepresentableFrontmatterValue);
+    await expect(
+      harness.app.fileManager.processFrontMatter(file, (fm) => {
+        fm["stats"] = { mean: Number.POSITIVE_INFINITY };
+      }),
+    ).rejects.toMatchObject({ code: "unrepresentable_frontmatter_value" });
+    await harness.quiesce();
+    expect(harness.pendingRequests()).toHaveLength(0);
   });
 
   it("re-reads and re-runs the callback after a revision conflict", async () => {
@@ -206,7 +295,7 @@ describe("FileManager.processFrontMatter", () => {
     const second = await harness.expectRequest("patch_frontmatter");
     expect(second.request.params).toEqual({
       path: "A.md",
-      patch: [{ key_path: "title", value: "New" }],
+      patch: [{ key_path: ["title"], value: "New" }],
       expected: { revision: conflicted.revision },
     });
     harness.respondOk(second.id, "patch_frontmatter", { generation: 6, revision: "blake3:after" });
@@ -243,7 +332,7 @@ describe("FileManager.processFrontMatter", () => {
 });
 
 describe("FileManager.renameFile", () => {
-  it("routes a note to rename_note, with its revision and link rewriting on", async () => {
+  it("routes a note to rename_note, with no precondition and link rewriting on", async () => {
     // The brief's fixture wrote `A` as bare prose, which is no link at all: the
     // mirror's backlink index would have been empty and the case would have
     // proved nothing about the referrer set. A real wikilink makes it answer.
@@ -251,14 +340,14 @@ describe("FileManager.renameFile", () => {
     const file = harness.vault.getFileByPath("A.md") as TFile;
     const pending = harness.app.fileManager.renameFile(file, "Renamed.md");
     const sent = await harness.nextRequest();
+    // No `expected`. Obsidian's `renameFile` has no compare-and-swap failure
+    // mode, the mirror's revision lags the filesystem by a watcher round trip,
+    // and a move does not depend on the bytes being moved — so a precondition
+    // here refused a rename whenever anything had touched the note a moment
+    // earlier. `Vault.rename` sends none either.
     expect(sent.request).toEqual({
       method: "rename_note",
-      params: {
-        from: "A.md",
-        to: "Renamed.md",
-        expected: { revision: harness.revisionOf("A.md") },
-        rewrite_links: true,
-      },
+      params: { from: "A.md", to: "Renamed.md", rewrite_links: true },
     });
     harness.respondOk(sent.id, "rename_note", {
       generation: 5,
@@ -316,6 +405,46 @@ describe("FileManager.renameFile", () => {
     expect(harness.app.fileManager.lastRenameFailures()).toEqual([
       { path: "Busy.md", reason: "revision_conflict" },
     ]);
+  });
+
+  it("captures the referrers before the rename, not after it", async () => {
+    // The mechanism the whole refetch set rests on, and the one a mutation
+    // survived until this case existed: `mirror.backlinks(from)` is read at the
+    // call, before anything has moved. Here the mirror learns that `B.md` no
+    // longer links to `A.md` **while the rename is in flight** — which is
+    // exactly what happens when the daemon's own rewrite reaches this host
+    // before the rename's answer does. A shim that asked afterwards would find
+    // no referrers and leave `B.md` stale for good.
+    const harness = await ShimHarness.withVault(ONE_REFERRER_VAULT);
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    expect(harness.mirror.backlinks("A.md").map((reference) => reference.source_path)).toEqual([
+      "B.md",
+    ]);
+    const pending = harness.app.fileManager.renameFile(file, "Renamed.md");
+    const sent = await harness.expectRequest("rename_note");
+
+    // The link is gone from the mirror's index before the response is handled.
+    const applying = harness.mirror.applyMutation(4, ["B.md"]);
+    await harness.answerRefetch(4, [{ path: "B.md", revision: "blake3:b-rewritten" }]);
+    await applying;
+    expect(harness.mirror.backlinks("A.md")).toEqual([]);
+
+    harness.respondOk(sent.id, "rename_note", {
+      generation: 5,
+      revision: "blake3:r",
+      links_rewritten: 1,
+      link_rewrite_failures: [],
+    });
+    const refetching = harness.answerRefetch(
+      5,
+      [
+        { path: "Renamed.md", revision: "blake3:r" },
+        { path: "B.md", revision: "blake3:b3" },
+      ],
+      { absent: ["A.md"] },
+    );
+    await pending;
+    expect([...(await refetching)].sort()).toEqual(["A.md", "B.md", "Renamed.md"]);
   });
 
   it("routes a folder to rename_folder, with no expected and the whole subtree", async () => {
@@ -443,6 +572,40 @@ describe("FileManager.generateMarkdownLink", () => {
         "Alias",
       ),
     ).toBe("[Alias](Solo.md)");
+  });
+
+  it("encodes the subpath and the delimiters a vault path may contain", async () => {
+    // Measured against this repo's own parser, which is the thing that has to
+    // read the result: `Solo.md#My Heading` is unresolved and `Hash %231.md`
+    // written as `Hash #1.md` is not a link at all, because `encodeURI` leaves
+    // `#` and a space in a fragment alone. `shim-real-daemon.test.ts` proves
+    // the encoded forms resolve; this case pins the spelling.
+    const harness = await ShimHarness.withVault(LINK_VAULT, {
+      configFiles: { ".obsidian/app.json": JSON.stringify({ useMarkdownLinks: true }) },
+    });
+    const fm = harness.app.fileManager;
+    const solo = harness.vault.getFileByPath("Solo.md") as TFile;
+    expect(fm.generateMarkdownLink(solo, "Folder/Source.md", "#My Heading")).toBe(
+      "[Solo](Solo.md#My%20Heading)",
+    );
+    expect(fm.generateMarkdownLink(harness.vault.getFileByPath("Hash #1.md") as TFile, "Solo.md")).toBe(
+      "[Hash #1](Hash%20%231.md)",
+    );
+    // The block marker stays literal: `%5E` decodes back to `^` but vaultd then
+    // reads the subpath as a heading named `^blockid` and answers
+    // `missing_subpath`, where the plain caret resolves as a block.
+    expect(fm.generateMarkdownLink(solo, "Folder/Source.md", "#^blockid")).toBe(
+      "[Solo](Solo.md#^blockid)",
+    );
+    // A wikilink is not a URL and is encoded nowhere.
+    const plain = await ShimHarness.withVault(LINK_VAULT);
+    expect(
+      plain.app.fileManager.generateMarkdownLink(
+        plain.vault.getFileByPath("Hash #1.md") as TFile,
+        "Solo.md",
+        "#My Heading",
+      ),
+    ).toBe("[[Hash #1#My Heading]]");
   });
 });
 

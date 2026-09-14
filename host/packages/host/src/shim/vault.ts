@@ -44,6 +44,7 @@ import { VaultdError } from "../client/errors";
 import { DataAdapter } from "./adapter";
 import { Events } from "./events";
 import { FileIndex, TFile, TFolder } from "./files";
+import { affectedPathsForRename } from "./rename-paths";
 import { stub } from "./policy";
 import type { VaultdClient } from "../client/client";
 import type {
@@ -438,6 +439,15 @@ export class Vault extends Events {
   /**
    * Rename, with links rewritten by the daemon.
    *
+   * **The refetch set is {@link affectedPathsForRename}'s**, shared with
+   * `FileManager.renameFile` — both ends, the subtree at both ends, and every
+   * note that linked to any of them. This method used to compute the first two
+   * and forget the third, which left every note whose links the daemon had just
+   * rewritten stale in the mirror: wrong `resolvedLinks`, wrong `backlinks`,
+   * wrong `outgoing` resolutions, all of them handed straight to plugin code.
+   * Found by Task 9's review, which had already fixed the same hole on the
+   * neighbouring surface.
+   *
    * **A folder move names its whole subtree.** The wire answers one generation
    * and nothing else: every descendant lands at a new path that no part of the
    * answer mentions. Refetching only the two named paths advanced the mirror
@@ -463,9 +473,9 @@ export class Vault extends Events {
    */
   async rename(file: TAbstractFile, newPath: string): Promise<void> {
     const folder = file instanceof TFolder;
-    const affected = folder
-      ? this.movedPaths(file.path, newPath)
-      : [file.path, newPath];
+    // Read before the send: afterwards `from` is gone and so is its backlink
+    // entry, so the same call would answer with a smaller set and say nothing.
+    const affected = affectedPathsForRename(this, this.deps.mirror, file, newPath);
     const result = await this.deps.writes.send<RenameResponse>(
       folder ? "rename_folder" : "rename_note",
       { from: file.path, to: newPath, rewrite_links: true },
