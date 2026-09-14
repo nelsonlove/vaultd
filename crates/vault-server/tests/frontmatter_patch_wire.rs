@@ -88,15 +88,27 @@ fn the_dot_string_form_still_addresses_a_nested_key() {
     );
 }
 
-/// An array that addresses nothing is a client bug, not a key named "".
+/// An array that addresses nothing is a client bug, not a key named "" — and
+/// so is an array carrying an empty segment, which is the refusal the
+/// dot-string form has always had. Both decode cleanly and are refused one
+/// layer later, which is why they are pinned here rather than at the DTO.
 #[test]
 fn an_empty_array_key_path_is_invalid_request() {
-    let mut vault = vault();
-    match vault.patch(r#"{"key_path":[],"value":"new"}"#) {
-        ResponseOutcome::Err(error) => assert_eq!(error.code, ErrorCode::InvalidRequest),
-        other => panic!("expected invalid_request, got {other:?}"),
+    for spelling in [
+        r#"{"key_path":[],"value":"new"}"#,
+        r#"{"key_path":["a",""],"value":"new"}"#,
+    ] {
+        let mut vault = vault();
+        match vault.patch(spelling) {
+            ResponseOutcome::Err(error) => assert_eq!(
+                error.code,
+                ErrorCode::InvalidRequest,
+                "{spelling} must be refused: {error:?}"
+            ),
+            other => panic!("expected invalid_request for {spelling}, got {other:?}"),
+        }
+        assert_eq!(vault.source(), NOTE, "a refusal writes nothing");
     }
-    assert_eq!(vault.source(), NOTE, "a refusal writes nothing");
 }
 
 /// Task 1e (b): `set_null` writes a YAML null for the key — created when it

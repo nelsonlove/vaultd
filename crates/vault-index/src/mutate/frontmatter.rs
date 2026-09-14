@@ -391,13 +391,15 @@ fn plan_existing(
 /// * a leaf addressed as a **sequence element** (`tags.0`) rather than as a
 ///   mapping key: there is no key span to take the separator from, and a
 ///   `- ` item's own geometry is not the same splice;
-/// * a leaf inside a **flow** collection (`{a: 1, b: 2}`, `[{a: 1}]`), where a
-///   `,` or a bracket ends the token. The replacement is built by [`after_key`],
-///   which quotes for *block* context, so writing it into flow context would
-///   split one value into two — `{a: x, y, b: 2}` is valid YAML holding
-///   `a: "x"` and a stray key `y`. The re-emit renders flow collections
-///   through [`flow_scalar`] and gets this right, so declining is both the
-///   smaller change and the correct one.
+/// * a leaf anywhere inside a **flow** collection (`{a: 1, b: 2}`, `[{a: 1}]`),
+///   where a `,` or a bracket ends the token. The replacement is built by
+///   [`after_key`], which quotes for *block* context, so writing it into flow
+///   context would split one value into two — `{a: x, y, b: 2}` is valid YAML
+///   holding `a: "x"` and a stray key `y`. The re-emit renders flow
+///   collections through [`flow_scalar`] and gets this right, so declining is
+///   both the smaller change and the correct one. Flow style is a property of
+///   the **container**, so it is asked of every container on the way down
+///   ([`starts_flow`]) rather than of the addressed key's own line.
 ///
 /// `VAULTD-COMPATIBILITY.md` records what is left reflowing.
 fn plan_nested_scalar(
@@ -422,7 +424,7 @@ fn plan_nested_scalar(
     ) {
         return None;
     }
-    let (key, target) = locate_scalar(&property.value, &edit.key_path[1..])?;
+    let (key, target) = locate_scalar(source, &property.value, &edit.key_path[1..])?;
     if !opens_its_own_line(source, key.span.start()) {
         return None;
     }
@@ -449,22 +451,37 @@ fn plan_nested_scalar(
     })
 }
 
+/// Whether a container's own source text opens with `{` or `[` — which is
+/// exactly what makes it a **flow** collection.
+///
+/// The question has to be asked of the source, not of the parsed tree: the
+/// parse reports a `Mapping` for `{a: 1}` and for a block mapping alike, and a
+/// `Sequence` for `[1]` and for a block list alike, so nothing in
+/// [`PropertyValue`] can tell them apart. A container's span starts at its
+/// first byte, so one byte answers it — and asking the *container* rather than
+/// the addressed key's line is what makes the answer hold however the
+/// collection is laid out across lines.
+///
+/// A plain scalar cannot start with either byte (that spelling *is* a flow
+/// collection), and a quoted one starts with its quote, so this never mistakes
+/// a value for a container.
+fn starts_flow(source: &str, offset: usize) -> bool {
+    matches!(source.as_bytes().get(offset), Some(b'{') | Some(b'['))
+}
+
 /// Whether the key at `key_start` **opens its own line** — the bytes before it
 /// on that line are only indentation and block sequence markers.
 ///
-/// This is how block context is told from flow context, and it is deliberately
-/// a question about the *source bytes* rather than about the parsed tree: the
-/// parse reports a `Mapping` for `{a: 1}` and for a block mapping alike, so
-/// nothing in [`PropertyValue`] can answer it. A key inside `{…}` or `[…]`
-/// always has something other than indentation in front of it on its line —
-/// the opening brace, or the `,` that separated it from the entry before —
-/// while a block key has at most spaces, tabs, and `- ` markers.
-///
-/// A flow collection written across several lines is handled by the same
-/// test: its first key follows the `{` on that line, and a later key follows
-/// the `,` or the `{` on its own. The only shape this treats as block when it
-/// is not would need a key sitting alone on a line inside a flow collection
-/// with no separator before it, which no YAML flow syntax produces.
+/// A cheap second test, kept behind [`starts_flow`] rather than relied upon.
+/// It was the original flow-context check and it is **not sufficient**: a flow
+/// mapping written across several lines (`top: {` … `  a: 1,`) puts its first
+/// key alone on a line with nothing but indentation in front of it, so this
+/// answers "block" for a key that is inside `{…}`. That shape is ordinary flow
+/// syntax, and it corrupted a value exactly as the single-line case did.
+/// [`starts_flow`] subsumes this test; it stays because it costs one line scan
+/// and refuses anything whose line geometry this module does not model —
+/// nothing correct reaches the splice through a key that does not open its
+/// own line.
 fn opens_its_own_line(source: &str, key_start: usize) -> bool {
     let mut prefix =
         source[line_start(source, key_start)..key_start].trim_start_matches([' ', '\t']);
@@ -478,18 +495,30 @@ fn opens_its_own_line(source: &str, key_start: usize) -> bool {
 /// when every segment resolves and the value it lands on is a scalar.
 ///
 /// `None` for everything else: a missing segment, a non-numeric index into a
-/// sequence, an index past its end, a target that is a collection, and the
-/// sequence-element case, which has a value span but no key span.
+/// sequence, an index past its end, a target that is a collection, the
+/// sequence-element case (which has a value span but no key span), and any
+/// container written in **flow** style.
+///
+/// The flow test runs on entry, so it covers the property's own value and
+/// every container descended into — a leaf is reachable only when nothing
+/// above it on the path is a flow collection. Testing only the innermost
+/// container would be enough for the quoting, but a leaf nested inside a flow
+/// collection inherits its layout too, and re-emitting the property is the
+/// answer for the whole shape rather than for one level of it.
 fn locate_scalar<'a>(
+    source: &str,
     value: &'a Spanned<PropertyValue>,
     segments: &[String],
 ) -> Option<(&'a Spanned<String>, &'a Spanned<PropertyValue>)> {
+    if starts_flow(source, value.span.start()) {
+        return None;
+    }
     let (segment, rest) = segments.split_first()?;
     match &value.value {
         PropertyValue::Mapping(entries) => {
             let (key, child) = entries.iter().find(|(key, _)| &key.value == segment)?;
             if !rest.is_empty() {
-                return locate_scalar(child, rest);
+                return locate_scalar(source, child, rest);
             }
             match child.value {
                 PropertyValue::Sequence(_) | PropertyValue::Mapping(_) => None,
@@ -502,7 +531,7 @@ fn locate_scalar<'a>(
             if rest.is_empty() {
                 return None;
             }
-            locate_scalar(child, rest)
+            locate_scalar(source, child, rest)
         }
         _ => None,
     }

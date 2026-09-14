@@ -741,6 +741,83 @@ fn a_scalar_inside_a_flow_map_on_a_block_item_survives_a_comma() {
     );
 }
 
+const MULTILINE_FLOW_MAP: &str = "---\ntop: {\n  a: 1,\n  b: 2 }\nother: keep\n---\n# Body\n";
+const MULTILINE_FLOW_SEQUENCE_OF_MAPS: &str =
+    "---\nitems: [\n  {\n    a: 1,\n    b: 2\n  }\n]\nother: keep\n---\n# Body\n";
+
+/// A flow mapping written across several lines. The addressed key *does*
+/// open its own line — the `{` ended the line before it — so a line-local
+/// test says "block" and the splice writes block quoting into flow context
+/// again, with the same stray-key result. Flow style is a property of the
+/// **container**, and the container's span is where to ask.
+#[test]
+fn a_scalar_inside_a_multiline_flow_mapping_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        MULTILINE_FLOW_MAP,
+        &[segments(
+            &["top", "a"],
+            Some(PatchValue::String("x, y".into())),
+        )],
+    )
+    .expect("set a leaf inside a multi-line flow mapping");
+    assert_eq!(
+        read_back_nested(&patched, &["top", "a"]),
+        PropertyValue::String("x, y".into()),
+        "one value, not two: {patched}"
+    );
+    assert_eq!(
+        mapping_keys(&read_back(&patched, "top")),
+        vec!["a", "b"],
+        "no stray key was invented: {patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["top", "b"]),
+        PropertyValue::Integer(2),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back(&patched, "other"),
+        PropertyValue::String("keep".into()),
+        "the sibling property is untouched: {patched}"
+    );
+}
+
+/// The same shape one level deeper: a flow sequence holding a flow mapping,
+/// both written across several lines, so every key opens its own line.
+#[test]
+fn a_scalar_inside_a_multiline_flow_sequence_of_maps_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        MULTILINE_FLOW_SEQUENCE_OF_MAPS,
+        &[segments(
+            &["items", "0", "a"],
+            Some(PatchValue::String("x, y".into())),
+        )],
+    )
+    .expect("set a leaf inside a multi-line flow sequence of maps");
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "a"]),
+        PropertyValue::String("x, y".into()),
+        "{patched}"
+    );
+    assert_eq!(
+        mapping_keys(&read_back_nested(&patched, &["items", "0"])),
+        vec!["a", "b"],
+        "no stray key was invented: {patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "b"]),
+        PropertyValue::Integer(2),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back(&patched, "other"),
+        PropertyValue::String("keep".into()),
+        "{patched}"
+    );
+}
+
 /// The hostile-string matrix the top-level path already has, against a
 /// **nested** leaf — the one scalar-replacement path in this module that had
 /// no coverage of it. Every spelling here reads back as YAML's own bool,
