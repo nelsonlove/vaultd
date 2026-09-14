@@ -28,12 +28,14 @@ import { Harvest } from "../shim/harvest";
 import { HostErrors } from "../shim/errors";
 import { Workspace } from "../shim/workspace";
 import { createObsidianApi } from "../shim/api";
+import { installGlobals } from "../shim/globals";
 import { installPluginHost } from "../shim/plugin";
 import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
 import type { ObsidianApi } from "../shim/api";
 import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
+import type { GlobalInstallation } from "../shim/globals";
 import type { WriteGate } from "../shim/vault";
 // activated by Task 13:  import { registerElectronStub } from "../runtime/electron-registry";
 // activated by Task 11b: import { NoticeLog } from "../shim/notice";
@@ -69,6 +71,17 @@ export interface HostAssembly {
    * Task 14b's quarantine listens here.
    */
   readonly errors: HostErrors;
+  /**
+   * The `window`, `document` and prototype extensions this host installed on
+   * `globalThis`, and the undo for them.
+   *
+   * Part of the assembly rather than a side effect nobody holds, because they
+   * are process-wide state: a caller that assembles a second host — Task 22's
+   * live host beside a harness — has to be able to put the first one's globals
+   * back, and a caller that never asks still has the objects the `obsidian`
+   * barrel binds `window` and `activeDocument` to.
+   */
+  readonly globals: GlobalInstallation;
   // activated by Task 11b: readonly noticeLog: NoticeLog;
   /**
    * The module object a plugin bundle resolves `obsidian` to.
@@ -178,6 +191,14 @@ export function assembleShim(deps: {
   const queue = new DispatchQueue();
   const writes = deps.writes ?? forwardingWriteGate(client);
   const app = new App({ appId: appIdFor(config.vaultRoot) });
+  // Straight after the `App` and before anything else, for the same reason the
+  // electron stub goes first: a plugin bundle reads `globalThis.app`,
+  // `window.moment` and `document` while its *module* is still evaluating —
+  // before any instance exists to hand an `App` to — so the globals have to be
+  // standing before a bundle can be loaded. The `App`'s own surfaces land a few
+  // lines below, and nothing reads them in between: only the assembler is
+  // running.
+  const globals = installGlobals(app, config);
   const vault = new Vault({ config, client, mirror, events, writes, queue });
   // After the vault, because it resolves link paths to the `TFile` instances
   // the vault's index owns — and it reads that index rather than holding a
@@ -228,6 +249,7 @@ export function assembleShim(deps: {
     writes,
     harvest,
     errors,
+    globals,
   };
   // Last, and built from the assembly itself: the barrel binds this host's
   // clock into the timer functions a plugin calls, so a test advancing its own

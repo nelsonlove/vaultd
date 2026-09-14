@@ -300,7 +300,7 @@ export class ShimHarness extends MirrorHarness {
    */
   async flipLayoutReady(): Promise<void> {
     this.layoutReady = true;
-    // activated by Task 11a: this.app.workspace.markLayoutReady();
+    this.app.workspace.markLayoutReady();
     await this.quiesce();
   }
 
@@ -455,8 +455,16 @@ export class ShimHarness extends MirrorHarness {
     await this.quiesce();
   }
 
-  // activated by Task 11a: openFileIntents — it reads state that exists only
-  // once Task 11a builds `WorkspaceLeaf.openFile`.
+  /**
+   * Every path a plugin asked to have opened, in order.
+   *
+   * The only observable consequence of an `openFile` on a host with no window:
+   * the leaf records the intent and opens nothing, so this is what a case
+   * asserts on instead of asserting that nothing happened.
+   */
+  openFileIntents(): readonly string[] {
+    return this.app.workspace.openFileIntents();
+  }
 
   /**
    * How many plugin-facing timers are armed.

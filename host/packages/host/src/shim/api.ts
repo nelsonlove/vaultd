@@ -24,48 +24,47 @@ import { DataAdapter, FileSystemAdapter } from "./adapter";
 import { Events, Menu, MenuItem } from "./events";
 import { FileManager } from "./file-manager";
 import { MetadataCache } from "./metadata-cache";
-import { ShimTimers } from "./timers";
+import { StubEl, StubFragment, createDiv, createEl, createFragment, createSpan, getIcon, setIcon } from "./dom";
 import { TAbstractFile, TFile, TFolder } from "./files";
 import { Vault } from "./vault";
-import { Workspace } from "./workspace";
+import {
+  EditableFileView,
+  FileView,
+  ItemView,
+  MarkdownView,
+  View,
+  Workspace,
+  WorkspaceLeaf,
+} from "./workspace";
 import type { HostAssembly } from "../testing/assemble";
+import type { HostWindow } from "./globals";
+import type { StubDocument } from "./dom";
 
 /**
- * `window`, as a plugin uses it: four timer functions and nothing else yet.
+ * `window` and `document`, as a plugin uses them.
  *
- * The timers are the reason this exists at all. `registerInterval` is handed a
- * bare id, so the cadence has to be captured where it is known — inside
- * `setInterval` — and that means the `window` a plugin calls has to be the
- * host's rather than the real global. Task 11a installs the fuller globals.
+ * **Aliases since Task 11a**, and that is the point: the `window` a plugin
+ * reaches through the `obsidian` module and the `window` it reaches as a bare
+ * global have to be the same object, or a plugin that arms an interval through
+ * one and clears it through the other would leak a timer the host cannot see.
+ * The names stay because Task 10's surfaces are typed with them.
  */
-export interface ShimWindow {
-  setInterval(callback: () => void, ms: number): number;
-  clearInterval(id: number): void;
-  setTimeout(callback: () => void, ms: number): number;
-  clearTimeout(id: number): void;
-  readonly document: ShimDocument;
-}
-
-/**
- * `activeDocument`, as a plugin uses it: something to hand `registerDomEvent`.
- *
- * It accepts listeners and drops them, because there is no DOM to deliver
- * anything from. `registerDomEvent` records the hit; this is only the object
- * the plugin passes in.
- */
-export interface ShimDocument {
-  addEventListener(...args: unknown[]): void;
-  removeEventListener(...args: unknown[]): void;
-  readonly body: ShimDocument;
-}
+export type ShimWindow = HostWindow;
+export type ShimDocument = StubDocument;
 
 export interface ObsidianApi {
   readonly App: typeof App;
   readonly Component: typeof Component;
   readonly DataAdapter: typeof DataAdapter;
+  readonly DocumentFragment: typeof StubFragment;
+  readonly EditableFileView: typeof EditableFileView;
   readonly Events: typeof Events;
   readonly FileManager: typeof FileManager;
   readonly FileSystemAdapter: typeof FileSystemAdapter;
+  readonly FileView: typeof FileView;
+  readonly HTMLElement: typeof StubEl;
+  readonly ItemView: typeof ItemView;
+  readonly MarkdownView: typeof MarkdownView;
   readonly Menu: typeof Menu;
   readonly MenuItem: typeof MenuItem;
   readonly MetadataCache: typeof MetadataCache;
@@ -74,7 +73,16 @@ export interface ObsidianApi {
   readonly TFile: typeof TFile;
   readonly TFolder: typeof TFolder;
   readonly Vault: typeof Vault;
+  readonly View: typeof View;
   readonly Workspace: typeof Workspace;
+  readonly WorkspaceLeaf: typeof WorkspaceLeaf;
+  readonly createDiv: typeof createDiv;
+  readonly createEl: typeof createEl;
+  readonly createFragment: typeof createFragment;
+  readonly createSpan: typeof createSpan;
+  readonly getIcon: typeof getIcon;
+  readonly setIcon: typeof setIcon;
+  readonly moment: HostWindow["moment"];
   readonly window: ShimWindow;
   readonly activeWindow: ShimWindow;
   readonly activeDocument: ShimDocument;
@@ -94,26 +102,20 @@ export interface ObsidianApi {
  * is assignable to it, so a later caller holding one passes it unchanged.
  */
 export function createObsidianApi(assembly: Omit<HostAssembly, "api">): ObsidianApi {
-  const timers = new ShimTimers(assembly.clock);
-  const document = headlessDocument();
-  const shimWindow: ShimWindow = {
-    setInterval: (callback, ms) => timers.setInterval(callback, ms),
-    clearInterval: (id) => {
-      timers.clearInterval(id);
-    },
-    setTimeout: (callback, ms) => timers.setTimeout(callback, ms),
-    clearTimeout: (id) => {
-      timers.clearTimeout(id);
-    },
-    document,
-  };
+  const { globals } = assembly;
   return Object.freeze({
     App,
     Component,
     DataAdapter,
+    DocumentFragment: StubFragment,
+    EditableFileView,
     Events,
     FileManager,
     FileSystemAdapter,
+    FileView,
+    HTMLElement: StubEl,
+    ItemView,
+    MarkdownView,
     Menu,
     MenuItem,
     MetadataCache,
@@ -122,19 +124,26 @@ export function createObsidianApi(assembly: Omit<HostAssembly, "api">): Obsidian
     TFile,
     TFolder,
     Vault,
+    View,
     Workspace,
-    window: shimWindow,
-    activeWindow: shimWindow,
-    activeDocument: document,
+    WorkspaceLeaf,
+    createDiv,
+    createEl,
+    createFragment,
+    createSpan,
+    getIcon,
+    setIcon,
+    // The same library the globals install, at the second address plugins read
+    // it from: `import { moment } from "obsidian"`. Two of the eight golden
+    // bundles take that road and `window.moment` the other, and handing them
+    // two different objects would be a bug waiting for a locale change.
+    moment: globals.window.moment,
+    // The installed globals themselves, not a second pair: a plugin that arms
+    // an interval through `window.setInterval` and clears it through the bare
+    // global has to be talking to one registry, or the host leaks a timer it
+    // cannot count.
+    window: globals.window,
+    activeWindow: globals.window,
+    activeDocument: globals.document,
   });
-}
-
-/** One inert document, self-referential so `document.body` is also inert. */
-function headlessDocument(): ShimDocument {
-  const document = {
-    addEventListener: (): void => undefined,
-    removeEventListener: (): void => undefined,
-  } as { addEventListener(): void; removeEventListener(): void; body?: ShimDocument };
-  document.body = document as ShimDocument;
-  return document as ShimDocument;
 }
