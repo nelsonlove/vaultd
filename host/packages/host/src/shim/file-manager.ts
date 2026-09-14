@@ -19,13 +19,18 @@
  * **What "preserves the bytes" does and does not promise.** Everything outside
  * the addressed *top-level key* survives exactly — key order, comments,
  * quoting, the block scalar three keys down, and the body — which is measured
- * rather than hoped. Inside an addressed key the daemon re-emits that key's
- * whole subtree, so a leaf changed inside a list of maps reflows its siblings
- * to flow style (`- {name: a, value: 1}`) and a rewritten block scalar comes
- * back as a quoted one-liner. That is still **narrower than Obsidian**, which
- * re-serializes the entire frontmatter block on every `processFrontMatter`
- * call; a later daemon change may narrow it to the addressed scalar, at which
- * point this paragraph gets shorter.
+ * rather than hoped. Within the addressed key it depends on the edit: setting a
+ * **scalar onto a scalar that is already there, reached as a mapping key**,
+ * splices that scalar's own span and moves nothing around it, however deep it
+ * sits. Every other edit below the stored granularity re-serializes the
+ * smallest enclosing top-level property — a deletion, a new sequence or
+ * mapping, a target that is itself a sequence or mapping, a target that does
+ * not exist yet, or a leaf addressed as a sequence element — so that one
+ * property can come back in the document's addition dialect (block collections
+ * in flow style, indentation normalized, comments between its own lines
+ * dropped) while nothing outside it moves. Still **narrower than Obsidian**,
+ * which re-serializes the entire frontmatter block on every
+ * `processFrontMatter` call.
  *
  * Four rules decide what a diff emits, and each exists because the alternative
  * is wrong rather than merely different:
@@ -44,20 +49,23 @@
  *   does not exist.
  * - An **array goes whole whenever it differs at all**. The daemon does address
  *   sequence elements by index — `["maps", "0", "value"]` is accepted — so this
- *   is a choice rather than a limit: the indexed form produces the *identical*
- *   re-emission of the enclosing key that the whole-array send produces, so it
- *   buys nothing and leans on a capability `docs/protocol.md` does not
- *   document.
+ *   is a choice rather than a limit, and the choice costs nothing: a leaf
+ *   addressed as a sequence element is one of the shapes that re-serializes the
+ *   enclosing property anyway, so the indexed form produces the *same* bytes as
+ *   sending the array whole while addressing a position rather than a value.
  *
- * **Key paths go out as segment arrays, never as a dotted string.** The dotted
- * spelling is unusable for a key whose own name contains a dot: the daemon
- * splits on `.` with no escaping, so `my.key` addresses `my` → `key`, finds no
- * `my`, creates one, and leaves the real key stale — a silent wrong-target
- * write in the one method whose whole point is not to disturb a note. Measured
- * against the shipped daemon in review. The array form has no such ambiguity,
- * and until the release binary carries it a key containing a dot is refused
- * with {@link UnaddressableFrontmatterKey} rather than sent — see
- * {@link DOTTED_KEYS_ADDRESSABLE}.
+ * **Key paths go out as segment arrays, never as a dotted string.** The two
+ * spellings address differently and the daemon rewrites neither into the other:
+ * a string is a dot-path, so `"my.key"` means `key` inside `my`, while
+ * `["my.key"]` is the single key of that name. For a key whose own name
+ * contains a dot the string form is not merely ambiguous but wrong — measured
+ * in review against the shipped daemon, it grew a nested `my:` mapping beside
+ * the real key and left the real key stale, a silent wrong-target write in the
+ * one method whose whole point is not to disturb a note. Segments are never
+ * split, joined, or escaped anywhere in this module. What no `key_path` can
+ * name is an **empty segment**, which the daemon refuses with
+ * `invalid_request`; this host refuses it first, with
+ * {@link UnaddressableFrontmatterKey}, so the error names the note and the key.
  *
  * The whole read-diff-send loop holds the path's lock through
  * `DispatchQueue.runExclusivePath`, the same serialization `Vault.process`
@@ -176,28 +184,20 @@ const PATCH_ATTEMPTS = 3;
 const UNTITLED_FOLDER = "Untitled";
 
 /**
- * Whether the daemon on the other end understands an array `key_path`.
+ * A frontmatter key no `key_path` can name.
  *
- * **`false` until the release binary carries the additive form.** While it is
- * false a frontmatter key whose name contains a literal dot is refused by this
- * host with {@link UnaddressableFrontmatterKey} instead of being sent: the old
- * daemon would split the name and write to the wrong place, and a loud refusal
- * naming the key is the only honest answer a host that cannot address it can
- * give. Flip it to `true` — and delete nothing else — once the build in use
- * accepts segment arrays; the only thing it gates is the refusal.
- *
- * Every patch entry carries the array form either way. A daemon that does not
- * understand it refuses the whole request with `invalid_request`, which is
- * loud, immediate, and incapable of corrupting a note.
- */
-const DOTTED_KEYS_ADDRESSABLE = false;
-
-/**
- * A frontmatter key this host will not address until the wire can.
+ * **A dot in a key is no longer one of these.** The daemon takes a segment
+ * array (`["my.key"]`) as of the additive wire form, and that is what this host
+ * sends, so a dotted name is ordinary. What remains unnameable is an **empty
+ * segment**: `docs/protocol.md` makes a path with one `invalid_request` in
+ * either spelling, and a key named `""` is something YAML can hold and this
+ * protocol cannot address.
  *
  * Typed, and carrying the key and the note, because the plugin that asked has
  * to be able to tell this apart from "the write failed" — nothing was written,
- * nothing was corrupted, and the key it named is the reason.
+ * nothing was corrupted, and the key it named is the reason. Refusing here
+ * rather than letting the daemon refuse means the error names the note and the
+ * segment list instead of a decode position.
  */
 export class UnaddressableFrontmatterKey extends Error {
   readonly code = "unaddressable_frontmatter_key";
@@ -205,9 +205,8 @@ export class UnaddressableFrontmatterKey extends Error {
   readonly keyPath: readonly string[];
   constructor(path: string, keyPath: readonly string[]) {
     super(
-      `${path}: the frontmatter key ${JSON.stringify(keyPath.join(" › "))} contains a "." and ` +
-        `this daemon build addresses keys by splitting on it, so patching it would write to the ` +
-        `wrong key and leave the real one stale`,
+      `${path}: the frontmatter key ${JSON.stringify(keyPath.join(" › "))} has an empty segment, ` +
+        `which no key_path can address — the daemon refuses one with invalid_request`,
     );
     this.name = "UnaddressableFrontmatterKey";
     this.path = path;
@@ -746,10 +745,9 @@ function collect(
   }
 }
 
-/** Refuse a key this host cannot address on the wire it is talking to. */
+/** Refuse a key no `key_path` can name. A dot is fine; an empty segment is not. */
 function guardKeyPath(keyPath: readonly string[], path: string): void {
-  if (DOTTED_KEYS_ADDRESSABLE) return;
-  if (!keyPath.some((segment) => segment.includes("."))) return;
+  if (keyPath.length > 0 && !keyPath.some((segment) => segment === "")) return;
   throw new UnaddressableFrontmatterKey(path, keyPath);
 }
 

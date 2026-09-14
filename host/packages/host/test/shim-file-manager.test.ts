@@ -209,42 +209,52 @@ describe("FileManager.processFrontMatter", () => {
     await pending;
   });
 
-  it("refuses a key containing a dot rather than writing to the wrong one", async () => {
-    // The daemon build in use splits `key_path` on `.` with no escaping, so
-    // `my.key` addresses `my` → `key`, finds no `my`, creates one, and leaves
-    // the real key stale — measured in review. Nothing is sent and nothing is
-    // written; the plugin is told which key it was.
+  it("addresses a key containing a dot as one segment, never as a path", async () => {
+    // The two spellings address different places and the daemon rewrites
+    // neither into the other: `"my.key"` means `key` inside `my`, and sending
+    // it for this note grew a nested `my:` mapping beside the real key and left
+    // the real key stale (measured in review). `["my.key"]` is the key itself.
     const harness = await ShimHarness.withVault(DOTTED_VAULT);
     const file = harness.vault.getFileByPath("A.md") as TFile;
     const handed: Record<string, unknown>[] = [];
-    await expect(
-      harness.app.fileManager.processFrontMatter(file, (fm) => {
-        handed.push({ ...fm });
-        fm["my.key"] = "changed";
-      }),
-    ).rejects.toBeInstanceOf(UnaddressableFrontmatterKey);
-    // The callback still *saw* the key: reading one has never been the problem.
-    expect(handed[0]).toEqual({ "my.key": "dotted", plain: "kept" });
-    await harness.quiesce();
-    expect(harness.pendingRequests()).toHaveLength(0);
-
-    // A deletion is refused the same way. The old daemon treated it as "delete
-    // a key that is not there", which is a no-op the plugin never hears about.
-    await expect(
-      harness.app.fileManager.processFrontMatter(file, (fm) => {
-        delete fm["my.key"];
-      }),
-    ).rejects.toMatchObject({ code: "unaddressable_frontmatter_key", path: "A.md" });
-    // A neighbouring key with no dot in it is unaffected.
     const pending = harness.app.fileManager.processFrontMatter(file, (fm) => {
-      fm["plain"] = "moved";
+      handed.push({ ...fm });
+      fm["my.key"] = "changed";
+      delete fm["plain"];
     });
     const sent = await harness.nextRequest();
     expect((sent.request.params as { patch: unknown[] }).patch).toEqual([
-      { key_path: ["plain"], value: "moved" },
+      { key_path: ["my.key"], value: "changed" },
+      { key_path: ["plain"], value: null },
     ]);
-    harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:plain" });
-    await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:plain" }]);
+    expect(handed[0]).toEqual({ "my.key": "dotted", plain: "kept" });
+    harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:dotted" });
+    await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:dotted" }]);
+    await pending;
+  });
+
+  it("refuses a key with an empty segment, which no key_path can name", async () => {
+    // The one shape that is still unaddressable: `docs/protocol.md` makes an
+    // empty segment `invalid_request` in either spelling. Refusing it here
+    // names the note and the key instead of a decode position.
+    const harness = await ShimHarness.withVault(UNCHANGED_VAULT);
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    await expect(
+      harness.app.fileManager.processFrontMatter(file, (fm) => {
+        fm[""] = "nameless";
+      }),
+    ).rejects.toBeInstanceOf(UnaddressableFrontmatterKey);
+    // A new branch that *contains* an empty key goes whole, so the empty
+    // segment never becomes a key path of its own and nothing refuses it.
+    const pending = harness.app.fileManager.processFrontMatter(file, (fm) => {
+      fm["nested"] = { "": "nameless" };
+    });
+    const sent = await harness.nextRequest();
+    expect((sent.request.params as { patch: unknown[] }).patch).toEqual([
+      { key_path: ["nested"], value: { "": "nameless" } },
+    ]);
+    harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:nested" });
+    await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:nested" }]);
     await pending;
   });
 

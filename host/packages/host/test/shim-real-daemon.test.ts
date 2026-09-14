@@ -250,16 +250,15 @@ describe.skipIf(!BINARY_EXISTS)("the shim against a real vaultd", () => {
   /**
    * The two patch shapes that need the daemon's additive wire forms.
    *
-   * Both are **written now and skipped until the release binary carries them**:
-   * the array `key_path` (so a key whose name contains a dot is addressable at
-   * all) and `set_null` (so `fm.key = null` writes a YAML null instead of
-   * deleting). Against the current build every `patch_frontmatter` this shim
-   * sends is refused `invalid_request` at decode — loud, and incapable of
-   * corrupting a note, which is the property that made shipping the array form
-   * first the safe order. Unskip this block, and flip
-   * `DOTTED_KEYS_ADDRESSABLE` in `shim/file-manager.ts`, together.
+   * The array `key_path` (so a key whose own name contains a dot is addressable
+   * at all) and `set_null` (so `fm.key = null` writes a YAML null instead of
+   * deleting). Both are facts about the shipped daemon rather than about this
+   * host's intent, which is why they are here and not in the fake-daemon file:
+   * the dotted key in particular was a silent wrong-target write that a fake
+   * daemon agreed with, and only the real one can say the write landed on the
+   * key the plugin named.
    */
-  describe.skip("patching frontmatter through the additive wire forms", () => {
+  describe("patching frontmatter through the additive wire forms", () => {
     it("addresses a key whose name contains a dot, and deletes and adds one", async () => {
       const config = vaultFor({
         "A.md": "---\nmy.key: dotted\nplain: kept\n---\nbody\n",
