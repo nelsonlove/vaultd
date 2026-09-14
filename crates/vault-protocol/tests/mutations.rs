@@ -424,6 +424,30 @@ fn a_key_path_may_be_an_array_of_literal_segments() {
     );
 }
 
+/// What an array `key_path` is **not**. A segment is a string; anything else
+/// is a typed decode error rather than a panic or a coerced value, and the
+/// transport reports every one of them as `invalid_request` with the serde
+/// text carried through. The empty array is pinned end to end in
+/// `vault-server`'s `frontmatter_patch_wire.rs`, because it decodes fine and
+/// is refused one layer later.
+#[test]
+fn an_array_key_path_takes_strings_and_nothing_else() {
+    for spelling in [
+        r#"{"key_path":["a",3],"value":"set"}"#,
+        r#"{"key_path":["a",null],"value":"set"}"#,
+        r#"{"key_path":[["a"]],"value":"set"}"#,
+        r#"{"key_path":{"a":1},"value":"set"}"#,
+        r#"{"key_path":7,"value":"set"}"#,
+    ] {
+        let error = serde_json::from_str::<vault_protocol::FrontmatterEditDto>(spelling)
+            .expect_err("a key path is a string or an array of strings");
+        assert!(
+            error.to_string().contains("invalid type"),
+            "error should name the type mismatch for {spelling}: {error}"
+        );
+    }
+}
+
 /// The dot-string form keeps its meaning exactly: every `.` starts a new
 /// segment, which is why the array form had to exist.
 #[test]

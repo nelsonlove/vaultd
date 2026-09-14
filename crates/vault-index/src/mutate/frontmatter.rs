@@ -390,7 +390,14 @@ fn plan_existing(
 ///   mapping;
 /// * a leaf addressed as a **sequence element** (`tags.0`) rather than as a
 ///   mapping key: there is no key span to take the separator from, and a
-///   `- ` item's own geometry is not the same splice.
+///   `- ` item's own geometry is not the same splice;
+/// * a leaf inside a **flow** collection (`{a: 1, b: 2}`, `[{a: 1}]`), where a
+///   `,` or a bracket ends the token. The replacement is built by [`after_key`],
+///   which quotes for *block* context, so writing it into flow context would
+///   split one value into two — `{a: x, y, b: 2}` is valid YAML holding
+///   `a: "x"` and a stray key `y`. The re-emit renders flow collections
+///   through [`flow_scalar`] and gets this right, so declining is both the
+///   smaller change and the correct one.
 ///
 /// `VAULTD-COMPATIBILITY.md` records what is left reflowing.
 fn plan_nested_scalar(
@@ -416,6 +423,9 @@ fn plan_nested_scalar(
         return None;
     }
     let (key, target) = locate_scalar(&property.value, &edit.key_path[1..])?;
+    if !opens_its_own_line(source, key.span.start()) {
+        return None;
+    }
     let start = after_colon(source, key.span.end());
     // `after_colon` answers the key's own end when it finds no `:` at all.
     // Nothing sensible can be spliced then, so fall back rather than guess.
@@ -437,6 +447,31 @@ fn plan_nested_scalar(
             newline,
         ),
     })
+}
+
+/// Whether the key at `key_start` **opens its own line** — the bytes before it
+/// on that line are only indentation and block sequence markers.
+///
+/// This is how block context is told from flow context, and it is deliberately
+/// a question about the *source bytes* rather than about the parsed tree: the
+/// parse reports a `Mapping` for `{a: 1}` and for a block mapping alike, so
+/// nothing in [`PropertyValue`] can answer it. A key inside `{…}` or `[…]`
+/// always has something other than indentation in front of it on its line —
+/// the opening brace, or the `,` that separated it from the entry before —
+/// while a block key has at most spaces, tabs, and `- ` markers.
+///
+/// A flow collection written across several lines is handled by the same
+/// test: its first key follows the `{` on that line, and a later key follows
+/// the `,` or the `{` on its own. The only shape this treats as block when it
+/// is not would need a key sitting alone on a line inside a flow collection
+/// with no separator before it, which no YAML flow syntax produces.
+fn opens_its_own_line(source: &str, key_start: usize) -> bool {
+    let mut prefix =
+        source[line_start(source, key_start)..key_start].trim_start_matches([' ', '\t']);
+    while let Some(rest) = prefix.strip_prefix("- ") {
+        prefix = rest.trim_start_matches([' ', '\t']);
+    }
+    prefix.is_empty()
 }
 
 /// The addressed entry inside one parsed property — its key and its value —

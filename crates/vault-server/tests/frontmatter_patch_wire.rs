@@ -137,11 +137,21 @@ fn set_null_together_with_a_value_is_invalid_request() {
         r#"{"key_path":"title","value":null,"set_null":true}"#,
     ] {
         match vault.patch(entry) {
-            ResponseOutcome::Err(error) => assert_eq!(
-                error.code,
-                ErrorCode::InvalidRequest,
-                "contradictory actions must refuse: {error:?}"
-            ),
+            ResponseOutcome::Err(error) => {
+                assert_eq!(
+                    error.code,
+                    ErrorCode::InvalidRequest,
+                    "contradictory actions must refuse: {error:?}"
+                );
+                // The code alone would let a later refactor reduce the message
+                // to "invalid request" without a test noticing. A client that
+                // sent the pair has to be told which field it was.
+                assert!(
+                    error.message.contains("set_null"),
+                    "the refusal must name the conflicting field: {}",
+                    error.message
+                );
+            }
             other => panic!("expected invalid_request, got {other:?}"),
         }
         assert_eq!(vault.source(), NOTE, "a refusal writes nothing");
