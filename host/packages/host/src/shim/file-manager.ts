@@ -28,9 +28,11 @@
  * not exist yet, or a leaf addressed as a sequence element — so that one
  * property can come back in the document's addition dialect (block collections
  * in flow style, indentation normalized, comments between its own lines
- * dropped) while nothing outside it moves. Still **narrower than Obsidian**,
- * which re-serializes the entire frontmatter block on every
- * `processFrontMatter` call.
+ * dropped, and a scalar re-quoted: deleting a sibling key can leave an
+ * untouched `reviewed: yes` as `reviewed: "yes"`, which preserves the *value*
+ * vault-core parsed but not the user's spelling of it) while nothing outside it
+ * moves. Still **narrower than Obsidian**, which re-serializes the entire
+ * frontmatter block on every `processFrontMatter` call.
  *
  * Four rules decide what a diff emits, and each exists because the alternative
  * is wrong rather than merely different:
@@ -47,12 +49,17 @@
  *   a scalar that became an object, or a new key whose value is a subtree. A
  *   key path into a branch that no longer has that shape addresses a span that
  *   does not exist.
- * - An **array goes whole whenever it differs at all**. The daemon does address
- *   sequence elements by index — `["maps", "0", "value"]` is accepted — so this
- *   is a choice rather than a limit, and the choice costs nothing: a leaf
- *   addressed as a sequence element is one of the shapes that re-serializes the
- *   enclosing property anyway, so the indexed form produces the *same* bytes as
- *   sending the array whole while addressing a position rather than a value.
+ * - An **array is addressed by index exactly where an index splices**, and goes
+ *   whole otherwise. The qualifying shape is a same-length array whose every
+ *   changed element is a mapping differing only in scalar leaves that were
+ *   already there: `["maps", "0", "value"]` then changes one line, where
+ *   sending `maps` whole re-emits the property and reflows the *untouched*
+ *   sibling item into flow style (`- {name: b, value: 2}`) — measured, four
+ *   lines to two. Everything else goes whole, because an indexed path there
+ *   would re-emit the property anyway: a length change, a changed scalar
+ *   element of a plain list (a `- ` item has no key span to splice against,
+ *   and its re-emission is a one-line edit regardless), an added or deleted key
+ *   inside an element, and any leaf that became or stopped being a collection.
  *
  * **Key paths go out as segment arrays, never as a dotted string.** The two
  * spellings address differently and the daemon rewrites neither into the other:
@@ -727,6 +734,15 @@ function collect(
       continue;
     }
     if (sameValue(previous, value)) continue;
+    // A same-length array whose changed elements are scalar leaves under
+    // mapping keys is addressed element by element; anything else goes whole.
+    if (Array.isArray(previous) && Array.isArray(value) && previous.length === value.length) {
+      const indexed = indexedEdits(keyPath, previous, value, path);
+      if (indexed !== null) {
+        for (const edit of indexed) edits.push(edit);
+        continue;
+      }
+    }
     guardKeyPath(keyPath, path);
     // A YAML null, written *into* the key. `value: null` would have removed it.
     if (value === null) {
@@ -743,6 +759,99 @@ function collect(
     guardKeyPath(keyPath, path);
     edits.push({ key_path: keyPath, value: null });
   }
+}
+
+/**
+ * The indexed edits for a changed array, or `null` for "send it whole".
+ *
+ * **It answers `null` for every shape the daemon's narrow splice declines**,
+ * because an indexed path there would re-emit the enclosing property exactly as
+ * the whole-array send does while claiming a precision the wire does not have.
+ * The shapes that qualify are the ones that splice: a **same-length** array
+ * (a length change moves every item after it), whose every changed element is a
+ * **mapping**, differing only in **scalar leaves that were already there**,
+ * reached by mapping keys however deep. A changed *scalar element of a plain
+ * list* is the interesting exclusion: `["tags", "0"]` addresses a `- ` item,
+ * which has no key span to take the separator from, so the daemon re-emits the
+ * property — and for a list of scalars that re-emission is a one-line edit
+ * anyway, so the whole-array send costs nothing there.
+ *
+ * The qualifying test is about the **values**, not about how the document spells
+ * them, so an indexed path can still meet a daemon that declines to splice —
+ * inside a flow collection (`maps: [{name: a}]`), for one. That costs nothing:
+ * declining means re-emitting the enclosing property, which is exactly what
+ * sending the array whole would have produced.
+ */
+function indexedEdits(
+  keyPath: readonly string[],
+  before: readonly unknown[],
+  after: readonly unknown[],
+  path: string,
+): FrontmatterEditDto[] | null {
+  const edits: FrontmatterEditDto[] = [];
+  for (let at = 0; at < after.length; at += 1) {
+    const was = before[at];
+    const now = after[at];
+    if (sameValue(was, now)) continue;
+    if (!isBranch(was) || !isBranch(now)) return null;
+    const inner = scalarLeafEdits([...keyPath, String(at)], was, now, path);
+    if (inner === null) return null;
+    for (const edit of inner) edits.push(edit);
+  }
+  // Defensive: the arrays differ (the caller checked) but nothing addressable
+  // came out, so the honest send is the whole array.
+  return edits.length === 0 ? null : edits;
+}
+
+/**
+ * The edits inside one array element, or `null` if any of them is not a scalar
+ * set onto a scalar that is already there.
+ *
+ * An addition, a deletion, a value that became a collection, a value that was
+ * one, and a target that did not exist are each a shape the splice declines —
+ * and one declining edit is enough to make the whole array's worth of indexed
+ * paths pointless, which is why this refuses rather than emitting what it can.
+ */
+function scalarLeafEdits(
+  prefix: readonly string[],
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  path: string,
+): FrontmatterEditDto[] | null {
+  const edits: FrontmatterEditDto[] = [];
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    const was = Object.hasOwn(before, key) ? before[key] : undefined;
+    const now = Object.hasOwn(after, key) ? after[key] : undefined;
+    if (sameValue(was, now)) continue;
+    // An added or deleted key inside the element: not a value splice.
+    if (was === undefined || now === undefined) return null;
+    const keyPath = [...prefix, key];
+    if (isBranch(was) && isBranch(now)) {
+      const nested = scalarLeafEdits(keyPath, was, now, path);
+      if (nested === null) return null;
+      for (const edit of nested) edits.push(edit);
+      continue;
+    }
+    if (!isScalar(was) || !isScalar(now)) return null;
+    guardKeyPath(keyPath, path);
+    if (now === null) {
+      edits.push({ key_path: keyPath, set_null: true });
+      continue;
+    }
+    guardValue(now, keyPath, path);
+    edits.push({ key_path: keyPath, value: now as PatchValueDto });
+  }
+  return edits;
+}
+
+/** A leaf: what the daemon's splice calls a scalar, `null` included. */
+function isScalar(value: unknown): boolean {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  );
 }
 
 /** Refuse a key no `key_path` can name. A dot is fine; an empty segment is not. */

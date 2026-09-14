@@ -292,6 +292,32 @@ describe.skipIf(!BINARY_EXISTS)("the shim against a real vaultd", () => {
       );
     });
 
+    it("changes one line of a block list of maps, and leaves the sibling item alone", async () => {
+      // The fidelity this round exists for. Sending `maps` whole re-serializes
+      // the enclosing property, and the *untouched* second item comes back in
+      // flow style: four lines become two. Addressed by index, the edit is a
+      // scalar set onto a scalar that is already there under a mapping key —
+      // the one shape the daemon splices — so exactly one line moves and the
+      // rest of the file is byte-identical.
+      const source =
+        "---\ntitle: Keep\nmaps:\n  - name: a\n    value: 1\n  - name: b\n    value: 2\ntags:\n  - one\n  - two\n---\nbody text\n";
+      const config = vaultFor({ "A.md": source });
+      const { app, vault } = await shimOn(config);
+      const file = vault.getFileByPath("A.md") as TFile;
+      await app.fileManager.processFrontMatter(file, (fm) => {
+        ((fm["maps"] as Record<string, unknown>[])[0] as Record<string, unknown>)["value"] = 9;
+      });
+      const after = await vault.adapter.read("A.md");
+      expect(after).toBe(source.replace("    value: 1\n", "    value: 9\n"));
+      // Said the other way, so a future reflow cannot hide inside a passing
+      // equality: one line differs, and it is that one.
+      const changed = after
+        .split("\n")
+        .map((line, at) => [line, source.split("\n")[at]] as const)
+        .filter(([now, was]) => now !== was);
+      expect(changed).toEqual([["    value: 9", "    value: 1"]]);
+    });
+
     it("writes a YAML null with set_null and removes the key with value null", async () => {
       const config = vaultFor({ "A.md": "---\ntitle: Old\nkeep: yes\n---\nbody\n" });
       const { app, vault } = await shimOn(config);

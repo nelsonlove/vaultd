@@ -46,6 +46,11 @@ const CONFLICTED_SOURCE = "---\ntitle: Other\nkeep: yes\nnested:\n  inner: 1\n--
 const UNCHANGED_VAULT = { "A.md": "---\ntitle: Same\n---\nbody\n" };
 /** A key whose own name contains a dot, which the dotted wire form cannot reach. */
 const DOTTED_VAULT = { "A.md": "---\nmy.key: dotted\nplain: kept\n---\nbody\n" };
+/** A block-style list of maps beside a list of scalars: the two array shapes. */
+const INDEXED_VAULT = {
+  "A.md":
+    "---\ntitle: Keep\nmaps:\n  - name: a\n    value: 1\n  - name: b\n    value: 2\ntags:\n  - one\n  - two\n---\nbody\n",
+};
 const SHAPED_VAULT = {
   "A.md": "---\nlist:\n  - one\n  - two\nbranch:\n  leaf: 1\nplain: text\n---\nbody\n",
 };
@@ -68,6 +73,7 @@ const VAULTS = [
   FRONTMATTER_VAULT,
   UNCHANGED_VAULT,
   DOTTED_VAULT,
+  INDEXED_VAULT,
   SHAPED_VAULT,
   ONE_REFERRER_VAULT,
   TWO_REFERRERS_VAULT,
@@ -276,6 +282,51 @@ describe("FileManager.processFrontMatter", () => {
     ).rejects.toMatchObject({ code: "unrepresentable_frontmatter_value" });
     await harness.quiesce();
     expect(harness.pendingRequests()).toHaveLength(0);
+  });
+
+  it("addresses a changed leaf of a same-length list of maps by index", async () => {
+    // Sending the array whole re-serializes the enclosing property, which
+    // reflows the *untouched* sibling item too: four lines of block style
+    // become two of flow style. The indexed path is the one shape the daemon
+    // splices narrowly — a scalar set onto a scalar that is already there,
+    // reached as a mapping key — so the note changes by one line.
+    expect(await patchFor((fm) => {
+      ((fm["maps"] as Record<string, unknown>[])[0] as Record<string, unknown>)["value"] = 9;
+    })).toEqual([{ key_path: ["maps", "0", "value"], value: 9 }]);
+  });
+
+  it("sends an array whole whenever an indexed path would not splice", async () => {
+    // Every one of these is a shape the daemon's narrow splice declines, so
+    // addressing it by index would produce the same re-emitted property while
+    // claiming a precision the wire does not have.
+    //
+    // A length change: the items after it have all moved.
+    expect(await patchFor((fm) => {
+      (fm["tags"] as unknown[]).push("three");
+    })).toEqual([{ key_path: ["tags"], value: ["one", "two", "three"] }]);
+    // A scalar element of a plain list: a `- ` item has no key to hang the
+    // splice on, so `tags.0` re-emits the property.
+    expect(await patchFor((fm) => {
+      (fm["tags"] as unknown[])[0] = "ONE";
+    })).toEqual([{ key_path: ["tags"], value: ["ONE", "two"] }]);
+    // A key added inside an item: the target does not exist yet.
+    expect(await patchFor((fm) => {
+      ((fm["maps"] as Record<string, unknown>[])[0] as Record<string, unknown>)["extra"] = true;
+    })).toEqual([
+      { key_path: ["maps"], value: [{ name: "a", value: 1, extra: true }, { name: "b", value: 2 }] },
+    ]);
+    // A key deleted inside an item: a deletion removes a key from a mapping,
+    // which is not a value splice.
+    expect(await patchFor((fm) => {
+      delete ((fm["maps"] as Record<string, unknown>[])[0] as Record<string, unknown>)["name"];
+    })).toEqual([{ key_path: ["maps"], value: [{ value: 1 }, { name: "b", value: 2 }] }]);
+    // A leaf that became a collection: its block layout depends on where it
+    // lands, so the daemon re-emits.
+    expect(await patchFor((fm) => {
+      ((fm["maps"] as Record<string, unknown>[])[0] as Record<string, unknown>)["value"] = [1, 2];
+    })).toEqual([
+      { key_path: ["maps"], value: [{ name: "a", value: [1, 2] }, { name: "b", value: 2 }] },
+    ]);
   });
 
   it("re-reads and re-runs the callback after a revision conflict", async () => {
@@ -786,6 +837,25 @@ describe("FileManager: the rest of the surface", () => {
     expect(harness.pendingRequests()).toHaveLength(0);
   });
 });
+
+/**
+ * One `processFrontMatter` call over {@link INDEXED_VAULT}, answered, with the
+ * patch it sent handed back.
+ *
+ * A harness per call, because answering the refetch replaces the note's row and
+ * a second patch would then diff against an empty frontmatter.
+ */
+async function patchFor(fn: (frontmatter: Record<string, unknown>) => void): Promise<unknown[]> {
+  const harness = await ShimHarness.withVault(INDEXED_VAULT);
+  const file = harness.vault.getFileByPath("A.md") as TFile;
+  const pending = harness.app.fileManager.processFrontMatter(file, fn);
+  const sent = await harness.expectRequest("patch_frontmatter");
+  const patch = (sent.request.params as { patch: unknown[] }).patch;
+  harness.respondOk(sent.id, "patch_frontmatter", { generation: 2, revision: "blake3:patched" });
+  await harness.answerRefetch(2, [{ path: "A.md", revision: "blake3:patched" }]);
+  await pending;
+  return patch;
+}
 
 /** A parsed row as the refetch answer wants it. */
 function asFixtureNote(row: MirrorNoteRow): FixtureNote {
