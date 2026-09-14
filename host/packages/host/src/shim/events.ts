@@ -25,6 +25,8 @@
  *    instead, and every registration made inside it is owned by that plugin.
  */
 
+import { stub } from "./policy";
+
 /** Anything a shim event hands its listeners. Obsidian's own signature is untyped. */
 export type EventCallback = (...data: never[]) => unknown;
 
@@ -243,5 +245,174 @@ export class Events {
 
   protected prefix(): string {
     return "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The recording menu (Task 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a plugin may pass to {@link MenuItem.setTitle}.
+ *
+ * Obsidian's own signature is `string | DocumentFragment`. This host compiles
+ * against `lib: es2023` with no DOM, so the fragment arm is spelled
+ * structurally: anything carrying a `textContent`. A plugin that builds its
+ * title out of nodes therefore still gets a title, and the harvest still has a
+ * string to report, rather than the shim throwing on a type it cannot name.
+ */
+export type MenuTitle = string | { readonly textContent?: string | null };
+
+/** The string form of whatever a plugin handed {@link MenuItem.setTitle}. */
+function titleTextOf(title: MenuTitle): string {
+  if (typeof title === "string") return title;
+  return title.textContent ?? "";
+}
+
+/**
+ * One item a plugin added to a menu, recorded rather than drawn.
+ *
+ * Every setter returns `this` because plugins chain them, and every one of them
+ * is really stored: the harvest reports the title, icon, section and checked
+ * state a plugin asked for, and {@link invoke} calls the very closure it
+ * registered. Nothing here is a stub — a context menu is one of the two places
+ * (commands being the other) where a GUI-less host can still do the whole of
+ * what the plugin meant.
+ */
+export class MenuItem {
+  private titleValue = "";
+  private iconValue: string | null = null;
+  private sectionValue: string | null = null;
+  private checkedValue: boolean | null = null;
+  private disabledValue = false;
+  private isLabelValue = false;
+  private click: ((evt: unknown) => unknown) | null = null;
+
+  get title(): string {
+    return this.titleValue;
+  }
+
+  get icon(): string | null {
+    return this.iconValue;
+  }
+
+  get section(): string | null {
+    return this.sectionValue;
+  }
+
+  get checked(): boolean | null {
+    return this.checkedValue;
+  }
+
+  get disabled(): boolean {
+    return this.disabledValue;
+  }
+
+  get isLabel(): boolean {
+    return this.isLabelValue;
+  }
+
+  setTitle(title: MenuTitle): this {
+    this.titleValue = titleTextOf(title);
+    return this;
+  }
+
+  setIcon(icon: string | null): this {
+    this.iconValue = icon;
+    return this;
+  }
+
+  setSection(section: string): this {
+    this.sectionValue = section;
+    return this;
+  }
+
+  setChecked(checked: boolean | null): this {
+    this.checkedValue = checked;
+    return this;
+  }
+
+  setDisabled(disabled: boolean): this {
+    this.disabledValue = disabled;
+    return this;
+  }
+
+  setIsLabel(isLabel: boolean): this {
+    this.isLabelValue = isLabel;
+    return this;
+  }
+
+  onClick(callback: (evt: unknown) => unknown): this {
+    this.click = callback;
+    return this;
+  }
+
+  /**
+   * Run this item's `onClick`, as a chooser picking it would.
+   *
+   * It `await`s the result, so an item whose handler is async has finished by
+   * the time the host answers whoever asked for the click. An item with no
+   * handler — a label, a separator's neighbour — is a no-op rather than a
+   * throw.
+   */
+  async invoke(evt?: unknown): Promise<void> {
+    if (this.click === null) return;
+    await this.click(evt);
+  }
+}
+
+/**
+ * The menu a `file-menu` or `editor-menu` handler is handed.
+ *
+ * Obsidian's `Menu` draws itself; this one records. A plugin adds its items
+ * exactly as it always has, and what would have been pixels is instead a list
+ * something outside the process can read and pick from.
+ *
+ * **Built fresh for every listing and every invocation.** A plugin's item text
+ * and its `onClick` closure both close over the file the menu was opened for,
+ * so caching the items from one listing and firing them later would run a
+ * handler bound to a stale file.
+ */
+export class Menu {
+  private readonly entries: MenuItem[] = [];
+
+  addItem(callback: (item: MenuItem) => unknown): this {
+    const item = new MenuItem();
+    callback(item);
+    this.entries.push(item);
+    return this;
+  }
+
+  /**
+   * Separators are dropped rather than recorded.
+   *
+   * The items are addressed by their ordinal, and a chooser has nothing to do
+   * with a divider — recording one would shift every id after it for a thing
+   * nobody can pick.
+   */
+  addSeparator(): this {
+    return this;
+  }
+
+  setNoIcon(): this {
+    return this;
+  }
+
+  showAtMouseEvent(evt: unknown): this {
+    void evt;
+    return stub("Menu.showAtMouseEvent", this);
+  }
+
+  showAtPosition(position: unknown): this {
+    void position;
+    return stub("Menu.showAtPosition", this);
+  }
+
+  hide(): this {
+    return this;
+  }
+
+  items(): readonly MenuItem[] {
+    return [...this.entries];
   }
 }

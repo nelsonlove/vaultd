@@ -13,9 +13,14 @@ import { join } from "node:path";
  * five one-line delegations and exists so nothing else under `src/` ever names
  * `setTimeout` directly.
  *
- * Plugin-facing timers (`window.setInterval`, `registerInterval`) deliberately
- * use the **real** globals: a plugin observing a frozen clock is a plugin
- * observing a lie. They are cleaned up by the component registry instead.
+ * **Plugin-facing timers come from here too** (`window.setInterval`,
+ * `registerInterval`) — corrected in Task 10, where an earlier draft had them
+ * using the real globals on the grounds that a plugin observing a frozen clock
+ * is a plugin observing a lie. A plugin cannot tell which clock armed its
+ * callback, and a host whose own timers it cannot count is a host that cannot
+ * report them: `shim/timers.ts` arms every one of them on this clock, records
+ * the cadence for the harvest, and the component registry still clears them on
+ * unload.
  */
 export interface Clock {
   now(): number;

@@ -18,15 +18,18 @@
  *
  * The fields land as their tasks build them, and this comment is the map:
  * Task 7 added `vault`, Task 8 adds `metadataCache`, Task 9 `fileManager`,
- * Task 11a `workspace` (it is Task 11a that builds `workspace.ts` and
- * `WorkspaceLeaf`, not Task 10 — the old Task 11 split into 11a and 11b and
- * this line did not follow), Task 12 `plugins`, `internalPlugins`, `commands`,
+ * Task 10 `workspace` — seeded rather than built: Task 11a still owns the real
+ * workspace (`WorkspaceLeaf`, the active file, the layout-ready latch) and
+ * extends the same class, but a `file-menu` hook is registered through
+ * `app.workspace.on` inside `onload`, so Task 10's harvest needed the field one
+ * task earlier — Task 12 `plugins`, `internalPlugins`, `commands`,
  * `keymap`, `scope`, `setting` and `foldManager`. Nothing here is re-decided later — a task adds its field and
  * the assembler's one assignment, and that is all.
  */
 import type { FileManager } from "./file-manager";
 import type { MetadataCache } from "./metadata-cache";
 import type { Vault } from "./vault";
+import type { Workspace } from "./workspace";
 
 export class App {
   /**
@@ -73,6 +76,18 @@ export class App {
    * them all final.
    */
   fileManager!: FileManager;
+
+  /**
+   * `app.workspace` — filled by `assembleShim`, exactly once.
+   *
+   * **Seeded by Task 10, expanded by Task 11a.** The field was always Task
+   * 11a's, but a plugin registers its context-menu hook with
+   * `app.workspace.on("file-menu", ...)` inside `onload`, so the harvest needed
+   * something to register against one task earlier. What Task 10 assigns is the
+   * menu-hook half of the real surface; Task 11a adds the leaves, the active
+   * file, and the layout-ready latch to the same class.
+   */
+  workspace!: Workspace;
 
   constructor(options: { appId: string }) {
     this.appId = options.appId;

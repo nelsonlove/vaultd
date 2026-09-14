@@ -34,9 +34,10 @@ import type { AppliedBatch } from "../shim/files";
 import type { PolicyRecorder } from "../shim/policy";
 import type { Vault, WriteGate } from "../shim/vault";
 import type { FixtureEntry } from "./mirror-harness";
-// activated by Task 10: import type { Plugin, PluginManifest } from "../shim/plugin";
-// activated by Task 10: import type { Harvest, HarvestedMenuItem } from "../shim/harvest";
-// activated by Task 10: import type { ObsidianApi } from "../shim/api";
+import type { HostAssembly } from "./assemble";
+import type { Plugin, PluginManifest } from "../shim/plugin";
+import type { Harvest, HarvestedMenuItem, MenuContext } from "../shim/harvest";
+import type { ObsidianApi } from "../shim/api";
 // activated by Task 11b: import type { NoticeLog } from "../shim/notice";
 
 export interface ShimHarnessOptions {
@@ -63,15 +64,28 @@ export class ShimHarness extends MirrorHarness {
   readonly vault!: Vault;
   readonly policyRecorder!: PolicyRecorder;
   readonly writes!: WriteGate;
-  // activated by Task 10:  readonly api!: ObsidianApi;
-  //   Task 10's own cases write `class extends harness.api.Plugin`, so the
-  //   barrel `shim/api.ts` (Task 11b) has to be reachable by then — which is
-  //   why this says 10 and not 11b: it is the task that first calls it.
-  // activated by Task 10:  readonly harvest!: Harvest;
+  /**
+   * The `obsidian` module a plugin resolves.
+   *
+   * Task 10's own cases write `class extends harness.api.Plugin`, so the barrel
+   * `shim/api.ts` had to be reachable by then — which is why it is created
+   * there and only filled in by Task 11b.
+   */
+  readonly api!: ObsidianApi;
+  readonly harvest!: Harvest;
   // activated by Task 11b: readonly noticeLog!: NoticeLog;
   /** The specifiers a plugin bundle may resolve to the host's own modules. */
   readonly hostModulePaths: readonly string[] = ["obsidian", "electron", "@electron/remote"];
 
+  /**
+   * The whole assembly, kept because a plugin's lifecycle needs two pieces of
+   * it that no shim surface exposes: the {@link DispatchQueue} every entry
+   * point runs through, and the event bus whose attribution window makes a
+   * registration the plugin's own.
+   */
+  private assembly!: HostAssembly;
+  /** The plugins this harness has instantiated, by id. */
+  private readonly plugins = new Map<string, Plugin>();
   private readonly configFiles = new Map<string, string>();
   private readonly sources = new Map<string, string>();
   /** The paths the auto-server answers. Everything else is answered by hand. */
@@ -95,14 +109,15 @@ export class ShimHarness extends MirrorHarness {
       clock: this.clock,
     });
     const mutable = this as {
-      -readonly [K in "app" | "vault" | "policyRecorder" | "writes"]: ShimHarness[K];
+      -readonly [K in "app" | "vault" | "policyRecorder" | "writes" | "api" | "harvest"]: ShimHarness[K];
     };
+    this.assembly = assembly;
     mutable.app = assembly.app;
     mutable.vault = assembly.app.vault;
     mutable.policyRecorder = assembly.policyRecorder;
     mutable.writes = assembly.writes;
-    // activated by Task 10:  mutable.api = assembly.api;
-    // activated by Task 10:  mutable.harvest = assembly.harvest;
+    mutable.api = assembly.api;
+    mutable.harvest = assembly.harvest;
     // activated by Task 11b: mutable.noticeLog = assembly.noticeLog;
   }
 
@@ -174,9 +189,81 @@ export class ShimHarness extends MirrorHarness {
     this.autoServeFiles({ [path]: contents });
   }
 
-  // activated by Task 10: manifestFor / instantiate / load / unload — every one
-  // of them names `Plugin` or `PluginManifest` from `../shim/plugin`, which
-  // that task creates.
+  /** A manifest for a plugin that has no `manifest.json`, as most cases do. */
+  manifestFor(id: string): PluginManifest {
+    return {
+      id,
+      name: id,
+      version: "0.0.0",
+      minAppVersion: "1.0.0",
+      description: `the ${id} fixture plugin`,
+      author: "vaultd host tests",
+      isDesktopOnly: false,
+      dir: `${this.config.configDirName}/plugins/${id}`,
+    };
+  }
+
+  /**
+   * Build one plugin, exactly as the real loader will: `new ctor(app, manifest)`.
+   *
+   * It also declares the plugin's `data.json` **absent**, unless a case
+   * supplied one through `configFiles`. A plugin with no saved data is the
+   * ordinary case, `not_found` is what the daemon says about it, and a path
+   * nothing answers would otherwise sit in the request queue — so the first
+   * `loadData()` would hang instead of answering `null`.
+   */
+  instantiate<T extends Plugin>(
+    id: string,
+    ctor: new (app: App, manifest: PluginManifest) => T,
+  ): T {
+    const dataPath = `${this.config.configDirName}/plugins/${id}/data.json`;
+    if (!this.configFiles.has(dataPath)) this.unserveFile(dataPath);
+    const plugin = new ctor(this.app, this.manifestFor(id));
+    this.plugins.set(id, plugin);
+    return plugin;
+  }
+
+  /**
+   * Drive one plugin's `onload` the way the host will.
+   *
+   * Through the {@link DispatchQueue}, so `currentPluginId()` answers for the
+   * whole of it and every policy hit is attributed; and inside the bus's
+   * attribution window, so every listener the plugin registers is owned by it
+   * and can be dropped again on unload.
+   */
+  async load(plugin: Plugin): Promise<void> {
+    const id = plugin.manifest.id;
+    this.plugins.set(id, plugin);
+    await this.assembly.queue.run(id, `${id}:onload`, async () => {
+      await this.assembly.events.attributingTo(id, () => plugin.load());
+    });
+    await this.quiesce();
+  }
+
+  /**
+   * Unload one plugin, completely.
+   *
+   * Three steps, and a quarantine needs all three: `onunload` plus the
+   * component teardown (the plugin's own), every listener it registered
+   * (`detachOwner`), and its whole harvest. A plugin that kept either of the
+   * last two could still be invoked, or still be woken by a vault change, after
+   * the host had decided it was gone.
+   *
+   * Unloading a plugin this harness does not hold is a no-op rather than a
+   * throw: a second unload is ordinary, and `Component.unload` is idempotent
+   * for the same reason.
+   */
+  async unload(id: string): Promise<void> {
+    const plugin = this.plugins.get(id);
+    if (plugin === undefined) return;
+    this.plugins.delete(id);
+    await this.assembly.queue.run(id, `${id}:onunload`, () => {
+      plugin.unload();
+    });
+    this.assembly.events.detachOwner(id);
+    this.harvest.forgetPlugin(id);
+    await this.quiesce();
+  }
 
   /**
    * Fire `layout-ready`, once.
@@ -299,14 +386,96 @@ export class ShimHarness extends MirrorHarness {
     await this.quiesce();
   }
 
-  // activated by Task 10:  listMenuItems / invokeMenuItem — both go through
-  // `Harvest`, which that task creates.
-  // activated by Task 10:  invokeProtocol — `ObsidianApi.protocolHandlers`.
+  /**
+   * Build every plugin's menu for `path` and report the items.
+   *
+   * The menu is built from scratch on every call, which is the whole point: a
+   * plugin's item text and its `onClick` both close over the file, so a listing
+   * kept from an earlier call would describe a different file's menu.
+   */
+  async listMenuItems(context: MenuContext, path: string): Promise<readonly HarvestedMenuItem[]> {
+    const subject = this.menuSubject(context, path);
+    return await this.assembly.queue.run(null, `menu:${context}:${path}`, () =>
+      this.harvest.listMenuItems(context, subject),
+    );
+  }
+
+  /**
+   * Pick one harvested menu item, as a chooser outside the process would.
+   *
+   * The menu is rebuilt for this call rather than reused from the listing, so
+   * the handler that runs is the one bound to *this* file.
+   */
+  async invokeMenuItem(id: string, path: string): Promise<void> {
+    const context = menuContextOf(id);
+    const found = this.harvest.menuItemFor(id, this.menuSubject(context, path));
+    if (found === null) throw new Error(`no harvested menu item ${id}`);
+    await this.assembly.queue.run(found.pluginId, `menu-item:${id}`, () => found.item.invoke());
+    await this.quiesce();
+  }
+
+  /**
+   * Deliver an `obsidian://` action to the plugin that registered it.
+   *
+   * `{ action, ...params }` is the shape Obsidian hands a protocol handler —
+   * the action is in the params — and plugins read it.
+   */
+  async invokeProtocol(action: string, params: Record<string, string> = {}): Promise<void> {
+    const found = this.harvest.protocolHandlerFor(action);
+    if (found === null) throw new Error(`no harvested protocol handler for ${action}`);
+    await this.assembly.queue.run(found.pluginId, `protocol:${action}`, () =>
+      found.handler({ action, ...params }),
+    );
+    await this.quiesce();
+  }
+
   // activated by Task 11a: openFileIntents — it reads state that exists only
   // once Task 11a builds `WorkspaceLeaf.openFile`.
-  // activated by Task 10:  activeTimerCount — `ObsidianApi.components`. It
-  // counts plugin-registered timers, which deliberately use the real globals
-  // rather than the `TestClock`, and are cleaned up by the component registry.
+
+  /**
+   * How many plugin-facing timers are armed.
+   *
+   * Every timer in this host — the host's own and the ones a plugin arms
+   * through `window.setInterval` — goes through the injected clock, so a leaked
+   * interval is a number a case can assert on rather than a process that will
+   * not exit.
+   */
+  activeTimerCount(): number {
+    return this.clock.armed();
+  }
+
+  /**
+   * What a menu handler is called with after the menu itself.
+   *
+   * `file-menu` gets `(file, source)`, which is Obsidian's own shape and which
+   * plugins branch on — a plugin that only adds its item for the file explorer
+   * would add nothing at all if the source were omitted. `editor-menu` gets
+   * `(editor, view)`, and this host has neither yet: Task 11a supplies the real
+   * pair, and until then the view carries the file so a handler that only reads
+   * `view.file` still works.
+   */
+  private menuSubject(context: MenuContext, path: string): readonly unknown[] {
+    const file = this.vault.getAbstractFileByPath(path);
+    if (file === null) throw new Error(`${path} is not in this harness's vault`);
+    if (context === "file-menu") return [file, "file-explorer-context-menu"];
+    return [{ headless: true }, { file }];
+  }
+}
+
+/**
+ * Which menu an item id belongs to.
+ *
+ * An item id is `<pluginId>:<context>:<hookOrdinal>:<itemOrdinal>`, so the
+ * context is the third segment from the right — read from the right because a
+ * plugin id is the only part that could itself contain a colon.
+ */
+function menuContextOf(id: string): MenuContext {
+  const segments = id.split(":");
+  const context = segments[segments.length - 3];
+  if (context !== "file-menu" && context !== "editor-menu") {
+    throw new Error(`${id} does not name a menu item`);
+  }
+  return context;
 }
 
 /** Every folder above `path`, as a fixture row. */

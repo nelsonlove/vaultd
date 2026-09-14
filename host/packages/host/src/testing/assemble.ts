@@ -24,14 +24,17 @@ import { MetadataCache } from "../shim/metadata-cache";
 import { DispatchQueue } from "../runtime/queue";
 import { setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
+import { Harvest } from "../shim/harvest";
+import { Workspace } from "../shim/workspace";
+import { createObsidianApi } from "../shim/api";
+import { installPluginHost } from "../shim/plugin";
 import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
+import type { ObsidianApi } from "../shim/api";
 import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
 import type { WriteGate } from "../shim/vault";
 // activated by Task 13:  import { registerElectronStub } from "../runtime/electron-registry";
-// activated by Task 11b: import { ObsidianApi } from "../shim/api";
-// activated by Task 10:  import { Harvest } from "../shim/harvest";
 // activated by Task 11b: import { NoticeLog } from "../shim/notice";
 //
 // `WriteGate` is declared in `../shim/vault` until Task 19 creates
@@ -58,10 +61,16 @@ export interface HostAssembly {
   readonly policyRecorder: PolicyRecorder;
   readonly app: App;
   readonly writes: WriteGate;
-  // activated by Task 10:  readonly harvest: Harvest;
+  readonly harvest: Harvest;
   // activated by Task 11b: readonly noticeLog: NoticeLog;
-  // activated by Task 11b: readonly api: ObsidianApi;
-  //   The Task 11b barrel: the module object a plugin bundle resolves to.
+  /**
+   * The module object a plugin bundle resolves `obsidian` to.
+   *
+   * Bound minimally in Task 10 — it is that task's tests that first write
+   * `class extends api.Plugin` — and filled in by Task 11b's policy-driven
+   * walk. It is last in the assembly because it names every surface above it.
+   */
+  readonly api: ObsidianApi;
 }
 
 /**
@@ -171,8 +180,11 @@ export function assembleShim(deps: {
   // it moves and the metadata cache's resolver for the links it composes.
   const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
   // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
-  // activated by Task 10:  const harvest = new Harvest();
-  // activated by Task 11b: const api = new ObsidianApi({ ... });
+  // The harvest holds nothing but its own rows, so it is built before the
+  // surfaces that write into it. The workspace needs it at construction — its
+  // `on` records menu hooks — which is why it comes first of the two.
+  const harvest = new Harvest();
+  const workspace = new Workspace({ events, harvest });
 
   // The assign-once step. `App` is a mutable container precisely so this can
   // happen after every surface exists; a plugin never sees the gap, because no
@@ -180,8 +192,14 @@ export function assembleShim(deps: {
   assignOnce(app, "vault", vault);
   assignOnce(app, "metadataCache", metadataCache);
   assignOnce(app, "fileManager", fileManager);
+  assignOnce(app, "workspace", workspace);
 
-  return {
+  // Everything a `Plugin` needs that its two constructor arguments cannot
+  // carry. Installed against the `App`, keyed by it, so two hosts in one
+  // process never read each other's wiring — see `shim/plugin.ts`.
+  installPluginHost(app, { config, client, writes, harvest, events, queue, clock });
+
+  const assembled = {
     config,
     clock,
     client,
@@ -191,7 +209,12 @@ export function assembleShim(deps: {
     policyRecorder,
     app,
     writes,
+    harvest,
   };
+  // Last, and built from the assembly itself: the barrel binds this host's
+  // clock into the timer functions a plugin calls, so a test advancing its own
+  // clock sees its own plugin's intervals fire.
+  return { ...assembled, api: createObsidianApi(assembled) };
 }
 
 /**
