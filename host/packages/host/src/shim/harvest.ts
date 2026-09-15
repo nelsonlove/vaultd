@@ -105,6 +105,18 @@ export interface HarvestedUnreachable {
   readonly pluginId: string;
   readonly kind:
     | "dom_delegated_menu"
+    /**
+     * A `window` listener for anything but a context menu.
+     *
+     * Added in Task 11a, beside `dom_delegated_menu` rather than folded into
+     * it, because the two answer different questions. A delegated context-menu
+     * listener is a *capability a user could have reached* and Task 14's bundle
+     * scan works out what it would have offered; an ordinary listener —
+     * `keydown`, `pointerup`, `resize` — is not a capability at all, and
+     * counting it as one would inflate the number the compatibility report
+     * exists to be honest about. `detail` is the event type either way.
+     */
+    | "dom_listener"
     | "view"
     | "editor_extension"
     | "code_block_processor"
@@ -283,6 +295,20 @@ export class Harvest {
 
   recordUnreachable(row: HarvestedUnreachable): void {
     this.unreachableRows.push(row);
+  }
+
+  /**
+   * Drop one unreachable row, by the identity of the row that was recorded.
+   *
+   * By identity rather than by value, because a plugin may register the same
+   * event type twice and withdraw one of them — the same distinction `off` and
+   * `offref` draw for listeners. A row that was never recorded, or was already
+   * withdrawn, is a no-op: `removeEventListener` for something never added is
+   * ordinary plugin code, not an error.
+   */
+  forgetUnreachable(row: HarvestedUnreachable): void {
+    const at = this.unreachableRows.indexOf(row);
+    if (at !== -1) this.unreachableRows.splice(at, 1);
   }
 
   // --- Invoking --------------------------------------------------------------

@@ -169,10 +169,22 @@ export function assembleShim(deps: {
   client: VaultdClient;
   mirror: Mirror;
   clock: Clock;
+  /**
+   * Where this host may write its own state — `localStorage` today.
+   *
+   * A parameter rather than `config.dataDir`, because the default config's
+   * value is `$XDG_STATE_HOME/vaultd-host`: a harness assembled from it would
+   * persist into the developer's home directory, and two test files would share
+   * one document. Task 22's `main.ts` passes the real path; every harness
+   * passes a fresh directory of its own. Omitting it falls back to the config,
+   * which is what a caller that really means the real one is saying.
+   */
+  dataDir?: string;
   writes?: WriteGate;
   policyRecorder?: PolicyRecorder;
 }): HostAssembly {
   const { config, client, mirror, clock } = deps;
+  const dataDir = deps.dataDir ?? config.dataDir;
   // activated by Task 13: registerElectronStub(...). It is registered *first*,
   // before anything that could load a plugin bundle, because a bundle that
   // resolves `electron` before the stub is in place gets the real module or a
@@ -190,27 +202,11 @@ export function assembleShim(deps: {
   setPolicyRecorder(policyRecorder);
   const queue = new DispatchQueue();
   const writes = deps.writes ?? forwardingWriteGate(client);
-  const app = new App({ appId: appIdFor(config.vaultRoot) });
-  // Straight after the `App` and before anything else, for the same reason the
-  // electron stub goes first: a plugin bundle reads `globalThis.app`,
-  // `window.moment` and `document` while its *module* is still evaluating —
-  // before any instance exists to hand an `App` to — so the globals have to be
-  // standing before a bundle can be loaded. The `App`'s own surfaces land a few
-  // lines below, and nothing reads them in between: only the assembler is
-  // running.
-  const globals = installGlobals(app, config);
-  const vault = new Vault({ config, client, mirror, events, writes, queue });
-  // After the vault, because it resolves link paths to the `TFile` instances
-  // the vault's index owns — and it reads that index rather than holding a
-  // copy, so a file the vault renames is the same object this answers with.
-  const metadataCache = new MetadataCache({ mirror, events, index: vault.index });
-  // Third, because it reads both of the others: the vault's index for the files
-  // it moves and the metadata cache's resolver for the links it composes.
-  const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
-  // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
-  // The harvest holds nothing but its own rows, so it is built before the
-  // surfaces that write into it. The workspace needs it at construction — its
-  // `on` records menu hooks — which is why it comes first of the two.
+  // The error sink and the harvest are built here, above every surface that
+  // writes into them, because the globals need both: a torn `localStorage`
+  // document is reported to the first, and a `window` listener nothing can
+  // deliver to is recorded in the second. Neither reads anything during
+  // construction, so moving them up costs nothing.
   //
   // A menu hook that throws is reported to the same sink a plugin's teardown
   // failures go to. Without the wiring the `Harvest` would catch the throw and
@@ -222,6 +218,26 @@ export function assembleShim(deps: {
       errors.report(failure.error, failure.pluginId, "menu-hook");
     },
   });
+  const app = new App({ appId: appIdFor(config.vaultRoot) });
+  // Straight after the `App` and before anything else, for the same reason the
+  // electron stub goes first: a plugin bundle reads `globalThis.app`,
+  // `window.moment` and `document` while its *module* is still evaluating —
+  // before any instance exists to hand an `App` to — so the globals have to be
+  // standing before a bundle can be loaded. The `App`'s own surfaces land a few
+  // lines below, and nothing reads them in between: only the assembler is
+  // running.
+  const globals = installGlobals(app, config, { dataDir, errors, harvest, clock });
+  const vault = new Vault({ config, client, mirror, events, writes, queue });
+  // After the vault, because it resolves link paths to the `TFile` instances
+  // the vault's index owns — and it reads that index rather than holding a
+  // copy, so a file the vault renames is the same object this answers with.
+  const metadataCache = new MetadataCache({ mirror, events, index: vault.index });
+  // Third, because it reads both of the others: the vault's index for the files
+  // it moves and the metadata cache's resolver for the links it composes.
+  const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
+  // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
+  // The workspace needs the harvest at construction — its `on` records menu
+  // hooks — and the harvest is built above, with the error sink.
   const workspace = new Workspace({ events, harvest });
 
   // The assign-once step. `App` is a mutable container precisely so this can

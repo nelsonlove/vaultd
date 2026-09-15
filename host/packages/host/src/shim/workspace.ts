@@ -505,6 +505,13 @@ declarePolicy("Workspace.getLeavesOfType", "safe_stub");
 declarePolicy("Workspace.iterateAllLeaves", "safe_stub");
 declarePolicy("Workspace.getLastOpenFiles", "safe_stub");
 declarePolicy("Workspace.registerHoverLinkSource", "safe_stub");
+// `harvested` for the two open paths, with one caveat a reader of the table is
+// owed: "harvested" elsewhere in this host means "recorded as something a
+// caller can invoke by name" — a command, a menu item, a protocol action. An
+// open intent is recorded and readable but not invokable; there is nothing to
+// invoke, because the host answered the call by writing it down. It is
+// `harvested` rather than `safe_stub` because a `safe_stub` keeps nothing,
+// and something outside the process really can act on these rows.
 declarePolicy("Workspace.openLinkText", "harvested");
 declarePolicy("WorkspaceLeaf.openFile", "harvested");
 declarePolicy("WorkspaceLeaf.setViewState", "safe_stub");
@@ -513,3 +520,15 @@ declarePolicy("WorkspaceLeaf.getViewState", "safe_stub");
 declarePolicy("WorkspaceLeaf.getDisplayText", "safe_stub");
 declarePolicy("WorkspaceLeaf.setEphemeralState", "safe_stub");
 declarePolicy("WorkspaceLeaf.getEphemeralState", "safe_stub");
+
+// The classes themselves, so `policyOf` does not answer `absent` for a name
+// this host really does bind. A class whose whole job is to be an `instanceof`
+// target is a `safe_stub`: it is there, and it does nothing. `Workspace` is the
+// exception — it really keeps the latch, the active file and the menu hooks.
+declarePolicy("Workspace", "implemented");
+declarePolicy("WorkspaceLeaf", "safe_stub");
+declarePolicy("View", "safe_stub");
+declarePolicy("ItemView", "safe_stub");
+declarePolicy("FileView", "safe_stub");
+declarePolicy("EditableFileView", "safe_stub");
+declarePolicy("MarkdownView", "safe_stub");

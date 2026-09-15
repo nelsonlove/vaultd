@@ -24,9 +24,12 @@
  *   there would issue reads nothing can answer.
  */
 
+import { join, resolve } from "node:path";
+
 import { assembleShim } from "./assemble";
 import { FixtureVault } from "./fixture-vault";
 import { MirrorHarness } from "./mirror-harness";
+import { fs } from "../runtime/fs-access";
 import type { HostConfig } from "../config";
 import type { MirrorChangeBatch } from "../mirror/types";
 import type { App } from "../shim/app";
@@ -43,6 +46,22 @@ import type { ObsidianApi } from "../shim/api";
 // activated by Task 11b: import type { NoticeLog } from "../shim/notice";
 
 export interface ShimHarnessOptions {
+  /**
+   * Where this harness's host may write its own state.
+   *
+   * **Defaults to a fresh directory under the repository's `target/tmp`**, and
+   * that default is a safety rail rather than a convenience: the host persists
+   * `localStorage` through `DataDir`, and `HostConfig.dataDir` is
+   * `$XDG_STATE_HOME/vaultd-host` — so a harness that took the config's value
+   * would write into the developer's home directory the first time a case
+   * called `setItem`, and two test files would share one document with no
+   * isolation between them. Fresh per harness, so no two cases can see each
+   * other's stored values either.
+   *
+   * `test/shim-dom.test.ts` holds the guard that fails if this ever resolves
+   * under the real state directory.
+   */
+  dataDir?: string;
   /** Default `true`: most tests want a shim that has finished starting. */
   layoutReady?: boolean;
   /** Default `true`, and ignored by a fixture with no note sources to read. */
@@ -105,7 +124,9 @@ export class ShimHarness extends MirrorHarness {
   private layoutReady: boolean;
 
   protected constructor(options: ShimHarnessOptions) {
-    super(options.config ?? {});
+    // The data dir goes in **first**, so an explicit `config.dataDir` from a
+    // case still wins: the spread that follows overwrites it.
+    super({ dataDir: options.dataDir ?? freshDataDir(), ...(options.config ?? {}) });
     this.layoutReady = options.layoutReady ?? true;
     for (const [path, contents] of Object.entries(options.configFiles ?? {})) {
       this.configFiles.set(path, contents);
@@ -119,6 +140,7 @@ export class ShimHarness extends MirrorHarness {
       client: this.client,
       mirror: this.mirror,
       clock: this.clock,
+      dataDir: this.config.dataDir,
     });
     const mutable = this as {
       -readonly [K in "app" | "vault" | "policyRecorder" | "writes" | "api" | "harvest"]: ShimHarness[K];
@@ -521,6 +543,69 @@ function ancestorFoldersOf(path: string): { path: string; kind: "folder" }[] {
     cut = path.lastIndexOf("/", cut - 1);
   }
   return folders;
+}
+
+/**
+ * A directory no other harness has, under the repository's own `target/tmp`.
+ *
+ * Inside the worktree on purpose: a test suite that writes outside the tree it
+ * was checked out into is the one class of defect a suite must not have, and
+ * `target/` is where this repository already puts build scratch, so a `cargo
+ * clean` sweeps these with everything else.
+ *
+ * `mkdtemp` rather than a counter, because test files run in separate forked
+ * processes: a name built from a counter would collide the moment two forks
+ * reached the same case number, and the collision would be two harnesses
+ * sharing one stored document — exactly the isolation this exists to give.
+ * The call goes through the fs seam like every other file-system call under
+ * `src/`, so the write guard can see it.
+ */
+function freshDataDir(): string {
+  const root = resolve(__dirname, "..", "..", "..", "..", "..", "target", "tmp");
+  fs.mkdirSync(root, { recursive: true });
+  sweepStaleDataDirs(root);
+  return fs.mkdtempSync(join(root, PREFIX));
+}
+
+/** The name every harness data dir starts with, and the sweep matches on. */
+const PREFIX = "host-state-";
+/** Old enough that nothing a live run made can be caught by the sweep. */
+const STALE_MS = 6 * 60 * 60 * 1000;
+/** One sweep per process, at the first harness. */
+let swept = false;
+
+/**
+ * Remove the data dirs earlier runs left behind.
+ *
+ * A fresh directory per harness means a full suite leaves several hundred of
+ * them, almost all empty — nothing is written unless a case touches
+ * `localStorage` — and nothing else would ever collect them. The age bound is
+ * what makes this safe against the runner's own parallelism: test files run in
+ * separate forked processes that sweep independently, and every directory a
+ * live process owns is seconds old, so a six-hour floor cannot reach one.
+ *
+ * Failures are swallowed on purpose. Two forks sweeping the same stale
+ * directory at the same time is the ordinary case, not an error, and a harness
+ * that could not tidy up must still start.
+ */
+function sweepStaleDataDirs(root: string): void {
+  if (swept) return;
+  swept = true;
+  const cutoff = Date.now() - STALE_MS;
+  try {
+    for (const name of fs.readdirSync(root)) {
+      if (!name.startsWith(PREFIX)) continue;
+      const full = join(root, name);
+      try {
+        if (fs.statSync(full).mtimeMs > cutoff) continue;
+        fs.rmSync(full, { recursive: true, force: true });
+      } catch {
+        // Another fork got there first, or the entry went away underneath us.
+      }
+    }
+  } catch {
+    // No directory to sweep, or it is not readable. Neither stops a harness.
+  }
 }
 
 /** The two files `Vault.getConfig` reads, host directory first. */

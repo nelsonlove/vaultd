@@ -58,6 +58,45 @@ export class DataDir {
   }
 
   /**
+   * As {@link writeJson}, but a reader never sees a half-written document.
+   *
+   * `writeFileSync` truncates and then writes, so a crash, a full disk or a
+   * killed process between the two leaves a **truncated** file — which for JSON
+   * means an unparseable one, and for a store that is read at the next startup
+   * means the values are gone and the read throws. Writing a sibling and
+   * renaming it makes the swap atomic within the directory: a reader sees
+   * either the whole previous document or the whole new one, never a prefix.
+   *
+   * The sibling is in the same directory rather than the system temp dir,
+   * because `rename` is only atomic within a file system and a temp dir may be
+   * on another one. It carries the process id so two hosts writing at once
+   * cannot truncate each other's half-written file, and it is removed on the
+   * way out of a failure so a crashed write leaves no litter.
+   */
+  writeJsonAtomic(relative: string, value: unknown, mode?: number): void {
+    const full = this.resolve(relative);
+    fs.mkdirSync(dirname(full), { recursive: true });
+    const sibling = `${full}.${String(process.pid)}.tmp`;
+    const body = JSON.stringify(value, null, 2) + "\n";
+    try {
+      if (mode === undefined) fs.writeFileSync(sibling, body, "utf8");
+      else {
+        fs.writeFileSync(sibling, body, { encoding: "utf8", mode });
+        fs.chmodSync(sibling, mode);
+      }
+      fs.renameSync(sibling, full);
+    } catch (error) {
+      try {
+        fs.rmSync(sibling, { force: true });
+      } catch {
+        // The cleanup is best-effort: the write already failed, and a failure
+        // to remove the sibling must not replace the error that matters.
+      }
+      throw error;
+    }
+  }
+
+  /**
    * The parsed contents, or `null` when the file is not there.
    *
    * Absent is `null`; **malformed throws**. A plugin's `data.json` that someone

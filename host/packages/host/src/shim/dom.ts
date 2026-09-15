@@ -52,7 +52,7 @@ const ELEMENT_SYMBOL = "HTMLElement";
 /** Obsidian's `DomElementInfo`, as much of it as anything here reads. */
 export interface ElInfo {
   cls?: string | string[];
-  text?: string | StubEl;
+  text?: string | StubNode;
   attr?: Record<string, string | number | boolean | null>;
   title?: string;
   value?: string;
@@ -64,23 +64,30 @@ export interface ElInfo {
 }
 
 /** The text of whatever a caller passed as `text`. */
-function textOf(value: string | StubEl | undefined): string {
+function textOf(value: string | StubNode | undefined): string {
   if (value === undefined) return "";
   return typeof value === "string" ? value : value.textContent;
 }
 
 /**
- * An element, a node, a fragment and a text node — all of them this.
+ * Everything a node can do, which here is everything.
  *
- * The four constructors the globals install (`Node`, `Element`, `HTMLElement`,
- * `DocumentFragment`) collapse onto one class because nothing this host does
- * distinguishes them: plugins use the names for `instanceof` branches, and one
- * class answers those branches without four layers that differ in nothing.
- * {@link StubFragment} is the one exception, because `x instanceof
- * DocumentFragment` is a branch plugins take to mean "this is not an element",
- * and answering `true` for a `div` there would send them down the wrong arm.
+ * **The whole surface lives on the base class on purpose.** Obsidian's DOM
+ * extensions are installed on `Node.prototype`, not on `HTMLElement.prototype`
+ * — which is why `createFragment().createEl("span")` works in Obsidian — so a
+ * host that put them on the element class would break the fragment builders
+ * plugins write. Putting them here reproduces that by construction.
+ *
+ * The three classes below it are thin on purpose too: they exist to answer
+ * `instanceof`, which is the only thing a plugin does with these names.
+ * `globals.ts` installs {@link StubNode} as `Node`, {@link StubEl} as both
+ * `Element` and `HTMLElement` — nothing this host does distinguishes those two
+ * — and {@link StubFragment} as `DocumentFragment`. So the two branches a
+ * plugin actually writes both answer as they would in a browser: an element is
+ * a `Node` and an `HTMLElement` and not a `DocumentFragment`, and a fragment is
+ * a `Node` and a `DocumentFragment` and not an `HTMLElement`.
  */
-export class StubEl {
+export class StubNode {
   /** `1` — an element, as far as any plugin's `nodeType` check is concerned. */
   readonly nodeType: number = 1;
   readonly tagName: string;
@@ -95,8 +102,18 @@ export class StubEl {
   hidden = false;
   readonly style: Record<string, string> = {};
   readonly dataset: Record<string, string> = {};
-  /** Always empty — see the header: nothing here is a tree. */
+  /** Really remembers, so a plugin can read a class back off an element. */
   readonly classList = new StubClassList();
+  /**
+   * Really remembers too, for the same reason.
+   *
+   * A half-measure is worse than either end: an earlier draft wrote `id` and
+   * `class` through to their fields and answered `getAttr` with `null`, so a
+   * plugin that set an attribute and read it back got nothing. Everything set
+   * is readable, and `id`/`className` stay in step because plugins reach them
+   * both ways.
+   */
+  private readonly attributes = new Map<string, string>();
 
   constructor(tag = "div", info?: ElInfo) {
     this.tagName = tag.toUpperCase();
@@ -104,7 +121,7 @@ export class StubEl {
     if (info !== undefined) this.applyInfo(info);
   }
 
-  // -- the collections, all empty, none of them `undefined` ----------------
+  // -- the collections, all empty: nothing here is a tree -------------------
 
   get children(): StubEl[] {
     return [];
@@ -199,7 +216,7 @@ export class StubEl {
     return this.createEl(tag, info);
   }
 
-  setText(text: string | StubEl): this {
+  setText(text: string | StubNode): this {
     this.hit();
     this.textContent = textOf(text);
     return this;
@@ -258,8 +275,16 @@ export class StubEl {
 
   setAttr(name: string, value: string | number | boolean | null): this {
     this.hit();
-    if (name === "id" && typeof value === "string") this.id = value;
-    if (name === "class" && typeof value === "string") this.className = value;
+    // `null` removes, which is what a browser's `setAttribute(name, null)`
+    // does not do but what Obsidian's own `setAttr` is used for.
+    if (value === null) {
+      this.attributes.delete(name);
+      return this;
+    }
+    const text = String(value);
+    this.attributes.set(name, text);
+    if (name === "id") this.id = text;
+    if (name === "class") this.className = text;
     return this;
   }
 
@@ -269,8 +294,8 @@ export class StubEl {
   }
 
   getAttr(name: string): string | null {
-    void name;
-    return stub(ELEMENT_SYMBOL, null);
+    this.hit();
+    return this.attributes.get(name) ?? null;
   }
 
   setAttribute(name: string, value: string): void {
@@ -282,13 +307,15 @@ export class StubEl {
   }
 
   removeAttribute(name: string): void {
-    void name;
     this.hit();
+    this.attributes.delete(name);
+    if (name === "id") this.id = "";
+    if (name === "class") this.className = "";
   }
 
   hasAttribute(name: string): boolean {
-    void name;
-    return stub(ELEMENT_SYMBOL, false);
+    this.hit();
+    return this.attributes.has(name);
   }
 
   setCssStyles(styles: Record<string, string>): void {
@@ -532,13 +559,25 @@ export class StubEl {
 }
 
 /**
- * `DocumentFragment`, and the one subclass this file has.
+ * `Element` and `HTMLElement` — the same class, because nothing this host does
+ * tells the two apart and plugins use both names only as `instanceof` targets.
  *
- * A plugin branching on `x instanceof DocumentFragment` means "this is a bag
- * of nodes, not an element", so the branch has to be able to answer `false`
- * for an ordinary `div`.
+ * It adds nothing to {@link StubNode}: the whole surface is on the base,
+ * because Obsidian installs its DOM extensions on `Node.prototype` and a
+ * fragment builder depends on that.
  */
-export class StubFragment extends StubEl {
+export class StubEl extends StubNode {}
+
+/**
+ * `DocumentFragment` — a sibling of {@link StubEl}, not a subclass of it.
+ *
+ * A plugin branching `if (x instanceof HTMLElement) … else if (x instanceof
+ * DocumentFragment)` writes those two tests in that order, so a fragment that
+ * answered `true` to the first would take the element arm and never reach its
+ * own. Sibling classes under one `Node` are what make both tests answer the way
+ * a browser answers them.
+ */
+export class StubFragment extends StubNode {
   override readonly nodeType = 11;
 
   constructor() {

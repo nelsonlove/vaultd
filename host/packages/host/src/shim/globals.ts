@@ -45,16 +45,38 @@
  * property silently does nothing. {@link GlobalInstallation.restore} puts back
  * exactly what was there, which is what lets a process assemble a host, tear it
  * down, and assemble another.
+ *
+ * **Two hosts in one process share the globals, and that is accepted.** A
+ * second install shadows the first: the bare names (`app`, `document`,
+ * `localStorage`) point at the newest host, and because the first host's
+ * `window` owns only a handful of properties and resolves the rest through
+ * `globalThis`, its `window.document` resolves to the *newest* installation
+ * too. What stays per-host is what a plugin is actually handed — the `obsidian`
+ * barrel, which binds its own host's `window`, `app` and surfaces. This is
+ * accepted rather than fixed because production runs one host per process
+ * (`main.ts` starts one) and test files are forked and sequential; the fix, if
+ * a second live host ever shares a process, is to `restore()` the first.
  */
 
 import moment from "moment";
 
 import { DataDir } from "../datadir";
 import { ShimTimers } from "./timers";
-import { StubEl, StubFragment, createDiv, createEl, createFragment, createSpan, createStubDocument } from "./dom";
-import { declarePolicy, recordUse, stub, unsupported } from "./policy";
+import {
+  StubEl,
+  StubFragment,
+  StubNode,
+  createDiv,
+  createEl,
+  createFragment,
+  createSpan,
+  createStubDocument,
+} from "./dom";
+import { currentPluginId, declarePolicy, recordUse, stub, unsupported } from "./policy";
 import type { App } from "./app";
-import type { HostConfig } from "../config";
+import type { Clock, HostConfig } from "../config";
+import type { Harvest, HarvestedUnreachable } from "./harvest";
+import type { HostErrors } from "./errors";
 import type { StubDocument } from "./dom";
 
 /**
@@ -78,12 +100,44 @@ export interface HostWindow {
    * trip a ban it is not the subject of.
    */
   readonly require: (specifier: string) => unknown;
+  addEventListener(type: string, listener: unknown, options?: unknown): void;
+  removeEventListener(type: string, listener: unknown, options?: unknown): void;
+  dispatchEvent(event: unknown): boolean;
   readonly app: App;
   readonly moment: typeof moment;
   readonly document: StubDocument;
   readonly window: HostWindow;
   readonly localStorage: HostLocalStorage;
   readonly [member: string]: unknown;
+}
+
+/**
+ * What {@link installGlobals} needs that the config cannot carry.
+ *
+ * **`dataDir` is here rather than read off the config**, and that is the whole
+ * point of the parameter: `HostConfig.dataDir` is `$XDG_STATE_HOME/vaultd-host`
+ * by default, so a host assembled from a default config — which is every test
+ * harness — would persist `localStorage` into the developer's home directory.
+ * Production passes the real path from `main.ts`; a harness passes a fresh
+ * directory of its own, and `test/shim-dom.test.ts` holds the guard that says
+ * no harness root is ever under the real one.
+ */
+export interface GlobalDeps {
+  /** Where `localStorage` is persisted. Never defaulted from the config. */
+  readonly dataDir: string;
+  /** Where a failure nobody is waiting on goes — a torn stored document. */
+  readonly errors: HostErrors;
+  /** Where a `window` listener nothing can deliver to is recorded. */
+  readonly harvest: Harvest;
+  /**
+   * The clock `window.setInterval` arms on.
+   *
+   * Passed rather than read from `config.clock` so that one host has one clock:
+   * `assembleShim` threads `deps.clock` everywhere else, and a caller that
+   * passed a different one would otherwise get plugin timers on one clock and
+   * host timers on another, silently.
+   */
+  readonly clock: Clock;
 }
 
 /** What {@link installGlobals} hands back: the two objects, and the undo. */
@@ -106,10 +160,22 @@ export interface GlobalInstallation {
  *
  * **Lazy at both ends.** Nothing is read from disk until the first access and
  * nothing is written until the first mutation, so a host that never touches
- * `localStorage` — which is every test in this suite today — never creates the
- * file. The write is a whole-document rewrite rather than an append: the
- * document is a few kilobytes of UI state, and a torn append would be
- * unparseable where a torn rewrite is at worst the previous state.
+ * `localStorage` — which is every test in this suite that does not ask for it —
+ * never creates the file.
+ *
+ * **Keys and values are both `String()`-coerced**, because that is what a
+ * browser does: `setItem(7, "seven")` is readable as `getItem("7")`, and a
+ * bundle that keys by a numeric id and reads back by a string one finds its
+ * value rather than `null`.
+ *
+ * **A stored document that will not parse costs the values, not the store.**
+ * The read is wrapped, the failure is reported through the host's error seam,
+ * and the store starts empty — because the alternative is a `SyntaxError` out
+ * of a plugin's first `getItem`, inside `onload`, which takes the whole plugin
+ * down over a file the host itself wrote. The write goes through
+ * {@link DataDir.writeJsonAtomic}, so the host cannot be the thing that creates
+ * such a document: a truncated rewrite is never observable, only the whole
+ * previous document or the whole new one.
  */
 export class HostLocalStorage {
   private readonly entries = new Map<string, string>();
@@ -118,6 +184,7 @@ export class HostLocalStorage {
   constructor(
     private readonly dir: DataDir,
     private readonly file: string,
+    private readonly errors: HostErrors,
   ) {}
 
   get length(): number {
@@ -128,20 +195,20 @@ export class HostLocalStorage {
   getItem(key: string): string | null {
     this.load();
     recordUse("localStorage");
-    return this.entries.get(key) ?? null;
+    return this.entries.get(String(key)) ?? null;
   }
 
   setItem(key: string, value: string): void {
     this.load();
     recordUse("localStorage");
-    this.entries.set(key, String(value));
+    this.entries.set(String(key), String(value));
     this.persist();
   }
 
   removeItem(key: string): void {
     this.load();
     recordUse("localStorage");
-    this.entries.delete(key);
+    this.entries.delete(String(key));
     this.persist();
   }
 
@@ -159,11 +226,22 @@ export class HostLocalStorage {
 
   private load(): void {
     if (this.loaded) return;
+    // Set before the read, not after: a read that throws must not leave the
+    // store unloaded, or every later call would retry the same broken document
+    // and report it again.
     this.loaded = true;
-    // A document that is not there is an empty store; a document that is there
-    // but is not an object is a corrupt one, and an empty store is the only
-    // answer that does not throw inside somebody's `onload`.
-    const stored = this.dir.readJson<Record<string, unknown>>(this.file);
+    let stored: Record<string, unknown> | null = null;
+    try {
+      stored = this.dir.readJson<Record<string, unknown>>(this.file);
+    } catch (error) {
+      // `plugin-data` is the phase for stored data that will not parse, which
+      // is exactly what this is; the plugin whose call hit it is named when
+      // there is one, and the host owns it otherwise.
+      this.errors.report(error, currentPluginId() ?? "host", "plugin-data");
+      return;
+    }
+    // A document that parses to something other than an object — `3`, `null`,
+    // an array — is corrupt in the other direction, and gets the same answer.
     if (stored === null || typeof stored !== "object") return;
     for (const [key, value] of Object.entries(stored)) {
       if (typeof value === "string") this.entries.set(key, value);
@@ -171,12 +249,73 @@ export class HostLocalStorage {
   }
 
   private persist(): void {
-    this.dir.writeJson(this.file, Object.fromEntries(this.entries));
+    this.dir.writeJsonAtomic(this.file, Object.fromEntries(this.entries));
   }
 }
 
 /** The file the store lives in, under the host's own data directory. */
 const LOCAL_STORAGE_FILE = "localstorage.json";
+
+/**
+ * `window.addEventListener` and its two companions: accepted, recorded, and
+ * never delivered to.
+ *
+ * **Why they exist at all.** In a browser these three are always there, and
+ * `document`'s equivalents are already stubbed here — so a `window` without
+ * them is an asymmetry that ends in a raw `TypeError` inside `onload`, which is
+ * the failure mode this whole phase is built to avoid. `quickadd` calls
+ * `window.addEventListener` fourteen times and `tag-wrangler` twice.
+ *
+ * **Why they are recorded.** A listener is a plugin telling the host about a
+ * capability it is offering, and this host has no event loop that will ever
+ * deliver one — so the honest thing is to write down what was offered.
+ * `contextmenu` is separated out as `dom_delegated_menu` because that one is a
+ * menu a user could have opened, and Task 14's bundle scan can work out what it
+ * would have contained; everything else is a `dom_listener`, which is a fact
+ * about idle cost rather than a capability.
+ *
+ * A registration made outside a plugin's load has nobody to attribute it to and
+ * is accepted without being recorded — the same rule the workspace's menu hooks
+ * follow, for the same reason: an unowned row could not be withdrawn, reported,
+ * or dropped with its plugin.
+ */
+class WindowListeners {
+  private readonly rows: Array<{
+    readonly type: string;
+    readonly listener: unknown;
+    readonly row: HarvestedUnreachable;
+  }> = [];
+
+  constructor(private readonly harvest: Harvest) {}
+
+  add(type: string, listener: unknown): void {
+    stub("window.addEventListener", undefined);
+    const pluginId = currentPluginId();
+    if (pluginId === null) return;
+    const row: HarvestedUnreachable = {
+      pluginId,
+      kind: type === "contextmenu" ? "dom_delegated_menu" : "dom_listener",
+      detail: type,
+    };
+    this.harvest.recordUnreachable(row);
+    this.rows.push({ type, listener, row });
+  }
+
+  /**
+   * Withdraw the row a matching `addEventListener` recorded.
+   *
+   * By `(type, listener)` and only the first match, which is what
+   * `removeEventListener` does: a plugin that registered the same function for
+   * two event types, or twice for one, must be able to take exactly one back.
+   */
+  remove(type: string, listener: unknown): void {
+    stub("window.removeEventListener", undefined);
+    const at = this.rows.findIndex((entry) => entry.type === type && entry.listener === listener);
+    if (at === -1) return;
+    const [dropped] = this.rows.splice(at, 1);
+    if (dropped !== undefined) this.harvest.forgetUnreachable(dropped.row);
+  }
+}
 
 /**
  * An observer that never observes.
@@ -215,11 +354,12 @@ class InertMutationObserver {
  * a mutable container: nothing reads `globalThis.app.vault` between the two
  * points, because nothing but the assembler is running.
  */
-export function installGlobals(app: App, config: HostConfig): GlobalInstallation {
+export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): GlobalInstallation {
   const patcher = new GlobalPatcher();
-  const timers = new ShimTimers(config.clock);
+  const timers = new ShimTimers(deps.clock);
   const document = createStubDocument();
-  const localStorage = new HostLocalStorage(new DataDir(config.dataDir), LOCAL_STORAGE_FILE);
+  const localStorage = new HostLocalStorage(new DataDir(deps.dataDir), LOCAL_STORAGE_FILE, deps.errors);
+  const listeners = new WindowListeners(deps.harvest);
 
   // `window` first, because everything else is installed on `globalThis` and
   // therefore reachable through its prototype the moment it is defined.
@@ -236,6 +376,25 @@ export function installGlobals(app: App, config: HostConfig): GlobalInstallation
   defineOwn(host, "moment", moment);
   defineOwn(host, "app", app);
   defineOwn(host, "window", host);
+  // **A bundle's bare `setTimeout` does not come here**, and cannot be made to
+  // from this file: it resolves to `globalThis`, and replacing Node's own
+  // timers would freeze the runtime. Task 13's module wrapper shadows the four
+  // names with these, which is where a bundle's bare call becomes `window`'s,
+  // exactly as it is in the browser the bundle was compiled for.
+  defineOwn(host, "addEventListener", (type: string, listener: unknown, options?: unknown) => {
+    void options;
+    listeners.add(type, listener);
+  });
+  defineOwn(host, "removeEventListener", (type: string, listener: unknown, options?: unknown) => {
+    void options;
+    listeners.remove(type, listener);
+  });
+  defineOwn(host, "dispatchEvent", (event: unknown) => {
+    void event;
+    // `true` is "not cancelled", which is the honest answer when nothing
+    // listened: no handler ran, so no handler called `preventDefault`.
+    return stub("window.dispatchEvent", true);
+  });
 
   patcher.define(globalThis, "window", host);
   patcher.define(globalThis, "activeWindow", host);
@@ -253,12 +412,13 @@ export function installGlobals(app: App, config: HostConfig): GlobalInstallation
   });
   patcher.define(globalThis, "MutationObserver", InertMutationObserver);
 
-  // The element constructors. `Node`, `Element` and `HTMLElement` are all the
-  // same class, because nothing this host does distinguishes them and plugins
-  // use the three names only as `instanceof` branches — see `shim/dom.ts`.
-  // `DocumentFragment` is the one that has to be separate: a plugin testing for
-  // it means "not an element", and a `div` must answer `false`.
-  patcher.define(globalThis, "Node", StubEl);
+  // The element constructors. `Element` and `HTMLElement` are the same class,
+  // because nothing this host does distinguishes them and plugins use both
+  // names only as `instanceof` branches. `Node` is their base and
+  // `DocumentFragment` their sibling, so both tests a plugin writes — "is this
+  // an element" and "is this a fragment" — answer as a browser answers them.
+  // See `shim/dom.ts`.
+  patcher.define(globalThis, "Node", StubNode);
   patcher.define(globalThis, "Element", StubEl);
   patcher.define(globalThis, "HTMLElement", StubEl);
   patcher.define(globalThis, "DocumentFragment", StubFragment);
@@ -446,7 +606,19 @@ declare global {
 
 // The rows this file owns. Module-level, so the compatibility report knows
 // about them with nothing constructed and no vault open.
+//
+// **About a dozen of these can never record a hit**, and a reader of the report
+// should be told why rather than left to wonder: `window`, `activeWindow`,
+// `activeDocument`, `moment`, `app`, `Node`, `Element`, `DocumentFragment` and
+// the six prototype extensions are read as *properties*, and a property read on
+// a plain value cannot be intercepted. They are declarations of surface — "this
+// host has this, at this policy" — not counters. The rows that do count are the
+// ones behind a function call: `localStorage`, `window.require`,
+// `window.addEventListener`, `i18next`, `navigator.clipboard`.
 declarePolicy("window", "safe_stub");
+declarePolicy("window.addEventListener", "harvested");
+declarePolicy("window.removeEventListener", "harvested");
+declarePolicy("window.dispatchEvent", "safe_stub");
 declarePolicy("activeWindow", "safe_stub");
 declarePolicy("activeDocument", "safe_stub");
 declarePolicy("window.require", "absent");

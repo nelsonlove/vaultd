@@ -62,6 +62,32 @@ describe("Workspace", () => {
     expect(() => { tabManager.updateTabs(); }).not.toThrow();
   });
 
+  it("flips the latch once, however often the host says it is ready", async () => {
+    const harness = await ShimHarness.withVault({}, { layoutReady: false });
+    const order: string[] = [];
+    harness.app.workspace.onLayoutReady(() => order.push("startup"));
+    await harness.flipLayoutReady();
+    await harness.flipLayoutReady();
+    harness.app.workspace.markLayoutReady();
+    // Startup happens once. A second fan-out would run every plugin's startup
+    // work twice — which for the corpus means creating a daily note twice.
+    expect(order).toEqual(["startup"]);
+  });
+
+  it("flips the latch before the fan-out, so a nested registration still runs", async () => {
+    const harness = await ShimHarness.withVault({}, { layoutReady: false });
+    const order: string[] = [];
+    harness.app.workspace.onLayoutReady(() => {
+      order.push("outer");
+      // Registered from inside the event. The latch is already up, so this runs
+      // immediately; were it flipped after the fan-out it would be queued for a
+      // fan-out that has already happened and never run at all.
+      harness.app.workspace.onLayoutReady(() => order.push("inner"));
+    });
+    await harness.flipLayoutReady();
+    expect(order).toEqual(["outer", "inner"]);
+  });
+
   it("records an openFile intent on the inert leaf instead of opening anything", async () => {
     const harness = await ShimHarness.withVault({ "A.md": "x\n" });
     const leaf = harness.app.workspace.getLeaf(false);
