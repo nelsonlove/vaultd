@@ -573,6 +573,25 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
       // repaired, or a green run says nothing about the delta path.
       expect(unmasked).toBeGreaterThan(5);
       expect(failures).toEqual([]);
+      // **A cost ceiling, not a health signal.** Every re-hydration this
+      // counts is a whole `open_snapshot` + tree + notes walk during which the
+      // mirror answers every plugin from the old state, so a run that takes
+      // many of them is working correctly and expensively — which is exactly
+      // the kind of defect no correctness assertion in this file can see. The
+      // legitimate triggers are the daemon's `watcher_overflow` and the install
+      // guard's `refetch_oversized`, one re-hydration each, and they are rare:
+      // measured over forty seed-runs at 0 in half of them, 1 in most of the
+      // rest, and a maximum of 4 in a single seed-run, never once with
+      // `generation_gap` as the reason.
+      //
+      // The ceiling is deliberately loose against that — those triggers are the
+      // daemon's business and a loaded machine may meet more of them — and it
+      // is still an order of magnitude under what it exists to catch. Before an
+      // event already covered by a re-hydration stopped being judged for
+      // continuity, the same measurement was 227 re-hydrations over thirty
+      // seed-runs with 31 in a single run, every one of them a `generation_gap`
+      // escalation on an event `applyChangeSet` was about to drop anyway.
+      expect(live.resyncCount()).toBeLessThanOrEqual(8);
     },
     600_000,
   );

@@ -416,6 +416,102 @@ describe("Mirror resync", () => {
     expect(harness.mirror.appliedThrough()).toBe(7);
   });
 
+  it("does not judge an event a re-hydration already covered for continuity", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1" }],
+    });
+
+    // A burst. The daemon asks for a resync, and generations 6, 7 and 8 arrive
+    // behind it while the re-hydration is still in flight, so all three queue
+    // up behind the resync's task: `onCommitted`'s synchronous early exit reads
+    // an `appliedThrough` of 5, a number from before the swap.
+    const resyncing = harness.mirror.applyEvent(resync("watcher_overflow", 8));
+    const queued = [6, 7, 8].map((generation) =>
+      harness.mirror.applyEvent({
+        type: "generation_committed",
+        value: {
+          previous_generation: generation - 1,
+          generation,
+          cause: "watcher",
+          changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+          affected_note_count: 1,
+          affected_reference_count: 0,
+        },
+      }),
+    );
+    // Handled, so a build that leaves one of these pending or rejected fails on
+    // the assertions below rather than as a stray rejection at teardown.
+    for (const pending of queued) void pending.catch(() => undefined);
+
+    // The snapshot lands at 8, which is at or above every queued event.
+    await harness.answerHydration({
+      generation: 8,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a4" }],
+      notes: [{ path: "A.md", revision: "blake3:a4" }],
+    });
+    await resyncing;
+    expect(harness.mirror.appliedThrough()).toBe(8);
+    harness.clearMethodLog();
+    await harness.quiesce();
+
+    // Every one of 6, 7 and 8 is already covered by that snapshot, so every one
+    // is a no-op. Judged for continuity instead, every one reads as a gap —
+    // `previous_generation` 5, 6, 7 against an `appliedThrough` of 8 — and asks
+    // for a whole-vault re-hydration of its own, one per event. Measured
+    // against the real daemon at 227 re-hydrations over thirty seed-runs.
+    expect(harness.mirror.resyncCount()).toBe(1);
+    expect(harness.mirror.lastResyncReason()).toBe("watcher_overflow");
+    // Not a single request went out for any of the three.
+    expect(harness.methodsSeen()).toEqual([]);
+    await Promise.all(queued);
+
+    // A genuine gap is always an event *above* `appliedThrough`, and it still
+    // fires. First one that is continuous with the snapshot, which applies as
+    // an ordinary delta and asks for nothing but its own rows.
+    const continuous = harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 8,
+        generation: 10,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+    await harness.answerRefetch(10, [{ path: "A.md", revision: "blake3:a5" }]);
+    await continuous;
+    expect(harness.mirror.resyncCount()).toBe(1);
+    expect(harness.mirror.appliedThrough()).toBe(10);
+    expect(harness.mirror.note("A.md")?.revision).toBe("blake3:a5");
+
+    // And now generation 11's event is lost. Generation 12 arrives naming it,
+    // which is above `appliedThrough` and does not match it, so the continuity
+    // check escalates exactly as it always did.
+    const gapped = harness.mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: 11,
+        generation: 12,
+        cause: "watcher",
+        changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    });
+    await harness.answerHydration({
+      generation: 12,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a6" }],
+      notes: [{ path: "A.md", revision: "blake3:a6" }],
+    });
+    await gapped;
+    expect(harness.mirror.resyncCount()).toBe(2);
+    expect(harness.mirror.lastResyncReason()).toBe("generation_gap");
+    expect(harness.mirror.appliedThrough()).toBe(12);
+  });
+
   it("stays quiet for this host's own write echo and for the first event after a resync", async () => {
     const harness = await hydrated({
       generation: 5,

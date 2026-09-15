@@ -1272,6 +1272,21 @@ export class Mirror implements MirrorQuery {
       return this.requestResync("oversized_change_set");
     }
     return this.enqueue(async () => {
+      // **Stale before gap.** An event at or below `appliedThrough` is already
+      // covered by what this mirror holds — `applyChangeSet`'s own guard drops
+      // it a moment later — and it is emphatically *not* a continuity break.
+      // Without this line the check below reads a queued burst as a chain of
+      // gaps: one re-hydration moves `appliedThrough` to the snapshot's
+      // generation, and every event still queued for a generation at or below
+      // it then mismatches and asks for a whole-vault re-hydration of its own,
+      // one per event. Measured against the real daemon at 227 re-hydrations
+      // over thirty seed-runs, against 10 with this line.
+      //
+      // It masks nothing. A genuine continuity break is always an event
+      // *above* `appliedThrough` — if 7 is lost and 8 arrives, 8 > 7 and the
+      // check still fires — and an event at or below it cannot be a gap by
+      // definition, because everything up to that generation is installed.
+      if (value.generation <= this.appliedThroughValue) return;
       // **Continuity, checked where `appliedThrough` is final.** If generation
       // 7's event were lost and 8's arrived, 8 would apply, `appliedThrough`
       // would jump to 8, and 7's paths would be wrong forever with nothing to
@@ -1281,12 +1296,15 @@ export class Mirror implements MirrorQuery {
       // The placement is the whole of it. In `onCommitted`'s synchronous
       // arrival path an earlier event's application may still be queued and
       // `appliedThrough` is a number from the past, so the check would fire on
-      // every burst. Inside the queued task, two cases stay quiet by
-      // construction: the echo of this host's own write, because
-      // `applyMutation` already advanced `appliedThrough` to that generation;
-      // and the first event after a resync, because the re-hydration set
-      // `appliedThrough` to the snapshot's generation, which is what that
-      // event's `previous_generation` names.
+      // every burst. Inside the queued task two cases stay quiet — the echo of
+      // this host's own write, because `applyMutation` already advanced
+      // `appliedThrough` to that generation; and the *first* event after a
+      // resync, because the re-hydration set `appliedThrough` to the snapshot's
+      // generation, which is what that event's `previous_generation` names.
+      // That is not a completeness claim, and reading it as one is what hid the
+      // cascade above: in a burst the events behind that first one name
+      // generations the snapshot already passed, and only the staleness check
+      // keeps them quiet.
       if (
         this.appliedThroughValue !== 0 &&
         value.previous_generation !== this.appliedThroughValue
