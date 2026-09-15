@@ -242,4 +242,98 @@ describe("app.plugins and app.commands", () => {
     // that ran after the slot had closed.
     expect(duringBatch).toEqual(["editish"]);
   });
+
+  it("holds the note's lock across the flush, against a process that is not behind it", async () => {
+    const harness = await ShimHarness.withVault({ "A.md": "one\n" });
+    const file = harness.vault.getFileByPath("A.md")!;
+    const editish = harness.instantiate(
+      "editish",
+      class extends harness.api.Plugin {
+        override onload(): void {
+          this.addCommand({
+            id: "shout",
+            name: "Shout",
+            editorCallback: (editor: unknown) => {
+              const buffer = editor as Editor;
+              buffer.setValue(buffer.getValue().toUpperCase());
+            },
+          });
+        }
+      },
+    );
+    await harness.load(editish);
+    // The second plugin kicks off a `Vault.process` and does **not** await it,
+    // from a synchronous command — which is a real shape (an interval, an event
+    // handler, a command that starts work) and, crucially, one that is *not*
+    // queued behind the editor command on the dispatch FIFO. The FIFO therefore
+    // cannot be what serializes these two; only `runExclusivePath` can.
+    let processed: Promise<string> | null = null;
+    const other = harness.instantiate(
+      "other",
+      class extends harness.api.Plugin {
+        override onload(): void {
+          this.addCommand({
+            id: "kick",
+            name: "Kick",
+            callback: () => {
+              processed = this.app.vault.process(file, (text) => `${text}appended\n`);
+            },
+          });
+        }
+      },
+    );
+    await harness.load(other);
+    harness.clearMethodLog();
+
+    // The editor command is mid-flush: it holds the lock and is waiting on the
+    // daemon's answer to its `write_note`.
+    const invoking = harness.app.commands.invokeCommandById("editish:shout", { file });
+    const editorWrite = await harness.expectRequest("write_note");
+    expect(harness.methodsSeen()).toEqual(["get_note", "write_note"]);
+
+    // Now the other plugin starts its read-modify-write on the same note.
+    expect(harness.app.commands.executeCommandById("other:kick")).toBe(true);
+    await harness.quiesce();
+    // **The kill.** With the lock, `process` has not read anything yet: its
+    // task function is not called until the editor's whole open-mutate-flush
+    // has settled. Without it, the `read_file` is already out — against bytes
+    // the editor is in the middle of replacing, which is the lost update the
+    // lock exists to prevent.
+    expect(harness.methodsSeen()).toEqual(["get_note", "write_note"]);
+
+    // Let the editor's write land, and the process follows it.
+    harness.respondOk(editorWrite.id, "write_note", { generation: 3, revision: "blake3:upper" });
+    harness.setFileContent("A.md", "ONE\n");
+    await harness.answerRefetch(3, [{ path: "A.md", revision: "blake3:upper" }]);
+    expect(await invoking).toBe(true);
+
+    const processWrite = await harness.expectRequest("write_note");
+    // It read what the editor wrote, and states that revision as its own
+    // precondition — the whole point of serializing rather than racing.
+    expect(processWrite.request.params).toEqual({
+      path: "A.md",
+      content: "ONE\nappended\n",
+      expected: { revision: "blake3:upper" },
+    });
+    harness.respondOk(processWrite.id, "write_note", { generation: 4, revision: "blake3:both" });
+    harness.setFileContent("A.md", "ONE\nappended\n");
+    await harness.answerRefetch(4, [{ path: "A.md", revision: "blake3:both" }]);
+    expect(await processed!).toBe("ONE\nappended\n");
+    // The whole exchange, in order. The two `read_file`s after each refetch are
+    // the mirror re-warming the note's position index; the one before the
+    // second `write_note` is `process`'s own read, and it sits **after** the
+    // editor's write rather than beside it.
+    expect(harness.methodsSeen()).toEqual([
+      "get_note",
+      "write_note",
+      "get_tree_entries",
+      "get_note",
+      "read_file",
+      "read_file",
+      "write_note",
+      "get_tree_entries",
+      "get_note",
+      "read_file",
+    ]);
+  });
 });

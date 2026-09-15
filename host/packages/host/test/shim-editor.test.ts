@@ -151,6 +151,78 @@ describe("Editor", () => {
     expect(editor.dirty()).toBe(false);
   });
 
+  it("applies a transaction's changes, then its replaceSelection, then its selection", async () => {
+    const harness = await ShimHarness.withVault({ "A.md": "one two\nthree\n" });
+    const editor = await Editor.open({
+      client: harness.client,
+      mirror: harness.mirror,
+      writes: harness.writes,
+      file: harness.vault.getFileByPath("A.md")!,
+      initialSelection: { from: { line: 0, ch: 4 }, to: { line: 0, ch: 7 } },
+    });
+    // `changes` are applied last-first by offset, so the earlier one's
+    // positions are still true when it is applied.
+    editor.transaction({
+      changes: [
+        { from: { line: 0, ch: 0 }, to: { line: 0, ch: 3 }, text: "ONE" },
+        { from: { line: 1, ch: 0 }, to: { line: 1, ch: 5 }, text: "THREE" },
+      ],
+    });
+    expect(editor.getValue()).toBe("ONE two\nTHREE\n");
+
+    // `replaceSelection` replaces whatever is selected now, and `selection`
+    // then says where the caret is left. A transaction carrying **both**
+    // `changes` and `replaceSelection` is uncaptured territory — this host
+    // applies the replacement to the selection as the changes left it — so the
+    // two are pinned separately rather than in one combination no
+    // documentation describes.
+    editor.setSelection({ line: 0, ch: 4 }, { line: 0, ch: 7 });
+    editor.transaction({ replaceSelection: "TWO", selection: { from: { line: 0, ch: 0 } } });
+    expect(editor.getValue()).toBe("ONE TWO\nTHREE\n");
+    expect(editor.getCursor()).toEqual({ line: 0, ch: 0 });
+    expect(editor.somethingSelected()).toBe(false);
+  });
+
+  it("treats a reversed replaceRange range as the range between its two ends", async () => {
+    const harness = await ShimHarness.withVault({ "A.md": "one two\n" });
+    const open = async (): Promise<Editor> =>
+      Editor.open({
+        client: harness.client,
+        mirror: harness.mirror,
+        writes: harness.writes,
+        file: harness.vault.getFileByPath("A.md")!,
+      });
+    const ordered = await open();
+    ordered.replaceRange("X", { line: 0, ch: 0 }, { line: 0, ch: 3 });
+    // Obsidian's signature names a `from` and a `to`, and says nothing about a
+    // caller that passes them the other way round — it is **uncaptured**. This
+    // host normalises: the two positions bound a range whichever order they
+    // arrive in, so a reversed pair edits the same text an ordered pair does.
+    // The alternative is not "an error": an un-normalised slice silently
+    // *duplicates* the text between them.
+    const reversed = await open();
+    reversed.replaceRange("X", { line: 0, ch: 3 }, { line: 0, ch: 0 });
+    expect(reversed.getValue()).toBe(ordered.getValue());
+    expect(reversed.getValue()).toBe("X two\n");
+    // And the caret lands after the replacement either way, never before it.
+    expect(reversed.getCursor()).toEqual(ordered.getCursor());
+    expect(reversed.getCursor()).toEqual({ line: 0, ch: 1 });
+  });
+
+  it("answers a get_note it cannot classify rather than letting it hang", async () => {
+    const harness = await ShimHarness.withVault({ "A.md": "one\n" });
+    // The harness separates the editor's `get_note` from the mirror's refetch
+    // by the `include` field, which is an invariant of this host rather than a
+    // convention (`REFETCH_FACETS` is the mirror's only `include`, and
+    // `editor.ts` is the only other sender). A third shape means a caller has
+    // appeared that neither rule covers — and leaving it to `answerRefetch`
+    // would strand a request nothing answers, which is a test that times out
+    // naming nothing.
+    await expect(
+      harness.client.request("get_note", { path: "A.md", include: ["headings"] }),
+    ).rejects.toThrow(/neither the editor's \(absent\) nor the mirror's refetch/);
+  });
+
   it("round-trips a selection and replaces it", async () => {
     const harness = await ShimHarness.withVault({ "A.md": "hello world\n" });
     const editor = await Editor.open({
