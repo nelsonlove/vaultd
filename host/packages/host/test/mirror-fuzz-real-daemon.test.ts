@@ -43,6 +43,16 @@ import {
  * from `freshMirrorAt` means the two mirrors never landed on one generation —
  * so a busy machine loses samples rather than inventing failures.
  *
+ * **And one assertion that does not sample at all.** Every thirtieth mutation
+ * is a coarse net: drift the delta path creates is usually refetched away by
+ * ordinary later traffic before the next comparison, which is how one
+ * permanent-until-repaired bug read as a 10%-per-run flake through a whole
+ * investigation. So every **batch** is also checked against a local invariant
+ * the mirror owns outright — *no resolved link may name a path the mirror does
+ * not hold* — which is true of every fresh hydration by construction and can
+ * therefore only ever fail on this host's own bookkeeping. It catches the
+ * moment the wrong row is installed rather than the aftermath.
+ *
  * Tunable by environment for a longer soak: `FUZZ_TOTAL` (default 300) and
  * `FUZZ_BATCH` (default 30). The seeds are not tunable, deliberately.
  */
@@ -195,12 +205,102 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
       const failures: string[] = [];
       const batches: MirrorChangeBatch[] = [];
       const events: RuntimeEventDto[] = [];
-      live.onBatch((batch) => batches.push(batch));
+      const dangling: string[] = [];
+      let checked = 0;
+      live.onBatch((batch) => {
+        batches.push(batch);
+        // **Nothing may still resolve to a path this very batch removed.** The
+        // sharpest form of the invariant, and the one that needs no settling at
+        // all: the rows are installed, the removals are done, and a surviving
+        // row naming a removed path is wrong *now*. A path in `created` as well
+        // as `deleted` is Ruling W6's replace-in-place and is not a removal.
+        //
+        // This is the check that catches the defect at the instant it is
+        // created rather than in the aftermath — the whole-table check below
+        // has to wait for the tree to catch up, and by then ordinary traffic
+        // has usually refetched the offending row.
+        const removedNow = new Set(batch.deleted);
+        for (const path of batch.created) removedNow.delete(path);
+        if (removedNow.size > 0) {
+          const after = live.resolvedLinks();
+          for (const source of Object.keys(after)) {
+            for (const target of Object.keys(after[source]!)) {
+              if (!removedNow.has(target)) continue;
+              dangling.push(
+                `batch ${String(batch.generation)} removed ${target}, but ${source} still ` +
+                  `resolves to it`,
+              );
+            }
+          }
+        }
+
+        // **Only once the tree has caught up with the newest row this mirror
+        // holds.** A refetch is answered at whatever generation is current when
+        // it lands, so between a change set and the events that follow it the
+        // mirror legitimately holds rows *newer* than its tree: a row fetched
+        // at generation 8 can resolve to a path generation 8 created and
+        // generation 6 — the one being applied — has never heard of. That is
+        // the two-generation design working, not drift, and it heals the moment
+        // the later event applies. `appliedThrough >= generation` is exactly
+        // the moment every path any row can name has been installed or removed,
+        // and it is the only moment at which the invariant below is a statement
+        // about this host's bookkeeping rather than about how far ahead the
+        // daemon has run.
+        if (live.appliedThrough() < live.generation()) return;
+        checked += 1;
+        // **The mirror must never hold a resolved link to a path it does not
+        // hold**, and this is the cheapest true statement of that: the live
+        // mirror alone, no second hydration, no rendezvous on a generation.
+        //
+        // It is the mirror's own invariant and not the daemon's — a mirror
+        // hydrated from scratch cannot dangle, measured at sixty hydrations
+        // over six seed-runs with zero hits — so a failure here is always this
+        // host's.
+        //
+        // Checked on **every batch** rather than every thirtieth mutation,
+        // because the drift it catches is usually repaired by ordinary later
+        // traffic before the next full comparison comes round. That sampling
+        // gap, not the `watcher_overflow` resync the first investigation
+        // blamed, is what made a permanent-until-repaired bug read as a
+        // 10%-per-run flake: over twenty seed-runs the daemon asked for a
+        // resync **once**, while the live mirror dangled up to ninety-six
+        // times in a single run.
+        const resolved = live.resolvedLinks();
+        for (const source of Object.keys(resolved)) {
+          for (const target of Object.keys(resolved[source]!)) {
+            if (live.entry(target) !== undefined) continue;
+            dangling.push(
+              `generation ${String(live.generation())} (batch ${String(batch.generation)}): ` +
+                `${source} -> ${target}`,
+            );
+          }
+        }
+      });
       live.onApplyError((error) => {
         failures.push(error instanceof Error ? error.message : String(error));
       });
+      // Every resync the **daemon** asked for, by reason, and how many
+      // comparisons had none in their window. Not an assertion —
+      // `watcher_overflow` is legitimate protocol and the daemon really does
+      // emit it — but a comparison taken across one proves nothing about the
+      // delta path, because the re-hydration repairs whatever had drifted. The
+      // floor below says at least some samples were not taken across one.
+      //
+      // A resync the *mirror* asks itself for is not counted here: it raises no
+      // event, and nothing on this surface reports one. That is a known gap in
+      // this accounting and not a hole in the gate, because the per-batch
+      // assertions above are checked at the moment a row is installed, where no
+      // later re-hydration can have got there first.
+      const resyncReasons = new Map<string, number>();
+      let resyncsSinceComparison = 0;
+      let unmasked = 0;
       await supervisor.subscribe((event) => {
         events.push(event);
+        if (event.type === "resync_required") {
+          const reason = (event.value as { reason?: string }).reason ?? "unknown";
+          resyncReasons.set(reason, (resyncReasons.get(reason) ?? 0) + 1);
+          resyncsSinceComparison += 1;
+        }
         void live.applyEvent(event).catch(() => undefined);
       });
 
@@ -367,6 +467,8 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
           continue;
         }
         comparisons += 1;
+        if (resyncsSinceComparison === 0) unmasked += 1;
+        resyncsSinceComparison = 0;
 
         const a = snapshotOf(live);
         const b = snapshotOf(fresh);
@@ -429,11 +531,32 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
           `${String(Date.now() - started)} ms\n` +
           `  applied: ${[...applied].map(([k, v]) => `${k}=${String(v)}`).join(" ")}\n` +
           `  refused: ${[...refused].map(([k, v]) => `${k}=${String(v)}`).join(" ")}\n` +
-          `  apply failures: ${failures.length === 0 ? "none" : failures.join(" | ")}`,
+          `  apply failures: ${failures.length === 0 ? "none" : failures.join(" | ")}\n` +
+          `  resyncs: ${
+            [...resyncReasons].map(([k, v]) => `${k}=${String(v)}`).join(" ") || "none"
+          } | ${String(unmasked)} of ${String(comparisons)} comparisons had no resync in their ` +
+          `window\n` +
+          `  dangling resolved links: ${
+            dangling.length === 0 ? "none" : `${String(dangling.length)} — ${dangling[0]!}`
+          } (${String(checked)} of ${String(batches.length)} batches checked)`,
       );
 
+      // First, because it is the strongest and the most local: a dangling
+      // resolved link is wrong the instant it is installed, whatever a later
+      // comparison would have said about it.
+      expect(dangling).toEqual([]);
+      // The whole-table half is only worth having if it ran: a run in which the
+      // tree never caught up with the newest row checked nothing at all. The
+      // floor is low deliberately — measured at 12 to 45 over two dozen
+      // seed-runs, and it is a floor against "nothing ran", not a sample-size
+      // claim. The removal half above runs on every batch that removed
+      // anything and needs no floor.
+      expect(checked).toBeGreaterThan(5);
       expect(divergences).toBe(0);
       expect(comparisons).toBeGreaterThan(5);
+      // At least some comparisons must be samples no re-hydration could have
+      // repaired, or a green run says nothing about the delta path.
+      expect(unmasked).toBeGreaterThan(5);
       expect(failures).toEqual([]);
     },
     600_000,

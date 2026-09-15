@@ -1008,6 +1008,279 @@ describe("Mirror deltas", () => {
     });
   });
 
+  it("re-asks a referrer fetched earlier in this apply when a later pass finds its target gone", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a1" },
+        { path: "T.md", kind: "note", revision: "blake3:t1" },
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+      ],
+      notes: [
+        { path: "A.md", revision: "blake3:a1", outgoing: [harness_ref("A.md", "T", "T.md")] },
+        { path: "T.md", revision: "blake3:t1", outgoing: [harness_ref("T.md", "X", "X.md")] },
+        { path: "X.md", revision: "blake3:x1" },
+      ],
+    });
+
+    // **"Already fetched in this apply" is not "fetched late enough".** Each
+    // round of the late-removal walk is answered at whatever generation is
+    // current when it lands, and those generations increase: a row answered in
+    // round 0 can name a path round 2 has only just found gone. Subtracting
+    // everything already asked for is exactly how such a row reached the
+    // install still resolved to a path the same apply was about to remove — and
+    // it stayed that way, because the generation that really deletes that path
+    // finds the row gone and expands an empty subtree.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["A.md", "X.md"], deleted: [] },
+        affected_note_count: 2,
+      }),
+    );
+    // Round 0, answered at 8: `X.md` has gone, and `A.md` — asked in the same
+    // batch — still resolves to `T.md`, which is alive at 8.
+    const first = await harness.answerRefetch(
+      8,
+      [{ path: "A.md", revision: "blake3:a1", outgoing: [harness_ref("A.md", "T", "T.md")] }],
+      { absent: ["X.md"] },
+    );
+    // Round 1, answered at 9: `X.md`'s referrer `T.md` has gone too.
+    const second = await harness.answerRefetch(9, [], { absent: ["T.md"] });
+    // Round 2, answered at 10: the re-ask. Started but not awaited, so the case
+    // fails on the assertions below rather than hanging when the ask is not
+    // made; the `catch` is what keeps an unmade ask from surfacing as an
+    // unhandled rejection at teardown.
+    const third = harness
+      .answerRefetch(10, [
+        { path: "A.md", revision: "blake3:a1", outgoing: [harness_ref("A.md", "T", null)] },
+      ])
+      .catch(() => new Set<string>());
+    await applying;
+
+    expect([...first].sort()).toEqual(["A.md", "X.md"]);
+    expect([...second]).toEqual(["T.md"]);
+    expect(harness.mirror.entry("T.md")).toBeUndefined();
+    expect(harness.mirror.entry("X.md")).toBeUndefined();
+    // The invariant, stated as the oracle states it: nothing resolved names a
+    // path the mirror does not hold.
+    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(harness.mirror.unresolvedLinks()).toEqual({ "A.md": { T: 1 } });
+    expect([...(await third)]).toEqual(["A.md"]);
+  });
+
+  it("escalates when a row still resolves into a removal after its one re-ask", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a1" },
+        { path: "T1.md", kind: "note", revision: "blake3:t1" },
+        { path: "T2.md", kind: "note", revision: "blake3:t2" },
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+      ],
+      notes: [
+        {
+          path: "A.md",
+          revision: "blake3:a1",
+          outgoing: [harness_ref("A.md", "T1", "T1.md"), harness_ref("A.md", "T2", "T2.md")],
+        },
+        { path: "T1.md", revision: "blake3:t1", outgoing: [harness_ref("T1.md", "X", "X.md")] },
+        { path: "T2.md", revision: "blake3:t2", outgoing: [harness_ref("T2.md", "X", "X.md")] },
+        { path: "X.md", revision: "blake3:x1" },
+      ],
+    });
+
+    // The re-ask is **one per path**, deliberately: chasing a vault that keeps
+    // moving one round at a time is what `resync_required` is for. So when the
+    // re-asked row still names a removal — here because a *second* target went
+    // in a round after the re-ask was answered — the apply installs nothing and
+    // takes the re-hydration road, rather than installing a row it knows is
+    // wrong.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["A.md", "X.md"], deleted: [] },
+        affected_note_count: 2,
+      }),
+    );
+    await harness.answerRefetch(
+      8,
+      [
+        {
+          path: "A.md",
+          revision: "blake3:a1",
+          outgoing: [harness_ref("A.md", "T1", "T1.md"), harness_ref("A.md", "T2", "T2.md")],
+        },
+      ],
+      { absent: ["X.md"] },
+    );
+    // Round 1: `X.md`'s referrers are both `T1.md` and `T2.md`. `T1.md` has
+    // gone; `T2.md` is answered from before `X.md` went, so it is itself stale
+    // and earns a re-ask of its own.
+    await harness.answerRefetch(
+      9,
+      [{ path: "T2.md", revision: "blake3:t2", outgoing: [harness_ref("T2.md", "X", "X.md")] }],
+      { absent: ["T1.md"] },
+    );
+    // Round 2: the one re-ask each of `A.md` (for `T1.md`) and `T2.md` (for
+    // `X.md`) — and `T2.md` turns out to have gone too, which `A.md`'s fresh
+    // row, served in this same round, cannot possibly account for.
+    await harness.answerRefetch(
+      10,
+      [
+        {
+          path: "A.md",
+          revision: "blake3:a1",
+          outgoing: [harness_ref("A.md", "T1", null), harness_ref("A.md", "T2", "T2.md")],
+        },
+      ],
+      { absent: ["T2.md"] },
+    );
+    await harness.answerHydration({
+      generation: 11,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [
+        {
+          path: "A.md",
+          revision: "blake3:a1",
+          outgoing: [harness_ref("A.md", "T1", null), harness_ref("A.md", "T2", null)],
+        },
+      ],
+    });
+    await applying;
+
+    expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
+    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(harness.mirror.unresolvedLinks()).toEqual({ "A.md": { T1: 1, T2: 1 } });
+  });
+
+  it("walks a chain of late removals one round per link, and asks each path once", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+        { path: "P.md", kind: "note", revision: "blake3:p1" },
+        { path: "Q.md", kind: "note", revision: "blake3:q1" },
+        { path: "Other", kind: "folder" },
+        { path: "Other/P.md", kind: "note", revision: "blake3:op1" },
+      ],
+      notes: [
+        { path: "X.md", revision: "blake3:x1" },
+        { path: "P.md", revision: "blake3:p1", outgoing: [harness_ref("P.md", "X", "X.md")] },
+        {
+          path: "Q.md",
+          revision: "blake3:q1",
+          // Asked in round 1 because it wrote the *text* `X`; a referrer of
+          // `P.md` by text too, while resolving that name somewhere else.
+          outgoing: [harness_ref("Q.md", "X", "X.md"), harness_ref("Q.md", "P", "Other/P.md")],
+        },
+        { path: "Other/P.md", revision: "blake3:op1" },
+      ],
+    });
+
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["X.md"], deleted: [] },
+        affected_note_count: 1,
+      }),
+    );
+    const first = await harness.answerRefetch(8, [], { absent: ["X.md"] });
+    // Round 1: both of `X.md`'s referrers, one of which has gone as well.
+    const second = await harness.answerRefetch(
+      9,
+      [
+        {
+          path: "Q.md",
+          revision: "blake3:q1",
+          outgoing: [harness_ref("Q.md", "X", null), harness_ref("Q.md", "P", "Other/P.md")],
+        },
+      ],
+      { absent: ["P.md"] },
+    );
+    await applying;
+
+    expect([...first]).toEqual(["X.md"]);
+    expect([...second].sort()).toEqual(["P.md", "Q.md"]);
+    // **And no third round.** Expanding `P.md`'s absence derives `Q.md` again —
+    // by link text, since `Q.md` wrote that name — and folding each round's
+    // asks into `wanted` is the only thing that stops it being asked twice.
+    // `Q.md` needs no re-ask either: its round-1 answer was served after both
+    // removals were observed, so it resolves into neither.
+    expect(harness.methodsSeen().filter((method) => method === "get_tree_entries")).toHaveLength(2);
+    expect(harness.pendingRequests()).toHaveLength(0);
+    expect(harness.mirror.entry("X.md")).toBeUndefined();
+    expect(harness.mirror.entry("P.md")).toBeUndefined();
+    expect(harness.mirror.resolvedLinks()).toEqual({ "Q.md": { "Other/P.md": 1 } });
+    expect(harness.mirror.unresolvedLinks()).toEqual({ "Q.md": { X: 1 } });
+  });
+
+  it("escalates when the *late-removal loop* pushes the refetch past the path limit", async () => {
+    const referrers = ["R1.md", "R2.md", "R3.md", "R4.md", "R5.md"];
+    const harness = await hydrated(
+      {
+        generation: 5,
+        entries: [
+          { path: "X.md", kind: "note" as const, revision: "blake3:x1" },
+          ...referrers.map((path) => ({ path, kind: "note" as const, revision: `blake3:${path}` })),
+        ],
+        notes: [
+          { path: "X.md", revision: "blake3:x1" },
+          ...referrers.map((path) => ({
+            path,
+            revision: `blake3:${path}`,
+            outgoing: [harness_ref(path, "X", "X.md")],
+          })),
+        ],
+      },
+      { mirrorDeltaPathLimit: 3 },
+    );
+
+    // One modified path: the pre-queue check and the pre-loop escalation both
+    // let it through, because `wanted` is one. Only the loop's own expansion
+    // crosses the limit — when the late removal of `X.md` drags in five
+    // referrers nothing planned for — so this is the only road to that branch,
+    // and `mirrorDeltaPathLimit` defaults to 512, which a hub note reaches.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["X.md"], deleted: [] },
+        affected_note_count: 1,
+      }),
+    );
+    const asked = await harness.answerRefetch(8, [], { absent: ["X.md"] });
+    expect([...asked]).toEqual(["X.md"]);
+    await harness.answerHydration({
+      generation: 9,
+      entries: referrers.map((path) => ({
+        path,
+        kind: "note" as const,
+        revision: `blake3:${path}`,
+      })),
+      notes: referrers.map((path) => ({
+        path,
+        revision: `blake3:${path}`,
+        outgoing: [harness_ref(path, "X", null)],
+      })),
+    });
+    await applying;
+
+    expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
+    expect(harness.mirror.entry("X.md")).toBeUndefined();
+    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(harness.mirror.unresolvedLinks()).toEqual({
+      "R1.md": { X: 1 },
+      "R2.md": { X: 1 },
+      "R3.md": { X: 1 },
+      "R4.md": { X: 1 },
+      "R5.md": { X: 1 },
+    });
+  });
+
   it("asks for the ancestors of a modified path, because an edit moves the folder", async () => {
     const harness = await hydrated({
       generation: 5,

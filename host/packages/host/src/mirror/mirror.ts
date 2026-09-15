@@ -50,6 +50,31 @@
  * Both are refetches rather than escalations: one more row in a
  * `get_tree_entries` batch that is already going out, plus one `get_note` each.
  *
+ * ## The invariant an apply installs under
+ *
+ * **Every installed row was fetched at or after the generation at which every
+ * path it resolves to was last observed.**
+ *
+ * That is a stronger bar than "fetched at or after this change set's
+ * generation", and the difference is the whole of two bugs. A refetch is
+ * answered at whatever generation is current when it lands, so one apply's
+ * rounds are answered at *increasing* generations: a row served in the first
+ * round can name a path a later round has only just found gone, and installing
+ * it leaves a resolved link to a path this mirror does not hold. That is not a
+ * stale read that the next event repairs — the generation that really deletes
+ * the path finds the row already gone, expands an empty subtree, and asks
+ * nobody — so it is permanent, and it is invisible to everything except a
+ * check on the mirror's own tables.
+ *
+ * So the late-removal walk keeps going until a pass finds nothing new, and any
+ * row already fetched in this apply that resolves into a path a later pass
+ * removed is **asked again**, once. A row still stale after that re-ask means
+ * the vault is moving faster than this host can read it, and the apply takes
+ * the resync road rather than installing something it knows is wrong.
+ *
+ * `mirror-fuzz-real-daemon.test.ts` asserts the observable half of this on
+ * every batch: no resolved link may name a path the mirror does not hold.
+ *
  * ## The three rules a change set is applied under
  *
  * All three come from `docs/protocol.md` §Events by way of `client/events.ts`,
@@ -1382,12 +1407,21 @@ export class Mirror implements MirrorQuery {
       // later generation — it looked transient only because an unrelated
       // `watcher_overflow` resync happened to repair it.
       //
-      // The loop terminates: a round expands only paths that came back absent
-      // and have not been expanded before, and it asks only for paths this
-      // mirror's own indexes name, which no round adds to. In practice it is
-      // one round past the last one that found anything — chain depth, not
-      // vault size — and the oversize escalation below still bounds the cost.
+      // **Why it terminates**, which is worth being exact about, because the
+      // last reader reasoned from a comment that was merely confident. `wanted`
+      // only grows, every round subtracts it from `late`, and the universe a
+      // round can draw from is fixed: the change set's paths, their ancestors
+      // (pure string work), and the paths this mirror's own indexes name —
+      // `this.state` is not mutated until after the loop, so no round adds to
+      // it. A round therefore either breaks or strictly grows `wanted` inside a
+      // bounded set. The re-ask below adds at most one further ask per path,
+      // capped by `restaleAsked`. `expanded` is a **work saver** and not the
+      // guard — dropping it leaves the loop correct and terminating, just
+      // re-walking absences it has already walked — so nothing observable pins
+      // it, and that is on purpose rather than a gap. The oversize escalation
+      // bounds the cost a second time, at `mirrorDeltaPathLimit`.
       const expanded = new Set<string>();
+      const restaleAsked = new Set<string>();
       for (;;) {
         const late = new Set<string>();
         for (const path of plan.absent) {
@@ -1406,9 +1440,31 @@ export class Mirror implements MirrorQuery {
           }
         }
         for (const path of doomed) late.delete(path);
-        // Already fetched in this apply, at the generation this apply is being
-        // answered at. Asking twice would buy nothing and would never settle.
+        // Already fetched in this apply. That is *not* the same as "fetched
+        // late enough", which is what the re-ask below is for.
         for (const path of wanted) late.delete(path);
+        // **`wanted` means "asked once", not "asked at or past the absence".**
+        // Each round is answered at whatever generation is current when it
+        // lands, and those generations increase: a row answered in round 0 was
+        // served while a path round 2 has only just found gone was still
+        // there — and it still resolves to it. Subtracting `wanted` above is
+        // exactly how such a row reached the install pointing at a path this
+        // apply was about to remove, and it stayed that way, because the
+        // generation that really deletes that path finds the row gone and
+        // expands an empty subtree. Measured against the shipped daemon: the
+        // fuzz oracle's per-batch check counted up to ninety-six such rows in
+        // one three-hundred-mutation seed-run.
+        //
+        // One re-ask each — `restaleAsked` — answered past the absence, which
+        // is a generation at which the daemon has already re-resolved. A row
+        // that is *still* stale after its re-ask is a vault moving faster than
+        // this host can read it, and that is the resync road, taken below.
+        for (const [path, row] of plan.notes) {
+          if (doomed.has(path) || restaleAsked.has(path)) continue;
+          if (!resolvesInto(row, doomed)) continue;
+          restaleAsked.add(path);
+          late.add(path);
+        }
         if (late.size === 0) break;
         for (const path of late) wanted.add(path);
         // The same escalation the first expansion takes, for the same reason:
@@ -1427,6 +1483,33 @@ export class Mirror implements MirrorQuery {
       // failing a subscription fan-out over.
       if (error instanceof EngineLostError) return;
       throw error;
+    }
+
+    // **Nothing is installed that is already known to be wrong.** The re-ask
+    // above is one per path; a row that still resolves into a path this apply
+    // is removing has spent it, and installing it anyway would put back exactly
+    // the dangling resolution this whole expansion exists to prevent — silently
+    // and, because the row's real delete generation will find it gone, forever.
+    // So the apply stops and re-hydrates instead: the house answer to "I cannot
+    // get to this state one path at a time", and the same answer the oversize
+    // road gives, under the same reason.
+    // Two scans, because a row can arrive at the install from two directions
+    // and only one of them is in the plan.
+    //
+    // - **A row this apply fetched** that resolves into a removal: the re-ask
+    //   was spent, or the removal was found after it was answered.
+    // - **A row this mirror already holds** whose target is being removed and
+    //   which this apply is *not* replacing. The expansion asks for every such
+    //   referrer, so reaching the install still holding one means the ask did
+    //   not come back with it — a path that went absent between rounds, say.
+    //   Scanning the backlink buckets of what is being removed is O(affected),
+    //   which is the same order the expansion already runs at, and it makes the
+    //   guarantee structural rather than a claim about the expansion being
+    //   exhaustive.
+    if (this.wouldDangle(plan, doomed)) {
+      this.markResync("refetch_oversized");
+      await this.runResync();
+      return;
     }
 
     const removed = new Set<string>();
@@ -1512,6 +1595,35 @@ export class Mirror implements MirrorQuery {
       cause,
       synthetic: false,
     });
+  }
+
+  /**
+   * Would installing `plan` leave a resolved link to a path in `doomed`?
+   *
+   * The install's last question, and the one the whole late-removal expansion
+   * exists to be able to answer "no" to. Both directions a row can arrive
+   * from are asked, and both use {@link resolvedTargetOf} — the function the
+   * backlink index and `resolvedLinks` are themselves built from — so "resolves
+   * into `doomed`" here means exactly "dangles afterwards".
+   */
+  private wouldDangle(plan: RefetchPlan, doomed: ReadonlySet<string>): boolean {
+    for (const [path, row] of plan.notes) {
+      if (doomed.has(path)) continue;
+      if (resolvesInto(row, doomed)) return true;
+    }
+    for (const gone of doomed) {
+      for (const reference of this.state.backlinks(gone)) {
+        const source = reference.source_path;
+        if (doomed.has(source)) continue;
+        // Replaced by this apply with a row that does not dangle: fine. Not
+        // replaced at all, or replaced by one that still resolves into a
+        // removal: not fine.
+        const replacement = plan.notes.get(source);
+        if (replacement && !resolvesInto(replacement, doomed)) continue;
+        return true;
+      }
+    }
+    return false;
   }
 
   /** One `get_tree_entries` batch per 1024 paths, then one `get_note` per note. */
@@ -1773,12 +1885,41 @@ export class Mirror implements MirrorQuery {
 function mergedPlans(first: RefetchPlan, second: RefetchPlan): RefetchPlan {
   const notes = new Map(first.notes);
   for (const [path, row] of second.notes) notes.set(path, row);
+  // **Entries dedupe by path, later answer winning**, the same rule the notes
+  // map gets for free. One path really can appear in two passes now that a
+  // stale referrer is re-asked, and two rows for one path would otherwise be
+  // installed in sequence — harmless only by luck, since the second upsert
+  // moves no stamp, and a source of duplicate entries in the emitted batch the
+  // moment the two rows differ.
+  const entries = new Map<string, MirrorEntry>();
+  for (const entry of first.entries) entries.set(entry.path, entry);
+  for (const entry of second.entries) entries.set(entry.path, entry);
   return {
     generation: Math.max(first.generation, second.generation),
-    entries: [...first.entries, ...second.entries],
+    entries: [...entries.values()],
     notes,
     absent: [...first.absent, ...second.absent],
   };
+}
+
+/**
+ * Does any of `row`'s references resolve into `gone`?
+ *
+ * Through {@link resolvedTargetOf}, which is **the same function the backlink
+ * index and `resolvedLinks` are built from** — so "this row resolves into a
+ * path being removed" means exactly "installing this row would leave a
+ * resolved link to a path the mirror does not hold". Testing
+ * `resolution.kind === "resolved"` instead misses `missing_subpath` and
+ * `ambiguous`, both of which the indexes file under a target, and both of which
+ * the fuzz oracle then reports as dangling — measured, once in twelve
+ * seed-runs, after the rest of this fix was in place.
+ */
+function resolvesInto(row: MirrorNoteRow, gone: ReadonlySet<string>): boolean {
+  for (const reference of row.outgoing) {
+    const target = resolvedTargetOf(reference);
+    if (target !== null && gone.has(target)) return true;
+  }
+  return false;
 }
 
 /** Every ancestor folder of a path, shallowest first. `""` is not one. */
