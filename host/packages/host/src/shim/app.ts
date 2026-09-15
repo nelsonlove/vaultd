@@ -26,8 +26,13 @@
  * `keymap`, `scope`, `setting` and `foldManager`. Nothing here is re-decided later — a task adds its field and
  * the assembler's one assignment, and that is all.
  */
+import { FoldManager, Keymap, Scope, SettingRegistry } from "./keymap";
+import type { CommandRegistry } from "./commands";
 import type { FileManager } from "./file-manager";
+import type { HostLocalStorage } from "./globals";
+import type { InternalPluginRegistry } from "./internal-plugins";
 import type { MetadataCache } from "./metadata-cache";
+import type { PluginRegistry } from "./plugin-registry";
 import type { Vault } from "./vault";
 import type { Workspace } from "./workspace";
 
@@ -89,7 +94,107 @@ export class App {
    */
   workspace!: Workspace;
 
-  constructor(options: { appId: string }) {
+  /**
+   * `app.plugins` — filled by `assembleShim`, exactly once.
+   *
+   * Assigned rather than constructed into a `readonly` field like its three
+   * peers above: the registry holds the very `Plugin` instances that hold this
+   * `App`, so there is no order in which both are final.
+   */
+  plugins!: PluginRegistry;
+
+  /**
+   * `app.internalPlugins` — filled by `assembleShim`, exactly once.
+   *
+   * It reads config files through the client and subscribes to the mirror's
+   * `config_changed`, so it is built where those are in scope rather than here.
+   */
+  internalPlugins!: InternalPluginRegistry;
+
+  /**
+   * `app.commands` — filled by `assembleShim`, exactly once, and the **one**
+   * command map. `Plugin.addCommand` delegates into it; nothing keeps a second
+   * list. See `shim/commands.ts` for why the map is a plain mutable object.
+   */
+  commands!: CommandRegistry;
+
+  /**
+   * The four surfaces that are about a window, and hold nothing of this host's.
+   *
+   * Constructed here rather than assigned by the assembler, and that is not an
+   * inconsistency with the four fields above: those four are in a reference
+   * cycle with this object and these are not. A `Keymap` holds nothing, so
+   * there is no order problem to solve and `readonly` is honest.
+   */
+  readonly keymap: Keymap = new Keymap();
+  readonly scope: Scope = new Scope();
+  readonly setting: SettingRegistry = new SettingRegistry();
+  readonly foldManager: FoldManager = new FoldManager();
+
+  /**
+   * The Obsidian version this host reports, from `HostConfig.appVersion` — the
+   * same string `apiVersion` and `requireApiVersion` answer from.
+   */
+  readonly appVersion: string;
+
+  /**
+   * Obsidian's `app.lastEvent`: the DOM event that triggered what is running.
+   *
+   * Always `null`, because nothing here is triggered by a DOM event. Plugins
+   * read it to decide where to place a menu or whether a modifier was held, and
+   * every one of them handles the null case — it is null in Obsidian too for
+   * anything not driven by a click.
+   */
+  readonly lastEvent: null = null;
+
+  /**
+   * Where {@link loadLocalStorage} and {@link saveLocalStorage} really store.
+   *
+   * Assigned by `assembleShim` from the same installation that backs the bare
+   * `localStorage` global, so a plugin that writes through one and reads
+   * through the other sees one value rather than two stores.
+   */
+  localStorageStore!: HostLocalStorage;
+
+  constructor(options: { appId: string; appVersion: string }) {
     this.appId = options.appId;
+    this.appVersion = options.appVersion;
+  }
+
+  /**
+   * Obsidian's `app.loadLocalStorage(key)`: the vault-scoped JSON store.
+   *
+   * Keyed `<appId>-<key>`, which is Obsidian's own scheme and the reason
+   * `appId` is derived from the vault path rather than being random: a plugin
+   * that stored a value on one run finds it on the next.
+   *
+   * A stored document that will not parse answers `null` rather than throwing.
+   * The call is made from inside `onload` in half the corpus, and a
+   * `SyntaxError` there costs the plugin everything after it.
+   */
+  loadLocalStorage(key: string): unknown {
+    const raw = this.localStorageStore.getItem(this.storageKey(key));
+    if (raw === null) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The counterpart. `null` or `undefined` **removes** the key, which is
+   * Obsidian's own behaviour and what a plugin clearing a setting relies on.
+   */
+  saveLocalStorage(key: string, value: unknown): void {
+    if (value === null || value === undefined) {
+      this.localStorageStore.removeItem(this.storageKey(key));
+      return;
+    }
+    this.localStorageStore.setItem(this.storageKey(key), JSON.stringify(value));
+  }
+
+  private storageKey(key: string): string {
+    return `${this.appId}-${key}`;
   }
 }

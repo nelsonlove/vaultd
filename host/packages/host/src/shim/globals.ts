@@ -434,6 +434,19 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
     changeLanguage: (): Promise<void> => Promise.resolve(),
   });
   patcher.define(globalThis, "MutationObserver", InertMutationObserver);
+  // **`CodeMirrorAdapter` is Obsidian's CodeMirror 5 compatibility global**, and
+  // a plugin that wants to run something on save writes into its `commands`
+  // map: `window.CodeMirrorAdapter.commands.save = ...` is obsidian-linter's
+  // second save hook, straight after the `app.commands` one. There is no CM5
+  // here and no keyboard to press the binding, so the object accepts the
+  // assignment and nothing reads it back — but it has to *be* there: the
+  // assignment is a bare property write on an undefined object, which is a
+  // `TypeError` inside `onload` that costs the plugin everything after it. It
+  // is a bare global rather than a module export, exactly like `window` and
+  // `i18next`, so it is declared here and listed in `GLOBAL_ONLY_SYMBOLS`.
+  // Nothing records a hit on it: a plugin *assigns into* the map rather than
+  // calling anything, and there is no call to intercept.
+  patcher.define(globalThis, "CodeMirrorAdapter", { commands: {} });
 
   // The element constructors. `Element` and `HTMLElement` are the same class,
   // because nothing this host does distinguishes them and plugins use both
@@ -649,6 +662,7 @@ declarePolicy("navigator", "safe_stub");
 declarePolicy("navigator.clipboard", "safe_stub");
 declarePolicy("i18next", "safe_stub");
 declarePolicy("MutationObserver", "safe_stub");
+declarePolicy("CodeMirrorAdapter", "safe_stub");
 declarePolicy("Element", "safe_stub");
 declarePolicy("Node", "safe_stub");
 declarePolicy("DocumentFragment", "safe_stub");

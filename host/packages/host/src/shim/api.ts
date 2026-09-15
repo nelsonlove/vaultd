@@ -72,7 +72,9 @@ import { App } from "./app";
 import { Component, Plugin } from "./plugin";
 import { FileSystemAdapter } from "./adapter";
 import { Events, Menu, MenuItem } from "./events";
+import { Editor } from "./editor";
 import { FileManager } from "./file-manager";
+import { Keymap, Scope } from "./keymap";
 import { MetadataCache } from "./metadata-cache";
 import {
   addIcon,
@@ -103,18 +105,15 @@ import {
   ColorComponent,
   DisplayValueComponent,
   DropdownComponent,
-  Editor,
   EditorSuggest,
   ExtraButtonComponent,
   FuzzySuggestModal,
-  Keymap,
   MarkdownRenderChild,
   Modal,
   MomentFormatComponent,
   PluginSettingTab,
   PopoverSuggest,
   ProgressBarComponent,
-  Scope,
   SearchComponent,
   SecretComponent,
   Setting,
@@ -207,7 +206,7 @@ export const API_POLICY: Readonly<Record<string, ApiPolicy>> = {
   sortSearchResults: "implemented", requestUrl: "implemented", request: "implemented",
   arrayBufferToBase64: "implemented", base64ToArrayBuffer: "implemented",
   arrayBufferToHex: "implemented", hexToArrayBuffer: "implemented",
-  getBlobArrayBuffer: "implemented",
+  getBlobArrayBuffer: "implemented", Editor: "implemented",
 
   // ---- harvested: recorded as a capability, never rendered ----
   PluginSettingTab: "harvested", Setting: "harvested",
@@ -216,7 +215,7 @@ export const API_POLICY: Readonly<Record<string, ApiPolicy>> = {
   WorkspaceLeaf: "safe_stub", View: "safe_stub", ItemView: "safe_stub",
   FileView: "safe_stub", EditableFileView: "safe_stub", MarkdownView: "safe_stub",
   FileSystemAdapter: "safe_stub", MarkdownRenderChild: "safe_stub", Scope: "safe_stub",
-  Keymap: "safe_stub", Editor: "safe_stub", EditorSuggest: "safe_stub",
+  Keymap: "safe_stub", EditorSuggest: "safe_stub",
   AbstractInputSuggest: "safe_stub", PopoverSuggest: "safe_stub", Modal: "safe_stub",
   SettingTab: "safe_stub", BaseComponent: "safe_stub", ValueComponent: "safe_stub",
   AbstractTextComponent: "safe_stub", ButtonComponent: "safe_stub",
@@ -274,6 +273,7 @@ export const GLOBAL_ONLY_SYMBOLS: readonly string[] = [
   "navigator",
   "i18next",
   "MutationObserver",
+  "CodeMirrorAdapter",
   "Element",
   "Node",
   "HTMLElement",
@@ -447,6 +447,7 @@ function realBindings(assembly: Omit<HostAssembly, "api">): Record<string, unkno
     MetadataCache,
     FileManager,
     Workspace,
+    Editor,
     Menu,
     MenuItem,
     SuggestModal,
@@ -522,7 +523,6 @@ const SAFE_STUBS: Record<string, unknown> = {
   MarkdownRenderChild,
   Scope,
   Keymap,
-  Editor,
   EditorSuggest,
   AbstractInputSuggest,
   Modal,

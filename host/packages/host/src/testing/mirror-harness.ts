@@ -358,8 +358,12 @@ function snapshotNoteDto(fixture: FixtureNote): SnapshotNoteDto {
  * The same fixture as `get_note` answers it: flat metadata, `outgoing` rather
  * than `references`, a `source`, and `sections` / `list_items` present because
  * the refetch named them in `include`.
+ *
+ * Exported since Task 12, which serves the *other* `get_note` — the one an
+ * `Editor.open` issues, with no `include` — from the same shape rather than
+ * from a second hand-written DTO.
  */
-function noteDto(fixture: FixtureNote): NoteDto {
+export function noteDto(fixture: FixtureNote): NoteDto {
   return {
     path: fixture.path,
     revision: fixture.revision,

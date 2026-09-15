@@ -74,7 +74,21 @@ export const CONSTRUCTED: Record<string, (ctx: ShapeContext) => unknown[]> = {
   MarkdownRenderChild: (ctx) => [ctx.containerEl],
   Scope: () => [],
   Keymap: () => [],
-  Editor: () => [],
+  // **Two arguments since Task 12**, where `Editor` went from a class whose
+  // every method threw to a real buffer over a real note. Obsidian's own
+  // `Editor` is abstract and no plugin constructs one, so the awkward
+  // signature costs a plugin nothing — but the row still has to *build* one,
+  // because construction is what this bucket asserts and an editor with no
+  // note behind it is not an editor.
+  Editor: (ctx) => [
+    {
+      client: ctx.harness.client,
+      mirror: ctx.harness.mirror,
+      writes: ctx.harness.writes,
+      file: ctx.harness.vault.getFileByPath("Folder/A.md"),
+    },
+    { source: "# A\n\nbody\n", revision: ctx.harness.revisionOf("Folder/A.md") },
+  ],
   View: () => [],
   ItemView: () => [],
   FileView: () => [],

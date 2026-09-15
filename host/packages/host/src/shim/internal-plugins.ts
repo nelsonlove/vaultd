@@ -1,0 +1,326 @@
+/**
+ * `app.internalPlugins` — Obsidian's core plugins, as much of them as a vault's
+ * config files can honestly answer for.
+ *
+ * **Two are reimplemented, the rest are present-but-absent.** `daily-notes` and
+ * `bookmarks` are, from a plugin's point of view, config readers: what
+ * rollover-daily-todos wants from `daily-notes` is `{ folder, format, template }`
+ * out of `daily-notes.json`, and what a bookmark consumer wants is the tree out
+ * of `bookmarks.json`. Both are files this host can read, so both are real.
+ * Everything else a core plugin does — `file-explorer`'s tree, `global-search`'s
+ * query box, `bases`, `file-recovery`, `properties`, `workspaces` — is a *view*,
+ * and a headless host has none. Those report `enabled` truthfully from
+ * `core-plugins.json` and hand back `instance: null`, which is exactly the
+ * shape the consuming plugins already branch on: folder-notes' `getFileExplorer()`
+ * early-returns on a falsy instance and disables its CSS features cleanly.
+ *
+ * **`templates` falls to the same default, and that is a decision.** Nothing in
+ * the corpus reads its instance, and an object with an empty `options` would
+ * claim a template folder this host never read. `null` says "not here" to a
+ * plugin that asks, which is the answer a plugin can act on.
+ *
+ * **Config resolution is host-directory-first**, the same ladder
+ * `Vault.getConfig` uses for `app.json`: `<hostConfigDir>/<name>` first,
+ * `.obsidian/<name>` as the fallback. A fresh headless config dir therefore
+ * inherits the real vault's `daily-notes.json` — which is what makes rollover
+ * work on day one — while an explicit headless override wins. Both reads go
+ * through the daemon's `read_file`; the host never opens either file itself.
+ *
+ * **When the cache is re-read, stated against the daemon's real behaviour
+ * (Ruling W7).** The daemon raises `config_changed` for writes into `.obsidian`
+ * that it sees: this host's own raw writes, and another vaultd client's. It
+ * does **not** watch a GUI Obsidian editing those files. So {@link
+ * InternalPluginRegistry.refresh} runs on three occasions: once at startup,
+ * once per `config_changed` naming one of the three files this registry reads,
+ * and whenever Task 14's 60 s coexistence poll calls it for the external-edit
+ * case an event will never cover. It is public for exactly that third caller.
+ *
+ * The basename filter on the event matters: `config_changed` fires for every
+ * write into the config zone, including every plugin's own `data.json`, and
+ * re-reading the config files on each of those would turn one plugin's
+ * `saveData` into a handful of `read_file` round trips.
+ */
+
+import { declarePolicy, recordUse } from "./policy";
+import type { HostConfig } from "../config";
+import type { Mirror } from "../mirror/mirror";
+import type { ReadFileResponse } from "../client/protocol";
+import type { VaultdClient } from "../client/client";
+
+/** Obsidian's own config directory, which this host reads and never writes. */
+const OBSIDIAN_CONFIG_DIR = ".obsidian";
+
+/** One entry of `app.internalPlugins.plugins`. */
+export interface InternalPluginEntry {
+  readonly id: string;
+  readonly enabled: boolean;
+  /** The reimplemented pair's instance; `null` for everything else. */
+  readonly instance: unknown;
+}
+
+/** What `daily-notes`' instance carries, and all of it that plugins read. */
+export interface DailyNotesInstance {
+  options: { folder: string; format: string; template: string };
+}
+
+/** One node of the bookmarks tree, as `bookmarks.json` spells it. */
+export interface BookmarkItem {
+  type: "file" | "folder" | "search" | "graph" | "group" | "url" | (string & {});
+  title?: string;
+  path?: string;
+  subpath?: string;
+  query?: string;
+  url?: string;
+  ctime?: number;
+  items?: BookmarkItem[];
+}
+
+/** What `bookmarks`' instance carries. */
+export interface BookmarksInstance {
+  items: BookmarkItem[];
+  getBookmarks(): BookmarkItem[];
+  getItemTitle(item: BookmarkItem): string;
+}
+
+export interface InternalPluginDeps {
+  readonly client: VaultdClient;
+  readonly mirror: Mirror;
+  readonly config: HostConfig;
+}
+
+/**
+ * Obsidian's defaults for `daily-notes.json`, used for any key the file omits.
+ *
+ * A vault that has never opened the core plugin's settings has no file at all,
+ * and `YYYY-MM-DD` with no folder and no template is what Obsidian behaves as
+ * in that state.
+ */
+const DAILY_NOTES_DEFAULTS = { folder: "", format: "YYYY-MM-DD", template: "" } as const;
+
+/**
+ * The core plugins this host reports present and cannot serve an instance for.
+ *
+ * Every one of them is a view. A seventh id — or any id at all that is not
+ * `daily-notes` or `bookmarks` — falls to the same default; the list is written
+ * out because these six are the ones the corpus actually asks for, and a reader
+ * of this file is owed the names.
+ */
+const VIEW_ONLY = new Set<string>([
+  "file-explorer",
+  "global-search",
+  "bases",
+  "file-recovery",
+  "properties",
+  "workspaces",
+]);
+
+export class InternalPluginRegistry {
+  /** Every core plugin this host knows an `enabled` flag for, by id. */
+  readonly plugins: Record<string, InternalPluginEntry> = {};
+
+  private readonly deps: InternalPluginDeps;
+  private readonly unsubscribe: () => void;
+  /** The first refresh, so a caller can wait for the registry to be usable. */
+  private readonly primed: Promise<void>;
+
+  /**
+   * The files this registry reads. A write to anything else is ignored.
+   *
+   * **`app.json` is deliberately not here**, against the brief's list of four:
+   * nothing in this registry reads it, `Vault.getConfig` holds its own
+   * subscription for exactly that file, and a second listener re-reading three
+   * unrelated files on every `app.json` write would be round trips nobody
+   * consumes.
+   */
+  private static readonly WATCHED = new Set<string>([
+    "core-plugins.json",
+    "daily-notes.json",
+    "bookmarks.json",
+  ]);
+
+  constructor(deps: InternalPluginDeps) {
+    this.deps = deps;
+    this.unsubscribe = deps.mirror.onConfigChanged(async (path: string) => {
+      const name = path.slice(path.lastIndexOf("/") + 1);
+      if (!InternalPluginRegistry.WATCHED.has(name)) return;
+      await this.refresh();
+    });
+    this.primed = this.refresh();
+  }
+
+  /**
+   * The entry for a core plugin, or `null` for an id this host has no opinion
+   * about.
+   *
+   * The six view-only ids and the two reimplemented ones are always present,
+   * whatever `core-plugins.json` says, so the calls the corpus actually makes
+   * always get an entry. An id outside that set and outside the config file is
+   * one this host has never heard of, and `null` — Obsidian's own answer for a
+   * core plugin that does not exist — is the honest one.
+   */
+  getPluginById(id: string): InternalPluginEntry | null {
+    recordUse("InternalPluginRegistry.getPluginById");
+    return this.plugins[id] ?? null;
+  }
+
+  /**
+   * The instance, but only when the core plugin is enabled.
+   *
+   * `null` in every other case: disabled, unknown, or enabled-but-view-only.
+   * This is the call folder-notes and tag-wrangler make, and `null` is what
+   * sends them down their own already-written degraded branch.
+   */
+  getEnabledPluginById(id: string): unknown {
+    recordUse("InternalPluginRegistry.getEnabledPluginById");
+    const entry = this.plugins[id];
+    if (entry === undefined || !entry.enabled) return null;
+    return entry.instance;
+  }
+
+  /**
+   * Re-read every config file this registry serves from.
+   *
+   * Public because it has three callers: the constructor, the `config_changed`
+   * subscription, and Task 14's coexistence poll — see this file's header for
+   * why the third one is not redundant.
+   */
+  async refresh(): Promise<void> {
+    const core = await this.readConfigJson("core-plugins.json");
+    const enabled = enabledMap(core);
+    const daily = await this.readConfigJson("daily-notes.json");
+    const bookmarks = await this.readConfigJson("bookmarks.json");
+    const next: Record<string, InternalPluginEntry> = {};
+    for (const [id, on] of Object.entries(enabled)) {
+      next[id] = { id, enabled: on, instance: null };
+    }
+    for (const id of VIEW_ONLY) {
+      next[id] ??= { id, enabled: false, instance: null };
+    }
+    next["daily-notes"] = {
+      id: "daily-notes",
+      enabled: enabled["daily-notes"] ?? false,
+      instance: dailyNotesInstance(daily),
+    };
+    next["bookmarks"] = {
+      id: "bookmarks",
+      enabled: enabled["bookmarks"] ?? false,
+      instance: bookmarksInstance(bookmarks),
+    };
+    // Replace the contents rather than the object: a plugin that captured
+    // `app.internalPlugins.plugins` at load — which several do — must see the
+    // refreshed values rather than a snapshot of the old ones.
+    for (const id of Object.keys(this.plugins)) delete this.plugins[id];
+    Object.assign(this.plugins, next);
+  }
+
+  /** **HOST-ONLY.** Resolves once the first read has landed. */
+  ready(): Promise<void> {
+    return this.primed;
+  }
+
+  /** **HOST-ONLY.** Stop listening. For a host being torn down. */
+  detach(): void {
+    this.unsubscribe();
+  }
+
+  /**
+   * One config file's object, host directory first.
+   *
+   * `null` when neither copy is there or neither parses — which is an ordinary
+   * vault state, not a failure: a vault that has never enabled a core plugin
+   * has no `core-plugins.json` at all.
+   */
+  private async readConfigJson(name: string): Promise<Record<string, unknown> | null> {
+    const paths = [`${this.deps.config.configDirName}/${name}`, `${OBSIDIAN_CONFIG_DIR}/${name}`];
+    for (const path of paths) {
+      const parsed = await this.readOne(path);
+      if (parsed !== null) return parsed;
+    }
+    return null;
+  }
+
+  private async readOne(path: string): Promise<Record<string, unknown> | null> {
+    try {
+      const response = await this.deps.client.request<ReadFileResponse>("read_file", { path });
+      const source = Buffer.from(response.content_base64, "base64").toString("utf8");
+      const parsed: unknown = JSON.parse(source);
+      return typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * `core-plugins.json` in either of its two shapes.
+ *
+ * Obsidian wrote an **array of enabled ids** until 1.6 and an **object of
+ * id → boolean** after it. Both are still found in real vaults — the file is
+ * only rewritten when a core plugin is toggled — so both are read.
+ */
+function enabledMap(config: Record<string, unknown> | null): Record<string, boolean> {
+  if (config === null) return {};
+  const enabled: Record<string, boolean> = {};
+  if (Array.isArray(config)) {
+    for (const id of config) if (typeof id === "string") enabled[id] = true;
+    return enabled;
+  }
+  for (const [id, value] of Object.entries(config)) {
+    if (typeof value === "boolean") enabled[id] = value;
+  }
+  return enabled;
+}
+
+/** `daily-notes`' instance: its options, with Obsidian's defaults filled in. */
+function dailyNotesInstance(config: Record<string, unknown> | null): DailyNotesInstance {
+  return {
+    options: {
+      folder: stringOr(config?.["folder"], DAILY_NOTES_DEFAULTS.folder),
+      format: stringOr(config?.["format"], DAILY_NOTES_DEFAULTS.format),
+      template: stringOr(config?.["template"], DAILY_NOTES_DEFAULTS.template),
+    },
+  };
+}
+
+/** `bookmarks`' instance: the tree, and the two readers plugins call on it. */
+function bookmarksInstance(config: Record<string, unknown> | null): BookmarksInstance {
+  const raw = config?.["items"];
+  const items: BookmarkItem[] = Array.isArray(raw) ? (raw as BookmarkItem[]) : [];
+  return {
+    items,
+    getBookmarks: (): BookmarkItem[] => [...items],
+    getItemTitle: (item: BookmarkItem): string => bookmarkTitle(item),
+  };
+}
+
+/**
+ * What one bookmark is called.
+ *
+ * An explicit `title` always wins — that is the name the user typed. Otherwise
+ * the item names itself: a file by its basename without the extension (which is
+ * what Obsidian displays), a folder by its path, a search by its query, a URL
+ * by its address. A node that carries none of those has no name, and `""` is
+ * the answer Obsidian renders as a blank row.
+ */
+function bookmarkTitle(item: BookmarkItem): string {
+  if (typeof item.title === "string" && item.title !== "") return item.title;
+  if (item.type === "file" && typeof item.path === "string") {
+    const base = item.path.slice(item.path.lastIndexOf("/") + 1);
+    return base.endsWith(".md") ? base.slice(0, -3) : base;
+  }
+  if (typeof item.path === "string") return item.path;
+  if (typeof item.query === "string") return item.query;
+  if (typeof item.url === "string") return item.url;
+  return "";
+}
+
+function stringOr(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+// The rows this file owns. The class is not a barrel export: Obsidian's module
+// publishes neither it nor `app`, and a plugin reaches this through the app.
+declarePolicy("InternalPluginRegistry.getPluginById", "implemented");
+declarePolicy("InternalPluginRegistry.getEnabledPluginById", "implemented");

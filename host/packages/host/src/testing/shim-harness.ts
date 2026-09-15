@@ -28,7 +28,7 @@ import { join, resolve } from "node:path";
 
 import { assembleShim } from "./assemble";
 import { FixtureVault } from "./fixture-vault";
-import { MirrorHarness } from "./mirror-harness";
+import { MirrorHarness, noteDto } from "./mirror-harness";
 import { fs } from "../runtime/fs-access";
 import { socketPathFor } from "../config";
 import type { HostConfig } from "../config";
@@ -37,7 +37,7 @@ import type { App } from "../shim/app";
 import type { AppliedBatch } from "../shim/files";
 import type { PolicyRecorder } from "../shim/policy";
 import type { Vault, WriteGate } from "../shim/vault";
-import type { FixtureEntry } from "./mirror-harness";
+import type { FixtureEntry, FixtureNote } from "./mirror-harness";
 import type { HostAssembly } from "./assemble";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 import type { Harvest, HarvestedMenuItem, MenuContext } from "../shim/harvest";
@@ -139,6 +139,8 @@ export class ShimHarness extends MirrorHarness {
   private readonly plugins = new Map<string, Plugin>();
   private readonly configFiles = new Map<string, string>();
   private readonly sources = new Map<string, string>();
+  /** The fixture rows behind `get_note`, by path. See {@link serveNotes}. */
+  private readonly noteRows = new Map<string, FixtureNote>();
   /** The paths the auto-server answers. Everything else is answered by hand. */
   private readonly autoServed = new Set<string>();
   private layoutReady: boolean;
@@ -232,6 +234,7 @@ export class ShimHarness extends MirrorHarness {
       harness.sources.set(path, source);
       harness.autoServed.add(path);
     }
+    for (const note of spec.notes) harness.noteRows.set(note.path, note);
     for (const path of harness.configFiles.keys()) harness.autoServed.add(path);
     harness.autoServeFiles({ ...sources, ...Object.fromEntries(harness.configFiles) });
     // The `Vault` constructor primes `getConfig` from two files. A fixture that
@@ -244,7 +247,15 @@ export class ShimHarness extends MirrorHarness {
       if (!harness.configFiles.has(path)) harness.unserveFile(path);
     }
     await harness.openMirror(spec);
+    harness.serveNotes();
     harness.assemble();
+    // Both config readers prime themselves in their constructors, and both are
+    // read **synchronously** by the cases that follow — `vault.getConfig(key)`
+    // and `internalPlugins.getPluginById(id)`. Awaiting the primes here is what
+    // makes "the first synchronous call answers" true rather than a race
+    // against the fixture server.
+    await harness.vault.configReady();
+    await harness.app.internalPlugins.ready();
     // A fixture with no note sources has nothing to warm from: every read the
     // warm-up issued would sit unanswered, and the harness would never start.
     if ((options.warm ?? true) && Object.keys(sources).length > 0) {
@@ -316,6 +327,9 @@ export class ShimHarness extends MirrorHarness {
   async load(plugin: Plugin): Promise<void> {
     const id = plugin.manifest.id;
     this.plugins.set(id, plugin);
+    // **Before `onload`**, which is where Obsidian puts it: a plugin that looks
+    // itself — or a peer loaded earlier — up during startup has to find it.
+    this.app.plugins.register(plugin);
     await this.assembly.queue.run(id, `${id}:onload`, async () => {
       await this.assembly.events.attributingTo(id, () => plugin.load());
     });
@@ -345,6 +359,7 @@ export class ShimHarness extends MirrorHarness {
     });
     this.assembly.events.detachOwner(id);
     this.harvest.forgetPlugin(id);
+    this.app.plugins.deregister(id);
     await this.quiesce();
   }
 
@@ -545,6 +560,37 @@ export class ShimHarness extends MirrorHarness {
    * pair, and until then the view carries the file so a handler that only reads
    * `view.file` still works.
    */
+  /**
+   * Answer the `get_note` an `Editor.open` issues, and only that one.
+   *
+   * **The `include` field is what separates the two callers**, and the
+   * separation is the daemon's own shape rather than a convention invented
+   * here: the mirror's refetch always asks for `include: ["sections",
+   * "list_items"]` (`REFETCH_FACETS`, the only two optional facets there are),
+   * and an editor read asks for neither. So a `get_note` with no `include` is
+   * an editor's, and is served from the fixture's own row plus the source this
+   * harness currently holds; one **with** `include` is a refetch's and is left
+   * for `answerRefetch` to answer, which is what lets a case assert the
+   * read/write/refetch order of a real flush.
+   */
+  private serveNotes(): void {
+    this.serve((request) => {
+      if (request.request.method !== "get_note") return false;
+      const params = request.request.params as { path?: string; include?: unknown };
+      if (params.include !== undefined) return false;
+      const path = params.path;
+      if (path === undefined) return false;
+      const fixture = this.noteRows.get(path);
+      const source = this.sources.get(path);
+      if (fixture === undefined || source === undefined) return false;
+      this.respondOk(request.id, "get_note", {
+        generation: this.mirror.generation(),
+        note: { ...noteDto(fixture), source },
+      });
+      return true;
+    });
+  }
+
   private menuSubject(context: MenuContext, path: string): readonly unknown[] {
     const file = this.vault.getAbstractFileByPath(path);
     if (file === null) throw new Error(`${path} is not in this harness's vault`);
@@ -663,7 +709,17 @@ export function sweepStaleDataDirs(root: string): void {
   }
 }
 
-/** The two files `Vault.getConfig` reads, host directory first. */
+/**
+ * Every config-zone path this host's readers ask for at startup, host directory
+ * first.
+ *
+ * `Vault.getConfig` primes from `app.json`; Task 12's `InternalPluginRegistry`
+ * primes from three more. A path a fixture did not supply has to be answered
+ * `not_found` rather than left unanswered, or the prime's read would sit in the
+ * request queue and the next `nextRequest()` — which a case expects to be its
+ * own write — would hand out a `read_file` instead.
+ */
 function configFilePathsFor(harness: ShimHarness): string[] {
-  return [`${harness.config.configDirName}/app.json`, ".obsidian/app.json"];
+  const names = ["app.json", "core-plugins.json", "daily-notes.json", "bookmarks.json"];
+  return names.flatMap((name) => [`${harness.config.configDirName}/${name}`, `.obsidian/${name}`]);
 }

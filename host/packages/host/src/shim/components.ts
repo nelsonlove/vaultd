@@ -24,6 +24,7 @@
  */
 
 import { Component } from "./plugin";
+import { Scope } from "./keymap";
 import { StubEl } from "./dom";
 import { declarePolicy, recordUse, stub, unsupported } from "./policy";
 import { prepareFuzzySearch, sortSearchResults } from "./search";
@@ -1069,134 +1070,6 @@ export class MarkdownRenderChild extends Component {
   }
 }
 
-/** A keymap scope: it accepts registrations and there is no keyboard. */
-export class Scope {
-  readonly parent: Scope | null;
-  private readonly handlers: { modifiers: string | null; key: string | null; run: unknown }[] = [];
-
-  constructor(parent?: Scope) {
-    this.parent = parent ?? null;
-  }
-
-  register(modifiers: string[] | null, key: string | null, func: unknown): unknown {
-    const handler = { modifiers: modifiers === null ? null : modifiers.join(","), key, run: func };
-    this.handlers.push(handler);
-    return stub("Scope", handler);
-  }
-
-  unregister(handler: unknown): void {
-    const at = this.handlers.indexOf(handler as (typeof this.handlers)[number]);
-    if (at !== -1) this.handlers.splice(at, 1);
-    stub("Scope", undefined);
-  }
-}
-
-/**
- * The modifier helpers, as statics.
- *
- * Every question they answer is about an event that never happened, so every
- * answer is `false` — which is the same answer a real Obsidian gives for a
- * command invoked from the palette with no modifier held, and that is the case
- * a headless invocation most resembles.
- */
-export class Keymap {
-  static isModifier(event: unknown, modifier: string): boolean {
-    void event;
-    void modifier;
-    return stub("Keymap", false);
-  }
-
-  static isModEvent(event?: unknown): boolean | string {
-    void event;
-    return stub("Keymap", false);
-  }
-
-  pushScope(scope: Scope): void {
-    void scope;
-    stub("Keymap", undefined);
-  }
-
-  popScope(scope: Scope): void {
-    void scope;
-    stub("Keymap", undefined);
-  }
-}
-
-/**
- * The editor, as a name a plugin can test against and nothing more.
- *
- * **Every method refuses, and none of them lies.** This host has no editor: a
- * `getValue()` that answered `""` would tell a plugin the note is empty, and a
- * plugin that then wrote that back would empty the note. So the class exists —
- * `leaf.view instanceof MarkdownView` guards and `editor instanceof Editor`
- * guards both need it to — and every call throws a `HeadlessUnsupported` naming
- * the member. Nothing in this host constructs one, so nothing reaches those
- * throws today; a later task that supplies a real editor context replaces the
- * body rather than the name.
- */
-export class Editor {
-  getValue(): string {
-    return unsupported("Editor.getValue");
-  }
-
-  setValue(value: string): void {
-    void value;
-    unsupported("Editor.setValue");
-  }
-
-  getLine(line: number): string {
-    void line;
-    return unsupported("Editor.getLine");
-  }
-
-  setLine(line: number, text: string): void {
-    void line;
-    void text;
-    unsupported("Editor.setLine");
-  }
-
-  lineCount(): number {
-    return unsupported("Editor.lineCount");
-  }
-
-  getCursor(string?: string): unknown {
-    void string;
-    return unsupported("Editor.getCursor");
-  }
-
-  setCursor(pos: unknown): void {
-    void pos;
-    unsupported("Editor.setCursor");
-  }
-
-  getSelection(): string {
-    return unsupported("Editor.getSelection");
-  }
-
-  replaceSelection(replacement: string): void {
-    void replacement;
-    unsupported("Editor.replaceSelection");
-  }
-
-  replaceRange(replacement: string, from: unknown, to?: unknown): void {
-    void replacement;
-    void from;
-    void to;
-    unsupported("Editor.replaceRange");
-  }
-
-  getRange(from: unknown, to: unknown): string {
-    void from;
-    void to;
-    return unsupported("Editor.getRange");
-  }
-
-  transaction(tx: unknown): void {
-    void tx;
-    unsupported("Editor.transaction");
-  }
-}
-
 /**
  * A label for a value of unknown shape.
  *
@@ -1297,15 +1170,3 @@ declarePolicy("SuggestModal.open", "absent");
 declarePolicy("FuzzySuggestModal.open", "absent");
 declarePolicy("PopoverSuggest.open", "safe_stub");
 declarePolicy("PopoverSuggest.close", "safe_stub");
-declarePolicy("Editor.getValue", "absent");
-declarePolicy("Editor.setValue", "absent");
-declarePolicy("Editor.getLine", "absent");
-declarePolicy("Editor.setLine", "absent");
-declarePolicy("Editor.lineCount", "absent");
-declarePolicy("Editor.getCursor", "absent");
-declarePolicy("Editor.setCursor", "absent");
-declarePolicy("Editor.getSelection", "absent");
-declarePolicy("Editor.replaceSelection", "absent");
-declarePolicy("Editor.replaceRange", "absent");
-declarePolicy("Editor.getRange", "absent");
-declarePolicy("Editor.transaction", "absent");

@@ -19,8 +19,22 @@
  * can debug.
  */
 
-/** Which part of a plugin's life a failure happened in. */
-export type HostErrorPhase = "onload" | "onunload" | "teardown" | "menu-hook" | "plugin-data";
+/**
+ * Which part of a plugin's life a failure happened in.
+ *
+ * `command` is the one nobody is waiting on for a reason worth stating: a
+ * command callback may be `async`, and `executeCommandById` is synchronous, so
+ * the rejection of a command a plugin started has no caller left to reach. It
+ * lands here instead of becoming an unhandled rejection with no plugin name on
+ * it.
+ */
+export type HostErrorPhase =
+  | "onload"
+  | "onunload"
+  | "teardown"
+  | "menu-hook"
+  | "plugin-data"
+  | "command";
 
 export type HostErrorListener = (error: unknown, pluginId: string, phase: HostErrorPhase) => void;
 

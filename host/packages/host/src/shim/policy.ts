@@ -225,3 +225,28 @@ export async function enterPlugin<T>(
     pluginId = previous;
   }
 }
+
+/**
+ * The synchronous counterpart, for an entry point that **must** answer without
+ * awaiting.
+ *
+ * There is exactly one: `app.commands.executeCommandById`, which is synchronous
+ * in Obsidian and whose boolean plugins branch on. Its attribution window has to
+ * open and close inside one turn, and `enterPlugin` cannot do that — an `async`
+ * function returns to its caller at the first `await`, with the id still set.
+ *
+ * A promise the body returns is **not** covered by this window: the id is
+ * restored when the body returns, not when its promise settles. That is the
+ * honest boundary — a callback that continues after an `await` is no longer
+ * inside anything this function can attribute — and the queue's asynchronous
+ * {@link enterPlugin} is what covers the paths that can wait.
+ */
+export function enterPluginSync<T>(id: string | null, body: () => T): T {
+  const previous = pluginId;
+  pluginId = id;
+  try {
+    return body();
+  } finally {
+    pluginId = previous;
+  }
+}

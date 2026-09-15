@@ -18,7 +18,10 @@
  */
 
 import { App } from "../shim/app";
+import { CommandRegistry } from "../shim/commands";
 import { FileManager } from "../shim/file-manager";
+import { InternalPluginRegistry } from "../shim/internal-plugins";
+import { PluginRegistry } from "../shim/plugin-registry";
 import { ShimEventBus } from "../shim/events";
 import { MetadataCache } from "../shim/metadata-cache";
 import { DispatchQueue } from "../runtime/queue";
@@ -227,7 +230,7 @@ export function assembleShim(deps: {
       errors.report(failure.error, failure.pluginId, "menu-hook");
     },
   });
-  const app = new App({ appId: appIdFor(config.vaultRoot) });
+  const app = new App({ appId: appIdFor(config.vaultRoot), appVersion: config.appVersion });
   // Straight after the `App` and before anything else, for the same reason the
   // electron stub goes first: a plugin bundle reads `globalThis.app`,
   // `window.moment` and `document` while its *module* is still evaluating —
@@ -258,6 +261,21 @@ export function assembleShim(deps: {
   assignOnce(app, "metadataCache", metadataCache);
   assignOnce(app, "fileManager", fileManager);
   assignOnce(app, "workspace", workspace);
+  // The cross-plugin registries. `plugins` holds nothing until a loader
+  // registers one; `internalPlugins` starts its first config read in its
+  // constructor, so `app.internalPlugins.ready()` is what a caller awaits
+  // before the first synchronous `getPluginById`; `commands` seeds
+  // `editor:save-file` and is the map `Plugin.addCommand` delegates into.
+  assignOnce(app, "plugins", new PluginRegistry());
+  assignOnce(app, "internalPlugins", new InternalPluginRegistry({ client, mirror, config }));
+  assignOnce(
+    app,
+    "commands",
+    new CommandRegistry({ queue, client, mirror, writes, vault, workspace, errors }),
+  );
+  // The store behind `app.loadLocalStorage`, which is the same one the bare
+  // `localStorage` global is backed by — one store, two addresses.
+  assignOnce(app, "localStorageStore", globals.localStorage);
 
   // Everything a `Plugin` needs that its two constructor arguments cannot
   // carry. Installed against the `App`, keyed by it, so two hosts in one

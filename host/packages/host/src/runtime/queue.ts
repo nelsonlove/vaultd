@@ -25,7 +25,7 @@
  * would turn one plugin's bug into the host's.
  */
 
-import { enterPlugin } from "../shim/policy";
+import { enterPlugin, enterPluginSync } from "../shim/policy";
 
 export class DispatchQueue {
   private tail: Promise<void> = Promise.resolve();
@@ -58,6 +58,34 @@ export class DispatchQueue {
       () => undefined,
     );
     return result;
+  }
+
+  /**
+   * Run one plugin entry point **now**, attributed, without queueing it.
+   *
+   * The one caller is `app.commands.executeCommandById`, and the reason it
+   * cannot use {@link run} is the signature: Obsidian's `executeCommandById` is
+   * synchronous and answers a boolean, so a version of it that waited for a
+   * FIFO slot could only ever answer a promise — which would change what every
+   * plugin branching on that boolean does.
+   *
+   * **What is given up, stated rather than hidden:** this does not serialize.
+   * A command invoked from inside another plugin's entry point runs inside that
+   * one, nested, exactly as it would in Obsidian — where the palette, a hotkey
+   * and a plugin's own `executeCommandById` all dispatch synchronously too. The
+   * attribution window is still correct because it nests: `inFlight()` names
+   * the inner work while it runs and the outer work again afterwards.
+   */
+  runInline<T>(pluginId: string | null, label: string, task: () => T): T {
+    const outer = this.running;
+    this.depthValue += 1;
+    this.running = { pluginId, label };
+    try {
+      return enterPluginSync(pluginId, task);
+    } finally {
+      this.running = outer;
+      this.depthValue -= 1;
+    }
   }
 
   /**

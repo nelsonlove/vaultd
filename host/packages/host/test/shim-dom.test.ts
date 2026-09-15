@@ -250,7 +250,8 @@ describe("the installed globals", () => {
       ["String.prototype", String.prototype],
     ];
     const before = targets.map(([, target]) => snapshot(target));
-    const installation = installGlobals(new App({ appId: "0".repeat(16) }), defaultHostConfig("/vault"), {
+    const app = new App({ appId: "0".repeat(16), appVersion: "1.0.0" });
+    const installation = installGlobals(app, defaultHostConfig("/vault"), {
       dataDir: join(process.cwd(), "target", "tmp", "descriptor-probe"),
       errors: new HostErrors(),
       harvest: new Harvest(),

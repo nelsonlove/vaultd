@@ -665,13 +665,16 @@ interface CommandSink {
 /**
  * The command registry, when there is one.
  *
- * Task 12 assigns `app.commands`; until it does this answers `null` and the
- * harvest is the only list. Written as a duck-type check rather than a field
- * read so the delegation starts working the moment that task lands, with no
- * edit here.
+ * **Task 12 assigned `app.commands`, and this stayed a duck-type check.** The
+ * field is now a real `CommandRegistry` in every assembled host, but it is
+ * assigned by the assembler rather than by the constructor, and a case that
+ * builds an `App` by hand — or replaces `commands` with a recording double,
+ * which `shim-plugin.test.ts` does — still has to be able to load a plugin. A
+ * structural check answers for all three, where a field read would be a
+ * `TypeError` on the first `addCommand` of a half-built app.
  */
 function commandSinkOf(app: App): CommandSink | null {
-  const commands = (app as App & { commands?: unknown }).commands;
+  const commands: unknown = (app as App & { commands?: unknown }).commands;
   if (typeof commands !== "object" || commands === null) return null;
   const candidate = commands as { addCommand?: unknown };
   return typeof candidate.addCommand === "function" ? (commands as CommandSink) : null;
