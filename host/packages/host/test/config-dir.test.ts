@@ -276,8 +276,79 @@ describe("HeadlessConfigDir", () => {
       { name: "linked-plugin", kind: "symlink" },
     ]);
     await expect(listing).resolves.toEqual([]);
-    expect(reported.map((entry) => [entry.pluginId, entry.phase])).toEqual([["host", "config"]]);
+    // The folder name as the plugin id, the way the manifest-refusal arm below
+    // reports: both are one plugin failing to appear, and a seam entry saying
+    // only "host" would leave an operator knowing that something went missing
+    // without knowing what.
+    expect(reported.map((entry) => [entry.pluginId, entry.phase])).toEqual([
+      ["linked-plugin", "config"],
+    ]);
     expect(String((reported[0] as HostErrorEntry).error)).toContain("linked-plugin");
+  });
+
+  /**
+   * A manifest that lies about its id costs **that plugin**, not the listing.
+   *
+   * The refusal itself is unchanged — nothing loads a plugin whose identity is
+   * contested — but it is now scoped to the folder that caused it. One broken
+   * folder in `plugins/` used to make plugin discovery unavailable, which meant
+   * a host that could not start because one plugin was bad. Skipped and
+   * reported, exactly like the symlink arm, and the good plugin beside it still
+   * lists. `readManifest(id)` called directly still throws: a caller naming one
+   * plugin is asking about that plugin, and a `null` there would be answered by
+   * loading a bundle nobody verified.
+   */
+  it("skips a plugin whose manifest lies about its id, and keeps the rest", async () => {
+    const harness = DaemonHarness.create();
+    const { dir, reported } = withErrorSeam(harness);
+    const listing = dir.listInstalled();
+    const read = await harness.nextRequest();
+    harness.respondReadDir(read.id, ".obsidian-headless/plugins", [
+      { name: "liar", kind: "folder" },
+      { name: "quickadd", kind: "folder" },
+    ]);
+    const first = await harness.nextRequest();
+    expect((first.request.params as { path: string }).path).toBe(
+      ".obsidian-headless/plugins/liar/manifest.json",
+    );
+    harness.respondReadFile(
+      first.id,
+      JSON.stringify({ id: "something-else", name: "Liar", version: "1", minAppVersion: "1" }),
+      "blake3:m1",
+    );
+    // The listing carries on past it rather than ending there.
+    const second = await harness.nextRequest();
+    expect((second.request.params as { path: string }).path).toBe(
+      ".obsidian-headless/plugins/quickadd/manifest.json",
+    );
+    harness.respondReadFile(
+      second.id,
+      JSON.stringify({ id: "quickadd", name: "QuickAdd", version: "1.0", minAppVersion: "1.0" }),
+      "blake3:m2",
+    );
+    await expect(listing).resolves.toMatchObject([{ id: "quickadd" }]);
+    // The report names the folder, so an operator reading the seam knows which
+    // plugin went missing rather than only that something did.
+    expect(reported.map((entry) => [entry.pluginId, entry.phase])).toEqual([["liar", "config"]]);
+    const reason = (reported[0] as HostErrorEntry).error;
+    expect(reason).toBeInstanceOf(ManifestIdMismatch);
+    expect(reason).toMatchObject({ code: "manifest_id_mismatch", declaredId: "something-else" });
+  });
+
+  /** Naming one plugin is asking about that plugin: the typed refusal stands. */
+  it("still throws from readManifest when the caller named the plugin", async () => {
+    const harness = DaemonHarness.create();
+    const { dir, reported } = withErrorSeam(harness);
+    const reading = dir.readManifest("liar");
+    const read = await harness.nextRequest();
+    harness.respondReadFile(
+      read.id,
+      JSON.stringify({ id: "something-else", name: "Liar", version: "1", minAppVersion: "1" }),
+      "blake3:m1",
+    );
+    await expect(reading).rejects.toBeInstanceOf(ManifestIdMismatch);
+    // Thrown to its caller, not also reported: the caller is handling it.
+    expect(reported).toEqual([]);
   });
 
   /**

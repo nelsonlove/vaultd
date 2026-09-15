@@ -217,7 +217,7 @@ export class HeadlessConfigDir {
       this.reportedCorrupt.delete(path);
       return ids;
     } catch (error) {
-      this.reportOnce(path, error);
+      this.reportOnce(path, "host", error);
       return [];
     }
   }
@@ -261,22 +261,28 @@ export class HeadlessConfigDir {
    * `stale.json`); a folder with no `manifest.json` (a half-deleted plugin, an
    * editor's leftover); and an `other` kind. All three are skipped in silence.
    *
-   * **A `symlink` is skipped and reported.** The daemon classifies every entry
-   * from its own `lstat`, so a link to a directory arrives as `symlink` and
-   * never as `folder`, and this host does not follow it — following would mean
-   * loading a bundle from wherever the link happens to point, past the
-   * containment the vault's own path rules give every other read. Reported
-   * rather than dropped in silence because the person most likely to have made
-   * one is a plugin developer linking a repository checkout into their vault,
-   * and "my plugin does not load and nothing said why" is the worst answer
-   * available to them. Once per name, like every other report here.
+   * **Two things are skipped *and reported*, once each, naming the folder.** A
+   * `symlink`: the daemon classifies every entry from its own `lstat`, so a link
+   * to a directory arrives as `symlink` and never as `folder`, and this host
+   * does not follow it — following would mean loading a bundle from wherever the
+   * link happens to point, past the containment the vault's own path rules give
+   * every other read. And a `manifest.json` this host refuses — one that lies
+   * about its id ({@link ManifestIdMismatch}), or is missing a required field.
    *
-   * **A manifest that lies about its id still refuses**, and the refusal takes
-   * the whole listing with it: see {@link ManifestIdMismatch}. That is
-   * deliberate and it is the one failure here that is not degraded — an
-   * identity this host cannot resolve is not a plugin it can skip past, because
-   * every path it would build for *any* plugin in this directory comes from the
-   * same rule the lying manifest breaks.
+   * Both are reported rather than dropped in silence because both make a plugin
+   * the user installed fail to appear, and "my plugin does not load and nothing
+   * said why" is the worst answer available to them — the person most likely to
+   * have made a symlink is a developer linking a repository checkout into their
+   * vault. The report carries the **folder name** as its plugin id, so the seam
+   * says which plugin went missing.
+   *
+   * **The refusal costs that plugin and not the answer.** It used to propagate,
+   * which made plugin discovery unavailable because one folder was bad — a host
+   * that could not start over a plugin it was never going to run. The plugin
+   * stays unavailable, which is the refusal doing its job; the listing goes on,
+   * which is the rest of the vault not paying for it. {@link readManifest}
+   * called directly still throws, because a caller naming one plugin is asking
+   * about that plugin and is there to handle the answer.
    */
   async listInstalled(): Promise<InstalledPlugin[]> {
     const listing = await this.readDirOrNull(this.pluginsDir());
@@ -285,9 +291,10 @@ export class HeadlessConfigDir {
     for (const entry of listing) {
       if (entry.kind === "symlink") {
         this.reportOnce(
-          `${this.pluginsDir()}/${entry.name}`,
+          this.pluginDir(entry.name),
+          entry.name,
           new Error(
-            `${this.pluginsDir()}/${entry.name} is a symlink, and this host does not follow one: ` +
+            `${this.pluginDir(entry.name)} is a symlink, and this host does not follow one: ` +
               "a plugin is loaded from inside the vault or not at all. Copy the plugin's folder " +
               "in, or point the host at the directory the link targets.",
           ),
@@ -297,11 +304,20 @@ export class HeadlessConfigDir {
       if (entry.kind !== "folder") continue;
       const source = await this.readFileOrNull(this.manifestPath(entry.name));
       if (source === null) continue;
-      installed.push({
-        id: entry.name,
-        manifest: parseManifest(source, entry.name, this.pluginDir(entry.name)),
-        dir: this.pluginDir(entry.name),
-      });
+      let manifest: PluginManifest;
+      try {
+        manifest = parseManifest(source, entry.name, this.pluginDir(entry.name));
+      } catch (error) {
+        // The cost of a broken manifest is **that plugin**, not the answer. A
+        // refusal that propagated from here made plugin discovery unavailable
+        // because one folder was bad — a host that cannot start over a plugin it
+        // was never going to run. The plugin stays unavailable, which is the
+        // refusal doing its job; the listing goes on, which is the rest of the
+        // vault not paying for it.
+        this.reportOnce(this.manifestPath(entry.name), entry.name, error);
+        continue;
+      }
+      installed.push({ id: entry.name, manifest, dir: this.pluginDir(entry.name) });
     }
     return installed;
   }
@@ -425,11 +441,21 @@ export class HeadlessConfigDir {
     }
   }
 
-  /** Report a path's problem once, and only once. See {@link reportedCorrupt}. */
-  private reportOnce(path: string, error: unknown): void {
-    if (this.reportedCorrupt.has(path)) return;
-    this.reportedCorrupt.add(path);
-    this.errors.report(error, "host", "config");
+  /**
+   * Report a path's problem once, and only once. See {@link reportedCorrupt}.
+   *
+   * `pluginId` is the folder name when the trouble belongs to one plugin — a
+   * symlinked folder, a manifest that lies about its id — and `"host"` when it
+   * belongs to the host itself, as a damaged `community-plugins.json` does. An
+   * operator reading the seam then learns *which* plugin went missing rather
+   * than only that something did, and Task 14b's quarantine can tell a plugin's
+   * trouble from the host's. The `config` phase is what keeps either from being
+   * counted as a plugin crash.
+   */
+  private reportOnce(key: string, pluginId: string, error: unknown): void {
+    if (this.reportedCorrupt.has(key)) return;
+    this.reportedCorrupt.add(key);
+    this.errors.report(error, pluginId, "config");
   }
 }
 
