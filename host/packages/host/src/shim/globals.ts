@@ -240,9 +240,23 @@ export class HostLocalStorage {
       this.errors.report(error, currentPluginId() ?? "host", "plugin-data");
       return;
     }
-    // A document that parses to something other than an object — `3`, `null`,
-    // an array — is corrupt in the other direction, and gets the same answer.
-    if (stored === null || typeof stored !== "object") return;
+    // Absent is not corrupt: an empty store is what a host that has never
+    // written one has.
+    if (stored === null) return;
+    // A document that parses but is not an object — `3`, `"x"`, an array — is
+    // corrupt in the other direction, and gets the same answer as one that will
+    // not parse at all. **The array arm is the reason this is a test rather
+    // than a comment**: an array passes `typeof === "object"`, so a bare shape
+    // check would load `["a","b"]` as the entries `0` and `1` and hand a plugin
+    // values it never stored.
+    if (typeof stored !== "object" || Array.isArray(stored)) {
+      this.errors.report(
+        new Error(`${this.file} is not a JSON object; the stored values are unreadable`),
+        currentPluginId() ?? "host",
+        "plugin-data",
+      );
+      return;
+    }
     for (const [key, value] of Object.entries(stored)) {
       if (typeof value === "string") this.entries.set(key, value);
     }
@@ -269,10 +283,16 @@ const LOCAL_STORAGE_FILE = "localstorage.json";
  * **Why they are recorded.** A listener is a plugin telling the host about a
  * capability it is offering, and this host has no event loop that will ever
  * deliver one — so the honest thing is to write down what was offered.
- * `contextmenu` is separated out as `dom_delegated_menu` because that one is a
- * menu a user could have opened, and Task 14's bundle scan can work out what it
- * would have contained; everything else is a `dom_listener`, which is a fact
- * about idle cost rather than a capability.
+ *
+ * **Every one of them is a `dom_listener`, `contextmenu` included.** An earlier
+ * draft split `contextmenu` out as `dom_delegated_menu`, which reads well on
+ * its own and is wrong for the ledger: that kind means *delegated listener* to
+ * the bundle scan that produces it, which records all ten of tag-wrangler's —
+ * two `contextmenu`-typed and eight others — under it, and Task 22 asserts that
+ * count. One kind, two meanings depending on who wrote the row, is how an
+ * acceptance test becomes unsatisfiable. So the runtime path owns
+ * `dom_listener` and the static scan owns `dom_delegated_menu`, and the
+ * `detail` carries the event type either way.
  *
  * A registration made outside a plugin's load has nobody to attribute it to and
  * is accepted without being recorded — the same rule the workspace's menu hooks
@@ -289,14 +309,13 @@ class WindowListeners {
   constructor(private readonly harvest: Harvest) {}
 
   add(type: string, listener: unknown): void {
-    stub("window.addEventListener", undefined);
+    // `recordUse`, not `stub`: this symbol is declared `harvested`, and `stub`
+    // records every hit as `safe_stub` whatever the table says. A report whose
+    // rows contradict its own table is worse than one with a row missing.
+    recordUse("window.addEventListener");
     const pluginId = currentPluginId();
     if (pluginId === null) return;
-    const row: HarvestedUnreachable = {
-      pluginId,
-      kind: type === "contextmenu" ? "dom_delegated_menu" : "dom_listener",
-      detail: type,
-    };
+    const row: HarvestedUnreachable = { pluginId, kind: "dom_listener", detail: type };
     this.harvest.recordUnreachable(row);
     this.rows.push({ type, listener, row });
   }
@@ -309,7 +328,7 @@ class WindowListeners {
    * two event types, or twice for one, must be able to take exactly one back.
    */
   remove(type: string, listener: unknown): void {
-    stub("window.removeEventListener", undefined);
+    recordUse("window.removeEventListener");
     const at = this.rows.findIndex((entry) => entry.type === type && entry.listener === listener);
     if (at === -1) return;
     const [dropped] = this.rows.splice(at, 1);
@@ -357,9 +376,13 @@ class InertMutationObserver {
 export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): GlobalInstallation {
   const patcher = new GlobalPatcher();
   const timers = new ShimTimers(deps.clock);
-  const document = createStubDocument();
   const localStorage = new HostLocalStorage(new DataDir(deps.dataDir), LOCAL_STORAGE_FILE, deps.errors);
+  // One recorder for both surfaces: a plugin that listens on `document` and one
+  // that listens on `window` are making the same undeliverable offer, and a
+  // report that counted only one of them would be answering a question nobody
+  // asked.
   const listeners = new WindowListeners(deps.harvest);
+  const document = createStubDocument(listeners);
 
   // `window` first, because everything else is installed on `globalThis` and
   // therefore reachable through its prototype the moment it is defined.

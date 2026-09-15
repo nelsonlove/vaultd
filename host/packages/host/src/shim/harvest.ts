@@ -104,17 +104,25 @@ export interface HarvestedTimer {
 export interface HarvestedUnreachable {
   readonly pluginId: string;
   readonly kind:
+    /**
+     * A delegated DOM listener, as **Task 14's static bundle scan** finds it.
+     *
+     * Reserved for that producer. The scan reads a bundle's source and reports
+     * every listener a plugin delegates through the document — tag-wrangler has
+     * ten, two of them `contextmenu`-typed and eight pointer/drag/click — and
+     * Task 22 asserts those ten by this kind. "Delegated" is what it means, not
+     * "context menu": splitting the ten by event type would make that count
+     * unsatisfiable.
+     */
     | "dom_delegated_menu"
     /**
-     * A `window` listener for anything but a context menu.
+     * A listener the **running host** was handed and can never deliver to.
      *
-     * Added in Task 11a, beside `dom_delegated_menu` rather than folded into
-     * it, because the two answer different questions. A delegated context-menu
-     * listener is a *capability a user could have reached* and Task 14's bundle
-     * scan works out what it would have offered; an ordinary listener —
-     * `keydown`, `pointerup`, `resize` — is not a capability at all, and
-     * counting it as one would inflate the number the compatibility report
-     * exists to be honest about. `detail` is the event type either way.
+     * The runtime counterpart, added in Task 11a:
+     * `window.addEventListener` and `document.addEventListener` record one of
+     * these per registration, whatever the event type — `contextmenu` included,
+     * so that the two producers cannot write the same kind and mean different
+     * things. `detail` is the event type.
      */
     | "dom_listener"
     | "view"

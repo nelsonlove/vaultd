@@ -706,7 +706,22 @@ export interface StubDocument {
   off(...args: unknown[]): void;
 }
 
-export function createStubDocument(): StubDocument {
+/**
+ * Where a listener nothing will ever deliver to is written down.
+ *
+ * An interface rather than the `Harvest` itself, because this module knows
+ * nothing about plugins or attribution: `globals.ts` owns the one
+ * implementation and hands it in, so a `document` listener and a `window`
+ * listener land in the same place, under the same kind, with the same
+ * withdrawal rule. A document built without one still accepts listeners — it
+ * simply has nobody to tell.
+ */
+export interface DomListenerSink {
+  add(type: string, listener: unknown): void;
+  remove(type: string, listener: unknown): void;
+}
+
+export function createStubDocument(listeners?: DomListenerSink): StubDocument {
   const body = new StubEl("body");
   return {
     nodeType: 9,
@@ -728,11 +743,13 @@ export function createStubDocument(): StubDocument {
     getElementById: () => stub("document", null),
     getElementsByClassName: () => stub("document", []),
     getElementsByTagName: () => stub("document", []),
-    addEventListener: () => {
+    addEventListener: (...args: unknown[]) => {
       stub("document", undefined);
+      if (typeof args[0] === "string") listeners?.add(args[0], args[1]);
     },
-    removeEventListener: () => {
+    removeEventListener: (...args: unknown[]) => {
       stub("document", undefined);
+      if (typeof args[0] === "string") listeners?.remove(args[0], args[1]);
     },
     dispatchEvent: () => stub("document", true),
     on: () => {

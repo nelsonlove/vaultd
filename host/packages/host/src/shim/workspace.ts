@@ -257,7 +257,9 @@ export class Workspace extends Events {
     void sourcePath;
     void newLeaf;
     this.recordOpenIntent(linktext);
-    stub("Workspace.openLinkText", undefined);
+    // `recordUse`, not `stub`: the symbol is declared `harvested`, and `stub`
+    // records every hit as `safe_stub` whatever the table says.
+    recordUse("Workspace.openLinkText");
     return Promise.resolve();
   }
 
@@ -405,7 +407,9 @@ export class WorkspaceLeaf {
   openFile(file: TFile, state?: unknown): Promise<void> {
     void state;
     this.workspace.recordOpenIntent(file.path);
-    stub("WorkspaceLeaf.openFile", undefined);
+    // `recordUse` for the same reason `openLinkText` uses it: declared
+    // `harvested`, and `stub` would record the hit as `safe_stub`.
+    recordUse("WorkspaceLeaf.openFile");
     return Promise.resolve();
   }
 

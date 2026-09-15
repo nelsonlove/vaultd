@@ -18,17 +18,20 @@
  * bundle runs.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { App } from "../src/shim/app";
+import { DataDir } from "../src/datadir";
 import { Harvest } from "../src/shim/harvest";
 import { HostErrors } from "../src/shim/errors";
-import { ShimHarness } from "../src/testing/shim-harness";
+import { ShimHarness, sweepStaleDataDirs } from "../src/testing/shim-harness";
+import { assembleShim } from "../src/testing/assemble";
 import { defaultHostConfig } from "../src/config";
 import { installGlobals } from "../src/shim/globals";
+import { policyOf } from "../src/shim/policy";
 import { testClock } from "../src/testing/clock";
 
 /**
@@ -186,6 +189,11 @@ describe("the host's own state directory", () => {
     // plugin data later — lands under this root.
     expect(harness.config.dataDir).not.toBe(real);
     expect(harness.config.dataDir.startsWith(real + sep)).toBe(false);
+    // The socket path too: `defaultHostConfig` derives it from the real state
+    // directory, so a harness that moved only its data dir would still name a
+    // path in the user's home — and the first thing to bind it, or merely
+    // create its parent, would put the host back outside the tree.
+    expect(harness.config.socketPath.startsWith(harness.config.dataDir + sep)).toBe(true);
 
     globalStorage().setItem("vaultd-host-test", "written");
     expect(globalStorage().getItem("vaultd-host-test")).toBe("written");
@@ -204,11 +212,27 @@ describe("the host's own state directory", () => {
     writeFileSync(stored, '{"theme": "dar', "utf8");
     expect(() => globalStorage().getItem("theme")).not.toThrow();
     expect(globalStorage().getItem("theme")).toBeNull();
-    expect(harness.hostErrors.map((entry) => entry.phase)).toContain("plugin-data");
+    globalStorage().getItem("theme");
+    globalStorage().getItem("anything");
+    // Once, not once per call: the read is attempted a single time, so a broken
+    // document does not fill the error log from a plugin's polling loop.
+    expect(harness.hostErrors.filter((entry) => entry.phase === "plugin-data")).toHaveLength(1);
     // Still usable afterwards: a corrupt document costs the stored values, not
     // the store.
     globalStorage().setItem("theme", "light");
     expect(globalStorage().getItem("theme")).toBe("light");
+  });
+
+  it("treats a stored array as corrupt rather than loading it by index", async () => {
+    const harness = await ShimHarness.withVault({});
+    const stored = join(harness.config.dataDir, "localstorage.json");
+    mkdirSync(dirname(stored), { recursive: true });
+    // An array passes `typeof === "object"`, so a bare shape check would load
+    // this as the entries `0` and `1` and hand a plugin values it never stored.
+    writeFileSync(stored, '["a", "b"]', "utf8");
+    expect(globalStorage().getItem("0")).toBeNull();
+    expect(globalStorage().length).toBe(0);
+    expect(harness.hostErrors.filter((entry) => entry.phase === "plugin-data")).toHaveLength(1);
   });
 });
 
@@ -311,17 +335,140 @@ describe("the installed globals", () => {
     expect(globalWindow().dispatchEvent({ type: "keydown" })).toBe(true);
   });
 
-  it("records a contextmenu listener as a delegated menu", async () => {
+  it("records a contextmenu listener as a dom_listener like every other", async () => {
     const harness = await ShimHarness.withVault({});
     const plugin = harness.instantiate("demo", class extends harness.api.Plugin {
       override onload(): void {
         globalWindow().addEventListener("contextmenu", () => undefined);
+        harness.api.activeDocument.addEventListener("contextmenu", () => undefined);
       }
     });
     await harness.load(plugin);
+    // `dom_delegated_menu` belongs to Task 14's static bundle scan, which
+    // records every delegated listener under it and whose count Task 22
+    // asserts. One kind meaning two things depending on who wrote the row is
+    // how that count becomes unsatisfiable, so the runtime path never writes
+    // it — and `document` is recorded exactly as `window` is.
     expect(harness.harvest.unreachable()).toEqual([
-      { pluginId: "demo", kind: "dom_delegated_menu", detail: "contextmenu" },
+      { pluginId: "demo", kind: "dom_listener", detail: "contextmenu" },
+      { pluginId: "demo", kind: "dom_listener", detail: "contextmenu" },
     ]);
+  });
+
+  it("records every hit at the policy the table declares for it", async () => {
+    const harness = await ShimHarness.withVault({ "A.md": "x\n" });
+    const plugin = harness.instantiate("demo", class extends harness.api.Plugin {
+      override async onload(): Promise<void> {
+        // One touch of each shape a recorded symbol can have: harvested,
+        // safe_stub, implemented and absent.
+        globalWindow().addEventListener("keydown", () => undefined);
+        globalWindow().removeEventListener("keydown", () => undefined);
+        globalWindow().dispatchEvent({ type: "keydown" });
+        await this.app.workspace.openLinkText("A", "A.md");
+        await this.app.workspace.getLeaf(false).openFile(harness.vault.getFileByPath("A.md")!);
+        this.app.workspace.getLeavesOfType("markdown");
+        this.app.workspace.getActiveFile();
+        harness.api.setIcon(harness.api.createDiv(), "star");
+        globalStorage().setItem("k", "v");
+        try {
+          globalWindow().require("child_process");
+        } catch {
+          // The refusal is the point; the row it records is what is asserted.
+        }
+      }
+    });
+    await harness.load(plugin);
+    const entries = harness.policyRecorder.entries();
+    expect(entries.length).toBeGreaterThan(5);
+    // The compatibility report is one table read two ways — what the host says
+    // it does with a symbol, and what plugins did with it. A row recorded at a
+    // policy the table does not declare makes the report contradict itself.
+    const disagreements = entries
+      .filter((entry) => entry.policy !== policyOf(entry.symbol))
+      .map((entry) => `${entry.symbol}: recorded ${entry.policy}, declared ${policyOf(entry.symbol)}`);
+    expect(disagreements).toEqual([]);
+    // And the four that used to disagree really are in this sample.
+    const recorded = new Map(entries.map((entry) => [entry.symbol, entry.policy]));
+    expect(recorded.get("window.addEventListener")).toBe("harvested");
+    expect(recorded.get("window.removeEventListener")).toBe("harvested");
+    expect(recorded.get("Workspace.openLinkText")).toBe("harvested");
+    expect(recorded.get("WorkspaceLeaf.openFile")).toBe("harvested");
+  });
+});
+
+describe("DataDir.writeJsonAtomic", () => {
+  it("leaves no sibling behind, and leaves the previous file alone when the rename fails", async () => {
+    const harness = await ShimHarness.withVault({});
+    const dir = new DataDir(harness.config.dataDir);
+    dir.writeJsonAtomic("store.json", { first: true });
+    expect(dir.readJson("store.json")).toEqual({ first: true });
+    dir.writeJsonAtomic("store.json", { second: true });
+    expect(dir.readJson("store.json")).toEqual({ second: true });
+    // The whole point of the temp-then-rename: a reader never sees a prefix,
+    // and nothing is left over to be mistaken for one.
+    expect(readdirSync(harness.config.dataDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+
+    // A rename that cannot complete. A directory at the target is the cheapest
+    // way to make one fail without patching the seam.
+    mkdirSync(join(harness.config.dataDir, "blocked.json"), { recursive: true });
+    expect(() => dir.writeJsonAtomic("blocked.json", { third: true })).toThrow();
+    expect(existsSync(join(harness.config.dataDir, "blocked.json"))).toBe(true);
+    expect(readdirSync(harness.config.dataDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    // And the document that had nothing to do with the failure is untouched.
+    expect(dir.readJson("store.json")).toEqual({ second: true });
+  });
+
+  it("sweeps a stale harness directory and leaves everything else", () => {
+    const root = join(process.cwd(), "target", "tmp", `sweep-probe-${String(process.pid)}`);
+    mkdirSync(join(root, "host-state-stale"), { recursive: true });
+    mkdirSync(join(root, "host-state-live"), { recursive: true });
+    mkdirSync(join(root, "someone-elses-stale"), { recursive: true });
+    writeFileSync(join(root, "a-log-file.log"), "x", "utf8");
+    const old = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    utimesSync(join(root, "host-state-stale"), old, old);
+    utimesSync(join(root, "someone-elses-stale"), old, old);
+
+    sweepStaleDataDirs(root);
+
+    // The age bound is what makes the sweep safe under the runner's forked
+    // parallelism: a sibling fork's directory is seconds old, and losing one
+    // would lose that fork's stored values mid-run.
+    expect(existsSync(join(root, "host-state-stale"))).toBe(false);
+    expect(existsSync(join(root, "host-state-live"))).toBe(true);
+    // `target/tmp` is shared scratch — other tasks keep logs there.
+    expect(existsSync(join(root, "someone-elses-stale"))).toBe(true);
+    expect(existsSync(join(root, "a-log-file.log"))).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("the injected data dir and clock", () => {
+  it("are what the assembler uses, whatever the config says", async () => {
+    const harness = await ShimHarness.withVault({});
+    const elsewhere = join(harness.config.dataDir, "injected");
+    const otherClock = testClock();
+    // Deliberately different from `harness.config`: these two deps are the ones
+    // production passes and the harness does not, so without a case that pulls
+    // them apart a host reading the config instead would pass every test.
+    const assembly = assembleShim({
+      config: harness.config,
+      client: harness.client,
+      mirror: harness.mirror,
+      clock: otherClock,
+      dataDir: elsewhere,
+    });
+    try {
+      assembly.globals.localStorage.setItem("injected", "yes");
+      expect(existsSync(join(elsewhere, "localstorage.json"))).toBe(true);
+      expect(existsSync(join(harness.config.dataDir, "localstorage.json"))).toBe(false);
+
+      const armed = otherClock.armed();
+      assembly.globals.window.setInterval(() => undefined, 1_000);
+      expect(otherClock.armed()).toBe(armed + 1);
+      expect(harness.activeTimerCount()).toBe(0);
+    } finally {
+      assembly.globals.restore();
+    }
   });
 });
 

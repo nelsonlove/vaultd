@@ -30,6 +30,7 @@ import { assembleShim } from "./assemble";
 import { FixtureVault } from "./fixture-vault";
 import { MirrorHarness } from "./mirror-harness";
 import { fs } from "../runtime/fs-access";
+import { socketPathFor } from "../config";
 import type { HostConfig } from "../config";
 import type { MirrorChangeBatch } from "../mirror/types";
 import type { App } from "../shim/app";
@@ -125,8 +126,12 @@ export class ShimHarness extends MirrorHarness {
 
   protected constructor(options: ShimHarnessOptions) {
     // The data dir goes in **first**, so an explicit `config.dataDir` from a
-    // case still wins: the spread that follows overwrites it.
-    super({ dataDir: options.dataDir ?? freshDataDir(), ...(options.config ?? {}) });
+    // case still wins: the spread that follows overwrites it. The socket path
+    // is re-derived from it rather than left as `defaultHostConfig` computed
+    // it, because that one names the real state directory — and a harness that
+    // moved its data dir but kept a socket path in the user's home directory
+    // has only moved half of itself.
+    super(configFor(options));
     this.layoutReady = options.layoutReady ?? true;
     for (const [path, contents] of Object.entries(options.configFiles ?? {})) {
       this.configFiles.set(path, contents);
@@ -563,8 +568,19 @@ function ancestorFoldersOf(path: string): { path: string; kind: "folder" }[] {
 function freshDataDir(): string {
   const root = resolve(__dirname, "..", "..", "..", "..", "..", "target", "tmp");
   fs.mkdirSync(root, { recursive: true });
-  sweepStaleDataDirs(root);
+  // Once per process, before this process adds one of its own.
+  if (!swept) {
+    swept = true;
+    sweepStaleDataDirs(root);
+  }
   return fs.mkdtempSync(join(root, PREFIX));
+}
+
+/** Every config override a harness makes on its own behalf. */
+function configFor(options: ShimHarnessOptions): Partial<HostConfig> {
+  const dataDir = options.dataDir ?? freshDataDir();
+  const vaultRoot = options.config?.vaultRoot ?? "/vault";
+  return { dataDir, socketPath: socketPathFor(dataDir, vaultRoot), ...(options.config ?? {}) };
 }
 
 /** The name every harness data dir starts with, and the sweep matches on. */
@@ -575,7 +591,7 @@ const STALE_MS = 6 * 60 * 60 * 1000;
 let swept = false;
 
 /**
- * Remove the data dirs earlier runs left behind.
+ * Remove the data dirs earlier runs left behind. **Exported for its own test.**
  *
  * A fresh directory per harness means a full suite leaves several hundred of
  * them, almost all empty — nothing is written unless a case touches
@@ -588,9 +604,7 @@ let swept = false;
  * directory at the same time is the ordinary case, not an error, and a harness
  * that could not tidy up must still start.
  */
-function sweepStaleDataDirs(root: string): void {
-  if (swept) return;
-  swept = true;
+export function sweepStaleDataDirs(root: string): void {
   const cutoff = Date.now() - STALE_MS;
   try {
     for (const name of fs.readdirSync(root)) {

@@ -216,8 +216,14 @@ function hostDataDir(): string {
  * ~104-byte cap a Unix domain socket address has on Darwin, and it can contain
  * separators. Sixteen hex characters of SHA-256 keep the whole address short
  * and stable for a given root.
+ *
+ * Exported so that a caller which overrides `dataDir` can keep the socket
+ * under it: a harness that moved its data dir and left the socket path derived
+ * from the real one would still name a path in the user's home directory, and
+ * the first thing that bound it — or merely created its parent — would put the
+ * host back outside the tree it was told to stay in.
  */
-function socketPathFor(dataDir: string, vaultRoot: string): string {
+export function socketPathFor(dataDir: string, vaultRoot: string): string {
   const digest = createHash("sha256").update(vaultRoot).digest("hex").slice(0, 16);
   return join(dataDir, "run", digest, "host.sock");
 }
