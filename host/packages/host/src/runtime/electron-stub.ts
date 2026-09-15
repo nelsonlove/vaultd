@@ -105,13 +105,19 @@ export function createElectronStub(deps: ElectronStubDeps): ElectronStub {
    * they refuse by name, carrying the channel.
    */
   const ipcRenderer: ElectronStub["ipcRenderer"] = {
+    // Registrations and removals are counted apart. Collapsing `once` into
+    // `on` is fair — both are "a plugin offered a listener" — but recording a
+    // *removal* as a registration is not, and a report built from those rows
+    // would say a plugin still listens on a channel it withdrew from.
     on: () => stub("electron.ipcRenderer.on", undefined),
-    off: () => stub("electron.ipcRenderer.on", undefined),
     once: () => stub("electron.ipcRenderer.on", undefined),
-    removeListener: () => stub("electron.ipcRenderer.on", undefined),
-    removeAllListeners: () => stub("electron.ipcRenderer.on", undefined),
+    off: () => stub("electron.ipcRenderer.off", undefined),
+    removeListener: () => stub("electron.ipcRenderer.off", undefined),
+    removeAllListeners: () => stub("electron.ipcRenderer.off", undefined),
     send: () => stub("electron.ipcRenderer.send", undefined),
-    sendSync: (channel: string) => unsupported("electron.ipcRenderer.invoke", channel),
+    // Each refuses under **its own** name. A plugin that dies on `sendSync`
+    // must not be handed a message naming a method it never called.
+    sendSync: (channel: string) => unsupported("electron.ipcRenderer.sendSync", channel),
     invoke: (channel: string) => unsupported("electron.ipcRenderer.invoke", channel),
   };
 
@@ -139,5 +145,7 @@ declarePolicy("electron.shell.openPath", "implemented");
 declarePolicy("electron.shell.showItemInFolder", "implemented");
 declarePolicy("electron.shell.openExternal", "implemented");
 declarePolicy("electron.ipcRenderer.on", "safe_stub");
+declarePolicy("electron.ipcRenderer.off", "safe_stub");
 declarePolicy("electron.ipcRenderer.send", "safe_stub");
+declarePolicy("electron.ipcRenderer.sendSync", "absent");
 declarePolicy("electron.ipcRenderer.invoke", "absent");

@@ -44,6 +44,7 @@ import { stub } from "../shim/policy";
 import type { App } from "../shim/app";
 import type { DispatchQueue } from "./queue";
 import type { Harvest } from "../shim/harvest";
+import type { HostErrors } from "../shim/errors";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 import type { PluginLoader } from "../shim/plugin-registry";
 import type { ShimEventBus } from "../shim/events";
@@ -120,6 +121,44 @@ function loadPluginBundleWrapper(source: string): string {
   );
 }
 
+/**
+ * A bundle that would not evaluate, or that evaluated into nothing usable.
+ *
+ * **Typed and attributed, because a raw throw from `_compile` is neither.** A
+ * bundle's own module-scope error arrives as whatever the bundle threw — often
+ * a bare `Error` with a message about a variable nobody outside that bundle has
+ * heard of — and nothing in it names the plugin. A host that hands that
+ * straight to its caller has lost the one fact the caller needs. The original
+ * is kept as `cause`, so nothing is hidden.
+ */
+export class PluginBundleFailed extends Error {
+  readonly code = "plugin_bundle_failed";
+  readonly pluginId: string;
+  constructor(pluginId: string, reason: string, options?: { cause?: unknown }) {
+    super(`plugin ${pluginId} could not be loaded: ${reason}`, options);
+    this.name = "PluginBundleFailed";
+    this.pluginId = pluginId;
+  }
+}
+
+/**
+ * A plugin whose `onload` threw. The host has already rolled it back.
+ *
+ * Separate from {@link PluginBundleFailed} because the two leave the host in
+ * different states and a caller branches on that: a bundle that would not
+ * evaluate never registered anything, while a plugin whose `onload` threw was
+ * registered, ran, and has been taken back out again.
+ */
+export class PluginLoadFailed extends Error {
+  readonly code = "plugin_load_failed";
+  readonly pluginId: string;
+  constructor(pluginId: string, options?: { cause?: unknown }) {
+    super(`plugin ${pluginId} threw during onload and has been rolled back`, options);
+    this.name = "PluginLoadFailed";
+    this.pluginId = pluginId;
+  }
+}
+
 export function loadPluginBundle(request: BundleLoadRequest): LoadedBundle {
   // `undefined`, not `null`. Node's constructor is `Module(id, parent?: Module)`
   // and its body does `if (parent && parent.children)` — `null` works today by
@@ -131,16 +170,26 @@ export function loadPluginBundle(request: BundleLoadRequest): LoadedBundle {
     ...request.hostModulePaths,
     ...(Module as unknown as ModulePaths)._nodeModulePaths(dirname(request.filename)),
   ];
-  mod._compile(loadPluginBundleWrapper(request.source), request.filename);
+  try {
+    mod._compile(loadPluginBundleWrapper(request.source), request.filename);
+  } catch (error: unknown) {
+    throw new PluginBundleFailed(request.pluginId, describe(error), { cause: error });
+  }
   const exported = mod.exports;
   // Both shapes in the corpus: esbuild bundles export the class on `default`
   // through `__toCommonJS`, rollup bundles assign it straight to
   // `module.exports`.
   const candidate = (exported as { default?: unknown } | null)?.default ?? exported;
   if (typeof candidate !== "function") {
-    throw new Error(`plugin ${request.pluginId} exported no Plugin class`);
+    throw new PluginBundleFailed(request.pluginId, "it exported no Plugin class");
   }
   return { exports: mod.exports, pluginClass: candidate as LoadedBundle["pluginClass"] };
+}
+
+/** One line naming what went wrong, whatever a bundle chose to throw. */
+function describe(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
 }
 
 /**
@@ -210,6 +259,15 @@ export interface BundleLoaderDeps {
   readonly events: ShimEventBus;
   readonly harvest: Harvest;
   /**
+   * Where a failed `onload` is reported, with phase `"onload"`.
+   *
+   * The rejected promise is for the caller that is waiting; this is for
+   * everything else — the quarantine, the compatibility report, and a human
+   * reading a log. "Swallowed" and "reported" look identical from outside, so
+   * the failure goes to both places.
+   */
+  readonly errors: HostErrors;
+  /**
    * How `enablePlugin(id)` finds a bundle to load.
    *
    * Optional, and absent is not an error: `app.plugins.enablePlugin` is
@@ -259,14 +317,38 @@ export class BundleLoader implements PluginLoader {
     return plugin;
   }
 
-  /** Register and load a plugin this loader did not compile. */
+  /**
+   * Register and load a plugin this loader did not compile.
+   *
+   * **Registration comes before `onload` and a failure rolls it back.** The
+   * order is Obsidian's, and a plugin that looks itself (or a peer) up during
+   * startup depends on it — but "registered" is a claim about a plugin that is
+   * running, and a plugin whose `onload` threw is not. Left half-registered it
+   * would still be listed as enabled, still be findable by every other plugin,
+   * still own its harvested commands, and still be woken by vault changes;
+   * worse, a compatibility report would count it among the plugins that work.
+   *
+   * So the failure path undoes all of it — through {@link unload}, which is the
+   * same three-step teardown a deliberate unload takes, so a partial `onload`
+   * cannot leave an armed interval or a live subscription behind — reports the
+   * cause through the error seam with phase `"onload"`, and hands the caller a
+   * {@link PluginLoadFailed} naming the plugin.
+   */
   async load(plugin: Plugin): Promise<void> {
     const id = plugin.manifest.id;
     this.instances.set(id, plugin);
     this.deps.app.plugins.register(plugin);
-    await this.deps.queue.run(id, `${id}:onload`, async () => {
-      await this.deps.events.attributingTo(id, () => plugin.load());
-    });
+    try {
+      await this.deps.queue.run(id, `${id}:onload`, async () => {
+        await this.deps.events.attributingTo(id, () => plugin.load());
+      });
+    } catch (error: unknown) {
+      // `unload` never throws — `Component.unload` is written not to — so the
+      // rollback cannot itself bury the cause.
+      await this.unload(id);
+      this.deps.errors.report(error, id, "onload");
+      throw new PluginLoadFailed(id, { cause: error });
+    }
   }
 
   /**
@@ -311,6 +393,13 @@ export class BundleLoader implements PluginLoader {
   }
 
   async disable(id: string): Promise<void> {
+    if (this.instances.get(id) === undefined) {
+      // Nothing this loader knows about. Recorded rather than silent, so a
+      // harness with a loader installed reports the same thing one without a
+      // loader does — see {@link BundleLoaderDeps.provide}.
+      stub("PluginRegistry.disablePlugin", undefined);
+      return;
+    }
     await this.unload(id);
   }
 }

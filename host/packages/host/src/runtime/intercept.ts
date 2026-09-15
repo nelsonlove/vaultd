@@ -45,8 +45,8 @@
 import Module from "node:module";
 
 import { FS_MODULE_SPECIFIERS } from "./fs-access";
-import { currentElectronStub, currentObsidianApi } from "./electron-registry";
-import { currentPluginId, refuseInDryRun } from "../shim/policy";
+import { electronModule, obsidianModule } from "./electron-registry";
+import { currentPluginId, declarePolicy, refuseInDryRun } from "../shim/policy";
 import type { Harvest } from "../shim/harvest";
 
 export interface InterceptionOptions {
@@ -82,27 +82,93 @@ const CODEMIRROR = "@codemirror/";
  * around by accident. The fs spellings come from the seam, which is the one
  * file allowed to name them — see `runtime/fs-access.ts`.
  */
-const REFUSED_UNDER_DRY_RUN: ReadonlySet<string> = new Set([
-  ...FS_MODULE_SPECIFIERS,
+const REFUSED_BARE: readonly string[] = [
+  // The file system, through the seam that is the one file allowed to name it.
+  ...FS_MODULE_SPECIFIERS.filter((specifier) => !specifier.startsWith("node:")),
+  // Spawning a process, which reaches everything else on the machine.
   "child_process",
-  "node:child_process",
+  // The network, all of it. The review found `dgram`, `tls`, `dns` and `http2`
+  // resolving under an earlier list that named only `http`/`https`/`net`; a
+  // refusal list with holes is a refusal list a bundle walks around by
+  // accident, so the holes are closed rather than carried to Task 19.
   "http",
-  "node:http",
   "https",
-  "node:https",
+  "http2",
   "net",
-  "node:net",
+  "tls",
+  "dns",
+  "dgram",
+  // The escape hatches: three ways to reach any of the above from code this
+  // list would otherwise never see.
+  "worker_threads",
+  "vm",
+  "inspector",
+];
+
+/**
+ * What `--dry-run` refuses to hand a bundle: the file system, process spawning,
+ * the network, and the ways out of this list.
+ *
+ * Both spellings of each, because `require("http")` and `require("node:http")`
+ * are the same module.
+ *
+ * **It refuses every requester while installed, not only plugin bundles.** The
+ * host's own file-system access is captured at module scope in
+ * `runtime/fs-access.ts` and so is unaffected, but anything that reached for
+ * one of these lazily during a dry-run would refuse itself. Task 19 owns
+ * dry-run and is where that boundary gets drawn properly.
+ */
+const REFUSED_UNDER_DRY_RUN: ReadonlySet<string> = new Set([
+  ...REFUSED_BARE,
+  ...REFUSED_BARE.map((specifier) => `node:${specifier}`),
 ]);
+
+/** The symbol a refusal of `specifier` is recorded under. */
+function builtinSymbol(specifier: string): string {
+  return `node_builtin.${specifier}`;
+}
 
 /** Node's own loader, as a callable, plus the slot it lives in. */
 interface LoaderSlot {
   // A property rather than a method, so that reading it to keep the original
   // is not an unbound-method mistake: it really is a free function that takes
-  // its receiver from the call site, and `original.call(this, …)` below is what
+  // its receiver from the call site, and `delegate.call(this, …)` below is what
   // hands it back.
-  _load: (this: unknown, request: string, parent: unknown, isMain: boolean) => unknown;
+  _load: LoadFn;
   globalPaths: string[];
 }
+
+type LoadFn = (this: unknown, request: string, parent: unknown, isMain: boolean) => unknown;
+
+/**
+ * One installed interception, as a link in a chain rather than as an owner of
+ * the slot.
+ *
+ * **Why a chain and not "put back what I found".** Interceptions nest — a
+ * harness installs one, a test installs another inside it — and they are not
+ * guaranteed to be restored in the order they were installed. The obvious
+ * implementation captures `Module._load` at install and writes it back at
+ * restore, which silently clobbers a newer patch; the obvious repair ("only
+ * write back if the slot is still mine") turns that into something worse, an
+ * outer layer that quietly gives up its original and leaves `Module._load`
+ * patched for the life of the process with no handle able to undo it.
+ *
+ * So each layer keeps a `delegate` it forwards to and an `active` flag, and
+ * restoring a layer does two things: it goes inert (so an orphaned reference to
+ * its `patched` still forwards correctly), and the layer above it is re-linked
+ * to skip it. Only the top layer touches the slot. Restore the layers in any
+ * order and `Module._load` ends byte-identical to what Node installed.
+ */
+interface Layer {
+  active: boolean;
+  /** What this layer forwards to: the layer below, or Node's own `_load`. */
+  delegate: LoadFn;
+  /** The function this layer put in the slot. */
+  patched: LoadFn;
+}
+
+/** Every interception installed and not yet restored, bottom first. */
+const layers: Layer[] = [];
 
 /**
  * One inert stub module per `@codemirror/*` specifier, for the life of the
@@ -111,17 +177,28 @@ interface LoaderSlot {
  * Cached because a module is: two requires of the same package in one process
  * hand back the same object, and a bundle that compares what it got from two
  * call sites would otherwise see two different things.
+ *
+ * The *recording* state is deliberately not here — see the note on
+ * `recorded` inside {@link installModuleInterception}.
  */
 const codemirrorModules = new Map<string, unknown>();
 
-/** Which plugins have already been recorded against which package. */
-const codemirrorRecorded = new Set<string>();
-
 export function installModuleInterception(options: InterceptionOptions): Interception {
   const slot = Module as unknown as LoaderSlot;
-  const original = slot._load;
   let intercepted = 0;
   let restored = false;
+  /**
+   * Which `(plugin, package)` pairs this interception has already written down.
+   *
+   * **Per interception, not per process.** A module-level set would be a
+   * process-wide memo of rows already reported, so a second host in the same
+   * process — a second harness, a test that assembles twice — would record
+   * nothing at all for a bundle the first host had already loaded, and its
+   * compatibility report would be silently short. The dedup is only ever meant
+   * to collapse a bundle requiring one package from three call sites into one
+   * dependency; that question is per host, and an interception belongs to one.
+   */
+  const recorded = new Set<string>();
 
   // The host's `node_modules` as a **last-resort** lookup path, which is what
   // `globalPaths` is: Node consults it only for a specifier that its ordinary
@@ -132,39 +209,59 @@ export function installModuleInterception(options: InterceptionOptions): Interce
   const addedGlobalPaths = options.hostModulePaths.filter((path) => !slot.globalPaths.includes(path));
   slot.globalPaths.unshift(...addedGlobalPaths);
 
+  const layer: Layer = { active: true, delegate: slot._load, patched: passThrough };
+
   function patched(this: unknown, request: string, parent: unknown, isMain: boolean): unknown {
+    // Restored, but somebody still holds a reference to this function — an
+    // outer patch that captured it as its own original. Forward and stay out of
+    // the way.
+    if (!layer.active) return layer.delegate.call(this, request, parent, isMain);
+    // Both mechanisms hand back the **same** module object, built once per
+    // process by `electron-registry.ts`. Returning the barrel directly here
+    // would make this mechanism the one that hands out a snapshot.
     if (request === "obsidian") {
       intercepted += 1;
-      return currentObsidianApi();
+      return obsidianModule();
     }
     if (request === "electron") {
       intercepted += 1;
-      return currentElectronStub();
+      return electronModule();
     }
     if (request.startsWith(CODEMIRROR)) {
       intercepted += 1;
-      return codemirrorModule(request, options.harvest);
+      return codemirrorModule(request, options.harvest, recorded);
     }
     if (!options.allowNodeBuiltins && REFUSED_UNDER_DRY_RUN.has(request)) {
-      refuseInDryRun(`node_builtin.${request}`, "node_builtin", request);
+      refuseInDryRun(builtinSymbol(request), "node_builtin", request);
     }
-    return original.call(this, request, parent, isMain);
+    return layer.delegate.call(this, request, parent, isMain);
   }
 
+  layer.patched = patched;
+  layers.push(layer);
   slot._load = patched;
 
   return {
     restore(): void {
       if (restored) return;
       restored = true;
-      // Only if it is still ours. A second interception installed on top of
-      // this one and not yet restored owns the slot, and putting Node's
-      // original back would drop that one silently — a patch that vanished
-      // without anyone asking is the failure this guard exists to prevent.
-      if (slot._load === patched) slot._load = original;
+      layer.active = false;
+      const at = layers.indexOf(layer);
+      if (at !== -1) {
+        layers.splice(at, 1);
+        // After the splice, index `at` is the layer that sat directly above
+        // this one. Re-link it past this layer, so a chain that is later
+        // unwound from the top reaches Node's own `_load` and nothing else.
+        const above = layers[at];
+        if (above !== undefined && above.delegate === patched) above.delegate = layer.delegate;
+      }
+      // Only the top layer owns the slot. Any other position is already handled
+      // by the re-link above, and a foreign patch on top is left alone — this
+      // layer has gone inert, so it costs that patch nothing but one forward.
+      if (slot._load === patched) slot._load = layer.delegate;
       for (const path of addedGlobalPaths) {
-        const at = slot.globalPaths.indexOf(path);
-        if (at !== -1) slot.globalPaths.splice(at, 1);
+        const at2 = slot.globalPaths.indexOf(path);
+        if (at2 !== -1) slot.globalPaths.splice(at2, 1);
       }
     },
     interceptedCount(): number {
@@ -172,6 +269,22 @@ export function installModuleInterception(options: InterceptionOptions): Interce
     },
   };
 }
+
+/** Placeholder until the real `patched` closure exists. Never called. */
+function passThrough(this: unknown, request: string, parent: unknown, isMain: boolean): unknown {
+  void request;
+  void parent;
+  void isMain;
+  throw new Error("module interception was used before it finished installing");
+}
+
+// The refusal rows this file owns. Declared `implemented`, because that is what
+// these modules are: a host outside dry-run really does hand them over, and a
+// compatibility report that showed the file system as a surface this host does
+// not have would be describing the flag rather than the host. The dry-run
+// refusal records a hit at this policy, which is the honest shape — "reached
+// for, and this run said no".
+for (const specifier of REFUSED_UNDER_DRY_RUN) declarePolicy(builtinSymbol(specifier), "implemented");
 
 /**
  * The stub a `@codemirror/*` specifier resolves to, and the row it records.
@@ -181,12 +294,16 @@ export function installModuleInterception(options: InterceptionOptions): Interce
  * requires the same package from three call sites has one dependency on it, not
  * three.
  */
-function codemirrorModule(specifier: string, harvest: Harvest | undefined): unknown {
+function codemirrorModule(
+  specifier: string,
+  harvest: Harvest | undefined,
+  recorded: Set<string>,
+): unknown {
   const pluginId = currentPluginId();
   if (harvest !== undefined && pluginId !== null) {
     const key = `${pluginId}\0${specifier}`;
-    if (!codemirrorRecorded.has(key)) {
-      codemirrorRecorded.add(key);
+    if (!recorded.has(key)) {
+      recorded.add(key);
       harvest.recordUnreachable({ pluginId, kind: "editor_extension", detail: specifier });
     }
   }

@@ -139,6 +139,29 @@ export class App {
   readonly foldManager: FoldManager = new FoldManager();
 
   /**
+   * `app.metadataTypeManager` — Obsidian's property-type registry, as far as a
+   * plugin writing into it needs it to exist.
+   *
+   * **Uncaptured best-effort, and deliberately shallow.** No published typing
+   * mentions this object and no runtime capture in this repository pins the
+   * shape of a widget, so nothing here invents one: `registeredTypeWidgets` is
+   * an empty map that accepts whatever a plugin puts in it and answers
+   * `undefined` for a built-in widget it never had. What it buys is the same
+   * thing `window.CodeMirrorAdapter` buys — `app.metadataTypeManager.registered
+   * TypeWidgets[x] = …` is a bare property write on an undefined object, which
+   * is a `TypeError` inside `onload` that costs a plugin everything after it.
+   *
+   * A plugin that goes on to *use* a built-in widget it read back from here
+   * finds `undefined` and fails at that point instead, which is the honest
+   * place to fail: the widgets are a GUI surface this host does not have, and
+   * inventing one would be inventing rendering behaviour from no capture. The
+   * compatibility report is where such a plugin gets recorded.
+   */
+  readonly metadataTypeManager: { readonly registeredTypeWidgets: Record<string, unknown> } = {
+    registeredTypeWidgets: {},
+  };
+
+  /**
    * The Obsidian version this host reports, from `HostConfig.appVersion` — the
    * same string `apiVersion` and `requireApiVersion` answer from.
    */

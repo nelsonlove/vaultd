@@ -113,12 +113,16 @@ export interface HarvestedUnreachable {
      * to delegate through here, so every such registration is an entry point
      * that structurally cannot be reached. `globals.ts` records one per
      * registration with the **event type** as the detail, and `Node.off`
-     * withdraws it; tag-wrangler's whole surface is ten of these, two of them
-     * `contextmenu`-typed and eight pointer/drag/mouse, and Task 22 asserts
-     * that count by this kind.
+     * withdraws it.
      *
-     * "Delegated" is what the name means, not "context menu": splitting the ten
-     * by event type would make that count unsatisfiable.
+     * tag-wrangler is the corpus's case: loading it records **seventeen** of
+     * these, **three** of them `contextmenu`-typed, and Task 22 asserts those
+     * numbers by this kind. Its Task 0 capture record states a different
+     * figure, counted a different way; the record stays as it is, and the
+     * runtime count is what a compatibility report is built from.
+     *
+     * "Delegated" is what the name means, not "context menu": splitting the
+     * rows by event type would make the count unsatisfiable.
      *
      * (An earlier draft reserved this kind for a static bundle scan in Task 14.
      * Task 14's brief has no scan, and the registrations are visible at runtime

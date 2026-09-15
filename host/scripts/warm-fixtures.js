@@ -47,9 +47,13 @@
  * 3. Warms the eighteen parity fixtures, each as the one-note vault the parity
  *    test parses it as.
  *
- * Set `VAULTD_SKIP_FIXTURE_WARM=1` to skip the whole thing — for a machine with
- * no toolchain, or while someone else is mid-edit in `crates/` and a build would
- * fail on their half-written code.
+ * Set `VAULTD_SKIP_FIXTURE_WARM=1` to skip the **cargo build and the warm-up** —
+ * for a machine with no Rust toolchain, or while someone else is mid-edit in
+ * `crates/` and a build would fail on their half-written code. It does **not**
+ * skip step 2: since Task 13 the `tsc` build is what keeps `dist/` current for
+ * the `obsidian` and `electron` packages a plugin bundle resolves, so skipping
+ * it would take the suite red on the freshness guard instead of degrading
+ * gracefully. `tsc` needs nothing this suite does not already need.
  */
 
 const { spawnSync } = require("node:child_process");
@@ -69,9 +73,9 @@ function die(message) {
   process.exit(1);
 }
 
-if (process.env.VAULTD_SKIP_FIXTURE_WARM) {
-  note("skipped (VAULTD_SKIP_FIXTURE_WARM is set); tests will run against whatever the cache holds");
-  process.exit(0);
+const skipWarm = Boolean(process.env.VAULTD_SKIP_FIXTURE_WARM);
+if (skipWarm) {
+  note("VAULTD_SKIP_FIXTURE_WARM is set: skipping cargo and the fixture warm-up; tests will run against whatever the cache holds");
 }
 
 /**
@@ -92,7 +96,9 @@ function run(command, args, what, cwd) {
   if (result.status !== 0) die(`${what} exited ${String(result.status)}`);
 }
 
-if (hasCargo()) {
+if (skipWarm) {
+  note("no cargo build (warm-up skipped)");
+} else if (hasCargo()) {
   note("building the fixture generator");
   // Debug, never release: this binary is a test fixture, and a release build of
   // the workspace is minutes of work for no difference in what it prints.
@@ -106,13 +112,26 @@ if (hasCargo()) {
   note("no cargo on PATH; running from the cache as it stands");
 }
 
-note("compiling the host so the warm-up can use the real cache key");
+// **Always, whatever VAULTD_SKIP_FIXTURE_WARM says.** Since Task 13 the build
+// is not only this script's own errand: `packages/obsidian` and
+// `packages/electron` are what a plugin bundle resolves, and both reach the
+// host through `dist/`. Skipping it here would leave a bundle running against
+// whatever `dist/` last held, and would take the suite red on the freshness
+// guard in `test/module-intercept.test.ts` rather than degrading gracefully —
+// which is not what an escape hatch documented as "for a machine with no
+// toolchain" should do. `tsc` needs no toolchain beyond the one `npm test`
+// already requires, so there is nothing for the flag to protect here.
+note("compiling the host: dist is what the obsidian and electron packages resolve, and the warm-up's cache key");
 // From `host/`, not the workspace root: the build script lives in this
 // package's own manifest.
 run("npm", ["run", "--silent", "build"], "tsc --build", hostRoot);
 
 const compiled = join(hostRoot, "packages", "host", "dist", "testing", "fixture-vault.js");
 if (!existsSync(compiled)) die(`the build produced no ${compiled}`);
+if (skipWarm) {
+  note("dist is current; fixture warm-up skipped");
+  process.exit(0);
+}
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { warmFixtureCache, fixtureCacheDir } = require(compiled);
 

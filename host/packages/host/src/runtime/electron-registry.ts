@@ -73,6 +73,15 @@ export class ObsidianApiNotAssembled extends Error {
 interface ModuleRegistry {
   electron: ElectronStub | null;
   obsidian: ObsidianApi | null;
+  /**
+   * The two module objects a bundle is handed, built once per **process**
+   * rather than once per copy of this file — see {@link obsidianModule}. Both
+   * copies of this module must hand back the same object, or a bundle that
+   * resolved `obsidian` through Node and again through the `_load` patch would
+   * hold two different module objects for one host.
+   */
+  obsidianModule: ObsidianApi | null;
+  electronModule: ElectronStub | null;
 }
 
 const CELL = Symbol.for("vaultd.host.moduleRegistry");
@@ -81,7 +90,12 @@ function registry(): ModuleRegistry {
   const holder = globalThis as unknown as Record<symbol, ModuleRegistry | undefined>;
   const existing = holder[CELL];
   if (existing !== undefined) return existing;
-  const fresh: ModuleRegistry = { electron: null, obsidian: null };
+  const fresh: ModuleRegistry = {
+    electron: null,
+    obsidian: null,
+    obsidianModule: null,
+    electronModule: null,
+  };
   holder[CELL] = fresh;
   return fresh;
 }
@@ -125,4 +139,70 @@ export function currentObsidianApi(symbol?: string): ObsidianApi {
 /** Test-only: drop the registration so a fresh assembly can install its own. */
 export function clearObsidianApi(): void {
   registry().obsidian = null;
+}
+
+// ---------------------------------------------------------------------------
+// The two module objects a bundle is handed
+// ---------------------------------------------------------------------------
+
+/**
+ * Why these are here rather than in the packages that publish them.
+ *
+ * There are **two** ways a bundle reaches `obsidian`: Node's own resolution
+ * through `host/node_modules/obsidian` (the loader's `module.paths`), and the
+ * `Module._load` patch in `runtime/intercept.ts`. If those two handed back
+ * different objects the design would have two module systems rather than one —
+ * and the difference that would actually bite is staleness: a snapshot taken at
+ * require time is the barrel of whichever host was assembled then, so a bundle
+ * that outlived a second assembly would hold surfaces pointing at a vault that
+ * is gone.
+ *
+ * So the module object is built **once, here**, as a forwarding proxy, and both
+ * mechanisms hand back that same object. The packages are three lines each.
+ *
+ * `has`, `ownKeys` and `getOwnPropertyDescriptor` are forwarded as well as
+ * `get`, because bundlers interrogate a module object as well as reading from
+ * it — `"default" in mod`, `Object.keys(mod)`, esbuild's `__toESM` own-keys
+ * walk. A proxy answering only `get` looks empty to all three.
+ *
+ * The descriptor trap forces `configurable: true`. The assembled barrel is
+ * frozen, so its own descriptors are non-configurable, and reporting a
+ * non-configurable property that the proxy's target does not have is a
+ * `TypeError` by the Proxy invariants — a true answer the language refuses to
+ * let us give.
+ */
+function forwarding<T extends object>(current: (symbol?: string) => T): T {
+  return new Proxy(Object.create(null) as T, {
+    get(_target, property: string | symbol): unknown {
+      if (typeof property === "symbol") return undefined;
+      return (current(property) as Record<string, unknown>)[property];
+    },
+    has(_target, property: string | symbol): boolean {
+      if (typeof property === "symbol") return false;
+      return property in current(property);
+    },
+    ownKeys(): ArrayLike<string | symbol> {
+      return Reflect.ownKeys(current());
+    },
+    getOwnPropertyDescriptor(_target, property: string | symbol): PropertyDescriptor | undefined {
+      if (typeof property === "symbol") return undefined;
+      const descriptor = Reflect.getOwnPropertyDescriptor(current(property), property);
+      if (descriptor === undefined) return undefined;
+      return { ...descriptor, configurable: true };
+    },
+  });
+}
+
+/** The `obsidian` module object, live. Built once per process. */
+export function obsidianModule(): ObsidianApi {
+  const cell = registry();
+  cell.obsidianModule ??= forwarding<ObsidianApi>(currentObsidianApi);
+  return cell.obsidianModule;
+}
+
+/** The `electron` module object, live. Built once per process. */
+export function electronModule(): ElectronStub {
+  const cell = registry();
+  cell.electronModule ??= forwarding<ElectronStub>(() => currentElectronStub());
+  return cell.electronModule;
 }

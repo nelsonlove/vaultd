@@ -1,12 +1,19 @@
-import { createRequire } from "node:module";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import Module, { createRequire } from "node:module";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { BundleLoader, loadPluginBundle, provisionUserScriptGlobals } from "../src/runtime/loader";
+import {
+  BundleLoader,
+  PluginBundleFailed,
+  PluginLoadFailed,
+  loadPluginBundle,
+  provisionUserScriptGlobals,
+} from "../src/runtime/loader";
 import { installModuleInterception } from "../src/runtime/intercept";
 import { HeadlessUnsupported, DryRunRefused, resetPolicyTable } from "../src/shim/policy";
 import { ShimHarness } from "../src/testing/shim-harness";
+import type { ElectronStub } from "../src/runtime/electron-registry";
 import type { Interception } from "../src/runtime/intercept";
 import type { PluginManifest } from "../src/shim/plugin";
 
@@ -177,6 +184,59 @@ describe("module interception", () => {
     expect(rows.every((row) => row.pluginId === "cm-probe")).toBe(true);
   });
 
+  it("records the same @codemirror rows for a second host in the same process", async () => {
+    // The dedup exists to collapse one bundle's three call sites into one
+    // dependency — a question about **one** host. Held process-wide it becomes
+    // a memo of rows already reported, and the second host's compatibility
+    // report comes out silently short with nothing to say about why.
+    const rowsForOneHost = async (): Promise<string[]> => {
+      const harness = await ShimHarness.withVault({});
+      const plugin = harness.instantiate(
+        "cm-two-hosts",
+        class extends harness.api.Plugin {
+          override onload(): void {
+            nodeRequire("@codemirror/state");
+          }
+        },
+      );
+      const interception = intercepting({ harvest: harness.harvest });
+      await harness.load(plugin);
+      interception.restore();
+      installed = null;
+      return harness.harvest
+        .unreachable()
+        .filter((row) => row.kind === "editor_extension")
+        .map((row) => row.detail);
+    };
+    expect(await rowsForOneHost()).toEqual(["@codemirror/state"]);
+    expect(await rowsForOneHost(), "the second host records its own rows").toEqual([
+      "@codemirror/state",
+    ]);
+  });
+
+  it("hands every mechanism the live module, not the host assembled when it loaded", async () => {
+    const first = await ShimHarness.withVault({});
+    // Mechanism 1, no patch installed: Node's own resolution through the
+    // workspace link.
+    const mod = nodeRequire("obsidian") as Record<string, unknown>;
+    // `Notice` and `debounce` are bound per host; `TFile` is module-level and
+    // identical across hosts, so it cannot tell liveness from a snapshot.
+    expect(mod["Notice"]).toBe(first.api.Notice);
+    expect(mod["debounce"]).toBe(first.api.debounce);
+
+    const second = await ShimHarness.withVault({});
+    expect(mod["Notice"], "the module object follows the current host").toBe(second.api.Notice);
+    expect(mod["debounce"]).toBe(second.api.debounce);
+    expect(mod["Notice"]).not.toBe(first.api.Notice);
+
+    // Mechanism 2 hands back the **same object**, not a snapshot of the barrel:
+    // a bundle that re-requires through the patch must not end up holding an
+    // older host's surfaces than one that re-requires through the link.
+    intercepting();
+    expect(nodeRequire("obsidian")).toBe(mod);
+    expect(nodeRequire("electron")).toBe(nodeRequire("electron"));
+  });
+
   it("refuses the dangerous Node builtins under dry-run, and only those", () => {
     const interception = intercepting({ allowNodeBuiltins: false });
     for (const specifier of ["node:child_process", "node:http", "node:https", "node:net"]) {
@@ -189,6 +249,36 @@ describe("module interception", () => {
     // Still ordinary: a builtin that cannot reach the vault or the network.
     expect(typeof (nodeRequire("node:path") as { join: unknown }).join).toBe("function");
     void interception;
+  });
+
+  it("restores in any order, leaving Module._load byte-identical", async () => {
+    const slot = Module as unknown as { _load: unknown };
+    const nodesOwn = slot._load;
+    const harness = await ShimHarness.withVault({});
+
+    const outer = installModuleInterception({ hostModulePaths: [], allowNodeBuiltins: true });
+    const inner = installModuleInterception({ hostModulePaths: [], allowNodeBuiltins: true });
+
+    // The **outer** one goes first, which is the order the naive
+    // "put back what I found" implementation gets wrong in one direction and
+    // the naive "only if it is still mine" fix gets wrong in the other: the
+    // first clobbers the inner patch, the second strands it for the life of the
+    // process with no handle able to undo it.
+    outer.restore();
+    expect(slot._load, "the inner layer still owns the slot").not.toBe(nodesOwn);
+    // And still works: the outer layer went inert and re-linked, it did not
+    // take the inner one's delegate away.
+    expect(typeof (nodeRequire("obsidian") as { normalizePath: unknown }).normalizePath).toBe("function");
+    expect(inner.interceptedCount()).toBe(1);
+    expect(outer.interceptedCount()).toBe(0);
+
+    inner.restore();
+    expect(slot._load, "Module._load is Node's own function again").toBe(nodesOwn);
+    // Idempotent, in any order, however many times.
+    outer.restore();
+    inner.restore();
+    expect(slot._load).toBe(nodesOwn);
+    void harness;
   });
 
   it("restores Module._load, and the workspace link answers on its own after that", async () => {
@@ -209,6 +299,61 @@ describe("module interception", () => {
     expect(typeof resolved["normalizePath"]).toBe("function");
     expect(resolved["TFile"]).toBe(harness.api.TFile);
     expect(intercepted["TFile"]).toBe(harness.api.TFile);
+  });
+
+  it("resolves obsidian for a bundle outside the host tree, through module.paths alone", async () => {
+    // **Every other fixture and golden in this suite sits inside `host/`**, so
+    // Node's ordinary walk up the directory tree finds `host/node_modules`
+    // whether or not `hostModulePaths` was prepended — which would leave
+    // mechanism 1, the design's main road, untested by a case named after it.
+    // This one writes the bundle somewhere Node's walk cannot reach the host
+    // from, and proves both directions.
+    const harness = await ShimHarness.withVault({});
+    const scratch = join(HOST_ROOT, "..", "target", "tmp");
+    mkdirSync(scratch, { recursive: true });
+    const dir = mkdtempSync(join(scratch, "outside-bundle-"));
+    try {
+      const filename = join(dir, "main.js");
+      const source = readFileSync(bundle("cjs-plugin").filename, "utf8");
+      writeFileSync(filename, source, "utf8");
+
+      // No interception: nothing is patched, and `globalPaths` carries no host
+      // entry. Without the host's `node_modules` on `module.paths` there is
+      // simply no `obsidian` to find from here.
+      const withoutPaths = (): unknown =>
+        loadPluginBundle({ pluginId: "outside", filename, source, hostModulePaths: [] });
+      expect(withoutPaths).toThrow(PluginBundleFailed);
+      expect(withoutPaths).toThrow(/Cannot find module 'obsidian'/);
+
+      const loaded = loadPluginBundle({
+        pluginId: "outside",
+        filename,
+        source,
+        hostModulePaths: harness.hostModulePaths,
+      });
+      const instance = new loaded.pluginClass(harness.app, harness.manifestFor("outside"));
+      await instance.onload();
+      expect((instance as unknown as { loadedWith: string }).loadedWith).toBe("Folder/Note.md");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never gives a harness the real OS opener", async () => {
+    // `assembleShim`'s default `spawn` really launches the platform's `open`.
+    // No test needs a window on somebody's screen, and a future fixture that
+    // reached for one would do it silently — so a harness always passes a
+    // recording fake, and this is the guard that says so. If it were the real
+    // one, `spawns()` would be empty and a Finder window would have appeared.
+    const harness = await ShimHarness.withVault({});
+    const path = join(HOST_ROOT, "..", "target", "tmp", "spawn-guard.md");
+    const electron = nodeRequire("electron") as ElectronStub;
+    await expect(electron.shell.openPath(path)).resolves.toBe("");
+    await electron.shell.showItemInFolder(path);
+    expect(harness.spawns()).toEqual([
+      ["open", [path]],
+      ["open", ["-R", path]],
+    ]);
   });
 
   it("routes a bundle's bare setTimeout and setInterval through the host's clock", async () => {
@@ -258,6 +403,35 @@ describe("module interception", () => {
   });
 });
 
+describe("delegated DOM listeners", () => {
+  it("withdraws exactly the row a matching Node.off names", async () => {
+    const harness = await ShimHarness.withVault({});
+    const handler = (): void => undefined;
+    const other = (): void => undefined;
+    const plugin = harness.instantiate(
+      "off-probe",
+      class extends harness.api.Plugin {
+        override onload(): void {
+          harness.document.body.on("contextmenu", ".tag", handler);
+          harness.document.body.on("click", ".tag", handler);
+          harness.document.on("dragstart", ".tag", handler);
+          // Withdrawn: this row must not survive.
+          harness.document.body.off("contextmenu", ".tag", handler);
+          // Three near-misses, none of which may withdraw anything: wrong
+          // selector, wrong handler, wrong type.
+          harness.document.body.off("click", ".other", handler);
+          harness.document.body.off("click", ".tag", other);
+          harness.document.body.off("mouseover", ".tag", handler);
+        }
+      },
+    );
+    await harness.load(plugin);
+    const rows = harness.harvest.unreachable().filter((row) => row.kind === "dom_delegated_menu");
+    expect(rows.map((row) => row.detail)).toEqual(["click", "dragstart"]);
+    expect(rows.every((row) => row.pluginId === "off-probe")).toBe(true);
+  });
+});
+
 describe("the loader's plugin lifecycle", () => {
   it("registers a bundle's instance with app.plugins and deregisters it on unload", async () => {
     const harness = await ShimHarness.withVault({});
@@ -298,6 +472,79 @@ describe("the loader's plugin lifecycle", () => {
     // An id the provider does not know is not a throw: `enablePlugin` is
     // reachable from inside another plugin's `onload`.
     await expect(harness.app.plugins.enablePlugin("nobody")).resolves.toBeUndefined();
+  });
+
+  it("rolls a plugin all the way back when its onload throws", async () => {
+    const harness = await ShimHarness.withVault({});
+    const loader = new BundleLoader(harness.loaderDeps());
+    const { filename, source } = bundle("throwing-onload");
+    const manifest = harness.manifestFor("throwing");
+    harness.setConfigFile(`${manifest.dir}/data.json`, "{}");
+
+    const loading = loader.loadBundle({
+      request: { pluginId: "throwing", filename, source, hostModulePaths: harness.hostModulePaths },
+      manifest,
+    });
+    await expect(loading).rejects.toBeInstanceOf(PluginLoadFailed);
+    await expect(loading).rejects.toThrow(/plugin throwing threw during onload/);
+
+    // Registered before `onload` — correct, and Obsidian's order — but a
+    // plugin whose `onload` threw is not running, so none of this may survive.
+    expect(harness.app.plugins.getPlugin("throwing")).toBeNull();
+    expect(harness.app.plugins.isEnabled("throwing")).toBe(false);
+    expect(Object.keys(harness.app.plugins.manifests)).toEqual([]);
+    // Its command was harvested before the throw. A report that still listed it
+    // would be offering an entry point into a plugin that is not there.
+    expect(harness.harvest.commands()).toEqual([]);
+    // And its interval was armed before the throw. This is why the rollback
+    // runs the full teardown rather than only clearing the registry.
+    expect(harness.activeTimerCount()).toBe(0);
+    // Reported as well as rejected: "swallowed" and "reported" look identical
+    // from outside, so the failure goes to both places.
+    const reported = harness.hostErrors.filter(
+      (entry) => entry.pluginId === "throwing" && entry.phase === "onload",
+    );
+    expect(reported.length).toBeGreaterThanOrEqual(1);
+    expect(String(reported[0]?.error)).toMatch(/onload blew up/);
+  });
+
+  it("names the plugin when a bundle will not evaluate at all", () => {
+    const filename = join(__dirname, "fixtures", "bundles", "cjs-plugin", "main.js");
+    const broken = (): unknown =>
+      loadPluginBundle({
+        pluginId: "broken",
+        filename,
+        source: "throw new Error('module scope blew up');",
+        hostModulePaths: [],
+      });
+    expect(broken).toThrow(PluginBundleFailed);
+    // The plugin's id is the one fact the caller needs and the one thing a
+    // bundle's own throw can never carry.
+    expect(broken).toThrow(/plugin broken could not be loaded: Error: module scope blew up/);
+
+    const empty = (): unknown =>
+      loadPluginBundle({ pluginId: "empty", filename, source: "module.exports = {};", hostModulePaths: [] });
+    expect(empty).toThrow(/plugin empty could not be loaded: it exported no Plugin class/);
+  });
+
+  it("compiles a bundle inside its plugin's attribution window", async () => {
+    // A bundle's module scope is where several of the corpus register the
+    // interesting things — `nested-properties` reaches CodeMirror there. A
+    // loader that opened the attribution window only around `onload` would
+    // record all of it against nobody, and the row would vanish.
+    const harness = await ShimHarness.withVault({});
+    intercepting({ harvest: harness.harvest });
+    const loader = new BundleLoader(harness.loaderDeps());
+    const { filename, source } = bundle("module-scope-cm");
+    const manifest = harness.manifestFor("module-scope");
+    harness.setConfigFile(`${manifest.dir}/data.json`, "{}");
+    await loader.loadBundle({
+      request: { pluginId: "module-scope", filename, source, hostModulePaths: harness.hostModulePaths },
+      manifest,
+    });
+    expect(harness.harvest.unreachable()).toEqual([
+      { pluginId: "module-scope", kind: "editor_extension", detail: "@codemirror/state" },
+    ]);
   });
 });
 
@@ -400,18 +647,30 @@ interface GoldenRun {
 }
 
 /**
- * The one golden whose `onload` does not survive this shim, and exactly why.
+ * Goldens whose `onload` does not survive this shim, and exactly what each one
+ * hits — matched against what reached the **error seam**, because that is where
+ * the plugin's own error lands; the caller gets a `PluginLoadFailed` wrapper.
  *
- * `nested-properties` bundles a `Component` base of its own that reaches into
- * Obsidian's **private** `_children` field — `[...this._children]`, inside its
- * own `load()`. This host's `Component` keeps its children in a field of its
- * own, so the spread is a spread of `undefined`. That is a shim-parity question
- * about undocumented internals rather than a loader one: before this task the
- * bundle could not be evaluated at all — it dies at a module-scope `tty`
- * require and two `@codemirror` packages — and it now evaluates, constructs,
- * and enters `onload`.
+ * `nested-properties` is the only one, and the reason has moved twice. It used
+ * to die at `[...this._children]` in a `Component` base of its own that reaches
+ * into Obsidian's *private* child list — `shim/plugin.ts` now provides
+ * `_children` and `_loaded` as an uncaptured best-effort mimic and it gets far
+ * past that. It then died on a bare property write to
+ * `app.metadataTypeManager.registeredTypeWidgets`, which `shim/app.ts` now
+ * provides for the same reason and in the same shallow way. What it hits now is
+ * its own check, not a `TypeError`: it reads the **built-in `multitext`
+ * widget** back out of that map and refuses to continue without one.
+ *
+ * That is where this stops. A property-type widget is a GUI rendering surface
+ * with no runtime capture behind it in this repository, and inventing one would
+ * be inventing behaviour rather than mirroring it — the line the design draws
+ * for undocumented internals. The plugin evaluates, constructs, registers and
+ * enters `onload`; it needs a surface this host does not have, and the
+ * compatibility report is where that gets said.
  */
-const KNOWN_ONLOAD_FAILURE = new Map([["nested-properties", /is not iterable/]]);
+const KNOWN_ONLOAD_FAILURE = new Map<string, RegExp>([
+  ["nested-properties", /Value is undefined/],
+]);
 
 describe("every golden bundle, through the loader", () => {
   for (const id of GOLDENS) {
@@ -419,20 +678,35 @@ describe("every golden bundle, through the loader", () => {
       const run = await loadGolden(id);
       const plugin = run.loader.instance(run.id);
       if (plugin === null) throw new Error(`${id} produced no plugin instance`);
-      // Registered **before** `onload`, which is what Obsidian does and what a
-      // plugin that looks itself up during startup depends on.
-      expect(run.harness.app.plugins.getPlugin(run.id)).toBe(plugin);
-      expect(run.harness.app.plugins.isEnabled(run.id)).toBe(true);
-      // `isLoaded` goes true before `onload` runs, so this says exactly what
-      // this task claims: the bundle evaluated, the class constructed, and the
-      // plugin's own `onload` was entered.
-      expect(plugin.isLoaded).toBe(true);
+      // `_loaded` goes true before `onload` runs and stays true through a
+      // rollback, so it says exactly what this task claims and nothing more:
+      // the bundle evaluated, the class constructed, and the plugin's own
+      // `onload` was entered.
+      expect(plugin._loaded).toBe(true);
       const expected = KNOWN_ONLOAD_FAILURE.get(id);
       if (expected === undefined) {
         expect(run.error).toBeNull();
         expect(run.harness.hostErrors.map((entry) => String(entry.error))).toEqual([]);
+        // Registered **before** `onload`, which is what Obsidian does and what
+        // a plugin that looks itself up during startup depends on — and still
+        // registered afterwards, because it is running.
+        expect(run.harness.app.plugins.getPlugin(run.id)).toBe(plugin);
+        expect(run.harness.app.plugins.isEnabled(run.id)).toBe(true);
+        expect(plugin.isLoaded).toBe(true);
       } else {
-        expect(String(run.error)).toMatch(expected);
+        expect(run.error).toBeInstanceOf(PluginLoadFailed);
+        expect(run.harness.hostErrors.map((entry) => String(entry.error)).join("\n")).toMatch(expected);
+        // And rolled back: a plugin whose `onload` threw is not running, so it
+        // is not registered, not enabled, and holds no harvest rows.
+        expect(run.harness.app.plugins.getPlugin(run.id)).toBeNull();
+        expect(run.harness.app.plugins.isEnabled(run.id)).toBe(false);
+        expect(run.harness.harvest.unreachable()).toEqual([]);
+        // Not asserted here: the timer count. A rollback undoes what the host
+        // was **told** about — `registerInterval`, `registerEvent`, the harvest
+        // — and a bare `setTimeout` a bundle armed and never registered is not
+        // one of those. Obsidian cannot disarm it either. The dedicated
+        // rollback case above arms a *registered* interval, which is the half
+        // this host does own.
       }
     }, 120_000);
   }
@@ -442,14 +716,17 @@ describe("every golden bundle, through the loader", () => {
     const delegated = run.harness.harvest
       .unreachable()
       .filter((row) => row.kind === "dom_delegated_menu");
-    // **Seventeen registrations from ten call sites**, and the difference is
-    // the bundle's own structure rather than a miscount on either side. Five
-    // `Node.on` call sites sit in the plugin's own `onload`; the other five sit
-    // in a helper component the plugin instantiates **three times** — once for
-    // the tag pane, once for preview, once for the editor — so those five run
-    // three times each. A registration is what this host cannot deliver to, so
-    // a registration is what it records. The Task 0 capture's "ten, two of them
-    // contextmenu" counts call sites, which nothing at runtime can see.
+    // **Seventeen registrations, three of them `contextmenu`.** Five come from
+    // `Node.on` call sites in the plugin's own `onload`; the other twelve from a
+    // helper component it instantiates four times — for the tag pane, preview,
+    // the properties pill and the editor — whose registrations branch on the
+    // options each instance is given. Every one of them is a registration this
+    // host cannot deliver to, which is what the row means and what a
+    // compatibility report is built from.
+    //
+    // The Task 0 capture record states a different figure. It is a capture
+    // record, it stays as it is, and no theory about how it was counted belongs
+    // here: what is asserted is what this host observes.
     expect(delegated.length).toBe(17);
     expect(delegated.filter((row) => row.detail === "contextmenu").length).toBe(3);
     expect(delegated.every((row) => row.pluginId === "tag-wrangler")).toBe(true);

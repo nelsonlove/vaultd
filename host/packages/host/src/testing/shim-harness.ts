@@ -164,6 +164,8 @@ export class ShimHarness extends MirrorHarness {
    * test-only arrangement that happens to work.
    */
   private loader!: BundleLoader;
+  /** What `electron.shell` asked the OS to open. See {@link spawns}. */
+  private readonly spawned: Array<[string, string[]]> = [];
   private readonly configFiles = new Map<string, string>();
   private readonly sources = new Map<string, string>();
   /** The fixture rows behind `get_note`, by path. See {@link serveNotes}. */
@@ -194,6 +196,17 @@ export class ShimHarness extends MirrorHarness {
       mirror: this.mirror,
       clock: this.clock,
       dataDir: this.config.dataDir,
+      // **Never the real opener.** `assembleShim`'s default is `osSpawn`, which
+      // really launches the platform's `open` — the same hazard class as a
+      // harness persisting `localStorage` into the developer's home directory.
+      // No test needs a window to appear on someone's screen, and a fixture
+      // that reached for one would otherwise do it silently. Recorded instead,
+      // readable through {@link spawns}. `test/module-intercept.test.ts` holds
+      // the guard that fails if this is ever the real one.
+      spawn: (command, args) => {
+        this.spawned.push([command, [...args]]);
+        return Promise.resolve();
+      },
     });
     const mutable = this as {
       -readonly [K in
@@ -208,12 +221,14 @@ export class ShimHarness extends MirrorHarness {
         | "document"]: ShimHarness[K];
     };
     this.assembly = assembly;
-    this.loader = new BundleLoader({
-      app: assembly.app,
-      queue: assembly.queue,
-      events: assembly.events,
-      harvest: assembly.harvest,
-    });
+    this.loader = new BundleLoader(this.loaderDeps());
+    // Installed, so `app.plugins.enablePlugin`/`disablePlugin` reach the same
+    // lifecycle `harness.load()` drives rather than a second, inert one. With
+    // no `provide` an `enable` for an unknown id still records and answers
+    // exactly as the loader-less stub did, so nothing a case asserts changes —
+    // what changes is that a harness now has **one** plugin lifecycle in it.
+    // Task 14's plugin set installs its own loader the same way.
+    assembly.app.plugins.setLoader(this.loader);
     mutable.app = assembly.app;
     mutable.vault = assembly.app.vault;
     mutable.policyRecorder = assembly.policyRecorder;
@@ -328,7 +343,19 @@ export class ShimHarness extends MirrorHarness {
       queue: this.assembly.queue,
       events: this.assembly.events,
       harvest: this.assembly.harvest,
+      errors: this.assembly.errors,
     };
+  }
+
+  /**
+   * Every OS-opener call this host's `electron.shell` would have made.
+   *
+   * `[command, args]` per call, in order. The harness never runs them — see the
+   * `spawn` it passes {@link assembleShim} — so a case asserts on this instead
+   * of on a window that opened on somebody's screen.
+   */
+  spawns(): ReadonlyArray<readonly [string, readonly string[]]> {
+    return this.spawned.map(([command, args]) => [command, [...args]] as const);
   }
 
   /** A manifest for a plugin that has no `manifest.json`, as most cases do. */

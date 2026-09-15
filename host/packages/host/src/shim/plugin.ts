@@ -202,11 +202,52 @@ export abstract class Component {
   private readonly eventRefs: EventRef[] = [];
   /** `registerInterval(id)` — disarmed last, so nothing can re-arm behind it. */
   private readonly timerIds: number[] = [];
-  private readonly children: Component[] = [];
+  /**
+   * This component's children — spelled with Obsidian's own leading underscore.
+   *
+   * **Uncaptured best-effort, and named as such.** `_children` and
+   * {@link _loaded} are Obsidian's *private* fields: no published typing
+   * mentions them and no runtime capture in this repository pins their shape.
+   * They are here because bundles reach for them anyway — `nested-properties`
+   * ships a `Component` subclass whose own `load()` does `[...this._children]`
+   * and whose own `addChild` pushes into it, so a base class without the field
+   * kills that plugin at its first `addChild` with a spread of `undefined`.
+   *
+   * It is the **real list**, not a copy: this host's `addChild` pushes here and
+   * its `unload` drains here, so a bundle that pushes in directly is pushing
+   * into the list this component will actually tear down. A copy would have
+   * been the worse kind of mimic — present, readable, and silently connected to
+   * nothing.
+   *
+   * If Obsidian's internals turn out to differ, this is a guess that costs
+   * nothing when unused, and the compatibility report is where a plugin needing
+   * deeper internals gets recorded.
+   */
+  readonly _children: Component[] = [];
 
   /** Whether `load()` has run and `unload()` has not. */
   get isLoaded(): boolean {
     return this.loadedFlag && !this.unloadedFlag;
+  }
+
+  /**
+   * Obsidian's private "has `onload` run" flag, mirroring this host's own.
+   *
+   * An accessor pair rather than a second field, deliberately: a bundle that
+   * reimplements `load()` sets `this._loaded = true` and never calls
+   * `super.load()`, and a duplicate field would leave this host believing the
+   * component never loaded — so its `unload()` would skip `onunload` and every
+   * registration made during that load would leak. Mirroring the one flag makes
+   * the bundle's write and this host's read the same fact.
+   *
+   * Uncaptured best-effort, for the reasons in {@link _children}.
+   */
+  get _loaded(): boolean {
+    return this.loadedFlag;
+  }
+
+  set _loaded(value: boolean) {
+    this.loadedFlag = value;
   }
 
   /**
@@ -241,7 +282,7 @@ export abstract class Component {
     if (this.unloadedFlag) return;
     this.unloadedFlag = true;
     if (!this.loadedFlag) return;
-    for (const child of this.children.splice(0).reverse()) {
+    for (const child of this._children.splice(0).reverse()) {
       this.guard("teardown", () => {
         child.unload();
       });
@@ -294,7 +335,7 @@ export abstract class Component {
    * uncaptured question.
    */
   addChild<T extends Component>(child: T): T {
-    this.children.push(child);
+    this._children.push(child);
     child.adoptContext(this.context);
     if (this.loadedFlag && !this.unloadedFlag) {
       void Promise.resolve(child.load()).catch((error: unknown) => {
@@ -305,8 +346,8 @@ export abstract class Component {
   }
 
   removeChild<T extends Component>(child: T): T {
-    const at = this.children.indexOf(child);
-    if (at !== -1) this.children.splice(at, 1);
+    const at = this._children.indexOf(child);
+    if (at !== -1) this._children.splice(at, 1);
     child.unload();
     return child;
   }

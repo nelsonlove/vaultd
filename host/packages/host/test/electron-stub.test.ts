@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HeadlessUnsupported } from "../src/shim/policy";
-import { DryRunRefused } from "../src/shim/policy";
+import { DryRunRefused, setPolicyRecorder } from "../src/shim/policy";
 import { createElectronStub } from "../src/runtime/electron-stub";
+import type { ApiPolicy, PolicyRecorder } from "../src/shim/policy";
 import {
   ElectronNotRegistered,
   clearElectronStub,
@@ -24,6 +25,22 @@ import {
 afterEach(() => {
   clearElectronStub();
 });
+
+/** A tally of `(symbol, hits)` in first-touch order, for the row-naming case. */
+function memoryRecorder(): { recorder: PolicyRecorder; hits(): Array<[string, number]> } {
+  const counts = new Map<string, number>();
+  return {
+    recorder: {
+      record(symbol: string, policy: ApiPolicy, pluginId: string | null): void {
+        void policy;
+        void pluginId;
+        counts.set(symbol, (counts.get(symbol) ?? 0) + 1);
+      },
+      entries: () => [],
+    },
+    hits: () => [...counts.entries()],
+  };
+}
 
 describe("electron stub", () => {
   it("bridges shell.openPath to the OS opener", async () => {
@@ -61,6 +78,41 @@ describe("electron stub", () => {
       expect((error as HeadlessUnsupported).symbol).toBe("electron.ipcRenderer.invoke");
       expect((error as HeadlessUnsupported).detail).toBe("some-channel");
       expect((error as HeadlessUnsupported).message).toContain("electron.ipcRenderer.invoke");
+    }
+  });
+
+  it("names each ipcRenderer surface as itself, registrations apart from removals", () => {
+    const recorder = memoryRecorder();
+    setPolicyRecorder(recorder.recorder);
+    try {
+      const stub = createElectronStub({ dryRun: false, spawn: () => Promise.resolve() });
+      const listener = vi.fn();
+      stub.ipcRenderer.on("channel", listener);
+      stub.ipcRenderer.once("channel", listener);
+      stub.ipcRenderer.off("channel", listener);
+      stub.ipcRenderer.removeListener("channel", listener);
+      stub.ipcRenderer.removeAllListeners("channel");
+      stub.ipcRenderer.send("channel", 1);
+      // Collapsing `once` into `on` is fair — both are "a plugin offered a
+      // listener". Recording a **removal** as a registration is not: a report
+      // built from those rows would say a plugin still listens on a channel it
+      // withdrew from.
+      expect(recorder.hits()).toEqual([
+        ["electron.ipcRenderer.on", 2],
+        ["electron.ipcRenderer.off", 3],
+        ["electron.ipcRenderer.send", 1],
+      ]);
+      // And a plugin that dies on `sendSync` is not handed a message naming a
+      // method it never called.
+      try {
+        stub.ipcRenderer.sendSync("some-channel");
+        expect.unreachable("sendSync must throw");
+      } catch (error) {
+        expect((error as HeadlessUnsupported).symbol).toBe("electron.ipcRenderer.sendSync");
+        expect((error as HeadlessUnsupported).detail).toBe("some-channel");
+      }
+    } finally {
+      setPolicyRecorder(null);
     }
   });
 
