@@ -710,11 +710,19 @@ pub struct DirEntryDto {
 /// `read_dir`'s answer: one directory's immediate entries, sorted by `name` in
 /// byte order.
 ///
-/// `path` echoes the directory the daemon listed, in the spelling it stores —
-/// the request's own vault path, or `""` for the root — so a client pairing
-/// answers to asks never has to re-derive it. It is never the canonicalized
-/// filesystem path: that would leak where the vault lives and could name a
-/// directory outside the client's own vocabulary.
+/// `path` echoes **the spelling the request used** — the parsed vault path, or
+/// `""` for the root — so a client pairing answers to asks never has to
+/// re-derive it. It is never the canonicalized filesystem path (that would
+/// leak where the vault lives and could name a directory outside the client's
+/// own vocabulary), and it is never re-spelled to match the filesystem's own
+/// casing: a request for `folder` on a case-insensitive filesystem lists
+/// `Folder`'s entries and still answers `"path":"folder"`.
+///
+/// Deliberately **not** the "stored spelling" `MutationOutcome::changed_paths`
+/// reports, which is defined as the way the filesystem holds a name and never
+/// the way the caller spelled it. The two are opposites, and a client that
+/// needs an entry's on-disk spelling takes it from that entry's `name`, which
+/// is the filesystem's own.
 ///
 /// The listing carries no generation. Nothing it reports is indexed — hidden
 /// paths and the configuration zone are exactly what it exists to reach — so

@@ -1647,12 +1647,20 @@ impl MutationEngine {
     /// the root is a distinct argument rather than a path this function
     /// special-cases after parsing.
     ///
-    /// Off the index on purpose. The tree index excludes every hidden path by
-    /// design, so nothing built on it can answer "what is inside
-    /// `.obsidian-headless/plugins/`" — which is precisely the question a
+    /// Off the index on purpose. The vault scan excludes every hidden
+    /// *directory* by design — a hidden *file* such as `.gitignore` is an
+    /// ordinary tree row, which is the rule [`VaultPath::is_hidden`] states —
+    /// so nothing built on the index can answer "what is inside
+    /// `.obsidian-headless/plugins/`", which is precisely the question a
     /// plugin host asks first. This walks the directory itself, takes the same
     /// containment [`MutationEngine::read_file`] takes, and joins no
     /// generation.
+    ///
+    /// No payload cap applies. [`MutationEngine::read_file`] weighs the file on
+    /// its `stat` before reading it; there is no equivalent here, so a very
+    /// large directory produces a very large answer rather than a refusal. It
+    /// is bounded by the one directory a caller named — this never recurses —
+    /// and a page or a cap is the follow-up if that stops being enough.
     ///
     /// Not gated on `read_only`, for [`MutationEngine::read_file`]'s reason: a
     /// read writes nothing.

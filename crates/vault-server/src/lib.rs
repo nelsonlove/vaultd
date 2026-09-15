@@ -1007,11 +1007,15 @@ impl Server {
                     Ok(entries) => ResponseEnvelope::success(
                         id,
                         Response::ReadDir(ReadDirResponse {
-                            // The daemon's own spelling of the directory it
-                            // listed, not the client's bytes: `VaultPath` is
-                            // what this server holds, and echoing anything
-                            // else would let a request's spelling and the
-                            // answer's drift apart.
+                            // The spelling the request used, echoed back: the
+                            // parsed `VaultPath`, or `""` for the root. A
+                            // client pairing answers to asks then needs no
+                            // bookkeeping of its own. This is **not** the
+                            // "stored spelling" a mutation reports — a
+                            // case-folded ask is echoed as it was asked, not
+                            // re-spelled to match the filesystem — and
+                            // canonicalizing here would leak where the vault
+                            // lives.
                             path: path
                                 .as_ref()
                                 .map(VaultPath::as_str)
