@@ -244,6 +244,20 @@ export class PluginSetHarness extends ShimHarness {
     if (this.guiEnabled === null) this.unserveFile(GUI_COMMUNITY_PLUGINS);
   }
 
+  /**
+   * Tear the assembled host down the way production does.
+   *
+   * `HostAssembly.teardown()` is what puts the process back — the module
+   * registries the `obsidian` and `electron` packages read through, every
+   * global, and (since fix round 1) the coexistence poll. A case that wants to
+   * assert the last of those needs the real teardown rather than
+   * `monitor.stop()`, which is the thing it is checking teardown remembers to
+   * call.
+   */
+  teardown(): void {
+    this.assembly.teardown();
+  }
+
   /** `CoexistenceMonitor.stop` is synchronous and idempotent — nothing to await. */
   override async stop(): Promise<void> {
     this.monitor.stop();

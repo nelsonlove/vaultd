@@ -231,6 +231,16 @@ export class HeadlessConfigDir {
    * directory, and a compare-and-swap against a revision nobody else can move is
    * a round trip that buys nothing. `Plugin.saveData` omits it for the same
    * reason.
+   *
+   * **Carry, for whichever task first calls this.** Nothing calls it yet. When
+   * an "enable a plugin" path does — Task 15's lifecycle, Task 16b's
+   * `host.enable_plugin` — it will read the set, append an id, and write it
+   * back; and {@link readEnabledSet} answers `[]` for a *damaged* file, having
+   * reported the damage only to the error seam. Read-append-write over that `[]`
+   * would overwrite a file the user may still want, silently, on the strength of
+   * a report nobody was obliged to read. The two halves are each correct and
+   * only dangerous together, so the guard belongs at the write: refuse to write
+   * a path this directory currently holds in {@link reportedCorrupt}.
    */
   async writeEnabledSet(ids: readonly string[]): Promise<void> {
     const body = `${JSON.stringify([...ids], null, 2)}\n`;
