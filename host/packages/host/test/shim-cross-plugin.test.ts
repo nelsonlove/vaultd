@@ -13,6 +13,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ShimHarness } from "../src/testing/shim-harness";
+import { currentPluginId } from "../src/shim/policy";
 import type { Editor } from "../src/shim/editor";
 
 describe("app.plugins and app.commands", () => {
@@ -92,10 +93,100 @@ describe("app.plugins and app.commands", () => {
     expect(ran).toBe(1);
   });
 
+  it("runs a command inside its own plugin's attribution window", async () => {
+    const harness = await ShimHarness.withVault({});
+    const seen: (string | null)[] = [];
+    const plugin = harness.instantiate(
+      "attributed",
+      class extends harness.api.Plugin {
+        override onload(): void {
+          this.addCommand({
+            id: "look",
+            name: "Look",
+            callback: () => {
+              seen.push(currentPluginId());
+            },
+          });
+        }
+      },
+    );
+    await harness.load(plugin);
+    // Outside a command there is nobody running; inside one it is the plugin
+    // that owns the command. Attribution is the whole reason the synchronous
+    // entry point goes through the queue at all — every policy hit a command
+    // makes, several layers down, is recorded against this id.
+    expect(currentPluginId()).toBeNull();
+    expect(harness.app.commands.executeCommandById("attributed:look")).toBe(true);
+    expect(seen).toEqual(["attributed"]);
+    expect(currentPluginId()).toBeNull();
+  });
+
+  it("refuses a command whose checkCallback says it does not apply", async () => {
+    const harness = await ShimHarness.withVault({});
+    const calls: boolean[] = [];
+    let available = false;
+    const plugin = harness.instantiate(
+      "gated",
+      class extends harness.api.Plugin {
+        override onload(): void {
+          this.addCommand({
+            id: "maybe",
+            name: "Maybe",
+            checkCallback: (checking: boolean) => {
+              calls.push(checking);
+              if (checking) return available;
+              return true;
+            },
+          });
+        }
+      },
+    );
+    await harness.load(plugin);
+
+    // A falsy check means "not right now": the command is asked and not run,
+    // which is what Obsidian does with a greyed-out palette entry.
+    expect(harness.app.commands.executeCommandById("gated:maybe")).toBe(false);
+    expect(calls).toEqual([true]);
+
+    available = true;
+    expect(harness.app.commands.executeCommandById("gated:maybe")).toBe(true);
+    expect(calls).toEqual([true, true, false]);
+  });
+
+  it("withdraws a plugin's commands on removeCommand and on unload", async () => {
+    const harness = await ShimHarness.withVault({});
+    const plugin = harness.instantiate(
+      "leaver",
+      class extends harness.api.Plugin {
+        override onload(): void {
+          this.addCommand({ id: "stay", name: "Stay", callback: () => undefined });
+          this.addCommand({ id: "go", name: "Go", callback: () => undefined });
+          this.removeCommand("go");
+        }
+      },
+    );
+    await harness.load(plugin);
+    // `removeCommand` takes the local id and the registry holds the qualified
+    // one, so a registry that never deleted would still look right to the
+    // plugin and wrong to everything that addresses commands by id.
+    expect(harness.app.commands.findCommand("leaver:go")).toBeUndefined();
+    expect(harness.app.commands.findCommand("leaver:stay")).toBeDefined();
+
+    await harness.unload("leaver");
+    // A plugin the host has torn down must not still be invokable.
+    expect(harness.app.commands.findCommand("leaver:stay")).toBeUndefined();
+    expect(harness.app.commands.executeCommandById("leaver:stay")).toBe(false);
+    expect(harness.app.plugins.getPlugin("leaver")).toBeNull();
+  });
+
   it("gives an editorCallback command a real editor, and flushes one write", async () => {
     const harness = await ShimHarness.withVault({ "A.md": "one\n" });
     const file = harness.vault.getFileByPath("A.md")!;
     const seen: (string | null)[] = [];
+    const duringBatch: (string | null)[] = [];
+    harness.mirror.onBatch(() => {
+      duringBatch.push(currentPluginId());
+    });
     const plugin = harness.instantiate(
       "editish",
       class extends harness.api.Plugin {
@@ -103,9 +194,17 @@ describe("app.plugins and app.commands", () => {
           this.addCommand({
             id: "shout",
             name: "Shout",
-            editorCallback: (editor: unknown) => {
+            editorCallback: (editor: unknown, context: unknown) => {
               const buffer = editor as Editor;
-              seen.push(this.app.workspace.getActiveFile()?.path ?? null);
+              const info = context as { file?: { path: string } | null; editor?: unknown };
+              // The context Obsidian hands an editor command is a
+              // `MarkdownFileInfo`: the file it is acting on and the editor
+              // over it. Six of obsidian-linter's seven commands guard on
+              // exactly this, so a context without it is a command that never
+              // runs.
+              seen.push(info.file?.path ?? null);
+              expect(info.editor).toBe(buffer);
+              expect(this.app.workspace.getActiveFile()?.path).toBe("A.md");
               buffer.setValue(buffer.getValue().toUpperCase());
             },
           });
@@ -136,5 +235,11 @@ describe("app.plugins and app.commands", () => {
     // file back afterwards.
     expect(seen).toEqual(["A.md"]);
     expect(harness.app.workspace.getActiveFile()).toBeNull();
+    // **The flush is the plugin's write.** It runs inside the queued command
+    // slot, so the `write_note`, the `applyMutation` behind it, and every
+    // listener that mutation fans out to are attributed to the plugin that
+    // caused them — like every other write in this host, and unlike a flush
+    // that ran after the slot had closed.
+    expect(duringBatch).toEqual(["editish"]);
   });
 });

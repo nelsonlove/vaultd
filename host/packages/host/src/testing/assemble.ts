@@ -271,7 +271,7 @@ export function assembleShim(deps: {
   assignOnce(
     app,
     "commands",
-    new CommandRegistry({ queue, client, mirror, writes, vault, workspace, errors }),
+    new CommandRegistry({ queue, client, mirror, writes, workspace, errors, app }),
   );
   // The store behind `app.loadLocalStorage`, which is the same one the bare
   // `localStorage` global is backed by — one store, two addresses.

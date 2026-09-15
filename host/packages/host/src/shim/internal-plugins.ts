@@ -19,6 +19,15 @@
  * claim a template folder this host never read. `null` says "not here" to a
  * plugin that asks, which is the answer a plugin can act on.
  *
+ * **With no `core-plugins.json` at all, every id reports `enabled: false`** —
+ * including `file-explorer`, `global-search` and `properties`, which a fresh
+ * real vault has on by default. Which way Obsidian reports a core plugin in a
+ * vault whose file has never been written is **uncaptured**, and `false` is the
+ * least-harm reading: the file is the only record this host has, and claiming
+ * `enabled` for a view that is certainly not there would be a second claim on
+ * top of one it cannot back. Nothing downstream turns on it — `instance` is
+ * `null` either way, so every consumer takes the same degraded branch.
+ *
  * **Config resolution is host-directory-first**, the same ladder
  * `Vault.getConfig` uses for `app.json`: `<hostConfigDir>/<name>` first,
  * `.obsidian/<name>` as the fallback. A fresh headless config dir therefore
@@ -124,6 +133,26 @@ export class InternalPluginRegistry {
   private readonly primed: Promise<void>;
 
   /**
+   * The last parse of each config file, kept so a refresh can re-read **one**
+   * file and still rebuild the whole map.
+   *
+   * `undefined` means "never read"; `null` means "read, and there is no such
+   * file or it does not parse" — which is an ordinary vault state and not the
+   * same claim.
+   */
+  private parsed = new Map<string, Record<string, unknown> | null>();
+
+  /** The refresh in flight, or `null`. See {@link refresh}. */
+  private inFlight: Promise<void> | null = null;
+  /** The rerun queued behind it, so overlapping events collapse into one. */
+  private queuedRun: Promise<void> | null = null;
+  /**
+   * What the next run must read: a set of basenames, or `null` for every file.
+   * `undefined` when nothing is queued.
+   */
+  private queuedNames: Set<string> | null | undefined = undefined;
+
+  /**
    * The files this registry reads. A write to anything else is ignored.
    *
    * **`app.json` is deliberately not here**, against the brief's list of four:
@@ -143,7 +172,8 @@ export class InternalPluginRegistry {
     this.unsubscribe = deps.mirror.onConfigChanged(async (path: string) => {
       const name = path.slice(path.lastIndexOf("/") + 1);
       if (!InternalPluginRegistry.WATCHED.has(name)) return;
-      await this.refresh();
+      // Named, so the event costs one file's ladder rather than every file's.
+      await this.refresh(name);
     });
     this.primed = this.refresh();
   }
@@ -178,17 +208,71 @@ export class InternalPluginRegistry {
   }
 
   /**
-   * Re-read every config file this registry serves from.
+   * Re-read this registry's config files and rebuild the map.
    *
    * Public because it has three callers: the constructor, the `config_changed`
    * subscription, and Task 14's coexistence poll — see this file's header for
    * why the third one is not redundant.
+   *
+   * **`name` reads one file.** A `config_changed` names the path that changed,
+   * and re-reading the other two costs four `read_file` round trips that answer
+   * what the registry already holds. The last parse of every file is kept
+   * ({@link parsed}), so a one-file refresh still rebuilds the whole map from
+   * current values. Omitting `name` re-reads everything, which is what the
+   * constructor and the coexistence poll — which is told *nothing* about what
+   * changed — both want.
+   *
+   * **Refreshes are single-flight, and overlapping ones collapse.** Two events
+   * in flight used to produce two interleaved read sequences, and whichever
+   * *finished* last installed its map — which need not be whichever was
+   * *written* last. Now a request that arrives while a refresh is running is
+   * merged into one queued rerun that starts when the current one finishes, so
+   * the runs are ordered and the last one to start is the last to write. Every
+   * caller's promise resolves only once a run that includes its request has
+   * finished.
    */
-  async refresh(): Promise<void> {
-    const core = await this.readConfigJson("core-plugins.json");
-    const enabled = enabledMap(core);
-    const daily = await this.readConfigJson("daily-notes.json");
-    const bookmarks = await this.readConfigJson("bookmarks.json");
+  refresh(name?: string): Promise<void> {
+    this.queueName(name);
+    if (this.inFlight === null) return this.startRun();
+    // One rerun however many events arrive: their names merge above, and they
+    // all await the same promise.
+    this.queuedRun ??= this.inFlight.then(
+      () => this.startRun(),
+      () => this.startRun(),
+    );
+    return this.queuedRun;
+  }
+
+  /** Merge one request into what the next run will read. */
+  private queueName(name: string | undefined): void {
+    if (name === undefined || this.queuedNames === null) {
+      this.queuedNames = null;
+      return;
+    }
+    if (this.queuedNames === undefined) this.queuedNames = new Set([name]);
+    else this.queuedNames.add(name);
+  }
+
+  /** Take the queued request and run it. One at a time, by construction. */
+  private startRun(): Promise<void> {
+    const names = this.queuedNames === undefined ? null : this.queuedNames;
+    this.queuedNames = undefined;
+    this.queuedRun = null;
+    const run = this.readAndRebuild(names).finally(() => {
+      this.inFlight = null;
+    });
+    this.inFlight = run;
+    return run;
+  }
+
+  private async readAndRebuild(names: ReadonlySet<string> | null): Promise<void> {
+    for (const file of InternalPluginRegistry.WATCHED) {
+      if (names !== null && !names.has(file) && this.parsed.has(file)) continue;
+      this.parsed.set(file, await this.readConfigJson(file));
+    }
+    const enabled = enabledMap(this.parsed.get("core-plugins.json") ?? null);
+    const daily = this.parsed.get("daily-notes.json") ?? null;
+    const bookmarks = this.parsed.get("bookmarks.json") ?? null;
     const next: Record<string, InternalPluginEntry> = {};
     for (const [id, on] of Object.entries(enabled)) {
       next[id] = { id, enabled: on, instance: null };

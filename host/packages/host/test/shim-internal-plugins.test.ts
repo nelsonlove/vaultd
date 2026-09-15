@@ -127,6 +127,18 @@ describe("app.internalPlugins", () => {
     expect(internal.getPluginById("file-explorer")?.enabled).toBe(true);
   });
 
+  it("answers Obsidian's daily-notes defaults when there is no config file", async () => {
+    const harness = await ShimHarness.withVault({});
+    const instance = harness.app.internalPlugins.getPluginById("daily-notes")?.instance as {
+      options: { folder: string; format: string; template: string };
+    };
+    // A vault that has never opened the core plugin's settings has no file at
+    // all, and rollover-daily-todos reads `format` on every rollover — a `""`
+    // there formats every date as the empty string and the plugin looks for a
+    // note called nothing.
+    expect(instance.options).toEqual({ folder: "", format: "YYYY-MM-DD", template: "" });
+  });
+
   it("lets folder-notes and tag-wrangler degrade instead of throwing", async () => {
     const harness = await ShimHarness.withVault({});
     const explorer = harness.app.internalPlugins.getEnabledPluginById("file-explorer");

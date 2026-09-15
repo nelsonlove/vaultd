@@ -7,10 +7,17 @@
  * plan that produced `App` in Task 12 produced it five tasks after its first
  * consumer.
  *
- * **A mutable container, assigned once.** The shim's surfaces refer to each
- * other in a cycle — the vault's rename event reaches the metadata cache, which
- * resolves links through the vault — so no construction order builds them all
- * with `readonly` fields set in their constructors. `assembleShim()` is the one
+ * **A container assigned once, and `readonly` from everywhere else.** Every
+ * field below is `readonly` with definite assignment: `assembleShim` fills it
+ * through `assignOnce`, which writes through a generic index (where TypeScript
+ * does not enforce `readonly`) and refuses a second assignment at runtime. So
+ * the brief's `readonly` is what a plugin — and every other file in this host —
+ * actually sees, while the one function allowed to assemble still can.
+ *
+ * The shim's surfaces refer to each other in a cycle — the vault's rename event
+ * reaches the metadata cache, which resolves links through the vault — so no
+ * construction order builds them all with constructor-set fields, which is why
+ * they are assigned rather than passed in. `assembleShim()` is the one
  * function allowed to fill this in, it does so exactly once, and every field
  * arrives non-null before any plugin bundle is loaded. A plugin therefore never
  * observes a half-built app; only the assembler does, and only for the length
@@ -56,7 +63,7 @@ export class App {
    * "assigned once by the assembler" is enforced rather than asserted, and no
    * plugin bundle is loaded before it lands.
    */
-  vault!: Vault;
+  readonly vault!: Vault;
 
   /**
    * `app.metadataCache` — filled by `assembleShim`, exactly once, straight
@@ -67,7 +74,7 @@ export class App {
    * into a `readonly` field for the same reason the vault is: the two surfaces
    * refer to each other, so no construction order leaves both final.
    */
-  metadataCache!: MetadataCache;
+  readonly metadataCache!: MetadataCache;
 
   /**
    * `app.fileManager` — filled by `assembleShim`, exactly once, after the
@@ -80,7 +87,7 @@ export class App {
    * peers — the surfaces refer to each other, so no construction order leaves
    * them all final.
    */
-  fileManager!: FileManager;
+  readonly fileManager!: FileManager;
 
   /**
    * `app.workspace` — filled by `assembleShim`, exactly once.
@@ -92,7 +99,7 @@ export class App {
    * menu-hook half of the real surface; Task 11a adds the leaves, the active
    * file, and the layout-ready latch to the same class.
    */
-  workspace!: Workspace;
+  readonly workspace!: Workspace;
 
   /**
    * `app.plugins` — filled by `assembleShim`, exactly once.
@@ -101,7 +108,7 @@ export class App {
    * peers above: the registry holds the very `Plugin` instances that hold this
    * `App`, so there is no order in which both are final.
    */
-  plugins!: PluginRegistry;
+  readonly plugins!: PluginRegistry;
 
   /**
    * `app.internalPlugins` — filled by `assembleShim`, exactly once.
@@ -109,14 +116,14 @@ export class App {
    * It reads config files through the client and subscribes to the mirror's
    * `config_changed`, so it is built where those are in scope rather than here.
    */
-  internalPlugins!: InternalPluginRegistry;
+  readonly internalPlugins!: InternalPluginRegistry;
 
   /**
    * `app.commands` — filled by `assembleShim`, exactly once, and the **one**
    * command map. `Plugin.addCommand` delegates into it; nothing keeps a second
    * list. See `shim/commands.ts` for why the map is a plain mutable object.
    */
-  commands!: CommandRegistry;
+  readonly commands!: CommandRegistry;
 
   /**
    * The four surfaces that are about a window, and hold nothing of this host's.
@@ -154,7 +161,7 @@ export class App {
    * `localStorage` global, so a plugin that writes through one and reads
    * through the other sees one value rather than two stores.
    */
-  localStorageStore!: HostLocalStorage;
+  readonly localStorageStore!: HostLocalStorage;
 
   constructor(options: { appId: string; appVersion: string }) {
     this.appId = options.appId;

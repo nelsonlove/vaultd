@@ -43,6 +43,7 @@
 
 import { Editor } from "./editor";
 import { declarePolicy, recordUse } from "./policy";
+import type { App } from "./app";
 import type { Command } from "./plugin";
 import type { DispatchQueue } from "../runtime/queue";
 import type { EditorRange } from "./editor";
@@ -50,7 +51,7 @@ import type { HostErrors } from "./errors";
 import type { Mirror } from "../mirror/mirror";
 import type { TFile } from "./files";
 import type { VaultdClient } from "../client/client";
-import type { Vault, WriteGate } from "./vault";
+import type { WriteGate } from "./vault";
 import type { Workspace } from "./workspace";
 
 export type { Command } from "./plugin";
@@ -61,9 +62,23 @@ export interface CommandDeps {
   readonly client: VaultdClient;
   readonly mirror: Mirror;
   readonly writes: WriteGate;
-  readonly vault: Vault;
   readonly workspace: Workspace;
   readonly errors: HostErrors;
+  /** Carried only so the editor context can hand a plugin its own `app`. */
+  readonly app: App;
+}
+
+/**
+ * Obsidian's `MarkdownFileInfo`, as much of it as a headless host has.
+ *
+ * The published interface is `{ app, file, editor?, hoverPopover, … }`. The
+ * three fields here are the three this host can answer truthfully; nothing else
+ * is invented. See {@link CommandRegistry.fileInfoFor}.
+ */
+export interface MarkdownFileInfo {
+  readonly app: App;
+  readonly file: TFile | null;
+  readonly editor: Editor;
 }
 
 /** How a caller names the note an `editorCallback` acts on. */
@@ -142,12 +157,28 @@ export class CommandRegistry {
    * Run a command with a subject file, building the editor the two editor kinds
    * need. **Host-only**; Task 16a's `host.invoke_command` is the caller.
    *
-   * The whole construction path, stated once: one `get_note` for the source and
-   * the revision, `workspace.setActiveFile(file)` so a callback that asks what
-   * it is acting on gets an answer, the callback through the dispatch queue,
-   * and `editor.flush()` on the way out — which writes only when the buffer
-   * really changed. `setActiveFile(null)` runs in a `finally`, so a callback
-   * that throws does not leave the host claiming a file is open.
+   * The whole construction path, stated once:
+   *
+   * 1. one `get_note` for the source and the revision;
+   * 2. the second argument — see {@link MarkdownFileInfo}, and it is the whole
+   *    difference between a command that runs and one that silently refuses;
+   * 3. `workspace.setActiveFile(file)`, so a callback that asks the workspace
+   *    what it is acting on gets the same answer as its `ctx.file`;
+   * 4. the callback, and then `editor.flush()`, **inside one queued plugin
+   *    slot and inside that path's exclusive lock** — the shape
+   *    `FileManager.processFrontMatter` and `Vault.process` already use;
+   * 5. `setActiveFile(null)` in a `finally`, so a callback that throws does not
+   *    leave the host claiming a file is open.
+   *
+   * **Why the lock and the slot, corrected in fix round 1.** Open-mutate-flush
+   * is a read-modify-write against a revision precondition, exactly like the
+   * other two, and it was the only one in this host taking no per-path lock: two
+   * commands editing one note interleaved into a `revision_conflict` rather
+   * than queueing. The flush also ran *after* `queue.run` had returned, so the
+   * `write_note`, its `applyMutation` and every `modify` handler that mutation
+   * fans out to ran with `currentPluginId()` null — a write attributed to
+   * nobody, where every other shim write in this host is attributed to the
+   * plugin that caused it.
    *
    * A command that needs an editor and was given no file answers `false` rather
    * than throwing: the caller is the one that knows whether a missing
@@ -165,31 +196,68 @@ export class CommandRegistry {
     }
     const file = options.file ?? null;
     if (file === null) return false;
-    const editor = await Editor.open({
-      client: this.deps.client,
-      mirror: this.deps.mirror,
-      writes: this.deps.writes,
-      file,
-      initialSelection: options.selection,
-    });
-    const view = this.deps.workspace.getLeaf(false).view;
-    this.deps.workspace.setActiveFile(file);
-    let ran = false;
-    try {
-      ran = await this.deps.queue.run(pluginId, `command:${id}`, async () => {
-        if (kind === "editorCheckCallback") {
-          if (command.editorCheckCallback!(true, editor, view) !== true) return false;
-          await settle(command.editorCheckCallback!(false, editor, view));
-          return true;
+    return await this.deps.queue.run(pluginId, `command:${id}`, () =>
+      // Independent of the FIFO this is already running under — see
+      // `DispatchQueue.runExclusivePath`, which exists precisely so a
+      // read-modify-write can serialize by path from inside a plugin slot
+      // without waiting on the queue it is running under.
+      this.deps.queue.runExclusivePath(file.path, async () => {
+        const editor = await Editor.open({
+          client: this.deps.client,
+          mirror: this.deps.mirror,
+          writes: this.deps.writes,
+          file,
+          initialSelection: options.selection,
+        });
+        const context = this.fileInfoFor(file, editor);
+        this.deps.workspace.setActiveFile(file);
+        let ran = false;
+        try {
+          if (kind === "editorCheckCallback") {
+            if (command.editorCheckCallback!(true, editor, context) === true) {
+              await settle(command.editorCheckCallback!(false, editor, context));
+              ran = true;
+            }
+          } else {
+            await settle(command.editorCallback!(editor, context));
+            ran = true;
+          }
+        } finally {
+          this.deps.workspace.setActiveFile(null);
         }
-        await settle(command.editorCallback!(editor, view));
-        return true;
-      });
-    } finally {
-      this.deps.workspace.setActiveFile(null);
-    }
-    if (ran) await editor.flush();
-    return ran;
+        // Inside the slot and inside the lock, so the write and everything it
+        // fans out to are the plugin's.
+        if (ran) await editor.flush();
+        return ran;
+      }),
+    );
+  }
+
+  /**
+   * The second argument every editor command is handed.
+   *
+   * Obsidian's signature is `editorCallback(editor: Editor, ctx: MarkdownView |
+   * MarkdownFileInfo)`, and `MarkdownFileInfo` — the published interface — is
+   * `{ app, file, editor?, hoverPopover?, … }`. **This is not decoration: it is
+   * the difference between a command running and silently not running.** Six of
+   * obsidian-linter's seven commands are `editorCheckCallback`s whose checking
+   * arm reads `ctx.file` (`view && view.file instanceof TFile && view.file.parent
+   * ? !view.file.parent.isRoot() : false`), so a context with no `file` answers
+   * `false` for every one of them — no throw, no error, the command simply does
+   * not happen. The inert leaf's `View`, which is what this used to hand over,
+   * has no `file`.
+   *
+   * `MarkdownFileInfo` rather than a `MarkdownView` instance, and the choice is
+   * a least-harm one: a `MarkdownView` would answer `true` to `ctx instanceof
+   * MarkdownView` and promise a rendering surface, a `previewMode`, a `getMode()`
+   * this host cannot serve. The documented smaller interface carries exactly
+   * what a headless host really has — the app, the file, and the editor over it
+   * — and a plugin that needs the bigger one still takes its own "no markdown
+   * view" branch. Anything beyond those three fields is uncaptured and is not
+   * invented here.
+   */
+  private fileInfoFor(file: TFile, editor: Editor): MarkdownFileInfo {
+    return { app: this.deps.app, file, editor };
   }
 
   /**

@@ -64,6 +64,76 @@ describe("config_changed refreshes the config readers", () => {
     expect(harness.vault.getConfig("attachmentFolderPath")).toBe("New");
   });
 
+  it("reads only the file the event names, and coalesces overlapping events", async () => {
+    const harness = await ShimHarness.withVault(
+      {},
+      {
+        configFiles: {
+          ".obsidian/core-plugins.json": JSON.stringify({ "daily-notes": true }),
+          ".obsidian/daily-notes.json": JSON.stringify({ folder: "One", format: "YYYY", template: "" }),
+          ".obsidian/bookmarks.json": JSON.stringify({ items: [] }),
+        },
+      },
+    );
+    const internal = harness.app.internalPlugins;
+    harness.clearMethodLog();
+
+    // One named file, one ladder: the host directory's copy and Obsidian's. The
+    // other two files are not re-read, because the event says they did not
+    // change and the registry still holds their last parse.
+    harness.setConfigFile(
+      ".obsidian/daily-notes.json",
+      JSON.stringify({ folder: "Two", format: "YYYY", template: "" }),
+    );
+    await harness.mirror.applyEvent({
+      type: "config_changed",
+      value: { path: ".obsidian/daily-notes.json" },
+    });
+    expect(harness.methodsSeen()).toEqual(["read_file", "read_file"]);
+    expect(
+      (internal.getPluginById("daily-notes")?.instance as { options: { folder: string } }).options
+        .folder,
+    ).toBe("Two");
+    // The untouched files are still answered from the last parse rather than
+    // forgotten: a one-file refresh rebuilds the whole map.
+    expect(internal.getPluginById("daily-notes")?.enabled).toBe(true);
+
+    // **Overlapping refreshes collapse into one rerun.** The mirror serializes
+    // its own events, so the way to reach this is the way Task 14's poll will:
+    // `refresh()` called again while one is still in flight. Without the
+    // single-flight guard these would interleave two read sequences and
+    // whichever *finished* last would install its map — which need not be
+    // whichever was *written* last.
+    harness.clearMethodLog();
+    harness.setConfigFile(
+      ".obsidian/daily-notes.json",
+      JSON.stringify({ folder: "Three", format: "YYYY", template: "" }),
+    );
+    harness.setConfigFile(
+      ".obsidian/bookmarks.json",
+      JSON.stringify({ items: [{ type: "file", path: "A.md" }] }),
+    );
+    const overlapping = [
+      internal.refresh("daily-notes.json"),
+      internal.refresh("bookmarks.json"),
+      internal.refresh("bookmarks.json"),
+    ];
+    await Promise.all(overlapping);
+    // Every caller's request landed: the first run re-read daily-notes, and the
+    // one queued rerun re-read bookmarks once for both callers that asked.
+    expect(
+      (internal.getPluginById("daily-notes")?.instance as { options: { folder: string } }).options
+        .folder,
+    ).toBe("Three");
+    const bookmarks = internal.getPluginById("bookmarks")?.instance as {
+      getBookmarks(): unknown[];
+    };
+    expect(bookmarks.getBookmarks()).toHaveLength(1);
+    // Two ladders, not three: one file per run, and three requests produced two
+    // runs. A whole-registry re-read would have cost six round trips per run.
+    expect(harness.methodsSeen()).toEqual(["read_file", "read_file", "read_file", "read_file"]);
+  });
+
   it("ignores a config_changed for a plugin data.json", async () => {
     const harness = await ShimHarness.withVault(
       {},

@@ -29,6 +29,7 @@ import { join, resolve } from "node:path";
 import { assembleShim } from "./assemble";
 import { FixtureVault } from "./fixture-vault";
 import { MirrorHarness, noteDto } from "./mirror-harness";
+import { REFETCH_FACETS } from "../mirror/mirror";
 import { fs } from "../runtime/fs-access";
 import { socketPathFor } from "../config";
 import type { HostConfig } from "../config";
@@ -577,7 +578,23 @@ export class ShimHarness extends MirrorHarness {
     this.serve((request) => {
       if (request.request.method !== "get_note") return false;
       const params = request.request.params as { path?: string; include?: unknown };
-      if (params.include !== undefined) return false;
+      if (params.include !== undefined) {
+        // The separator is an invariant, so a drift in it is answered loudly
+        // rather than by a hang: an `include` that is not the mirror's exact
+        // refetch shape means some third caller has appeared, and leaving it to
+        // `answerRefetch` would strand a request nothing answers.
+        if (!sameFacets(params.include)) {
+          this.respondErr(request.id, {
+            code: "invalid_request",
+            message:
+              `a get_note carried include=${JSON.stringify(params.include)}, which is neither ` +
+              `the editor's (absent) nor the mirror's refetch (${JSON.stringify(REFETCH_FACETS)}). ` +
+              "The harness separates the two by that field; teach it the third caller.",
+          });
+          return true;
+        }
+        return false;
+      }
       const path = params.path;
       if (path === undefined) return false;
       const fixture = this.noteRows.get(path);
@@ -613,6 +630,12 @@ function menuContextOf(id: string): MenuContext {
     throw new Error(`${id} does not name a menu item`);
   }
   return context;
+}
+
+/** Whether a `get_note`'s `include` is exactly the mirror's refetch facets. */
+function sameFacets(include: unknown): boolean {
+  if (!Array.isArray(include) || include.length !== REFETCH_FACETS.length) return false;
+  return REFETCH_FACETS.every((facet) => include.includes(facet));
 }
 
 /** Every folder above `path`, as a fixture row. */

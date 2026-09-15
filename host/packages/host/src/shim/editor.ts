@@ -67,6 +67,8 @@ export interface EditorChange {
 /** As much of Obsidian's `EditorTransaction` as a headless host can honour. */
 export interface EditorTransaction {
   changes?: EditorChange[];
+  /** Replaces the current selection, after `changes` — see {@link Editor.transaction}. */
+  replaceSelection?: string;
   selection?: { from: EditorPosition; to?: EditorPosition };
 }
 
@@ -156,6 +158,16 @@ export class Editor {
     return this.lines()[line] ?? "";
   }
 
+  /**
+   * Replace one line's text.
+   *
+   * A line outside the buffer is a **no-op**. Obsidian's editor is
+   * CodeMirror-backed and CodeMirror throws a `RangeError` for a line it does
+   * not have, so this is a deliberate divergence and it is **uncaptured**
+   * whether a plugin in the corpus ever reaches it: nothing here does, and a
+   * throw out of a command that had already made other edits would lose them.
+   * The same reading governs {@link posToOffset}, which clamps.
+   */
   setLine(line: number, text: string): void {
     recordUse("Editor.setLine");
     const lines = this.lines();
@@ -275,12 +287,20 @@ export class Editor {
   }
 
   /**
-   * Apply several changes at once, then the transaction's selection.
+   * Apply several changes at once, then `replaceSelection`, then the
+   * transaction's selection.
    *
    * The changes are applied **last-first** by offset, because applying them in
    * document order would invalidate every later change's positions — which is
    * the bug a plugin batching edits into one transaction is trying to avoid in
    * the first place.
+   *
+   * The **order of the three fields relative to each other is uncaptured.**
+   * `changes` first is the only order in which the positions those changes
+   * carry mean anything; `replaceSelection` before `selection` is the only
+   * order in which setting a selection and then replacing something else would
+   * not be silently pointless. Both are least-harm readings of an interface
+   * whose documentation states no order.
    */
   transaction(tx: EditorTransaction): void {
     recordUse("Editor.transaction");
@@ -288,6 +308,7 @@ export class Editor {
       (a, b) => this.posToOffset(b.from) - this.posToOffset(a.from),
     );
     for (const change of changes) this.replaceRange(change.text, change.from, change.to);
+    if (tx.replaceSelection !== undefined) this.replaceSelection(tx.replaceSelection);
     if (tx.selection !== undefined) {
       this.setSelection(tx.selection.from, tx.selection.to ?? tx.selection.from);
     }
@@ -301,7 +322,10 @@ export class Editor {
    * Clamped rather than thrown on, because a plugin computes positions from a
    * `CachedMetadata` that may describe the note as it was **before** the
    * plugin's own earlier edit in the same callback — and a throw there loses
-   * the whole command, where a clamp loses one character of precision.
+   * the whole command, where a clamp loses one character of precision. What
+   * CodeMirror does with an out-of-range position (a `RangeError`) is known;
+   * what Obsidian's `Editor` wrapper does with one is **uncaptured**, and the
+   * clamp is the least-harm reading.
    */
   posToOffset(pos: EditorPosition): number {
     recordUse("Editor.posToOffset");
