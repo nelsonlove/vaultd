@@ -72,6 +72,16 @@
  * the vault is moving faster than this host can read it, and the apply takes
  * the resync road rather than installing something it knows is wrong.
  *
+ * Two words in that sentence are load-bearing and were each got wrong once.
+ * *"Removed"* means **the paths this apply will not hold afterwards** — not
+ * the paths it removes, because Ruling W6's replace-in-place removes a path and
+ * puts a different thing there under the same name, and a link to it does not
+ * dangle. And *"resolves into"* means whatever the **link indexes** file under
+ * a target (`resolvedTargetOf`, which covers `missing_subpath` and the first
+ * candidate of an `ambiguous`), not `resolution.kind === "resolved"`: a guard
+ * that is not congruent with the index it protects agrees with the bug on
+ * exactly the shapes it forgot.
+ *
  * `mirror-fuzz-real-daemon.test.ts` asserts the observable half of this on
  * every batch: no resolved link may name a path the mirror does not hold.
  *
@@ -789,6 +799,7 @@ export class Mirror implements MirrorQuery {
   private resyncingValue = false;
   private pendingResync: { reason: MirrorResyncReason } | null = null;
   private lastResyncReasonValue: MirrorResyncReason | null = null;
+  private resyncCountValue = 0;
   private readonly batchListeners = new Set<(batch: MirrorChangeBatch) => void>();
   private readonly configListeners = new Set<(path: string) => void | Promise<void>>();
   private readonly applyErrorListeners = new Set<
@@ -950,6 +961,20 @@ export class Mirror implements MirrorQuery {
    */
   lastResyncReason(): MirrorResyncReason | null {
     return this.lastResyncReasonValue;
+  }
+
+  /**
+   * How many re-hydrations this mirror has run, for any reason.
+   *
+   * {@link lastResyncReason} records *that* one happened and is overwritten by
+   * the next, so a guard that escalates on one apply in fifty is invisible to
+   * every gate. Counting synthetic batches cannot stand in for it either:
+   * `runResync` emits nothing when the re-hydration found the vault exactly as
+   * the mirror already held it, which is precisely the repair case worth
+   * seeing. One integer, and Task 22's compatibility report wants it anyway.
+   */
+  resyncCount(): number {
+    return this.resyncCountValue;
   }
 
   /**
@@ -1363,7 +1388,17 @@ export class Mirror implements MirrorQuery {
     // cannot answer, so nothing else would catch them. A folder delete would
     // leave every ambiguous link naming a path inside it pointing at a path
     // that no longer exists, permanently.
-    for (const path of [...created, ...doomed]) {
+    // **`deleted` as well as `doomed`, which is not the same list.** `doomed`
+    // is built from `subtreePaths`, which answers `[]` for a path this mirror
+    // has already forgotten — so a generation that deletes something the mirror
+    // lost track of earlier consults nothing and repairs nothing. `linkSources`
+    // is keyed by link *text* and answers perfectly well for a path whose row
+    // is gone, so naming `deleted` here costs one index lookup and converts
+    // "permanent" into "one generation" for every hole of this family: the two
+    // this file has already had, and the next one. It is a mitigation and not a
+    // fix — it cannot find a link written as an **alias**, which needs the
+    // backlink index, which went with the row.
+    for (const path of [...created, ...deleted, ...doomed]) {
       for (const source of this.state.linkSourcesFor(path)) {
         if (!doomed.has(source)) wanted.add(source);
       }
@@ -1459,9 +1494,10 @@ export class Mirror implements MirrorQuery {
         // is a generation at which the daemon has already re-resolved. A row
         // that is *still* stale after its re-ask is a vault moving faster than
         // this host can read it, and that is the resync road, taken below.
+        const goneNow = notHeldAfter(doomed, plan);
         for (const [path, row] of plan.notes) {
-          if (doomed.has(path) || restaleAsked.has(path)) continue;
-          if (!resolvesInto(row, doomed)) continue;
+          if (goneNow.has(path) || restaleAsked.has(path)) continue;
+          if (!resolvesInto(row, goneNow)) continue;
           restaleAsked.add(path);
           late.add(path);
         }
@@ -1506,7 +1542,7 @@ export class Mirror implements MirrorQuery {
     //   which is the same order the expansion already runs at, and it makes the
     //   guarantee structural rather than a claim about the expansion being
     //   exhaustive.
-    if (this.wouldDangle(plan, doomed)) {
+    if (this.wouldDangle(plan, notHeldAfter(doomed, plan))) {
       this.markResync("refetch_oversized");
       await this.runResync();
       return;
@@ -1598,7 +1634,8 @@ export class Mirror implements MirrorQuery {
   }
 
   /**
-   * Would installing `plan` leave a resolved link to a path in `doomed`?
+   * Would installing `plan` leave a resolved link to a path in `notHeld` —
+   * the paths this apply will not hold afterwards?
    *
    * The install's last question, and the one the whole late-removal expansion
    * exists to be able to answer "no" to. Both directions a row can arrive
@@ -1606,20 +1643,20 @@ export class Mirror implements MirrorQuery {
    * backlink index and `resolvedLinks` are themselves built from — so "resolves
    * into `doomed`" here means exactly "dangles afterwards".
    */
-  private wouldDangle(plan: RefetchPlan, doomed: ReadonlySet<string>): boolean {
+  private wouldDangle(plan: RefetchPlan, notHeld: ReadonlySet<string>): boolean {
     for (const [path, row] of plan.notes) {
-      if (doomed.has(path)) continue;
-      if (resolvesInto(row, doomed)) return true;
+      if (notHeld.has(path)) continue;
+      if (resolvesInto(row, notHeld)) return true;
     }
-    for (const gone of doomed) {
+    for (const gone of notHeld) {
       for (const reference of this.state.backlinks(gone)) {
         const source = reference.source_path;
-        if (doomed.has(source)) continue;
+        if (notHeld.has(source)) continue;
         // Replaced by this apply with a row that does not dangle: fine. Not
         // replaced at all, or replaced by one that still resolves into a
         // removal: not fine.
         const replacement = plan.notes.get(source);
-        if (replacement && !resolvesInto(replacement, doomed)) continue;
+        if (replacement && !resolvesInto(replacement, notHeld)) continue;
         return true;
       }
     }
@@ -1711,6 +1748,7 @@ export class Mirror implements MirrorQuery {
     if (!requested) return;
     this.pendingResync = null;
     this.lastResyncReasonValue = requested.reason;
+    this.resyncCountValue += 1;
     const previous = this.snapshotRevisions();
     const previousRevisions = this.state.revisionMap();
     try {
@@ -1894,12 +1932,50 @@ function mergedPlans(first: RefetchPlan, second: RefetchPlan): RefetchPlan {
   const entries = new Map<string, MirrorEntry>();
   for (const entry of first.entries) entries.set(entry.path, entry);
   for (const entry of second.entries) entries.set(entry.path, entry);
+  // **The later answer wins for `absent` too**, and that is the half that
+  // cannot be left as a concatenation. A path served as a row in one round and
+  // reported gone in a later one is *gone*: keeping the earlier row makes the
+  // install remove the path and then put it straight back from a stale
+  // answer — a phantom row this mirror holds, resolved into whatever else the
+  // apply removed, and named in the batch's `deleted` while it is still there.
+  // The install guard cannot see it either: both of its scans skip a path that
+  // is being removed, which is exactly what this one is.
+  //
+  // An earlier absence that a later round then *answered* is the same rule the
+  // other way round, and it is why this is a set difference rather than a union
+  // — a path can be re-created between two rounds as easily as deleted.
+  const secondPresent = new Set(second.entries.map((entry) => entry.path));
+  const absent = new Set<string>();
+  for (const path of first.absent) if (!secondPresent.has(path)) absent.add(path);
+  for (const path of second.absent) absent.add(path);
+  for (const path of absent) {
+    entries.delete(path);
+    notes.delete(path);
+  }
   return {
     generation: Math.max(first.generation, second.generation),
     entries: [...entries.values()],
     notes,
-    absent: [...first.absent, ...second.absent],
+    absent: [...absent],
   };
+}
+
+/**
+ * The doomed paths this apply will **not** put back.
+ *
+ * Ruling W6's replace-in-place names one path in `deleted` and `created` at
+ * once, so it is in `doomed` *and* in the plan's rows: a link to it does not
+ * dangle afterwards, and treating it as a removal buys a re-ask nothing needed
+ * and then a whole re-hydration for a generation that wanted one upsert.
+ *
+ * So "resolves into a removal" means **"resolves to a path this apply will not
+ * hold afterwards"**, which is neither `doomed` nor `plan.absent` on its own.
+ */
+function notHeldAfter(doomed: ReadonlySet<string>, plan: RefetchPlan): Set<string> {
+  const installed = new Set(plan.entries.map((entry) => entry.path));
+  const gone = new Set<string>();
+  for (const path of doomed) if (!installed.has(path)) gone.add(path);
+  return gone;
 }
 
 /**

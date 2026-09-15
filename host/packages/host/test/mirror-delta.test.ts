@@ -1070,6 +1070,255 @@ describe("Mirror deltas", () => {
     expect([...(await third)]).toEqual(["A.md"]);
   });
 
+  it("drops a row a later refetch pass reported absent, rather than re-installing it", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "P.md", kind: "note", revision: "blake3:p1" },
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+        { path: "K.md", kind: "note", revision: "blake3:k1" },
+      ],
+      notes: [
+        { path: "P.md", revision: "blake3:p1", outgoing: [harness_ref("P.md", "X", "X.md")] },
+        { path: "X.md", revision: "blake3:x1", outgoing: [harness_ref("X.md", "K", "K.md")] },
+        { path: "K.md", revision: "blake3:k1" },
+      ],
+    });
+    const batches: MirrorChangeBatch[] = [];
+    harness.mirror.onBatch((batch) => batches.push(batch));
+
+    // **A later answer's absence wins.** A path served as a row in one round
+    // and reported gone in a later one is gone: merging the two answers by
+    // keeping both leaves the install removing the path and then putting it
+    // straight back from the stale row — a phantom this mirror holds, resolved
+    // into something else the same apply removed, and named in the batch's
+    // `deleted` while the row is still there. Neither scan of the install guard
+    // can see it, because both skip a path that is being removed.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["P.md", "K.md"], deleted: [] },
+        affected_note_count: 2,
+      }),
+    );
+    // Round 0 @ 8: `K.md` has gone; `P.md` is served, still resolved to `X.md`.
+    await harness.answerRefetch(
+      8,
+      [{ path: "P.md", revision: "blake3:p1", outgoing: [harness_ref("P.md", "X", "X.md")] }],
+      { absent: ["K.md"] },
+    );
+    // Round 1 @ 9: `K.md`'s referrer `X.md` has gone too.
+    await harness.answerRefetch(9, [], { absent: ["X.md"] });
+    // Round 2 @ 10: the re-ask of `P.md` — which has gone as well.
+    await harness.answerRefetch(10, [], { absent: ["P.md"] });
+    await applying;
+
+    expect(harness.mirror.entry("P.md")).toBeUndefined();
+    expect(harness.mirror.entry("X.md")).toBeUndefined();
+    expect(harness.mirror.entry("K.md")).toBeUndefined();
+    expect(harness.mirror.resolvedLinks()).toEqual({});
+    // Nothing needed a re-hydration: every removal was applied as a removal.
+    expect(harness.mirror.lastResyncReason()).toBeNull();
+    expect(batches).toHaveLength(1);
+    expect([...batches[0]!.deleted].sort()).toEqual(["K.md", "P.md", "X.md"]);
+  }, 20_000);
+
+  it("does not re-ask or escalate for a path replaced in place", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+        { path: "P.md", kind: "note", revision: "blake3:p1" },
+      ],
+      notes: [
+        { path: "X.md", revision: "blake3:x1", outgoing: [harness_ref("X.md", "P", "P.md")] },
+        { path: "P.md", revision: "blake3:p1" },
+      ],
+    });
+
+    // Ruling W6: one path in `deleted` *and* `created` means the thing there
+    // was removed and a different thing put in its place. It is a removal the
+    // apply immediately undoes, so a link to it does not dangle — and treating
+    // it as a removal costs a second refetch round nothing needed and then a
+    // whole re-hydration for a generation that wanted one upsert.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: ["P.md"], modified: [], deleted: ["P.md"] },
+        affected_note_count: 1,
+      }),
+    );
+    await harness.answerRefetch(6, [
+      { path: "P.md", revision: "blake3:p2" },
+      { path: "X.md", revision: "blake3:x1", outgoing: [harness_ref("X.md", "P", "P.md")] },
+    ]);
+    await applying;
+
+    expect(harness.methodsSeen().filter((method) => method === "get_tree_entries")).toHaveLength(1);
+    expect(harness.mirror.lastResyncReason()).toBeNull();
+    expect(harness.mirror.entry("P.md")?.revision).toBe("blake3:p2");
+    expect(harness.mirror.resolvedLinks()).toEqual({ "X.md": { "P.md": 1 } });
+  });
+
+  it("escalates when a held referrer the plan never replaced still resolves into a removal", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+        { path: "Y.md", kind: "note", revision: "blake3:y1" },
+      ],
+      notes: [
+        { path: "X.md", revision: "blake3:x1", outgoing: [harness_ref("X.md", "Y", "Y.md")] },
+        { path: "Y.md", revision: "blake3:y1" },
+      ],
+    });
+
+    // `Y.md` goes late, so `X.md` is asked as its referrer — and `X.md` comes
+    // back as a **folder**, which `refetch` asks no `get_note` for. So it is
+    // not an absence, the plan has no row to replace it with, and the note row
+    // this mirror still holds is resolved straight into the removal. Only the
+    // guard's second scan — the backlink sweep over what is being removed —
+    // can see that one.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["Y.md"], deleted: [] },
+        affected_note_count: 1,
+      }),
+    );
+    await harness.answerRefetch(8, [], { absent: ["Y.md"] });
+    await harness.answerRefetch(9, [], { entries: [{ path: "X.md", kind: "folder" }] });
+    // Started, not awaited, so a guard that never escalates fails on the
+    // assertion below instead of hanging on an answer nobody asked for.
+    const rehydrated = harness
+      .answerHydration({ generation: 10, entries: [{ path: "X.md", kind: "folder" }], notes: [] })
+      .then(() => true)
+      .catch(() => false);
+    await applying;
+
+    expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
+    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(await rehydrated).toBe(true);
+  }, 20_000);
+
+  it("treats every resolution the link index files under a target as resolving into it", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a1" },
+        { path: "Y.md", kind: "note", revision: "blake3:y1" },
+      ],
+      notes: [
+        {
+          path: "A.md",
+          revision: "blake3:a1",
+          outgoing: [
+            {
+              ...harness_ref("A.md", "Y", "Y.md"),
+              resolution: {
+                kind: "missing_subpath",
+                target: "Y.md",
+                subpath: { kind: "heading", value: "gone" },
+              },
+            },
+          ],
+        },
+        { path: "Y.md", revision: "blake3:y1" },
+      ],
+    });
+    expect(harness.mirror.resolvedLinks()).toEqual({ "A.md": { "Y.md": 1 } });
+
+    // **`missing_subpath` is filed under a target**, and so is the first
+    // candidate of an `ambiguous`. `resolvedLinks`, the backlink index and the
+    // guard must all agree about what "resolves into" means, or the guard
+    // agrees with the bug on precisely the shapes it forgot: measured against
+    // the real daemon, testing `resolution.kind === "resolved"` instead let one
+    // seed-run in twelve install a dangling link.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["Y.md"], deleted: [] },
+        affected_note_count: 1,
+      }),
+    );
+    const stale = {
+      path: "A.md",
+      revision: "blake3:a1",
+      outgoing: [
+        {
+          ...harness_ref("A.md", "Y", "Y.md"),
+          resolution: {
+            kind: "missing_subpath" as const,
+            target: "Y.md",
+            subpath: { kind: "heading" as const, value: "gone" },
+          },
+        },
+      ],
+    };
+    await harness.answerRefetch(8, [], { absent: ["Y.md"] });
+    // The referrer, asked and then re-asked, answered stale both times.
+    await harness.answerRefetch(9, [stale]);
+    await harness.answerRefetch(10, [stale]);
+    await harness.answerHydration({
+      generation: 11,
+      entries: [{ path: "A.md", kind: "note", revision: "blake3:a1" }],
+      notes: [{ path: "A.md", revision: "blake3:a1", outgoing: [harness_ref("A.md", "Y", null)] }],
+    });
+    await applying;
+
+    expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
+    expect(harness.mirror.resolvedLinks()).toEqual({});
+  }, 20_000);
+
+  it("installs one row for a path two passes both answered", async () => {
+    const harness = await hydrated({
+      generation: 5,
+      entries: [
+        { path: "A.md", kind: "note", revision: "blake3:a1" },
+        { path: "T.md", kind: "note", revision: "blake3:t1" },
+        { path: "X.md", kind: "note", revision: "blake3:x1" },
+      ],
+      notes: [
+        { path: "A.md", revision: "blake3:a1", outgoing: [harness_ref("A.md", "T", "T.md")] },
+        { path: "T.md", revision: "blake3:t1", outgoing: [harness_ref("T.md", "X", "X.md")] },
+        { path: "X.md", revision: "blake3:x1" },
+      ],
+    });
+    const batches: MirrorChangeBatch[] = [];
+    harness.mirror.onBatch((batch) => batches.push(batch));
+
+    // The re-ask is the first thing that can answer a path already in the plan,
+    // so the two answers must merge to one row rather than being installed in
+    // sequence — otherwise one path moves twice and is named twice in one
+    // batch, which a consumer replaying the batch would apply twice.
+    const applying = harness.mirror.applyEvent(
+      committed({
+        generation: 6,
+        previous_generation: 5,
+        changes: { kind: "detailed", created: [], modified: ["A.md", "X.md"], deleted: [] },
+        affected_note_count: 2,
+      }),
+    );
+    await harness.answerRefetch(
+      8,
+      [{ path: "A.md", revision: "blake3:a2", outgoing: [harness_ref("A.md", "T", "T.md")] }],
+      { absent: ["X.md"] },
+    );
+    await harness.answerRefetch(9, [], { absent: ["T.md"] });
+    await harness.answerRefetch(10, [
+      { path: "A.md", revision: "blake3:a3", outgoing: [harness_ref("A.md", "T", null)] },
+    ]);
+    await applying;
+
+    expect(harness.mirror.entry("A.md")?.revision).toBe("blake3:a3");
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.modified).toEqual(["A.md"]);
+  }, 20_000);
+
   it("escalates when a row still resolves into a removal after its one re-ask", async () => {
     const harness = await hydrated({
       generation: 5,

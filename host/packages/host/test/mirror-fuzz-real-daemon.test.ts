@@ -219,6 +219,14 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
         // created rather than in the aftermath — the whole-table check below
         // has to wait for the tree to catch up, and by then ordinary traffic
         // has usually refetched the offending row.
+        //
+        // It has one false-positive shape of its own, and it is unreachable
+        // here rather than impossible: a path deleted at generation G,
+        // **re-created** at G+1, and named by a row served at G+2 would be
+        // reported. Every mutation in this file mints a fresh name from a
+        // counter, so no path is ever re-used — which is a property of the
+        // mutation mix, and the next person to widen it should read this line
+        // before reading a failure.
         const removedNow = new Set(batch.deleted);
         for (const path of batch.created) removedNow.delete(path);
         if (removedNow.size > 0) {
@@ -286,14 +294,15 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
       // delta path, because the re-hydration repairs whatever had drifted. The
       // floor below says at least some samples were not taken across one.
       //
-      // A resync the *mirror* asks itself for is not counted here: it raises no
-      // event, and nothing on this surface reports one. That is a known gap in
-      // this accounting and not a hole in the gate, because the per-batch
-      // assertions above are checked at the moment a row is installed, where no
-      // later re-hydration can have got there first.
+      // A resync the *mirror* asks itself for raises no event, so it is counted
+      // from `resyncCount()` instead — and it counts towards masking exactly as
+      // the daemon's does, because a re-hydration repairs drift whoever asked
+      // for it. It is also the only number that says how often the install
+      // guard escalates, which is the cost side of that guard.
       const resyncReasons = new Map<string, number>();
       let resyncsSinceComparison = 0;
       let unmasked = 0;
+      let mirrorResyncsAtComparison = live.resyncCount();
       await supervisor.subscribe((event) => {
         events.push(event);
         if (event.type === "resync_required") {
@@ -467,7 +476,11 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
           continue;
         }
         comparisons += 1;
-        if (resyncsSinceComparison === 0) unmasked += 1;
+        const mirrorResyncs = live.resyncCount();
+        if (resyncsSinceComparison === 0 && mirrorResyncs === mirrorResyncsAtComparison) {
+          unmasked += 1;
+        }
+        mirrorResyncsAtComparison = mirrorResyncs;
         resyncsSinceComparison = 0;
 
         const a = snapshotOf(live);
@@ -534,8 +547,10 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
           `  apply failures: ${failures.length === 0 ? "none" : failures.join(" | ")}\n` +
           `  resyncs: ${
             [...resyncReasons].map(([k, v]) => `${k}=${String(v)}`).join(" ") || "none"
-          } | ${String(unmasked)} of ${String(comparisons)} comparisons had no resync in their ` +
-          `window\n` +
+          } | ${String(live.resyncCount())} re-hydrations by the mirror` +
+          `${live.resyncCount() === 0 ? "" : ` (last: ${String(live.lastResyncReason())})`} | ` +
+          `${String(unmasked)} of ${String(comparisons)} comparisons had no resync of either ` +
+          `kind in their window\n` +
           `  dangling resolved links: ${
             dangling.length === 0 ? "none" : `${String(dangling.length)} — ${dangling[0]!}`
           } (${String(checked)} of ${String(batches.length)} batches checked)`,
