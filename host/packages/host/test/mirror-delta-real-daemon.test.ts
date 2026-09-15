@@ -425,6 +425,93 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
     expect(failures).toEqual([]);
   }, 60_000);
 
+  /** Ref → Mid → Tail, all resolved. Three links deep, because the bug is. */
+  function chainVault(): HostConfig {
+    const root = scratchRoot("vaultd-chain-real-");
+    const vault = join(root, "vault");
+    mkdirSync(vault, { recursive: true });
+    writeFileSync(join(vault, "Ref.md"), "# Ref\n\n[[Mid]]\n", "utf8");
+    writeFileSync(join(vault, "Mid.md"), "# Mid\n\n[[Tail]]\n", "utf8");
+    writeFileSync(join(vault, "Tail.md"), "# Tail\n", "utf8");
+    const index = join(root, "index.db");
+    return {
+      ...defaultHostConfig(vault),
+      vaultdBinary: BINARY,
+      vaultdArgs: ["--vault", vault, "--index", index],
+      indexPath: index,
+      restartBackoffMs: [50, 50],
+    };
+  }
+
+  it("refetches the referrers of a path a *second* refetch pass found absent", async () => {
+    // **A refetch is answered at whatever generation is current when it lands**,
+    // so a change set for generation 6 can be answered at 9 — and a path it
+    // named can have been deleted in between. The mirror treats such a path as
+    // a late removal and refetches *its* referrers, which is the first pass. A
+    // referrer in that second batch can be gone by the time it lands too, and
+    // that removal used to be applied with no referrer expansion of its own:
+    // the mirror forgot the row and left everything that pointed at it resolved
+    // to a path this host no longer holds, permanently — nothing ever refetches
+    // it again, because the generation that really deletes it finds the row
+    // already gone and expands an empty subtree.
+    //
+    // Found by `mirror-fuzz-real-daemon.test.ts`, whose seeds produced exactly
+    // this chain roughly one run in ten; deterministic here because the events
+    // are handed over by hand, after the vault has already moved.
+    const config = chainVault();
+    const supervisor = await startedOn(config);
+    const client = (): VaultdClient => supervisor.client();
+    const mirror = await Mirror.open(client, config);
+    const failures: Error[] = [];
+    mirror.onApplyError((error) => {
+      failures.push(error instanceof Error ? error : new Error(String(error)));
+    });
+    expect(mirror.resolvedLinks()).toEqual({
+      "Mid.md": { "Tail.md": 1 },
+      "Ref.md": { "Mid.md": 1 },
+    });
+
+    // No subscription: this host drives the events itself, so the race is a
+    // fact of the test rather than a matter of how fast the machine is.
+    const previous = mirror.appliedThrough();
+    const touched = await client().request<MutationResponse>("write_note", {
+      path: "Tail.md",
+      content: "# Tail rewritten\n",
+    });
+    // Both gone before the change set above is ever handed over. `Mid.md`
+    // first, so that the refetch of `Tail.md` finds a referrer that is already
+    // absent as well.
+    await client().request("delete_note", { path: "Mid.md", mode: "permanent" });
+    await client().request("delete_note", { path: "Tail.md", mode: "permanent" });
+
+    await mirror.applyEvent({
+      type: "generation_committed",
+      value: {
+        previous_generation: previous,
+        generation: touched.generation,
+        cause: "mutation",
+        changes: { kind: "detailed", created: [], modified: ["Tail.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 0,
+      },
+    } satisfies RuntimeEventDto);
+
+    // The refetch was answered at the generation both deletes had landed in, so
+    // the mirror holds that generation's rows — and a second mirror hydrated
+    // now holds the same one. No settling: nothing has moved since.
+    const fresh = await Mirror.open(client, config);
+    expect(mirror.generation()).toBe(fresh.generation());
+    expect(mirror.entry("Mid.md")).toBeUndefined();
+    expect(mirror.entry("Tail.md")).toBeUndefined();
+    expect(mirror.resolvedLinks()).toEqual(fresh.resolvedLinks());
+    expect(mirror.unresolvedLinks()).toEqual(fresh.unresolvedLinks());
+    expect(mirror.note("Ref.md")!.outgoing.map((reference) => reference.resolution)).toEqual(
+      fresh.note("Ref.md")!.outgoing.map((reference) => reference.resolution),
+    );
+    expect(mirror.backlinks("Mid.md")).toHaveLength(0);
+    expect(failures).toEqual([]);
+  }, 60_000);
+
   it("refreshes a folder's own row when a child is added", async () => {
     const config = xLinksY();
     mkdirSync(join(config.vaultRoot, "F"), { recursive: true });

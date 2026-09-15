@@ -1363,32 +1363,64 @@ export class Mirror implements MirrorQuery {
     let plan: RefetchPlan;
     try {
       plan = await this.refetch([...wanted]);
-      // **A late removal has referrers too.** A path that comes back `absent`
-      // was deleted again between the event and the refetch, so nothing knew it
-      // was going to be a removal when `wanted` was built and its referrers
-      // were never asked for — leaving them resolved to a path that no longer
-      // exists, which is the same permanent silent drift the deleted half above
-      // exists to prevent. One more pass, over those referrers alone.
+      // **A late removal has referrers too, and so does the removal a late
+      // removal uncovers.** A path that comes back `absent` was deleted again
+      // between the event and the refetch, so nothing knew it was going to be a
+      // removal when `wanted` was built and its referrers were never asked for
+      // — leaving them resolved to a path that no longer exists, which is the
+      // same permanent silent drift the deleted half above exists to prevent.
       //
-      // One pass, not a loop: the second pass can itself meet a path that has
-      // gone in the meantime, and chasing that is a vault mutating faster than
-      // this host can read it — which is what `resync_required` is for.
-      const late = new Set<string>();
-      for (const path of plan.absent) {
-        // A late removal moves its folder's `mtime` as surely as a planned one,
-        // and the folder was not an ancestor of anything in `wanted` either.
-        for (const ancestor of ancestorsOf(path)) late.add(ancestor);
-        for (const gone of this.state.subtreePaths(path)) {
-          doomed.add(gone);
-          // Both indexes here too, for the same reason the planned removal
-          // consults both: neither answers the whole question.
-          for (const reference of this.state.backlinks(gone)) late.add(reference.source_path);
-          for (const source of this.state.linkSourcesFor(gone)) late.add(source);
+      // **Every pass, not one pass.** A referrer asked for in the second batch
+      // can be gone by the time that batch lands, and its own referrers are one
+      // more link out. Stopping after one pass removed that row and left
+      // whatever pointed at it resolved to a path this host no longer holds —
+      // *permanently*, because the generation that really deletes it finds the
+      // row already gone and expands an empty subtree, so nothing ever asks
+      // again. Measured, not reasoned: the fuzz oracle produced the three-deep
+      // chain (a modified note absent, its referrer absent, *its* referrer
+      // alive and stale) about one run in ten, and the drift survived every
+      // later generation — it looked transient only because an unrelated
+      // `watcher_overflow` resync happened to repair it.
+      //
+      // The loop terminates: a round expands only paths that came back absent
+      // and have not been expanded before, and it asks only for paths this
+      // mirror's own indexes name, which no round adds to. In practice it is
+      // one round past the last one that found anything — chain depth, not
+      // vault size — and the oversize escalation below still bounds the cost.
+      const expanded = new Set<string>();
+      for (;;) {
+        const late = new Set<string>();
+        for (const path of plan.absent) {
+          if (expanded.has(path)) continue;
+          expanded.add(path);
+          // A late removal moves its folder's `mtime` as surely as a planned
+          // one, and the folder was not an ancestor of anything in `wanted`
+          // either.
+          for (const ancestor of ancestorsOf(path)) late.add(ancestor);
+          for (const gone of this.state.subtreePaths(path)) {
+            doomed.add(gone);
+            // Both indexes here too, for the same reason the planned removal
+            // consults both: neither answers the whole question.
+            for (const reference of this.state.backlinks(gone)) late.add(reference.source_path);
+            for (const source of this.state.linkSourcesFor(gone)) late.add(source);
+          }
         }
+        for (const path of doomed) late.delete(path);
+        // Already fetched in this apply, at the generation this apply is being
+        // answered at. Asking twice would buy nothing and would never settle.
+        for (const path of wanted) late.delete(path);
+        if (late.size === 0) break;
+        for (const path of late) wanted.add(path);
+        // The same escalation the first expansion takes, for the same reason:
+        // past the measured crossover a re-hydration is cheaper and more
+        // coherent than chasing a vault that is moving this fast.
+        if (wanted.size > this.config.mirrorDeltaPathLimit) {
+          this.markResync("refetch_oversized");
+          await this.runResync();
+          return;
+        }
+        plan = mergedPlans(plan, await this.refetch([...late]));
       }
-      for (const path of doomed) late.delete(path);
-      for (const path of wanted) late.delete(path);
-      if (late.size > 0) plan = mergedPlans(plan, await this.refetch([...late]));
     } catch (error) {
       // The engine went away mid-refetch. A `runtime_recovered` marker is on
       // its way and will re-hydrate the whole mirror; nothing here is worth
