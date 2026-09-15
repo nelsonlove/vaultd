@@ -35,6 +35,15 @@
  *    require the **real** `warmFixtureCache`. Re-implementing the cache key here
  *    would be a second copy of it, and a second copy is a thing to keep in step
  *    with the first.
+ *
+ *    **Since Task 13 that build has a second consumer, and it is not this
+ *    script.** `packages/obsidian` and `packages/electron` are plain CommonJS
+ *    stand-ins that the workspace links into `node_modules`, and both reach the
+ *    host through `dist/` — so a plugin bundle that resolves `obsidian` by
+ *    Node's own algorithm gets whatever `dist/` last held. Running the build
+ *    here is what keeps that current for every `npm test`.
+ *    `test/module-intercept.test.ts` holds a guard that fails, naming
+ *    `npm run build`, for anyone who runs `vitest` directly instead.
  * 3. Warms the eighteen parity fixtures, each as the one-note vault the parity
  *    test parses it as.
  *

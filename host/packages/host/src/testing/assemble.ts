@@ -41,7 +41,14 @@ import type { ObsidianApi } from "../shim/api";
 import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
 import type { GlobalInstallation } from "../shim/globals";
 import type { WriteGate } from "../shim/vault";
-// activated by Task 13:  import { registerElectronStub } from "../runtime/electron-registry";
+import { createElectronStub, osSpawn } from "../runtime/electron-stub";
+import {
+  clearElectronStub,
+  clearObsidianApi,
+  registerElectronStub,
+  registerObsidianApi,
+} from "../runtime/electron-registry";
+import type { OsSpawn } from "../runtime/electron-stub";
 //
 // `WriteGate` is declared in `../shim/vault` until Task 19 creates
 // `../dryrun/dry-run`, which owns the interface and the one implementation
@@ -103,6 +110,16 @@ export interface HostAssembly {
    * walk. It is last in the assembly because it names every surface above it.
    */
   readonly api: ObsidianApi;
+  /**
+   * Put this process back the way it was found: the module registries the
+   * `obsidian` and `electron` packages read through, and every global.
+   *
+   * One call rather than three, because the three are one fact — "this host is
+   * no longer the host of this process" — and a caller that put the globals
+   * back while leaving a torn-down assembly registered would hand the next
+   * bundle to load a barrel whose surfaces point at a vault that is gone.
+   */
+  teardown(): void;
 }
 
 /**
@@ -194,13 +211,25 @@ export function assembleShim(deps: {
   dataDir?: string;
   writes?: WriteGate;
   policyRecorder?: PolicyRecorder;
+  /**
+   * How `electron.shell.openPath` reaches the platform opener.
+   *
+   * Injected so a test can watch what would have been run without running it.
+   * Production takes the default, which really spawns.
+   */
+  spawn?: OsSpawn;
 }): HostAssembly {
   const { config, client, mirror, clock } = deps;
   const dataDir = deps.dataDir ?? config.dataDir;
-  // activated by Task 13: registerElectronStub(...). It is registered *first*,
-  // before anything that could load a plugin bundle, because a bundle that
+  // **First**, before anything that could load a plugin bundle: a bundle that
   // resolves `electron` before the stub is in place gets the real module or a
-  // throw — and either way the failure surfaces far from its cause.
+  // throw — and either way the failure surfaces far from its cause. The barrel
+  // the `obsidian` package resolves is registered at the very end instead,
+  // because it is the last thing built; nothing can load a bundle in between,
+  // since only the assembler is running.
+  registerElectronStub(
+    createElectronStub({ dryRun: config.dryRun, spawn: deps.spawn ?? osSpawn }),
+  );
 
   // Nothing below observes anything but its own arguments during construction,
   // which is what lets a cycle be wired at all: the vault holds the event bus,
@@ -300,7 +329,21 @@ export function assembleShim(deps: {
   // Last, and built from the assembly itself: the barrel binds this host's
   // clock into the timer functions a plugin calls, so a test advancing its own
   // clock sees its own plugin's intervals fire.
-  return { ...assembled, api: createObsidianApi(assembled) };
+  const api = createObsidianApi(assembled);
+  // And registered immediately, because this is the object the workspace's
+  // `obsidian` package forwards every property read to. A bundle resolving the
+  // specifier before this line would find nothing registered and be told so by
+  // name; after it, it finds this host.
+  registerObsidianApi(api);
+  return {
+    ...assembled,
+    api,
+    teardown(): void {
+      clearObsidianApi();
+      clearElectronStub();
+      globals.restore();
+    },
+  };
 }
 
 /**

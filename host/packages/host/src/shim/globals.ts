@@ -71,6 +71,7 @@ import {
   createFragment,
   createSpan,
   createStubDocument,
+  setDelegatedListenerSink,
 } from "./dom";
 import { currentPluginId, declarePolicy, recordUse, stub, unsupported } from "./policy";
 import type { App } from "./app";
@@ -337,6 +338,51 @@ class WindowListeners {
 }
 
 /**
+ * Every delegated listener a plugin registered, and the rows they recorded.
+ *
+ * The runtime counterpart to what an earlier draft expected a static bundle
+ * scan to produce. `Node.on(type, selector, handler)` is Obsidian's own
+ * delegation helper, this host has no DOM to delegate through, and the
+ * registration is therefore an entry point that structurally cannot be reached
+ * — `dom_delegated_menu`, with the event type as the detail. `off` withdraws
+ * the row its `on` recorded, so a plugin that takes a registration back is not
+ * reported as still offering it.
+ *
+ * Attribution follows the same rule as {@link WindowListeners}: a registration
+ * made outside a plugin's load has nobody to own it, so it is accepted and not
+ * recorded.
+ */
+class DelegatedListeners {
+  private readonly rows: Array<{
+    readonly type: string;
+    readonly selector: unknown;
+    readonly handler: unknown;
+    readonly row: HarvestedUnreachable;
+  }> = [];
+
+  constructor(private readonly harvest: Harvest) {}
+
+  add(type: string, selector: unknown, handler: unknown): void {
+    recordUse("Node.on");
+    const pluginId = currentPluginId();
+    if (pluginId === null) return;
+    const row: HarvestedUnreachable = { pluginId, kind: "dom_delegated_menu", detail: type };
+    this.harvest.recordUnreachable(row);
+    this.rows.push({ type, selector, handler, row });
+  }
+
+  remove(type: string, selector: unknown, handler: unknown): void {
+    recordUse("Node.off");
+    const at = this.rows.findIndex(
+      (entry) => entry.type === type && entry.selector === selector && entry.handler === handler,
+    );
+    if (at === -1) return;
+    const [dropped] = this.rows.splice(at, 1);
+    if (dropped !== undefined) this.harvest.forgetUnreachable(dropped.row);
+  }
+}
+
+/**
  * An observer that never observes.
  *
  * Plugins construct one in `onload` and disconnect it in `onunload`; there is
@@ -383,6 +429,14 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
   // asked.
   const listeners = new WindowListeners(deps.harvest);
   const document = createStubDocument(listeners);
+  // Module-level rather than passed, because `Node.on` is a method on a class
+  // instantiated everywhere — see `dom.ts`. Taken down with everything else, so
+  // a host that restores its globals stops recording into a harvest nobody
+  // holds any more.
+  setDelegatedListenerSink(new DelegatedListeners(deps.harvest));
+  patcher.onRestore(() => {
+    setDelegatedListenerSink(null);
+  });
 
   // `window` first, because everything else is installed on `globalThis` and
   // therefore reachable through its prototype the moment it is defined.
@@ -658,6 +712,12 @@ declarePolicy("window.dispatchEvent", "safe_stub");
 declarePolicy("activeWindow", "safe_stub");
 declarePolicy("activeDocument", "safe_stub");
 declarePolicy("window.require", "absent");
+// Obsidian's delegated-listener extension on `Node.prototype`. `harvested`
+// rather than `safe_stub`: the registration really is written down and really
+// does reach the compatibility report — it is only the *delivery* that cannot
+// happen, which is what the `dom_delegated_menu` row says.
+declarePolicy("Node.on", "harvested");
+declarePolicy("Node.off", "harvested");
 declarePolicy("navigator", "safe_stub");
 declarePolicy("navigator.clipboard", "safe_stub");
 declarePolicy("i18next", "safe_stub");

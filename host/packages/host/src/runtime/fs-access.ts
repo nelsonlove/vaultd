@@ -39,3 +39,21 @@ export const fsPromises = nodeRequire("node:fs/promises") as typeof import("node
 export function realpathSync(target: string): string {
   return fs.realpathSync(target);
 }
+
+/**
+ * Every spelling of the file-system modules, as a `require` specifier.
+ *
+ * **Here because this is the one file allowed to name them.** The dry-run
+ * refusal list in `runtime/intercept.ts` has to name the fs modules in order to
+ * refuse them, and `test/fs-seam.test.ts` bans the literal spellings everywhere
+ * else under `src/` — rightly, since a grep cannot tell "names it to refuse it"
+ * from "names it to use it". So the list lives with the seam and the module that
+ * refuses imports it, which also means a new spelling is added once, beside the
+ * others, rather than in two places that drift.
+ */
+export const FS_MODULE_SPECIFIERS: readonly string[] = [
+  "node:fs",
+  "node:fs/promises",
+  "fs",
+  "fs/promises",
+];

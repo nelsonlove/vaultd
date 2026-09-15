@@ -45,6 +45,28 @@ module.exports = [
     },
     rules: js.configs.recommended.rules,
   },
+  {
+    /**
+     * The fixture plugin bundles, which are not host code at all.
+     *
+     * They are stand-ins for what a real community plugin ships: CommonJS
+     * compiled for a browser, reaching `window` and the bare timer names
+     * because that is what a browser build does — and because a bundle's bare
+     * timers are the thing `runtime/loader.ts`'s wrapper exists to route. So
+     * they get the globals a browser has, rather than being rewritten into
+     * something no plugin looks like.
+     */
+    files: ["packages/host/test/fixtures/bundles/**/*.js"],
+    languageOptions: {
+      globals: {
+        window: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+      },
+    },
+  },
   ...tseslint.configs.recommendedTypeChecked.map((config) => ({
     ...config,
     files: ["**/*.ts"],

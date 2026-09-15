@@ -54,6 +54,54 @@ export class HeadlessUnsupported extends Error {
 }
 
 /**
+ * The other way this host refuses: the mode said no, rather than the surface.
+ *
+ * **A different error from {@link HeadlessUnsupported}, because it is a
+ * different claim.** "This host has no window manager" is permanent and is what
+ * the compatibility report is about; "this run was told to change nothing" is a
+ * property of the run, and the same call on the same host succeeds with the
+ * flag off. A reader who could not tell them apart would read every dry-run
+ * report as a list of missing surfaces.
+ *
+ * `surface` is the group a dry-run report tallies by — `os_bridge` for the
+ * `electron.shell` openers, and the names Task 19 adds for writes and network.
+ * The code is in the message so a stack trace with no structured logging still
+ * says which of the two refusals happened.
+ *
+ * Declared here beside {@link HeadlessUnsupported} because the two are the
+ * host's whole refusal vocabulary and a caller should meet them in one place.
+ * Task 19 owns dry-run itself and may relocate this; the type is what callers
+ * name, so a move costs them nothing.
+ */
+export class DryRunRefused extends Error {
+  readonly code = "dry_run_refused";
+  readonly symbol: string;
+  readonly pluginId: string | null;
+  readonly surface: string;
+  readonly detail: string | null;
+  constructor(symbol: string, pluginId: string | null, surface: string, detail?: string) {
+    super(
+      `dry_run_refused: ${symbol} is a ${surface} and this host is in dry-run` +
+        (detail === undefined ? "" : ` (${detail})`),
+    );
+    this.name = "DryRunRefused";
+    this.symbol = symbol;
+    this.pluginId = pluginId;
+    this.surface = surface;
+    this.detail = detail ?? null;
+  }
+}
+
+/** Records the hit against the current plugin, then throws {@link DryRunRefused}. */
+export function refuseInDryRun(symbol: string, surface: string, detail?: string): never {
+  // Recorded at the symbol's own declared policy: a surface this host really
+  // implements is still implemented, and a report that relabelled it `absent`
+  // because one run was pretending would be describing the flag, not the host.
+  recorder?.record(symbol, policyOf(symbol), pluginId);
+  throw new DryRunRefused(symbol, pluginId, surface, detail);
+}
+
+/**
  * The tally behind the compatibility report.
  *
  * An interface rather than a class because the host has exactly one ordinary

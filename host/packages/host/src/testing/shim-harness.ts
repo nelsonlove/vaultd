@@ -28,6 +28,7 @@ import { join, resolve } from "node:path";
 
 import { assembleShim } from "./assemble";
 import { FixtureVault } from "./fixture-vault";
+import { BundleLoader } from "../runtime/loader";
 import { MirrorHarness, noteDto } from "./mirror-harness";
 import { REFETCH_FACETS } from "../mirror/mirror";
 import { fs } from "../runtime/fs-access";
@@ -42,6 +43,7 @@ import type { FixtureEntry, FixtureNote } from "./mirror-harness";
 import type { HostAssembly } from "./assemble";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 import type { Harvest, HarvestedMenuItem, MenuContext } from "../shim/harvest";
+import type { BundleLoaderDeps } from "../runtime/loader";
 import type { HostErrorEntry } from "../shim/errors";
 import type { ShimEventBus } from "../shim/events";
 import type { ObsidianApi } from "../shim/api";
@@ -126,8 +128,21 @@ export class ShimHarness extends MirrorHarness {
    */
   readonly window!: HostWindow;
   readonly document!: StubDocument;
-  /** The specifiers a plugin bundle may resolve to the host's own modules. */
-  readonly hostModulePaths: readonly string[] = ["obsidian", "electron", "@electron/remote"];
+  /**
+   * Where the host's own modules live — **directories**, prepended to a
+   * bundle's `module.paths`.
+   *
+   * Corrected in Task 13, which is the first task to use them. They held
+   * *specifiers* (`["obsidian", "electron", …]`), which nothing could have
+   * consumed: `module.paths` is a list of `node_modules` directories Node walks,
+   * and Node resolves `obsidian` by looking for a directory of that name inside
+   * one of them. `host/node_modules` is a real directory holding real workspace
+   * links to `packages/obsidian` and `packages/electron`, so one entry is the
+   * whole answer and a bundle materialised anywhere on disk finds both.
+   */
+  readonly hostModulePaths: readonly string[] = [
+    resolve(__dirname, "..", "..", "..", "..", "node_modules"),
+  ];
 
   /**
    * The whole assembly, kept because a plugin's lifecycle needs two pieces of
@@ -138,6 +153,17 @@ export class ShimHarness extends MirrorHarness {
   private assembly!: HostAssembly;
   /** The plugins this harness has instantiated, by id. */
   private readonly plugins = new Map<string, Plugin>();
+  /**
+   * The real loader, doing the real lifecycle.
+   *
+   * Task 13 moved `register`/`onload`/`onunload`/`deregister` out of this
+   * harness and into {@link BundleLoader}, which is what `app.plugins` and Task
+   * 14's plugin set both use. The harness keeps only what is harness-shaped —
+   * the instantiation bookkeeping below and the `quiesce()` either side — so
+   * that a test drives the same lifecycle production does rather than a
+   * test-only arrangement that happens to work.
+   */
+  private loader!: BundleLoader;
   private readonly configFiles = new Map<string, string>();
   private readonly sources = new Map<string, string>();
   /** The fixture rows behind `get_note`, by path. See {@link serveNotes}. */
@@ -182,6 +208,12 @@ export class ShimHarness extends MirrorHarness {
         | "document"]: ShimHarness[K];
     };
     this.assembly = assembly;
+    this.loader = new BundleLoader({
+      app: assembly.app,
+      queue: assembly.queue,
+      events: assembly.events,
+      harvest: assembly.harvest,
+    });
     mutable.app = assembly.app;
     mutable.vault = assembly.app.vault;
     mutable.policyRecorder = assembly.policyRecorder;
@@ -283,6 +315,22 @@ export class ShimHarness extends MirrorHarness {
     return this.assembly.events;
   }
 
+  /**
+   * The four things a {@link BundleLoader} needs from an assembled host.
+   *
+   * Exposed so a test can build its own loader — with a `provide` of its own,
+   * to drive `app.plugins.enablePlugin` — against the same host this harness is
+   * driving, rather than against a second assembly.
+   */
+  loaderDeps(): BundleLoaderDeps {
+    return {
+      app: this.assembly.app,
+      queue: this.assembly.queue,
+      events: this.assembly.events,
+      harvest: this.assembly.harvest,
+    };
+  }
+
   /** A manifest for a plugin that has no `manifest.json`, as most cases do. */
   manifestFor(id: string): PluginManifest {
     return {
@@ -326,14 +374,10 @@ export class ShimHarness extends MirrorHarness {
    * and can be dropped again on unload.
    */
   async load(plugin: Plugin): Promise<void> {
-    const id = plugin.manifest.id;
-    this.plugins.set(id, plugin);
-    // **Before `onload`**, which is where Obsidian puts it: a plugin that looks
-    // itself — or a peer loaded earlier — up during startup has to find it.
-    this.app.plugins.register(plugin);
-    await this.assembly.queue.run(id, `${id}:onload`, async () => {
-      await this.assembly.events.attributingTo(id, () => plugin.load());
-    });
+    this.plugins.set(plugin.manifest.id, plugin);
+    // Registration-before-`onload` and the attribution window are the loader's,
+    // not this harness's — see {@link loader}.
+    await this.loader.load(plugin);
     await this.quiesce();
   }
 
@@ -355,12 +399,10 @@ export class ShimHarness extends MirrorHarness {
   async unload(id: string): Promise<void> {
     const plugin = this.plugins.get(id);
     if (plugin === undefined) return;
-    await this.assembly.queue.run(id, `${id}:onunload`, () => {
-      plugin.unload();
-    });
-    this.assembly.events.detachOwner(id);
-    this.harvest.forgetPlugin(id);
-    this.app.plugins.deregister(id);
+    // A plugin this harness only `instantiate`d never reached the loader, so it
+    // is handed over here rather than looked up there.
+    this.loader.track(plugin);
+    await this.loader.unload(id);
     await this.quiesce();
   }
 

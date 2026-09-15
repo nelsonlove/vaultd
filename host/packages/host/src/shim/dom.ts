@@ -479,15 +479,26 @@ export class StubNode {
     return stub(ELEMENT_SYMBOL, true);
   }
 
-  /** Obsidian's delegated-listener helpers: accepted, never delivered from. */
+  /**
+   * Obsidian's delegated-listener helper: accepted, recorded, never delivered
+   * from.
+   *
+   * `Node.on(type, selector, handler)` is Obsidian's own prototype extension
+   * and it is how a plugin attaches behaviour to elements it never created —
+   * tag-wrangler's whole surface is ten of these, wrapped in one three-argument
+   * helper. There is no DOM to delegate through, so the registration is
+   * structurally unreachable, and the honest thing to do with it is write it
+   * down: {@link setDelegatedListenerSink} is where it goes, and the compat
+   * report says "ten entry points this host cannot reach" instead of silence.
+   */
   on(...args: unknown[]): void {
-    void args;
     this.hit();
+    if (typeof args[0] === "string") delegated?.add(args[0], args[1], args[2]);
   }
 
   off(...args: unknown[]): void {
-    void args;
     this.hit();
+    if (typeof args[0] === "string") delegated?.remove(args[0], args[1], args[2]);
   }
 
   onClickEvent(handler: unknown): this {
@@ -822,6 +833,35 @@ export interface DomListenerSink {
   remove(type: string, listener: unknown): void;
 }
 
+/**
+ * Where a **delegated** listener is written down — `Node.on(type, selector,
+ * handler)`, Obsidian's own prototype extension.
+ *
+ * A separate seam from {@link DomListenerSink}, and a separate harvest kind,
+ * because the two are different offers: `addEventListener` binds a handler to
+ * the element it is called on, while `on` binds a handler to *every future
+ * element matching a selector*, which is how a plugin attaches to parts of the
+ * UI it never built. A report that merged them could not say how much of a
+ * plugin's surface is delegated — which for tag-wrangler is all of it.
+ */
+export interface DelegatedListenerSink {
+  add(type: string, selector: unknown, handler: unknown): void;
+  remove(type: string, selector: unknown, handler: unknown): void;
+}
+
+/**
+ * Module-level, like the policy table and for the same reason: `on` is a method
+ * on a class instantiated everywhere, several layers below anything that holds a
+ * reference to the host, so there is no parameter to thread it through. One host
+ * per process makes one sink the right sink; `globals.ts` installs it beside the
+ * `window` listener recorder and takes it down again on restore.
+ */
+let delegated: DelegatedListenerSink | null = null;
+
+export function setDelegatedListenerSink(sink: DelegatedListenerSink | null): void {
+  delegated = sink;
+}
+
 export function createStubDocument(listeners?: DomListenerSink): StubDocument {
   const body = new StubEl("body");
   return {
@@ -853,11 +893,17 @@ export function createStubDocument(listeners?: DomListenerSink): StubDocument {
       if (typeof args[0] === "string") listeners?.remove(args[0], args[1]);
     },
     dispatchEvent: () => stub("document", true),
-    on: () => {
+    // Delegated from the document itself, which is where a plugin puts a
+    // listener meant to survive every re-render. Recorded exactly as an
+    // element's is — same sink, same kind — so a report does not depend on
+    // which node a plugin happened to delegate from.
+    on: (...args: unknown[]) => {
       stub("document", undefined);
+      if (typeof args[0] === "string") delegated?.add(args[0], args[1], args[2]);
     },
-    off: () => {
+    off: (...args: unknown[]) => {
       stub("document", undefined);
+      if (typeof args[0] === "string") delegated?.remove(args[0], args[1], args[2]);
     },
   };
 }

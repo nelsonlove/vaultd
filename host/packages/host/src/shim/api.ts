@@ -401,11 +401,11 @@ export interface ObsidianApi {
  * the object this host installed. A module-level pair would give every host the
  * last one assembled.
  *
- * The parameter is spelled `Omit<HostAssembly, "api">` so the assembler can
+ * The parameter is spelled `Omit<HostAssembly, "api" | "teardown">` so the assembler can
  * call it while building the very object it returns; a full {@link HostAssembly}
  * is assignable to it, so a later caller holding one passes it unchanged.
  */
-export function createObsidianApi(assembly: Omit<HostAssembly, "api">): ObsidianApi {
+export function createObsidianApi(assembly: Omit<HostAssembly, "api" | "teardown">): ObsidianApi {
   const real = realBindings(assembly);
   const bound: Record<string, unknown> = {};
   for (const [symbol, policy] of Object.entries(API_POLICY)) {
@@ -433,7 +433,7 @@ export function createObsidianApi(assembly: Omit<HostAssembly, "api">): Obsidian
  * {@link createObsidianApi}. Everything that does not depend on the assembly is
  * still written here rather than hoisted, so one table is one place to read.
  */
-function realBindings(assembly: Omit<HostAssembly, "api">): Record<string, unknown> {
+function realBindings(assembly: Omit<HostAssembly, "api" | "teardown">): Record<string, unknown> {
   const { config, clock, globals, noticeLog } = assembly;
   return {
     App,

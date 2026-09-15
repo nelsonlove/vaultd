@@ -310,6 +310,17 @@ describe("the installed globals", () => {
     expect(globalStorage().getItem("7")).toBeNull();
   });
 
+  /**
+   * **The state before a user script is provisioned**, which is the state a
+   * plugin bundle meets and the one this case pins.
+   *
+   * A bundle gets its own `require` from the module wrapper, so a bundle
+   * reaching for `window.require` is reaching around its own door and the
+   * report should say so. `provisionUserScriptGlobals` (Task 13) swaps this
+   * refusal for a host-bound `require` for as long as a QuickAdd user script is
+   * running, and puts it back afterwards —
+   * `test/module-intercept.test.ts` asserts that cycle from both ends.
+   */
   it("refuses window.require by name instead of answering undefined", async () => {
     const harness = await ShimHarness.withVault({});
     expect(typeof globalWindow().require).toBe("function");

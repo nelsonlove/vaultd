@@ -105,14 +105,25 @@ export interface HarvestedUnreachable {
   readonly pluginId: string;
   readonly kind:
     /**
-     * A delegated DOM listener, as **Task 14's static bundle scan** finds it.
+     * A delegated DOM listener, as the **running host** is handed one.
      *
-     * Reserved for that producer. The scan reads a bundle's source and reports
-     * every listener a plugin delegates through the document — tag-wrangler has
-     * ten, two of them `contextmenu`-typed and eight pointer/drag/click — and
-     * Task 22 asserts those ten by this kind. "Delegated" is what it means, not
-     * "context menu": splitting the ten by event type would make that count
-     * unsatisfiable.
+     * `Node.on(type, selector, handler)` is Obsidian's own delegation helper:
+     * it binds a handler to every future element matching a selector, which is
+     * how a plugin attaches to parts of the UI it never built. There is no DOM
+     * to delegate through here, so every such registration is an entry point
+     * that structurally cannot be reached. `globals.ts` records one per
+     * registration with the **event type** as the detail, and `Node.off`
+     * withdraws it; tag-wrangler's whole surface is ten of these, two of them
+     * `contextmenu`-typed and eight pointer/drag/mouse, and Task 22 asserts
+     * that count by this kind.
+     *
+     * "Delegated" is what the name means, not "context menu": splitting the ten
+     * by event type would make that count unsatisfiable.
+     *
+     * (An earlier draft reserved this kind for a static bundle scan in Task 14.
+     * Task 14's brief has no scan, and the registrations are visible at runtime
+     * through the helper the stub already implements, so the producer is the
+     * host — corrected when Task 13 wired it.)
      */
     | "dom_delegated_menu"
     /**
