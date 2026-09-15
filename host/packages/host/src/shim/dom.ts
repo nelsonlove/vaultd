@@ -677,6 +677,57 @@ export function getIcon(icon: string): StubEl | null {
 }
 
 /**
+ * The icons plugins have added, by name.
+ *
+ * Really remembered, even though nothing draws them: {@link getIconIds} is how
+ * a plugin checks whether its own icon registered, and a registry that forgot
+ * would make a plugin register the same icon on every load — or, worse, take a
+ * "the icon is missing" branch that does something else instead.
+ */
+const addedIcons = new Map<string, string>();
+
+/** `addIcon(name, svg)` — recorded, and nothing is drawn. */
+export function addIcon(name: string, svgContent: string): void {
+  addedIcons.set(name, svgContent);
+  stub("addIcon", undefined);
+}
+
+/**
+ * Every icon id this host knows, which is every one a plugin added.
+ *
+ * Obsidian's answer also contains its own built-in set, and that set is
+ * **uncaptured** — nothing in the corpus records it. Inventing a list would be
+ * worse than a short one: a plugin that tests `getIconIds().includes("lucide-x")`
+ * and gets `false` skips an icon, while one that gets a `true` this host cannot
+ * back goes on to use a name nothing here can draw.
+ */
+export function getIconIds(): string[] {
+  return stub("getIconIds", [...addedIcons.keys()]);
+}
+
+/** `setTooltip(el, text)` — there is nothing to hover. */
+export function setTooltip(element: unknown, tooltip: string, options?: unknown): void {
+  void element;
+  void tooltip;
+  void options;
+  stub("setTooltip", undefined);
+}
+
+/**
+ * `sanitizeHTMLToDom(html)` — a fragment carrying the text, and no markup.
+ *
+ * There is no parser here, so the tags cannot become nodes. The **text** is
+ * kept rather than dropped, because the calls in the corpus build a notice or a
+ * label out of this and then read it back: an empty fragment turns a message
+ * into a blank, while the text alone is the message with its formatting lost.
+ */
+export function sanitizeHTMLToDom(html: string): StubFragment {
+  const fragment = new StubFragment();
+  fragment.setText(html.replace(/<[^>]*>/g, ""));
+  return stub("sanitizeHTMLToDom", fragment);
+}
+
+/**
  * The document, as inert as the elements.
  *
  * `body`, `head` and `documentElement` are real {@link StubEl}s rather than
@@ -770,4 +821,8 @@ declarePolicy("createSpan", "safe_stub");
 declarePolicy("createFragment", "safe_stub");
 declarePolicy("setIcon", "safe_stub");
 declarePolicy("getIcon", "safe_stub");
+declarePolicy("addIcon", "safe_stub");
+declarePolicy("getIconIds", "safe_stub");
+declarePolicy("setTooltip", "safe_stub");
+declarePolicy("sanitizeHTMLToDom", "safe_stub");
 declarePolicy("document", "safe_stub");

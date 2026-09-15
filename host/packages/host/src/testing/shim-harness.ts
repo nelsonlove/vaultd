@@ -44,7 +44,7 @@ import type { Harvest, HarvestedMenuItem, MenuContext } from "../shim/harvest";
 import type { HostErrorEntry } from "../shim/errors";
 import type { ShimEventBus } from "../shim/events";
 import type { ObsidianApi } from "../shim/api";
-// activated by Task 11b: import type { NoticeLog } from "../shim/notice";
+import type { NoticeLog } from "../shim/notice";
 
 export interface ShimHarnessOptions {
   /**
@@ -105,7 +105,14 @@ export class ShimHarness extends MirrorHarness {
    * because "swallowed" and "reported" look identical from outside.
    */
   readonly hostErrors: HostErrorEntry[] = [];
-  // activated by Task 11b: readonly noticeLog!: NoticeLog;
+  /**
+   * Every notice this host's plugins raised.
+   *
+   * Read by cases that assert what a command told the user, and by Task 19's:
+   * the log records outside dry-run too, so "the notice was raised" is a fact a
+   * case can assert in the mode it actually runs in.
+   */
+  readonly noticeLog!: NoticeLog;
   /** The specifiers a plugin bundle may resolve to the host's own modules. */
   readonly hostModulePaths: readonly string[] = ["obsidian", "electron", "@electron/remote"];
 
@@ -148,7 +155,14 @@ export class ShimHarness extends MirrorHarness {
       dataDir: this.config.dataDir,
     });
     const mutable = this as {
-      -readonly [K in "app" | "vault" | "policyRecorder" | "writes" | "api" | "harvest"]: ShimHarness[K];
+      -readonly [K in
+        | "app"
+        | "vault"
+        | "policyRecorder"
+        | "writes"
+        | "api"
+        | "harvest"
+        | "noticeLog"]: ShimHarness[K];
     };
     this.assembly = assembly;
     mutable.app = assembly.app;
@@ -160,7 +174,7 @@ export class ShimHarness extends MirrorHarness {
     assembly.errors.onError((error, pluginId, phase) => {
       this.hostErrors.push({ error, pluginId, phase });
     });
-    // activated by Task 11b: mutable.noticeLog = assembly.noticeLog;
+    mutable.noticeLog = assembly.noticeLog;
   }
 
   /** A shim over a tree with no note bodies — the cheapest useful fixture. */

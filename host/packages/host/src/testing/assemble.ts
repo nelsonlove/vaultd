@@ -25,6 +25,7 @@ import { DispatchQueue } from "../runtime/queue";
 import { setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
 import { Harvest } from "../shim/harvest";
+import { NoticeLog } from "../shim/notice";
 import { HostErrors } from "../shim/errors";
 import { Workspace } from "../shim/workspace";
 import { createObsidianApi } from "../shim/api";
@@ -38,7 +39,6 @@ import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
 import type { GlobalInstallation } from "../shim/globals";
 import type { WriteGate } from "../shim/vault";
 // activated by Task 13:  import { registerElectronStub } from "../runtime/electron-registry";
-// activated by Task 11b: import { NoticeLog } from "../shim/notice";
 //
 // `WriteGate` is declared in `../shim/vault` until Task 19 creates
 // `../dryrun/dry-run`, which owns the interface and the one implementation
@@ -82,7 +82,16 @@ export interface HostAssembly {
    * barrel binds `window` and `activeDocument` to.
    */
   readonly globals: GlobalInstallation;
-  // activated by Task 11b: readonly noticeLog: NoticeLog;
+  /**
+   * Every notice a plugin raised, in order, **in every mode**.
+   *
+   * Unconditional rather than gated on dry-run, which is the correction Task
+   * 11b carries: `host.invoke_command` takes a `mark()` before dispatch and
+   * reports `since(mark)` in its response, so a client sees exactly the notices
+   * that command produced whether or not the host is pretending. Task 19's
+   * `DryRunGate` reads a window of this log; it owns no second one.
+   */
+  readonly noticeLog: NoticeLog;
   /**
    * The module object a plugin bundle resolves `obsidian` to.
    *
@@ -235,7 +244,9 @@ export function assembleShim(deps: {
   // Third, because it reads both of the others: the vault's index for the files
   // it moves and the metadata cache's resolver for the links it composes.
   const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
-  // activated by Task 11b: const noticeLog = new NoticeLog({ clock });
+  // On this host's clock, so a notice's `atUnixMs` is the same time base every
+  // other timestamp in this host is measured against.
+  const noticeLog = new NoticeLog({ clock });
   // The workspace needs the harvest at construction — its `on` records menu
   // hooks — and the harvest is built above, with the error sink.
   const workspace = new Workspace({ events, harvest });
@@ -266,6 +277,7 @@ export function assembleShim(deps: {
     harvest,
     errors,
     globals,
+    noticeLog,
   };
   // Last, and built from the assembly itself: the barrel binds this host's
   // clock into the timer functions a plugin calls, so a test advancing its own
