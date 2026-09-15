@@ -335,6 +335,88 @@ describe("HeadlessConfigDir", () => {
     expect(reason).toMatchObject({ code: "manifest_id_mismatch", declaredId: "something-else" });
   });
 
+  /**
+   * "Once per spell of trouble" means the key clears when the path is well.
+   *
+   * The enabled set's half. A file that is damaged, repaired and damaged again
+   * is two spells and two reports — and the second is the one you least want to
+   * lose, because it is the one telling you a repair did not hold. Without the
+   * clear this would report once per process, and the field's doc comment would
+   * be claiming something untrue.
+   */
+  it("reports a corrupt enabled set again after it has been well in between", async () => {
+    const harness = DaemonHarness.create();
+    const { dir, reported } = withErrorSeam(harness);
+    const answer = async (body: string): Promise<string[]> => {
+      const reading = dir.readEnabledSet();
+      const read = await harness.nextRequest();
+      harness.respondReadFile(read.id, body, "blake3:c1");
+      return reading;
+    };
+    await expect(answer('{"not": "an array"}')).resolves.toEqual([]);
+    // Still damaged: the same spell, so still one report.
+    await expect(answer("[[")).resolves.toEqual([]);
+    expect(reported).toHaveLength(1);
+    // Repaired.
+    await expect(answer(JSON.stringify(["quickadd"]))).resolves.toEqual(["quickadd"]);
+    // And damaged again — a new spell, and a second report.
+    await expect(answer('{"not": "an array"}')).resolves.toEqual([]);
+    expect(reported.map((entry) => [entry.pluginId, entry.phase])).toEqual([
+      ["host", "config"],
+      ["host", "config"],
+    ]);
+  });
+
+  /**
+   * The same rule for the listing's two skip arms.
+   *
+   * A folder that was a symlink and is now a real plugin, or a manifest that was
+   * broken and is now valid, clears its key on the listing that finds it well —
+   * so if it breaks again, the seam says so again. Both keys are cleared,
+   * because either arm could have reported the same folder.
+   */
+  it("reports a plugin folder again after a clean listing in between", async () => {
+    const harness = DaemonHarness.create();
+    const { dir, reported } = withErrorSeam(harness);
+    const good = JSON.stringify({
+      id: "quickadd",
+      name: "QuickAdd",
+      version: "1.0",
+      minAppVersion: "1.0",
+    });
+    const lying = JSON.stringify({
+      id: "something-else",
+      name: "QuickAdd",
+      version: "1.0",
+      minAppVersion: "1.0",
+    });
+    const list = async (kind: "symlink" | "folder", manifest: string): Promise<string[]> => {
+      const listing = dir.listInstalled();
+      const read = await harness.nextRequest();
+      harness.respondReadDir(read.id, ".obsidian-headless/plugins", [{ name: "quickadd", kind }]);
+      if (kind === "folder") {
+        const manifestRead = await harness.nextRequest();
+        harness.respondReadFile(manifestRead.id, manifest, "blake3:m1");
+      }
+      return (await listing).map((plugin) => plugin.id);
+    };
+
+    await expect(list("symlink", good)).resolves.toEqual([]);
+    await expect(list("folder", lying)).resolves.toEqual([]);
+    expect(reported).toHaveLength(2);
+    // Well: a real folder with a manifest that agrees with it. Both keys clear.
+    await expect(list("folder", good)).resolves.toEqual(["quickadd"]);
+    // Broken both ways again — a new spell for each arm, and two more reports.
+    await expect(list("symlink", good)).resolves.toEqual([]);
+    await expect(list("folder", lying)).resolves.toEqual([]);
+    expect(reported.map((entry) => entry.pluginId)).toEqual([
+      "quickadd",
+      "quickadd",
+      "quickadd",
+      "quickadd",
+    ]);
+  });
+
   /** Naming one plugin is asking about that plugin: the typed refusal stands. */
   it("still throws from readManifest when the caller named the plugin", async () => {
     const harness = DaemonHarness.create();

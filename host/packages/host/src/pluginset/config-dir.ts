@@ -305,8 +305,11 @@ export class HeadlessConfigDir {
           entry.name,
           new Error(
             `${this.pluginDir(entry.name)} is a symlink, and this host does not follow one: ` +
-              "a plugin is loaded from inside the vault or not at all. Copy the plugin's folder " +
-              "in, or point the host at the directory the link targets.",
+              "what a plugin loads comes from inside the vault or not at all. If it links a " +
+              "plugin folder, copy the folder in or point the host at the directory it targets; " +
+              "if it links something else, nothing here was going to load it anyway. " +
+              "(The kind comes from the entry's own lstat, so this host cannot tell which " +
+              "without following the link — which is the thing it will not do.)",
           ),
         );
         continue;
@@ -327,6 +330,14 @@ export class HeadlessConfigDir {
         this.reportOnce(this.manifestPath(entry.name), entry.name, error);
         continue;
       }
+      // Well again. Both keys, because either arm could have reported this name:
+      // the folder may have been a symlink last time, or its manifest may have
+      // been the broken one. Without this, "once per spell of trouble" would be
+      // "once per process" for everything but the enabled set — a plugin
+      // repaired and broken again would report only the first time, which is
+      // the report you least want to lose.
+      this.reportedCorrupt.delete(this.pluginDir(entry.name));
+      this.reportedCorrupt.delete(this.manifestPath(entry.name));
       installed.push({ id: entry.name, manifest, dir: this.pluginDir(entry.name) });
     }
     return installed;
