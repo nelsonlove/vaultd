@@ -573,6 +573,13 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
       // repaired, or a green run says nothing about the delta path.
       expect(unmasked).toBeGreaterThan(5);
       expect(failures).toEqual([]);
+      // **The claim, asserted directly.** No event the subscription delivers is
+      // ever lost in this process, so a continuity escalation here is always
+      // this host judging an event it had already covered — the defect stated
+      // exactly, rather than proxied by a total that needs nine of them before
+      // it notices. Measured: a five-deep cascade passes the ceiling below and
+      // fails this line.
+      expect(live.resyncCounts().get("generation_gap") ?? 0).toBe(0);
       // **A cost ceiling, not a health signal.** Every re-hydration this
       // counts is a whole `open_snapshot` + tree + notes walk during which the
       // mirror answers every plugin from the old state, so a run that takes
@@ -591,6 +598,10 @@ describe.skipIf(!BINARY_EXISTS)("mirror fuzz: deltas against a fresh hydration",
       // continuity, the same measurement was 227 re-hydrations over thirty
       // seed-runs with 31 in a single run, every one of them a `generation_gap`
       // escalation on an event `applyChangeSet` was about to drop anyway.
+      //
+      // Kept alongside the sharper assertion above rather than replaced by it:
+      // this is the tripwire for the *next* cost defect, which will not be
+      // called `generation_gap`.
       expect(live.resyncCount()).toBeLessThanOrEqual(8);
     },
     600_000,

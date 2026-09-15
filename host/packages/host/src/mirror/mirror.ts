@@ -800,6 +800,7 @@ export class Mirror implements MirrorQuery {
   private pendingResync: { reason: MirrorResyncReason } | null = null;
   private lastResyncReasonValue: MirrorResyncReason | null = null;
   private resyncCountValue = 0;
+  private readonly resyncReasonCounts = new Map<MirrorResyncReason, number>();
   private readonly batchListeners = new Set<(batch: MirrorChangeBatch) => void>();
   private readonly configListeners = new Set<(path: string) => void | Promise<void>>();
   private readonly applyErrorListeners = new Set<
@@ -975,6 +976,21 @@ export class Mirror implements MirrorQuery {
    */
   resyncCount(): number {
     return this.resyncCountValue;
+  }
+
+  /**
+   * How many re-hydrations this mirror has run, by reason.
+   *
+   * {@link resyncCount} is a cost number and conflates the daemon's business
+   * with this host's: `watcher_overflow` and `subscriber_lag` are the daemon
+   * asking, while `generation_gap`, `apply_failed` and `refetch_oversized` are
+   * this mirror's own judgement. Only the split can say which of those a run
+   * actually exercised, which is what an assertion about *this host's*
+   * behaviour needs — and what Task 22's compatibility report should print,
+   * since a total reads one trigger as thirty-one problems.
+   */
+  resyncCounts(): ReadonlyMap<MirrorResyncReason, number> {
+    return this.resyncReasonCounts;
   }
 
   /**
@@ -1767,6 +1783,10 @@ export class Mirror implements MirrorQuery {
     this.pendingResync = null;
     this.lastResyncReasonValue = requested.reason;
     this.resyncCountValue += 1;
+    this.resyncReasonCounts.set(
+      requested.reason,
+      (this.resyncReasonCounts.get(requested.reason) ?? 0) + 1,
+    );
     const previous = this.snapshotRevisions();
     const previousRevisions = this.state.revisionMap();
     try {
