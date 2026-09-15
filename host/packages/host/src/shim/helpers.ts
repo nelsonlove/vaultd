@@ -81,22 +81,23 @@ export function parseLinktext(linktext: string): { path: string; subpath: string
 }
 
 /**
- * A heading, with the characters that would break a link to it removed.
+ * A heading, normalised for **matching**.
  *
- * The published documentation says this "prepares headings for linking by
- * stripping out some bad combinations of special characters that could break
- * links", and **which** combinations is uncaptured — nothing in the corpus
- * records the output of the real function. So this removes exactly the
- * characters that are structurally unusable inside `[[target#heading]]`: the
- * link and embed brackets, the `#` that would start another subpath, the `|`
- * that would start an alias, and the `^` that would make it a block reference.
- * Whitespace is collapsed and trimmed, because a heading that ends in a space
- * cannot be matched by a link that does not.
+ * The published sentence for this name is "normalizes headings for link
+ * matching by stripping out special characters and shrinking consecutive
+ * spaces", and that is what this does: the characters structurally unusable
+ * inside `[[target#heading]]` come out — the link and embed brackets, the `#`
+ * that would start another subpath, the `|` that would start an alias, the `^`
+ * that would make it a block reference — runs of whitespace shrink to one, and
+ * the result is trimmed, because a heading that ends in a space cannot be
+ * matched by a link that does not.
  *
- * Least-harm where it is uncertain: the function only ever *removes* the
- * characters a link cannot carry, so a heading that needed no stripping comes
- * back unchanged and a caller comparing against `cache.headings[].heading` is
- * never handed something the note does not contain.
+ * **Which** special characters is uncaptured; nothing in the corpus records the
+ * real function's output. Least-harm where it is uncertain: this only ever
+ * *removes* the characters a link cannot carry, so a heading that needed no
+ * stripping comes back unchanged and a caller comparing against
+ * `cache.headings[].heading` is never handed something the note does not
+ * contain.
  */
 export function stripHeading(heading: string): string {
   return heading
@@ -106,11 +107,22 @@ export function stripHeading(heading: string): string {
 }
 
 /**
- * The same, for the link-target half.
+ * The link-target half — and **a documented divergence, not an uncaptured one.**
  *
- * Obsidian publishes both names and this host answers them identically: the
- * difference between them is uncaptured, and two answers that differ for a
- * reason nobody can state would be worse than one.
+ * The two published sentences describe different jobs: {@link stripHeading}
+ * "normalizes headings for link matching", while this one "prepares headings
+ * for linking by stripping out some bad combinations of special characters that
+ * could break links". Obsidian therefore has two functions and this host has
+ * one, aliased — so a caller that would have got different text from the two
+ * gets the same text from both here, and that is a difference the documentation
+ * states rather than one no capture could settle.
+ *
+ * It is aliased anyway because the divergence is bounded in the direction that
+ * matters: both published descriptions remove the link-breaking characters, and
+ * this removes exactly those. What cannot be known without a capture is whether
+ * the real `stripHeadingForLink` removes *more* — so **Task 22 captures both**,
+ * and until it does, one answer nobody can mistake for two is better than a
+ * second implementation invented to look different.
  */
 export function stripHeadingForLink(heading: string): string {
   return stripHeading(heading);
@@ -119,6 +131,22 @@ export function stripHeadingForLink(heading: string): string {
 // ---------------------------------------------------------------------------
 // Buffers
 // ---------------------------------------------------------------------------
+//
+// **The two decoders are lenient with malformed input, and a browser's are
+// not.** They go through Node's `Buffer.from`, which skips what it cannot read
+// rather than refusing: `base64ToArrayBuffer("not base64!!")` answers six
+// garbage bytes, `hexToArrayBuffer("abc")` drops the trailing nibble and
+// answers one, and `hexToArrayBuffer("zz")` answers empty. In a renderer these
+// go through `atob`, which **throws** on a bad character — so a plugin
+// decoding a corrupt payload gets silent truncation here and an exception
+// there.
+//
+// Which behaviour Obsidian's own helpers have is **uncaptured**; nothing in the
+// corpus feeds them a malformed string. Leniency is kept rather than guessed
+// away because throwing is the change that can break a working plugin — a
+// decoder that suddenly refuses input it used to accept fails inside `onload`
+// — while truncation fails where the bytes are used, which is where a capture
+// will settle it. Task 22 captures both decoders on malformed input.
 
 /** Bytes to base64, the spelling a plugin storing an attachment uses. */
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -598,6 +626,11 @@ export interface HttpBindings {
  * makes no DNS query and opens no connection: "nothing was attempted" is the
  * property a test suite loading real community bundles needs, and "the request
  * failed" is not the same claim.
+ *
+ * **This is the only thing that may turn the network on.** The two functions
+ * below refuse by default (see {@link requestUrl}), so reaching the network is
+ * something a caller holding a {@link HostConfig} does deliberately, once, here
+ * — and every other caller in the process gets the safe answer for free.
  */
 export function createHttp(config: { allowNetwork: boolean }): HttpBindings {
   return {
@@ -606,9 +639,21 @@ export function createHttp(config: { allowNetwork: boolean }): HttpBindings {
   };
 }
 
+/**
+ * The real request — **refused unless a caller says otherwise.**
+ *
+ * The default is `false`, and the direction is the whole point. The barrel is
+ * the only caller today and it always passes the host's flag, so nothing
+ * changes for a plugin; what changes is what the *next* in-host caller gets
+ * when it imports this function from here and forgets the second argument. A
+ * default of `true` would hand that caller the network silently, and the
+ * failure would be a test run reaching the internet — which nobody would notice
+ * until it was a capture or a rate limit. A default of `false` fails loudly, at
+ * the call, naming the address.
+ */
 export async function requestUrl(
   param: string | RequestUrlParam,
-  allowNetwork = true,
+  allowNetwork = false,
 ): Promise<RequestUrlResponse> {
   const request = typeof param === "string" ? { url: param } : param;
   if (!allowNetwork) throw new NetworkRefused(request.url);
@@ -639,8 +684,11 @@ export async function requestUrl(
   return answered;
 }
 
-/** The text-only spelling of {@link requestUrl}. */
-export async function request(param: string | RequestUrlParam, allowNetwork = true): Promise<string> {
+/** The text-only spelling of {@link requestUrl}, refusing by the same default. */
+export async function request(
+  param: string | RequestUrlParam,
+  allowNetwork = false,
+): Promise<string> {
   return (await requestUrl(param, allowNetwork)).text;
 }
 

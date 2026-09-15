@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { API_POLICY } from "../src/shim/api";
 import { HeadlessUnsupported } from "../src/shim/policy";
-import { NetworkRefused } from "../src/shim/helpers";
+import { NetworkRefused, request, requestUrl } from "../src/shim/helpers";
 import { ShimHarness } from "../src/testing/shim-harness";
 import type { SearchResult } from "../src/shim/search";
 
@@ -498,6 +498,33 @@ describe("implemented barrel symbols", () => {
         expect((refusal as NetworkRefused).code).toBe("network_refused");
       }
       expect(attempts).toBe(0);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("refuses a direct module import too, so the unsafe direction is never the default", async () => {
+    const harness = await ShimHarness.withVault({});
+    const realFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (...args: Parameters<typeof fetch>) => {
+      attempts += 1;
+      return realFetch(...args);
+    };
+    try {
+      // Not through the barrel: this is the next in-host caller who imports the
+      // function from `shim/helpers` and forgets the second argument. The
+      // default answers for them, and it answers **no** — a default of `true`
+      // would hand that caller the network silently, and nobody would notice
+      // until a test run reached the internet.
+      await expect(requestUrl("https://example.com/direct")).rejects.toBeInstanceOf(NetworkRefused);
+      await expect(request({ url: "https://example.com/direct" })).rejects.toBeInstanceOf(
+        NetworkRefused,
+      );
+      expect(attempts).toBe(0);
+      // And the harness's own barrel is still bound to its config, not to the
+      // default — the two are different mechanisms and both have to hold.
+      expect(harness.config.allowNetwork).toBe(false);
     } finally {
       globalThis.fetch = realFetch;
     }

@@ -112,6 +112,15 @@ export const LIVE: Record<string, (ctx: ShapeContext) => unknown> = {
  * `yes` sends it down a path that writes to the file system behind the daemon.
  * So what is asserted is what a plugin actually does with the name — extend it,
  * test against it — and never that a construction succeeds.
+ *
+ * **It must stay at exactly one member, and that is a rule rather than an
+ * observation.** This list is the shape guard's own exemption: a row named here
+ * is a row nothing constructs, which is precisely where a wrong binding would
+ * hide from the check built to catch it. A second entry means either a class
+ * whose constructor is awkward to call from a test — in which case the fix is
+ * arguments in {@link CONSTRUCTED} or an instance in {@link LIVE}, both of which
+ * assert more — or a surface nobody can build, which is a policy question and
+ * not an exemption. Growing this list is how the guard quietly stops guarding.
  */
 export const NOT_CONSTRUCTED: Record<string, string> = {
   FileSystemAdapter:
