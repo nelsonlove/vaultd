@@ -3,7 +3,7 @@
  * links, versions, timing and HTTP.
  *
  * **A file of its own, which the brief did not name.** Task 11b's file list is
- * `notice.ts`, `components.ts`, `search.ts` and `api.ts`, and these eighteen
+ * `notice.ts`, `components.ts`, `search.ts` and `api.ts`, and these two dozen
  * functions belong to none of the first three. Putting them in `api.ts` would
  * bury the policy table — the one thing that file exists to make readable —
  * under four hundred lines of string handling. So they live here and the barrel
@@ -18,7 +18,7 @@
  */
 
 import { dump, load } from "js-yaml";
-import type { CachedMetadata } from "../mirror/metadata";
+import type { CachedMetadata, Reference, ReferenceCache } from "../mirror/metadata";
 import type { Clock } from "../config";
 import type { Pos } from "../mirror/positions";
 
@@ -33,6 +33,13 @@ import type { Pos } from "../mirror/positions";
  * leading or trailing slash come off, and the result is NFC-normalised —
  * Obsidian normalises because macOS hands out NFD filenames and a vault written
  * on one machine has to be addressable from another.
+ *
+ * **It normalises spelling, not structure: `..` is left alone.**
+ * `normalizePath("../Secret.md")` answers `"../Secret.md"`, which is what
+ * Obsidian answers, so this function is **not** a path-escape guard and nothing
+ * may be built on it as though it were — refusing a path that climbs out of the
+ * vault is the daemon's job, on every request, where it cannot be bypassed by a
+ * caller that forgot to normalise first.
  *
  * The empty path answers `"/"`, which is the vault root and is what Obsidian
  * answers. It is the one case where the output is longer than the input, and
@@ -56,9 +63,120 @@ export function normalizePath(path: string): string {
  * is in — which is why an empty answer is a real answer and not a failure.
  */
 export function getLinkpath(linktext: string): string {
+  return parseLinktext(linktext).path;
+}
+
+/**
+ * A link target split into its file part and its subpath.
+ *
+ * The published signature is `{ path, subpath }` and the subpath **keeps its
+ * `#`** — `parseLinktext("Note#Heading")` is `{ path: "Note", subpath:
+ * "#Heading" }` — because `resolveSubpath` takes it in that form, which is the
+ * one place its output goes.
+ */
+export function parseLinktext(linktext: string): { path: string; subpath: string } {
   const cut = linktext.indexOf("#");
-  if (cut === -1) return linktext;
-  return linktext.slice(0, cut);
+  if (cut === -1) return { path: linktext, subpath: "" };
+  return { path: linktext.slice(0, cut), subpath: linktext.slice(cut) };
+}
+
+/**
+ * A heading, with the characters that would break a link to it removed.
+ *
+ * The published documentation says this "prepares headings for linking by
+ * stripping out some bad combinations of special characters that could break
+ * links", and **which** combinations is uncaptured — nothing in the corpus
+ * records the output of the real function. So this removes exactly the
+ * characters that are structurally unusable inside `[[target#heading]]`: the
+ * link and embed brackets, the `#` that would start another subpath, the `|`
+ * that would start an alias, and the `^` that would make it a block reference.
+ * Whitespace is collapsed and trimmed, because a heading that ends in a space
+ * cannot be matched by a link that does not.
+ *
+ * Least-harm where it is uncertain: the function only ever *removes* the
+ * characters a link cannot carry, so a heading that needed no stripping comes
+ * back unchanged and a caller comparing against `cache.headings[].heading` is
+ * never handed something the note does not contain.
+ */
+export function stripHeading(heading: string): string {
+  return heading
+    .replace(/[#|^\\[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The same, for the link-target half.
+ *
+ * Obsidian publishes both names and this host answers them identically: the
+ * difference between them is uncaptured, and two answers that differ for a
+ * reason nobody can state would be worse than one.
+ */
+export function stripHeadingForLink(heading: string): string {
+  return stripHeading(heading);
+}
+
+// ---------------------------------------------------------------------------
+// Buffers
+// ---------------------------------------------------------------------------
+
+/** Bytes to base64, the spelling a plugin storing an attachment uses. */
+export function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  return Buffer.from(buffer).toString("base64");
+}
+
+/** Base64 back to bytes. */
+export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const bytes = Buffer.from(base64, "base64");
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+/** Bytes to lower-case hex. */
+export function arrayBufferToHex(data: ArrayBuffer): string {
+  return Buffer.from(data).toString("hex");
+}
+
+/** Hex back to bytes. */
+export function hexToArrayBuffer(hex: string): ArrayBuffer {
+  const bytes = Buffer.from(hex, "hex");
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+/** A `Blob`'s bytes. Node has had `Blob` since 18, so this is the real thing. */
+export async function getBlobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
+  return await blob.arrayBuffer();
+}
+
+// ---------------------------------------------------------------------------
+// Cache iteration
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk every reference in a cache — links, embeds and frontmatter links.
+ *
+ * The published contract is the return value, not the walk: **the callback
+ * returning `true` interrupts the iteration, and the function answers whether
+ * it was interrupted.** A caller uses it to find the first reference matching
+ * something, so an implementation that ran the callback over everything and
+ * always answered `false` would turn a search into a full scan with the wrong
+ * answer.
+ */
+export function iterateCacheRefs(
+  cache: CachedMetadata,
+  cb: (ref: ReferenceCache) => boolean | void,
+): boolean {
+  return iterateRefs([...(cache.links ?? []), ...(cache.embeds ?? [])], cb);
+}
+
+/** The same walk over a list a caller already has. */
+export function iterateRefs<T extends Reference>(
+  refs: readonly T[],
+  cb: (ref: T) => boolean | void,
+): boolean {
+  for (const ref of refs) {
+    if (cb(ref) === true) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +262,13 @@ export function getFrontMatterInfo(content: string): FrontMatterInfo {
 export function parseFrontMatterEntry(frontmatter: unknown, key: string | RegExp): unknown {
   const record = asRecord(frontmatter);
   if (record === null) return null;
-  if (typeof key === "string") return record[key] ?? null;
+  if (typeof key === "string") {
+    // `hasOwnProperty`, not a plain read: `record["toString"]` would otherwise
+    // answer with `Object.prototype`'s method, and a note with no `toString`
+    // key would report one — which `parseFrontMatterStringArray` then turns
+    // into `[]` where the honest answer is `null`.
+    return Object.prototype.hasOwnProperty.call(record, key) ? (record[key] ?? null) : null;
+  }
   for (const [name, value] of Object.entries(record)) {
     if (key.test(name)) return value;
   }
@@ -442,8 +566,52 @@ export interface RequestUrlResponse {
  * ordinary, and a body that could only be read once would give it an empty
  * string.
  */
-export async function requestUrl(param: string | RequestUrlParam): Promise<RequestUrlResponse> {
+/**
+ * The refusal a host that may not reach the network answers with.
+ *
+ * Typed, and carrying the URL, because a plugin that swallows the error still
+ * leaves something the host can report: "this plugin wanted this address" is
+ * the fact a compatibility report and a dry-run summary both want, and a bare
+ * `TypeError: fetch failed` — which is what an unreachable address gives —
+ * carries neither the reason nor the address.
+ */
+export class NetworkRefused extends Error {
+  readonly code = "network_refused";
+  readonly url: string;
+  constructor(url: string) {
+    super(`network access is disabled for this host (${url})`);
+    this.name = "NetworkRefused";
+    this.url = url;
+  }
+}
+
+/** The two HTTP helpers, bound to one host's network policy. */
+export interface HttpBindings {
+  requestUrl(param: string | RequestUrlParam): Promise<RequestUrlResponse>;
+  request(param: string | RequestUrlParam): Promise<string>;
+}
+
+/**
+ * Bind `requestUrl`/`request` to a host that may — or may not — reach out.
+ *
+ * The check happens **before** anything touches a socket, so a refused host
+ * makes no DNS query and opens no connection: "nothing was attempted" is the
+ * property a test suite loading real community bundles needs, and "the request
+ * failed" is not the same claim.
+ */
+export function createHttp(config: { allowNetwork: boolean }): HttpBindings {
+  return {
+    requestUrl: (param) => requestUrl(param, config.allowNetwork),
+    request: (param) => request(param, config.allowNetwork),
+  };
+}
+
+export async function requestUrl(
+  param: string | RequestUrlParam,
+  allowNetwork = true,
+): Promise<RequestUrlResponse> {
   const request = typeof param === "string" ? { url: param } : param;
+  if (!allowNetwork) throw new NetworkRefused(request.url);
   const headers: Record<string, string> = { ...(request.headers ?? {}) };
   if (request.contentType !== undefined) headers["Content-Type"] = request.contentType;
   const response = await fetch(request.url, {
@@ -472,8 +640,8 @@ export async function requestUrl(param: string | RequestUrlParam): Promise<Reque
 }
 
 /** The text-only spelling of {@link requestUrl}. */
-export async function request(param: string | RequestUrlParam): Promise<string> {
-  return (await requestUrl(param)).text;
+export async function request(param: string | RequestUrlParam, allowNetwork = true): Promise<string> {
+  return (await requestUrl(param, allowNetwork)).text;
 }
 
 // ---------------------------------------------------------------------------

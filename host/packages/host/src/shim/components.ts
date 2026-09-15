@@ -406,6 +406,99 @@ export class ColorComponent extends ValueComponent<string> {
 }
 
 /**
+ * A moment.js format field: a text input plus a live sample of what it renders.
+ *
+ * The sample is real — it formats `moment()` through the same library the
+ * globals install — because a plugin reads `sampleEl.textContent` back to warn
+ * a user that their format is wrong, and a blank sample reads as "your format
+ * produces nothing".
+ */
+export class MomentFormatComponent extends AbstractTextComponent<StubEl> {
+  readonly sampleEl: StubEl;
+  private defaultFormatValue = "YYYY-MM-DD";
+  private sampleFormatter: ((format: string) => string) | null = null;
+
+  constructor(containerEl: StubEl) {
+    super(containerEl.createEl("input", { type: "text" }));
+    this.sampleEl = containerEl.createSpan({ cls: "u-pop" });
+    stub("MomentFormatComponent", undefined);
+  }
+
+  setDefaultFormat(defaultFormat: string): this {
+    this.defaultFormatValue = defaultFormat;
+    this.inputEl.setAttr("placeholder", defaultFormat);
+    return this;
+  }
+
+  setSampleEl(sampleEl: StubEl): this {
+    void sampleEl;
+    return this;
+  }
+
+  /** Install what turns a format into its sample. The barrel passes `moment`. */
+  setFormatter(formatter: (format: string) => string): this {
+    this.sampleFormatter = formatter;
+    this.updateSample();
+    return this;
+  }
+
+  override setValue(value: string): this {
+    super.setValue(value);
+    this.updateSample();
+    return this;
+  }
+
+  updateSample(): void {
+    const format = this.getValue() === "" ? this.defaultFormatValue : this.getValue();
+    this.sampleEl.setText(this.sampleFormatter?.(format) ?? format);
+  }
+}
+
+/** A progress bar: it holds a number between 0 and 100 and shows nothing. */
+export class ProgressBarComponent extends ValueComponent<number> {
+  readonly progressBar: StubEl;
+
+  constructor(containerEl: StubEl) {
+    super();
+    this.progressBar = containerEl.createDiv({ cls: "setting-progress-bar" });
+    this.currentValue = 0;
+    stub("ProgressBarComponent", undefined);
+  }
+
+  override getValue(): number {
+    return this.currentValue ?? 0;
+  }
+
+  override setValue(value: number): this {
+    this.currentValue = Math.max(0, Math.min(100, value));
+    this.progressBar.setAttr("data-value", String(this.currentValue));
+    return this;
+  }
+}
+
+/** A read-only label for a settings row. It stores what it was given. */
+export class DisplayValueComponent extends ValueComponent<string> {
+  readonly valueEl: StubEl;
+
+  constructor(containerEl: StubEl) {
+    super();
+    this.valueEl = containerEl.createDiv({ cls: "setting-item-value" });
+    this.currentValue = "";
+    stub("DisplayValueComponent", undefined);
+  }
+
+  override getValue(): string {
+    return this.currentValue ?? "";
+  }
+
+  override setValue(value: string): this {
+    this.currentValue = value;
+    this.valueEl.setText(value);
+    return this;
+  }
+}
+
+/**
  * The secret field, which is a text field that never shows what it holds.
  *
  * It really stores the value, because a plugin reads its own setting back — but
@@ -565,6 +658,18 @@ export class Setting {
     return this.add(new SecretComponent(this.controlEl), callback);
   }
 
+  addMomentFormat(callback: (component: MomentFormatComponent) => unknown): this {
+    return this.add(new MomentFormatComponent(this.controlEl), callback);
+  }
+
+  addProgressBar(callback: (component: ProgressBarComponent) => unknown): this {
+    return this.add(new ProgressBarComponent(this.controlEl), callback);
+  }
+
+  addDisplayValue(callback: (component: DisplayValueComponent) => unknown): this {
+    return this.add(new DisplayValueComponent(this.controlEl), callback);
+  }
+
   then(callback: (setting: this) => unknown): this {
     callback(this);
     return this;
@@ -584,22 +689,20 @@ export class Setting {
 }
 
 /**
- * The base a plugin's settings tab extends.
+ * The published base of {@link PluginSettingTab}, and an `instanceof` target.
  *
- * `display()` is left empty rather than made abstract: a plugin always
- * overrides it, and a tab that somehow did not must still be constructible.
- * Nothing in this plan calls it.
+ * Obsidian exports both names and `PluginSettingTab extends SettingTab`, so the
+ * chain is reproduced rather than flattened: a plugin testing
+ * `tab instanceof SettingTab` gets the answer it would get in the application.
  */
-export class PluginSettingTab {
+export class SettingTab {
   readonly app: App;
-  readonly plugin: Plugin;
   readonly containerEl: StubEl;
 
-  constructor(app: App, plugin: Plugin) {
+  constructor(app: App) {
     this.app = app;
-    this.plugin = plugin;
     this.containerEl = new StubEl("div", { cls: "vertical-tab-content" });
-    recordUse("PluginSettingTab");
+    stub("SettingTab", undefined);
   }
 
   display(): void {
@@ -608,6 +711,23 @@ export class PluginSettingTab {
 
   hide(): void {
     this.containerEl.empty();
+  }
+}
+
+/**
+ * The base a plugin's settings tab extends.
+ *
+ * `display()` is left empty rather than made abstract: a plugin always
+ * overrides it, and a tab that somehow did not must still be constructible.
+ * Nothing in this plan calls it.
+ */
+export class PluginSettingTab extends SettingTab {
+  readonly plugin: Plugin;
+
+  constructor(app: App, plugin: Plugin) {
+    super(app);
+    this.plugin = plugin;
+    recordUse("PluginSettingTab");
   }
 }
 
@@ -711,6 +831,21 @@ export class SuggestModal<T> extends Modal {
     super(app);
     this.inputEl = this.modalEl.createEl("input", { type: "text", cls: "prompt-input" });
     this.resultContainerEl = this.modalEl.createDiv({ cls: "prompt-results" });
+    // Its own row, at its own declared policy. Without it a plugin that uses a
+    // suggester appears in the compatibility report as a bare `Modal` stub hit,
+    // and the report cannot say which of the two surfaces it leaned on.
+    recordUse("SuggestModal");
+  }
+
+  /**
+   * The showing half, which does not exist, named as itself.
+   *
+   * Inherited from {@link Modal.open} the refusal would say `Modal.open`, and a
+   * report reader would be told a plugin opened a modal when what it opened was
+   * a picker — the one Task 18 can broker.
+   */
+  override open(): void {
+    unsupported("SuggestModal.open", this.constructor.name);
   }
 
   setPlaceholder(placeholder: string): this {
@@ -760,6 +895,15 @@ export class SuggestModal<T> extends Modal {
  * to be right, because the order it offers is the order a caller picks from.
  */
 export class FuzzySuggestModal<T> extends SuggestModal<FuzzyMatch<T>> {
+  constructor(app: App) {
+    super(app);
+    recordUse("FuzzySuggestModal");
+  }
+
+  override open(): void {
+    unsupported("FuzzySuggestModal.open", this.constructor.name);
+  }
+
   /** A plugin overrides this. */
   getItems(): T[] {
     return [];
@@ -1149,6 +1293,8 @@ function hueToChannel(p: number, q: number, t: number): number {
 // classes themselves are declared by the barrel, from the policy table.
 declarePolicy("Modal.open", "absent");
 declarePolicy("Modal.close", "safe_stub");
+declarePolicy("SuggestModal.open", "absent");
+declarePolicy("FuzzySuggestModal.open", "absent");
 declarePolicy("PopoverSuggest.open", "safe_stub");
 declarePolicy("PopoverSuggest.close", "safe_stub");
 declarePolicy("Editor.getValue", "absent");

@@ -147,7 +147,11 @@ export class Notice {
     this.timeoutMs = timeout ?? null;
     this.noticeEl = new StubEl("div", { cls: "notice" });
     this.messageEl = this.noticeEl.createDiv({ cls: "notice-message" });
-    this.setMessage(message);
+    // Written directly rather than through `setMessage`, so **one** notice
+    // records **one** hit and **one** entry. Routing the constructor through
+    // the setter cost a second `Notice` row in the compatibility report for
+    // every notice ever raised, which reads as twice the use.
+    this.write(message);
   }
 
   /**
@@ -159,11 +163,16 @@ export class Notice {
    * sequence rather than only whichever text happened to be last.
    */
   setMessage(message: string | StubFragment): this {
+    this.write(message);
+    return this;
+  }
+
+  /** Store the text and record it, once. */
+  private write(message: string | StubFragment): void {
     const text = typeof message === "string" ? message : message.textContent;
     this.messageEl.setText(text);
     recordUse("Notice");
     this.log?.record(text, this.timeoutMs);
-    return this;
   }
 
   /** There is nothing on screen to take down. */

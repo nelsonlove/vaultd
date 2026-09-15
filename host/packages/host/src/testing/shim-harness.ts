@@ -45,6 +45,8 @@ import type { HostErrorEntry } from "../shim/errors";
 import type { ShimEventBus } from "../shim/events";
 import type { ObsidianApi } from "../shim/api";
 import type { NoticeLog } from "../shim/notice";
+import type { HostWindow } from "../shim/globals";
+import type { StubDocument } from "../shim/dom";
 
 export interface ShimHarnessOptions {
   /**
@@ -113,6 +115,16 @@ export class ShimHarness extends MirrorHarness {
    * case can assert in the mode it actually runs in.
    */
   readonly noticeLog!: NoticeLog;
+  /**
+   * The `window` and `document` this host installed.
+   *
+   * Reachable here rather than off the barrel, because Obsidian's module
+   * exports neither: they are globals, they are declared in the policy table's
+   * `GLOBAL_ONLY_SYMBOLS` list, and a test that wants *this host's* pair should
+   * ask the host for it rather than a module that would be lying to offer it.
+   */
+  readonly window!: HostWindow;
+  readonly document!: StubDocument;
   /** The specifiers a plugin bundle may resolve to the host's own modules. */
   readonly hostModulePaths: readonly string[] = ["obsidian", "electron", "@electron/remote"];
 
@@ -162,7 +174,9 @@ export class ShimHarness extends MirrorHarness {
         | "writes"
         | "api"
         | "harvest"
-        | "noticeLog"]: ShimHarness[K];
+        | "noticeLog"
+        | "window"
+        | "document"]: ShimHarness[K];
     };
     this.assembly = assembly;
     mutable.app = assembly.app;
@@ -175,6 +189,8 @@ export class ShimHarness extends MirrorHarness {
       this.hostErrors.push({ error, pluginId, phase });
     });
     mutable.noticeLog = assembly.noticeLog;
+    mutable.window = assembly.globals.window;
+    mutable.document = assembly.globals.document;
   }
 
   /** A shim over a tree with no note bodies — the cheapest useful fixture. */
@@ -594,7 +610,18 @@ function freshDataDir(): string {
 function configFor(options: ShimHarnessOptions): Partial<HostConfig> {
   const dataDir = options.dataDir ?? freshDataDir();
   const vaultRoot = options.config?.vaultRoot ?? "/vault";
-  return { dataDir, socketPath: socketPathFor(dataDir, vaultRoot), ...(options.config ?? {}) };
+  return {
+    dataDir,
+    socketPath: socketPathFor(dataDir, vaultRoot),
+    // **No test run may reach the network.** Production defaults to `true`;
+    // every harness turns it off, so a real community bundle loaded by a case —
+    // which is what the golden corpus is — cannot phone home even if its
+    // `onload` tries. A case that wants the forwarding path passes
+    // `config: { allowNetwork: true }` deliberately, and then owns the
+    // consequence. The spread below is what lets it.
+    allowNetwork: false,
+    ...(options.config ?? {}),
+  };
 }
 
 /** The name every harness data dir starts with, and the sweep matches on. */

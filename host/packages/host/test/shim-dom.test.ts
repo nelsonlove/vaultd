@@ -27,6 +27,10 @@ import { App } from "../src/shim/app";
 import { DataDir } from "../src/datadir";
 import { Harvest } from "../src/shim/harvest";
 import { HostErrors } from "../src/shim/errors";
+// The element builders are Obsidian **globals**, not exports of its module, so
+// they are no longer on the barrel — see `GLOBAL_ONLY_SYMBOLS` in `shim/api.ts`.
+// A plugin reaches them as bare globals; a test reaches them here.
+import { createDiv, createEl, createFragment } from "../src/shim/dom";
 import { ShimHarness, sweepStaleDataDirs } from "../src/testing/shim-harness";
 import { assembleShim } from "../src/testing/assemble";
 import { defaultHostConfig } from "../src/config";
@@ -88,8 +92,10 @@ function globalStorage(): {
 
 describe("DOM stubs", () => {
   it("swallows the whole createEl chain a settings tab builds", async () => {
-    const harness = await ShimHarness.withVault({});
-    const root = harness.api.createDiv({ cls: "panel" });
+    // The harness is what installs the globals and the policy recorder these
+    // builders record into, even though the builders themselves are imported.
+    await ShimHarness.withVault({});
+    const root = createDiv({ cls: "panel" });
     const heading = root.createEl("h2", { text: "Title" });
     heading.addClass("big").setAttr("data-x", "1");
     const child = root.createDiv().createSpan({ text: "inner" });
@@ -135,8 +141,8 @@ describe("DOM stubs", () => {
     const plugin = harness.instantiate("demo", class extends harness.api.Plugin {
       override async onload(): Promise<void> {
         this.addRibbonIcon("star", "Go", () => {});
-        harness.api.setIcon(harness.api.createDiv(), "star");
-        harness.api.setIcon(harness.api.createDiv(), "star");
+        harness.api.setIcon(createDiv(), "star");
+        harness.api.setIcon(createDiv(), "star");
       }
     });
     await harness.load(plugin);
@@ -147,14 +153,14 @@ describe("DOM stubs", () => {
   });
 
   it("keeps a fragment out of the element branch", async () => {
-    const harness = await ShimHarness.withVault({});
+    await ShimHarness.withVault({});
     const g = globalThis as unknown as {
       HTMLElement: new () => unknown;
       DocumentFragment: new () => unknown;
       Node: new () => unknown;
     };
-    const fragment = harness.api.createFragment();
-    const element = harness.api.createDiv();
+    const fragment = createFragment();
+    const element = createDiv();
     // A plugin branches `if (x instanceof HTMLElement) … else if (x instanceof
     // DocumentFragment)`, so a fragment answering `true` to the first test
     // takes it down the wrong arm — which is what a browser would never do.
@@ -167,8 +173,8 @@ describe("DOM stubs", () => {
   });
 
   it("answers getAttr with what setAttr wrote", async () => {
-    const harness = await ShimHarness.withVault({});
-    const element = harness.api.createEl("input", { attr: { placeholder: "Name" } });
+    await ShimHarness.withVault({});
+    const element = createEl("input", { attr: { placeholder: "Name" } });
     element.setAttr("data-x", "1");
     expect(element.getAttr("data-x")).toBe("1");
     expect(element.getAttribute("placeholder")).toBe("Name");
@@ -340,7 +346,7 @@ describe("the installed globals", () => {
     const plugin = harness.instantiate("demo", class extends harness.api.Plugin {
       override onload(): void {
         globalWindow().addEventListener("contextmenu", () => undefined);
-        harness.api.activeDocument.addEventListener("contextmenu", () => undefined);
+        harness.document.addEventListener("contextmenu", () => undefined);
       }
     });
     await harness.load(plugin);
@@ -368,7 +374,7 @@ describe("the installed globals", () => {
         await this.app.workspace.getLeaf(false).openFile(harness.vault.getFileByPath("A.md")!);
         this.app.workspace.getLeavesOfType("markdown");
         this.app.workspace.getActiveFile();
-        harness.api.setIcon(harness.api.createDiv(), "star");
+        harness.api.setIcon(createDiv(), "star");
         globalStorage().setItem("k", "v");
         try {
           globalWindow().require("child_process");

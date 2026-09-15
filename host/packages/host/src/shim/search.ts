@@ -54,7 +54,11 @@ const GAP_PENALTY = 0.4;
  * what an empty search box means.
  */
 export function prepareFuzzySearch(query: string): PreparedSearch {
-  const needle = query.toLowerCase();
+  // Trimmed, so the sentence above is true: a query of only whitespace is an
+  // empty search box, and an empty search box matches everything. Without the
+  // trim a single space matched nothing, because no candidate carries a space
+  // where the scorer looked for one.
+  const needle = query.trim().toLowerCase();
   return (text: string): SearchResult | null => scoreSubsequence(needle, text);
 }
 
@@ -124,6 +128,26 @@ export function renderResults(el: StubNode, text: string, result: SearchResult, 
 }
 
 /**
+ * Paint the matched spans of a result a caller already holds. `safe_stub`.
+ *
+ * `renderResults` takes a whole {@link SearchResult}; this takes the spans on
+ * their own, which is the shape a caller that built them itself is holding.
+ * Neither can highlight, for the same reason: there is no document. The text
+ * lands so a caller reading `el.textContent` back is not handed a blank.
+ */
+export function renderMatches(
+  el: StubNode,
+  text: string,
+  matches: SearchMatchPart[] | null,
+  offset?: number,
+): void {
+  void matches;
+  void offset;
+  stub("renderMatches", undefined);
+  el.setText(text);
+}
+
+/**
  * The matcher itself: leftmost-greedy, scored by how tightly it landed.
  *
  * Leftmost-greedy rather than optimal, which is a real limit and a deliberate
@@ -133,6 +157,13 @@ export function renderResults(el: StubNode, text: string, result: SearchResult, 
  * later, where taking the later occurrence would have scored better; the effect
  * is a slightly worse order, never a missed match, because the leftmost run
  * finds a match whenever one exists.
+ *
+ * **One measured limit in the offsets.** Matching is case-folded on both sides,
+ * and a few characters change length when folded — `"İ".toLowerCase()` is two
+ * UTF-16 units — so for a text containing one of them the reported `matches`
+ * spans drift from the original string's indices. Ordering is unaffected (both
+ * sides fold the same way); a highlighter painting those spans over the
+ * *unfolded* text would paint them one unit late.
  */
 function scoreSubsequence(needle: string, text: string): SearchResult | null {
   if (needle.length === 0) return { score: 0, matches: [] };

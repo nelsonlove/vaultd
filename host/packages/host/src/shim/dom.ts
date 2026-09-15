@@ -670,10 +670,24 @@ export function setIcon(element: unknown, icon: string): void {
   stub("setIcon", undefined);
 }
 
-/** `getIcon(name)` — there is no icon to hand back. */
+/**
+ * `getIcon(name)` — an element for an icon a plugin added, and `null` otherwise.
+ *
+ * The two halves are deliberate. Obsidian's built-in icon set is
+ * **uncaptured**, so a name this host never saw registered answers `null`: a
+ * plugin told "yes, that icon exists" would go on to place something this host
+ * cannot draw. But an icon the plugin registered itself through {@link addIcon}
+ * really is known, and answering `null` for that one would tell a plugin its
+ * own icon failed to register — which is the single thing {@link addedIcons}
+ * exists to prevent, and which {@link getIconIds} already contradicts.
+ */
 export function getIcon(icon: string): StubEl | null {
-  void icon;
-  return stub("getIcon", null);
+  const svg = addedIcons.get(icon);
+  if (svg === undefined) return stub("getIcon", null);
+  const element = new StubEl("svg", { cls: `svg-icon ${icon}` });
+  element.setAttr("data-icon", icon);
+  element.innerHTML = svg;
+  return stub("getIcon", element);
 }
 
 /**
@@ -705,6 +719,20 @@ export function getIconIds(): string[] {
   return stub("getIconIds", [...addedIcons.keys()]);
 }
 
+/** `removeIcon(name)` — really forgets an icon a plugin added. */
+export function removeIcon(iconId: string): void {
+  addedIcons.delete(iconId);
+  stub("removeIcon", undefined);
+}
+
+/** `displayTooltip(el, content)` — the imperative spelling; nothing to hover. */
+export function displayTooltip(element: unknown, content: unknown, options?: unknown): void {
+  void element;
+  void content;
+  void options;
+  stub("displayTooltip", undefined);
+}
+
 /** `setTooltip(el, text)` — there is nothing to hover. */
 export function setTooltip(element: unknown, tooltip: string, options?: unknown): void {
   void element;
@@ -723,8 +751,30 @@ export function setTooltip(element: unknown, tooltip: string, options?: unknown)
  */
 export function sanitizeHTMLToDom(html: string): StubFragment {
   const fragment = new StubFragment();
-  fragment.setText(html.replace(/<[^>]*>/g, ""));
+  fragment.setText(decodeEntities(html.replace(/<[^>]*>/g, "")));
   return stub("sanitizeHTMLToDom", fragment);
+}
+
+/**
+ * The five XML entities, decoded, plus numeric references.
+ *
+ * A browser's parser decodes them on the way in, so a plugin that built
+ * `"Tom &amp; Jerry"` and read the text back sees `"Tom & Jerry"` in Obsidian
+ * and would have seen a literal `&amp;` here. Five is the whole set that
+ * matters; the wider named-entity table is one this host has no reason to
+ * carry, and `&amp;` is decoded **last** so `&amp;lt;` stays `&lt;`.
+ */
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, code: string) =>
+      String.fromCodePoint(Number.parseInt(code, 16)),
+    )
+    .replace(/&amp;/g, "&");
 }
 
 /**
@@ -822,7 +872,9 @@ declarePolicy("createFragment", "safe_stub");
 declarePolicy("setIcon", "safe_stub");
 declarePolicy("getIcon", "safe_stub");
 declarePolicy("addIcon", "safe_stub");
+declarePolicy("removeIcon", "safe_stub");
 declarePolicy("getIconIds", "safe_stub");
 declarePolicy("setTooltip", "safe_stub");
+declarePolicy("displayTooltip", "safe_stub");
 declarePolicy("sanitizeHTMLToDom", "safe_stub");
 declarePolicy("document", "safe_stub");

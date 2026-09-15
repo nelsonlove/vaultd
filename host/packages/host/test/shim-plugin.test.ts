@@ -43,7 +43,7 @@ describe("Plugin base", () => {
           this.registerMarkdownCodeBlockProcessor("demo", () => {});
           this.registerEditorSuggest({});
           this.registerHoverLinkSource("demo", {});
-          this.registerDomEvent(harness.api.activeDocument, "click", () => {});
+          this.registerDomEvent(harness.document, "click", () => {});
           this.register(() => {});
         }
       },
@@ -98,8 +98,8 @@ describe("Plugin base", () => {
       "ticker",
       class extends harness.api.Plugin {
         override async onload(): Promise<void> {
-          this.registerInterval(harness.api.window.setInterval(() => {}, 200));
-          this.registerInterval(harness.api.window.setInterval(() => {}, 30_000));
+          this.registerInterval(harness.window.setInterval(() => {}, 200));
+          this.registerInterval(harness.window.setInterval(() => {}, 30_000));
         }
       },
     );
@@ -192,7 +192,7 @@ describe("Plugin base", () => {
           this.addChild(new Child());
           this.register(() => order.push("registered"));
           this.registerEvent(harness.app.vault.on("create", () => {}));
-          this.registerInterval(harness.api.window.setInterval(() => {}, 1_000));
+          this.registerInterval(harness.window.setInterval(() => {}, 1_000));
           this.addCommand({ id: "a", name: "A", callback: () => {} });
         }
         override onunload(): void {

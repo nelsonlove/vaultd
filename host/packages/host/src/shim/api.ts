@@ -45,6 +45,18 @@
  * throw. They are the clearest "this genuinely does not exist headless" cases
  * in the corpus.
  *
+ * **Which names get a row: the module's published value exports, all of them.**
+ * The list is the `obsidian` package's own typings — published documentation,
+ * never the application bundle — and every value it exports (158 of them at
+ * 1.13.1) carries a row here. A name with no row would resolve to `undefined`
+ * at require time with no diagnostic, so the default for a surface this host
+ * does not provide is `absent`, which refuses by name. The counterpart holds
+ * too: a name Obsidian's module does **not** export gets no row, however
+ * reachable it is here — `window`, `createDiv`, `HTMLElement` and the rest are
+ * *globals*, they are declared in {@link GLOBAL_ONLY_SYMBOLS}, and exporting
+ * them would put a surface in the compatibility report that no capture and no
+ * documentation supports.
+ *
  * **What this file does not declare.** The shim modules declare their own
  * **member** rows at module scope — `MetadataCache.getFileCache`,
  * `Menu.showAtPosition`, `Workspace.openLinkText`, `window.addEventListener`
@@ -58,20 +70,16 @@
 
 import { App } from "./app";
 import { Component, Plugin } from "./plugin";
-import { DataAdapter, FileSystemAdapter } from "./adapter";
+import { FileSystemAdapter } from "./adapter";
 import { Events, Menu, MenuItem } from "./events";
 import { FileManager } from "./file-manager";
 import { MetadataCache } from "./metadata-cache";
 import {
-  StubEl,
-  StubFragment,
   addIcon,
-  createDiv,
-  createEl,
-  createFragment,
-  createSpan,
+  displayTooltip,
   getIcon,
   getIconIds,
+  removeIcon,
   sanitizeHTMLToDom,
   setIcon,
   setTooltip,
@@ -89,8 +97,11 @@ import {
 } from "./workspace";
 import {
   AbstractInputSuggest,
+  AbstractTextComponent,
+  BaseComponent,
   ButtonComponent,
   ColorComponent,
+  DisplayValueComponent,
   DropdownComponent,
   Editor,
   EditorSuggest,
@@ -99,44 +110,55 @@ import {
   Keymap,
   MarkdownRenderChild,
   Modal,
+  MomentFormatComponent,
   PluginSettingTab,
+  PopoverSuggest,
+  ProgressBarComponent,
   Scope,
   SearchComponent,
   SecretComponent,
   Setting,
+  SettingTab,
   SliderComponent,
   SuggestModal,
   TextAreaComponent,
   TextComponent,
   ToggleComponent,
   ValueComponent,
-  hexToRgbValue,
-  rgbToHexValue,
 } from "./components";
 import {
   Platform,
+  arrayBufferToBase64,
+  arrayBufferToHex,
   atLeastVersion,
+  base64ToArrayBuffer,
   createDebounce,
+  createHttp,
   getAllTags,
+  getBlobArrayBuffer,
   getFrontMatterInfo,
   getLanguage,
   getLinkpath,
+  hexToArrayBuffer,
+  iterateCacheRefs,
+  iterateRefs,
   normalizePath,
   parseFrontMatterAliases,
   parseFrontMatterEntry,
   parseFrontMatterStringArray,
   parseFrontMatterTags,
+  parseLinktext,
   parseYaml,
-  request,
-  requestUrl,
   resolveSubpath,
   stringifyYaml,
+  stripHeading,
+  stripHeadingForLink,
 } from "./helpers";
 import { noticeClassFor } from "./notice";
 import {
-  fuzzySearch,
   prepareFuzzySearch,
   prepareSimpleSearch,
+  renderMatches,
   renderResults,
   sortSearchResults,
 } from "./search";
@@ -144,6 +166,7 @@ import { declarePolicy, declaredSymbols, policyOf, unsupported } from "./policy"
 import type { ApiPolicy } from "./policy";
 import type { HostAssembly } from "../testing/assemble";
 import type { HostWindow } from "./globals";
+import type { HttpBindings } from "./helpers";
 import type { Notice } from "./notice";
 import type { StubDocument } from "./dom";
 
@@ -165,104 +188,70 @@ export type ShimDocument = StubDocument;
 
 export const API_POLICY: Readonly<Record<string, ApiPolicy>> = {
   // ---- implemented: real behaviour ----
-  App: "implemented",
-  Plugin: "implemented",
-  Component: "implemented",
-  Events: "implemented",
-  TFile: "implemented",
-  TFolder: "implemented",
-  TAbstractFile: "implemented",
-  Vault: "implemented",
-  DataAdapter: "implemented",
-  MetadataCache: "implemented",
-  FileManager: "implemented",
-  Workspace: "implemented",
-  Notice: "implemented",
-  Menu: "implemented",
-  MenuItem: "implemented",
-  SuggestModal: "implemented",
-  FuzzySuggestModal: "implemented",
-  Platform: "implemented",
-  moment: "implemented",
-  normalizePath: "implemented",
-  parseYaml: "implemented",
-  stringifyYaml: "implemented",
-  parseFrontMatterAliases: "implemented",
-  parseFrontMatterTags: "implemented",
-  parseFrontMatterEntry: "implemented",
-  parseFrontMatterStringArray: "implemented",
-  getFrontMatterInfo: "implemented",
-  getAllTags: "implemented",
-  getLinkpath: "implemented",
-  resolveSubpath: "implemented",
-  requestUrl: "implemented",
-  request: "implemented",
-  requireApiVersion: "implemented",
-  apiVersion: "implemented",
-  getLanguage: "implemented",
-  debounce: "implemented",
-  prepareFuzzySearch: "implemented",
-  prepareSimpleSearch: "implemented",
-  fuzzySearch: "implemented",
-  sortSearchResults: "implemented",
-  hexToRgb: "implemented",
-  rgbToHex: "implemented",
+  App: "implemented", Plugin: "implemented", Component: "implemented",
+  Events: "implemented", TFile: "implemented", TFolder: "implemented",
+  TAbstractFile: "implemented", Vault: "implemented", MetadataCache: "implemented",
+  FileManager: "implemented", Workspace: "implemented", Notice: "implemented",
+  Menu: "implemented", MenuItem: "implemented", SuggestModal: "implemented",
+  FuzzySuggestModal: "implemented", Platform: "implemented", moment: "implemented",
+  apiVersion: "implemented", requireApiVersion: "implemented", getLanguage: "implemented",
+  debounce: "implemented", normalizePath: "implemented", getLinkpath: "implemented",
+  parseLinktext: "implemented", stripHeading: "implemented",
+  stripHeadingForLink: "implemented", resolveSubpath: "implemented",
+  parseYaml: "implemented", stringifyYaml: "implemented",
+  getFrontMatterInfo: "implemented", parseFrontMatterEntry: "implemented",
+  parseFrontMatterStringArray: "implemented", parseFrontMatterAliases: "implemented",
+  parseFrontMatterTags: "implemented", getAllTags: "implemented",
+  iterateCacheRefs: "implemented", iterateRefs: "implemented",
+  prepareFuzzySearch: "implemented", prepareSimpleSearch: "implemented",
+  sortSearchResults: "implemented", requestUrl: "implemented", request: "implemented",
+  arrayBufferToBase64: "implemented", base64ToArrayBuffer: "implemented",
+  arrayBufferToHex: "implemented", hexToArrayBuffer: "implemented",
+  getBlobArrayBuffer: "implemented",
 
   // ---- harvested: recorded as a capability, never rendered ----
-  PluginSettingTab: "harvested",
-  Setting: "harvested",
+  PluginSettingTab: "harvested", Setting: "harvested",
 
   // ---- safe_stub: inert value or no-op, recorded once per plugin+symbol ----
-  WorkspaceLeaf: "safe_stub",
-  View: "safe_stub",
-  ItemView: "safe_stub",
-  FileView: "safe_stub",
-  EditableFileView: "safe_stub",
-  MarkdownView: "safe_stub",
-  FileSystemAdapter: "safe_stub",
-  MarkdownRenderChild: "safe_stub",
-  Scope: "safe_stub",
-  Keymap: "safe_stub",
-  Editor: "safe_stub",
-  EditorSuggest: "safe_stub",
-  AbstractInputSuggest: "safe_stub",
-  Modal: "safe_stub",
-  ValueComponent: "safe_stub",
-  ButtonComponent: "safe_stub",
-  TextComponent: "safe_stub",
-  TextAreaComponent: "safe_stub",
-  DropdownComponent: "safe_stub",
-  ToggleComponent: "safe_stub",
-  SliderComponent: "safe_stub",
-  ExtraButtonComponent: "safe_stub",
-  SearchComponent: "safe_stub",
-  ColorComponent: "safe_stub",
-  SecretComponent: "safe_stub",
-  HTMLElement: "safe_stub",
-  DocumentFragment: "safe_stub",
-  createEl: "safe_stub",
-  createDiv: "safe_stub",
-  createSpan: "safe_stub",
-  createFragment: "safe_stub",
-  setIcon: "safe_stub",
-  addIcon: "safe_stub",
-  setTooltip: "safe_stub",
-  getIcon: "safe_stub",
-  getIconIds: "safe_stub",
-  renderResults: "safe_stub",
-  sanitizeHTMLToDom: "safe_stub",
-  window: "safe_stub",
-  activeWindow: "safe_stub",
-  activeDocument: "safe_stub",
+  WorkspaceLeaf: "safe_stub", View: "safe_stub", ItemView: "safe_stub",
+  FileView: "safe_stub", EditableFileView: "safe_stub", MarkdownView: "safe_stub",
+  FileSystemAdapter: "safe_stub", MarkdownRenderChild: "safe_stub", Scope: "safe_stub",
+  Keymap: "safe_stub", Editor: "safe_stub", EditorSuggest: "safe_stub",
+  AbstractInputSuggest: "safe_stub", PopoverSuggest: "safe_stub", Modal: "safe_stub",
+  SettingTab: "safe_stub", BaseComponent: "safe_stub", ValueComponent: "safe_stub",
+  AbstractTextComponent: "safe_stub", ButtonComponent: "safe_stub",
+  ExtraButtonComponent: "safe_stub", TextComponent: "safe_stub",
+  TextAreaComponent: "safe_stub", SearchComponent: "safe_stub",
+  DropdownComponent: "safe_stub", ToggleComponent: "safe_stub",
+  SliderComponent: "safe_stub", ColorComponent: "safe_stub", SecretComponent: "safe_stub",
+  MomentFormatComponent: "safe_stub", ProgressBarComponent: "safe_stub",
+  DisplayValueComponent: "safe_stub", setIcon: "safe_stub", addIcon: "safe_stub",
+  removeIcon: "safe_stub", getIcon: "safe_stub", getIconIds: "safe_stub",
+  setTooltip: "safe_stub", displayTooltip: "safe_stub", renderResults: "safe_stub",
+  renderMatches: "safe_stub", sanitizeHTMLToDom: "safe_stub",
 
-  // ---- absent: throws typed HeadlessUnsupported ----
-  MarkdownRenderer: "absent",
-  htmlToMarkdown: "absent",
-  renderMath: "absent",
-  finishRenderMath: "absent",
-  loadMathJax: "absent",
-  loadPrism: "absent",
-  loadMermaid: "absent",
+  // ---- absent: throws typed HeadlessUnsupported, by exact name ----
+  BasesEntry: "absent", BasesEntryGroup: "absent", BasesQueryResult: "absent",
+  BasesView: "absent", BasesViewConfig: "absent", BooleanValue: "absent",
+  CapacitorAdapter: "absent", ConfirmationButton: "absent", ConfirmationModal: "absent",
+  DateValue: "absent", DurationValue: "absent", FileValue: "absent", HTMLValue: "absent",
+  HoverPopover: "absent", IconValue: "absent", ImageValue: "absent", LinkValue: "absent",
+  ListValue: "absent", MarkdownEditView: "absent", MarkdownPreviewRenderer: "absent",
+  MarkdownPreviewView: "absent", MarkdownRenderer: "absent", MenuSeparator: "absent",
+  NotNullValue: "absent", NullValue: "absent", NumberValue: "absent",
+  ObjectValue: "absent", PopoverState: "absent", PrimitiveValue: "absent",
+  QueryController: "absent", RegExpValue: "absent", RelativeDateValue: "absent",
+  RenderContext: "absent", SecretStorage: "absent", SettingGroup: "absent",
+  SettingPage: "absent", StringValue: "absent", TagValue: "absent", Tasks: "absent",
+  TextFileView: "absent", UrlValue: "absent", Value: "absent",
+  WorkspaceContainer: "absent", WorkspaceFloating: "absent", WorkspaceItem: "absent",
+  WorkspaceMobileDrawer: "absent", WorkspaceParent: "absent", WorkspaceRibbon: "absent",
+  WorkspaceRoot: "absent", WorkspaceSidedock: "absent", WorkspaceSplit: "absent",
+  WorkspaceTabs: "absent", WorkspaceWindow: "absent", editorEditorField: "absent",
+  editorInfoField: "absent", editorLivePreviewField: "absent", editorViewField: "absent",
+  finishRenderMath: "absent", htmlToMarkdown: "absent", livePreviewState: "absent",
+  loadMathJax: "absent", loadMermaid: "absent", loadPdfJs: "absent", loadPrism: "absent",
+  parsePropertyId: "absent", renderMath: "absent",
 };
 
 /**
@@ -278,12 +267,21 @@ export const API_POLICY: Readonly<Record<string, ApiPolicy>> = {
 export const GLOBAL_ONLY_SYMBOLS: readonly string[] = [
   "app",
   "document",
+  "window",
+  "activeWindow",
+  "activeDocument",
   "localStorage",
   "navigator",
   "i18next",
   "MutationObserver",
   "Element",
   "Node",
+  "HTMLElement",
+  "DocumentFragment",
+  "createEl",
+  "createDiv",
+  "createSpan",
+  "createFragment",
 ];
 
 // ---------------------------------------------------------------------------
@@ -307,7 +305,6 @@ export interface ObsidianApi {
   readonly TFile: typeof TFile;
   readonly TFolder: typeof TFolder;
   readonly Vault: typeof Vault;
-  readonly DataAdapter: typeof DataAdapter;
   readonly FileSystemAdapter: typeof FileSystemAdapter;
   readonly MetadataCache: typeof MetadataCache;
   readonly FileManager: typeof FileManager;
@@ -343,12 +340,6 @@ export interface ObsidianApi {
   readonly SliderComponent: typeof SliderComponent;
   readonly ColorComponent: typeof ColorComponent;
   readonly SecretComponent: typeof SecretComponent;
-  readonly HTMLElement: typeof StubEl;
-  readonly DocumentFragment: typeof StubFragment;
-  readonly createEl: typeof createEl;
-  readonly createDiv: typeof createDiv;
-  readonly createSpan: typeof createSpan;
-  readonly createFragment: typeof createFragment;
   readonly setIcon: typeof setIcon;
   readonly addIcon: typeof addIcon;
   readonly getIcon: typeof getIcon;
@@ -365,25 +356,39 @@ export interface ObsidianApi {
   readonly getFrontMatterInfo: typeof getFrontMatterInfo;
   readonly getAllTags: typeof getAllTags;
   readonly getLinkpath: typeof getLinkpath;
+  readonly parseLinktext: typeof parseLinktext;
+  readonly stripHeading: typeof stripHeading;
+  readonly stripHeadingForLink: typeof stripHeadingForLink;
+  readonly iterateCacheRefs: typeof iterateCacheRefs;
+  readonly iterateRefs: typeof iterateRefs;
+  readonly arrayBufferToBase64: typeof arrayBufferToBase64;
+  readonly base64ToArrayBuffer: typeof base64ToArrayBuffer;
+  readonly arrayBufferToHex: typeof arrayBufferToHex;
+  readonly hexToArrayBuffer: typeof hexToArrayBuffer;
+  readonly getBlobArrayBuffer: typeof getBlobArrayBuffer;
   readonly resolveSubpath: typeof resolveSubpath;
-  readonly requestUrl: typeof requestUrl;
-  readonly request: typeof request;
+  readonly requestUrl: HttpBindings["requestUrl"];
+  readonly request: HttpBindings["request"];
   readonly getLanguage: typeof getLanguage;
-  readonly hexToRgb: typeof hexToRgbValue;
-  readonly rgbToHex: typeof rgbToHexValue;
   readonly prepareFuzzySearch: typeof prepareFuzzySearch;
   readonly prepareSimpleSearch: typeof prepareSimpleSearch;
-  readonly fuzzySearch: typeof fuzzySearch;
   readonly sortSearchResults: typeof sortSearchResults;
   readonly renderResults: typeof renderResults;
+  readonly renderMatches: typeof renderMatches;
+  readonly SettingTab: typeof SettingTab;
+  readonly BaseComponent: typeof BaseComponent;
+  readonly AbstractTextComponent: typeof AbstractTextComponent;
+  readonly PopoverSuggest: typeof PopoverSuggest;
+  readonly MomentFormatComponent: typeof MomentFormatComponent;
+  readonly ProgressBarComponent: typeof ProgressBarComponent;
+  readonly DisplayValueComponent: typeof DisplayValueComponent;
+  readonly removeIcon: typeof removeIcon;
+  readonly displayTooltip: typeof displayTooltip;
   readonly Platform: typeof Platform;
   readonly debounce: ReturnType<typeof createDebounce>;
   readonly apiVersion: string;
   readonly requireApiVersion: (version: string) => boolean;
   readonly moment: HostWindow["moment"];
-  readonly window: ShimWindow;
-  readonly activeWindow: ShimWindow;
-  readonly activeDocument: ShimDocument;
   readonly [symbol: string]: unknown;
 }
 
@@ -402,14 +407,13 @@ export interface ObsidianApi {
  */
 export function createObsidianApi(assembly: Omit<HostAssembly, "api">): ObsidianApi {
   const real = realBindings(assembly);
-  const stubs = stubBindings(assembly);
   const bound: Record<string, unknown> = {};
   for (const [symbol, policy] of Object.entries(API_POLICY)) {
     if (policy === "absent") {
       bound[symbol] = absentBinding(symbol);
       continue;
     }
-    const source = policy === "safe_stub" ? stubs : real;
+    const source = policy === "safe_stub" ? SAFE_STUBS : real;
     if (!Object.prototype.hasOwnProperty.call(source, symbol)) {
       // **At assembly time, not at plugin-load time.** A table entry with no
       // binding is a host bug: the symbol would be exported as `undefined` and
@@ -440,7 +444,6 @@ function realBindings(assembly: Omit<HostAssembly, "api">): Record<string, unkno
     TFolder,
     TAbstractFile,
     Vault,
-    DataAdapter,
     MetadataCache,
     FileManager,
     Workspace,
@@ -461,16 +464,25 @@ function realBindings(assembly: Omit<HostAssembly, "api">): Record<string, unkno
     getFrontMatterInfo,
     getAllTags,
     getLinkpath,
+    parseLinktext,
+    stripHeading,
+    stripHeadingForLink,
+    iterateCacheRefs,
+    iterateRefs,
+    arrayBufferToBase64,
+    base64ToArrayBuffer,
+    arrayBufferToHex,
+    hexToArrayBuffer,
+    getBlobArrayBuffer,
     resolveSubpath,
-    requestUrl,
-    request,
     getLanguage,
     prepareFuzzySearch,
     prepareSimpleSearch,
-    fuzzySearch,
     sortSearchResults,
-    hexToRgb: hexToRgbValue,
-    rgbToHex: rgbToHexValue,
+    // Bound to this host's network policy: a harness refuses before a socket is
+    // opened, production forwards. The policy row stays `implemented` either
+    // way — this host *can* reach the network; this run may not.
+    ...createHttp(config),
     // `new Notice(...)` records into this host's log, in every mode — dry-run
     // or not. `host.invoke_command` reads that log through `mark()`/`since()`,
     // so a notice a command produced reaches its caller.
@@ -489,28 +501,16 @@ function realBindings(assembly: Omit<HostAssembly, "api">): Record<string, unkno
 }
 
 /**
- * The `safe_stub` bindings, plus the three that are this host's own objects.
+ * The `safe_stub` bindings: inert values real enough to be held, chained and
+ * `instanceof`-tested.
  *
- * Almost none of them depends on the host: a class that answers `instanceof` is
- * the same class for every host in the process, and a stub function that
- * records a hit reaches the recorder through the policy module's own installed
- * one. The exceptions are `window`, `activeWindow` and `activeDocument`, which
- * must be **the very objects this host installed as globals** — a plugin that
- * arms an interval through `window.setInterval` and clears it through the bare
- * global has to be talking to one registry, or the host leaks a timer it cannot
- * count.
+ * Module-level, because none of them depends on the host — a class that answers
+ * `instanceof` is the same class for every host in the process, and a stub
+ * function that records a hit reaches the recorder through the policy module's
+ * own installed one. The globals that *are* per host — `window`,
+ * `activeDocument`, the element builders — are not exports of Obsidian's module
+ * and are no longer exports of this one either; see {@link GLOBAL_ONLY_SYMBOLS}.
  */
-function stubBindings(assembly: Omit<HostAssembly, "api">): Record<string, unknown> {
-  const { globals } = assembly;
-  return {
-    ...SAFE_STUBS,
-    window: globals.window,
-    activeWindow: globals.window,
-    activeDocument: globals.document,
-  };
-}
-
-/** The host-independent half of the stub bindings. */
 const SAFE_STUBS: Record<string, unknown> = {
   WorkspaceLeaf,
   View,
@@ -537,18 +537,22 @@ const SAFE_STUBS: Record<string, unknown> = {
   SearchComponent,
   ColorComponent,
   SecretComponent,
-  HTMLElement: StubEl,
-  DocumentFragment: StubFragment,
-  createEl,
-  createDiv,
-  createSpan,
-  createFragment,
+  MomentFormatComponent,
+  ProgressBarComponent,
+  DisplayValueComponent,
+  SettingTab,
+  BaseComponent,
+  AbstractTextComponent,
+  PopoverSuggest,
   setIcon,
   addIcon,
+  removeIcon,
   setTooltip,
+  displayTooltip,
   getIcon,
   getIconIds,
   renderResults,
+  renderMatches,
   sanitizeHTMLToDom,
 };
 
@@ -562,7 +566,17 @@ const SAFE_STUBS: Record<string, unknown> = {
  * called as functions.
  */
 function absentBinding(symbol: string): unknown {
-  const refuse = (): never => unsupported(symbol);
+  // A **function declaration**, not an arrow, and the difference is
+  // load-bearing: more than half of the absent rows are published *classes*,
+  // and `class X extends (an arrow function) {}` is a `TypeError` thrown while
+  // the bundle is still evaluating — before the plugin has run a line, and with
+  // a message naming nothing. A plain function is a constructor, so the class
+  // definition succeeds and the refusal lands where the plugin actually reaches
+  // for the thing: at `new X()`, or at the call, naming the symbol either way.
+  function refuse(): never {
+    return unsupported(symbol);
+  }
+  Object.defineProperty(refuse, "name", { value: symbol });
   if (symbol !== "MarkdownRenderer") return refuse;
   return Object.assign(refuse, {
     render: (): never => unsupported("MarkdownRenderer.render"),
@@ -575,30 +589,44 @@ function absentBinding(symbol: string): unknown {
 // ---------------------------------------------------------------------------
 
 /**
- * Declare the table, at module scope, and never a symbol twice.
+ * Declare a table, and never declare a symbol twice.
  *
  * A module that already declared a row keeps it: `dom.ts` says what `setIcon`
  * is, `workspace.ts` says what `MarkdownView` is, and those files carry the
  * reasoning for their own surfaces. The table has to **agree** with them, and a
- * disagreement stops the host here rather than becoming a compatibility report
- * that contradicts itself — this runs at import, so the failure lands before
- * any plugin is loaded and names both policies.
+ * disagreement throws rather than becoming a compatibility report that
+ * contradicts itself.
+ *
+ * Exported so the guard itself can be tested. `declarePolicy` is
+ * last-write-wins, so a second declaration of the same symbol is invisible at
+ * runtime and an assertion about it can only be decorative; the real property
+ * is *this throw*, and a case that hands this function a contradicting table is
+ * a real test of it.
+ *
+ * @param table the rows to declare
+ * @param alreadyDeclared what the modules declared before this table was seen
  */
-/** What the imports above declared, before this file adds anything. */
-const declaredByModules = new Set(declaredSymbols());
-
-for (const [symbol, policy] of Object.entries(API_POLICY)) {
-  if (!declaredByModules.has(symbol)) {
-    declarePolicy(symbol, policy);
-    continue;
-  }
-  const declared = policyOf(symbol);
-  if (declared !== policy) {
-    throw new Error(
-      `the obsidian barrel says ${symbol} is ${policy}, and its own module already declared it ${declared}`,
-    );
+export function declareTable(
+  table: Readonly<Record<string, ApiPolicy>>,
+  alreadyDeclared: ReadonlySet<string>,
+): void {
+  for (const [symbol, policy] of Object.entries(table)) {
+    if (!alreadyDeclared.has(symbol)) {
+      declarePolicy(symbol, policy);
+      continue;
+    }
+    const declared = policyOf(symbol);
+    if (declared !== policy) {
+      throw new Error(
+        `the obsidian barrel says ${symbol} is ${policy}, and its own module already declared it ${declared}`,
+      );
+    }
   }
 }
+
+// At module scope, so importing the barrel is all it takes for the whole
+// surface to appear in the report — with nothing constructed and no vault open.
+declareTable(API_POLICY, new Set(declaredSymbols()));
 
 // The members of the two absent surfaces that are reached through a static
 // rather than by calling the export itself.

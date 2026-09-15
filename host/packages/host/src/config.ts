@@ -72,6 +72,22 @@ export interface HostConfig {
   readonly clock: Clock;
   /** The version the shim reports as Obsidian's own. */
   readonly appVersion: string;
+  /**
+   * May a plugin reach the network through `requestUrl`/`request`?
+   *
+   * **True in production, false in every harness.** `requestUrl` exists in
+   * Obsidian to bypass the renderer's CORS rules; a Node process has none to
+   * bypass, so the honest implementation is the request itself and the policy
+   * row stays `implemented`. The switch is here rather than in the policy
+   * because "can this host reach the internet" is a property of the *run*, not
+   * of the API: a test suite that loads real community bundles must not be able
+   * to phone home, and a production host must be able to.
+   *
+   * When it is false, `requestUrl` and `request` throw a typed `NetworkRefused`
+   * naming the URL — before any socket is opened. Task 19's dry-run gate layers
+   * its own refusal on top of this one.
+   */
+  readonly allowNetwork: boolean;
   readonly promptTimeoutMs: number;
   readonly quarantineFailures: number;
   readonly quarantineWindowMs: number;
@@ -249,6 +265,9 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     socketPath: socketPathFor(dataDir, vaultRoot),
     clock: systemClock(),
     appVersion: "1.7.7",
+    // Production can reach the network; `ShimHarness` turns this off for itself
+    // so no test run can make a request, whatever bundle it loads.
+    allowNetwork: true,
     promptTimeoutMs: 120_000,
     quarantineFailures: 5,
     quarantineWindowMs: 60_000,
