@@ -281,6 +281,35 @@ describe("module interception", () => {
     void harness;
   });
 
+  it("shares one layer chain between the src and dist copies of itself", async () => {
+    // **Two copies of `intercept.ts` exist in a test process** — Vitest's
+    // transform of `src/`, and Node's `dist/` if a package pulls it in — and
+    // two module-level chains over one `Module._load` would re-open the
+    // stranded-patch bug the chain exists to close. The chain therefore lives
+    // in the same process cell the module registries do, and this loads the
+    // module under both paths to prove it.
+    const slot = Module as unknown as { _load: unknown };
+    const nodesOwn = slot._load;
+    const harness = await ShimHarness.withVault({});
+    const dist = nodeRequire(
+      join(HOST_ROOT, "packages", "host", "dist", "runtime", "intercept.js"),
+    ) as { installModuleInterception: typeof installModuleInterception };
+    expect(dist.installModuleInterception, "the dist copy is a different function object").not.toBe(
+      installModuleInterception,
+    );
+
+    const fromSrc = installModuleInterception({ hostModulePaths: [], allowNodeBuiltins: true });
+    const fromDist = dist.installModuleInterception({ hostModulePaths: [], allowNodeBuiltins: true });
+    // Out of order, across the two copies: the bottom layer belongs to one
+    // module instance and the top to the other.
+    fromSrc.restore();
+    expect(slot._load).not.toBe(nodesOwn);
+    expect(typeof (nodeRequire("obsidian") as { normalizePath: unknown }).normalizePath).toBe("function");
+    fromDist.restore();
+    expect(slot._load, "one chain, so unwinding it reaches Node's own _load").toBe(nodesOwn);
+    void harness;
+  });
+
   it("restores Module._load, and the workspace link answers on its own after that", async () => {
     const harness = await ShimHarness.withVault({});
     const interception = intercepting();
@@ -496,9 +525,15 @@ describe("the loader's plugin lifecycle", () => {
     // Its command was harvested before the throw. A report that still listed it
     // would be offering an entry point into a plugin that is not there.
     expect(harness.harvest.commands()).toEqual([]);
-    // And its interval was armed before the throw. This is why the rollback
-    // runs the full teardown rather than only clearing the registry.
+    // Three timers were armed before the throw: one handed to
+    // `registerInterval`, which the component teardown disarms, and two bare
+    // ones it cannot see. **Both halves go.** A timer left armed here would go
+    // on firing into a plugin that is gone, on this host's own clock, with
+    // nobody to attribute it to — see `shim/timers.ts`.
     expect(harness.activeTimerCount()).toBe(0);
+    // And the loader no longer holds it: a plugin that never finished loading
+    // is not one a caller asking "what is loaded under this id" may be handed.
+    expect(loader.instance("throwing")).toBeNull();
     // Reported as well as rejected: "swallowed" and "reported" look identical
     // from outside, so the failure goes to both places.
     const reported = harness.hostErrors.filter(
@@ -676,15 +711,14 @@ describe("every golden bundle, through the loader", () => {
   for (const id of GOLDENS) {
     it(`loads ${id} and enters onload`, async () => {
       const run = await loadGolden(id);
-      const plugin = run.loader.instance(run.id);
-      if (plugin === null) throw new Error(`${id} produced no plugin instance`);
-      // `_loaded` goes true before `onload` runs and stays true through a
-      // rollback, so it says exactly what this task claims and nothing more:
-      // the bundle evaluated, the class constructed, and the plugin's own
-      // `onload` was entered.
-      expect(plugin._loaded).toBe(true);
       const expected = KNOWN_ONLOAD_FAILURE.get(id);
       if (expected === undefined) {
+        const plugin = run.loader.instance(run.id);
+        if (plugin === null) throw new Error(`${id} produced no plugin instance`);
+        // `_loaded` goes true before `onload` runs, so it says exactly what this
+        // task claims and nothing more: the bundle evaluated, the class
+        // constructed, and the plugin's own `onload` was entered.
+        expect(plugin._loaded).toBe(true);
         expect(run.error).toBeNull();
         expect(run.harness.hostErrors.map((entry) => String(entry.error))).toEqual([]);
         // Registered **before** `onload`, which is what Obsidian does and what
@@ -694,19 +728,18 @@ describe("every golden bundle, through the loader", () => {
         expect(run.harness.app.plugins.isEnabled(run.id)).toBe(true);
         expect(plugin.isLoaded).toBe(true);
       } else {
+        // `PluginLoadFailed` is thrown from the `onload` path and nowhere else,
+        // after the plugin was constructed and registered — so its presence is
+        // this branch's "evaluated, constructed, entered `onload`" assertion.
         expect(run.error).toBeInstanceOf(PluginLoadFailed);
         expect(run.harness.hostErrors.map((entry) => String(entry.error)).join("\n")).toMatch(expected);
-        // And rolled back: a plugin whose `onload` threw is not running, so it
-        // is not registered, not enabled, and holds no harvest rows.
+        // And rolled back, completely: not registered, not enabled, no harvest
+        // rows, no timers — registered or bare — and not held by the loader.
         expect(run.harness.app.plugins.getPlugin(run.id)).toBeNull();
         expect(run.harness.app.plugins.isEnabled(run.id)).toBe(false);
         expect(run.harness.harvest.unreachable()).toEqual([]);
-        // Not asserted here: the timer count. A rollback undoes what the host
-        // was **told** about — `registerInterval`, `registerEvent`, the harvest
-        // — and a bare `setTimeout` a bundle armed and never registered is not
-        // one of those. Obsidian cannot disarm it either. The dedicated
-        // rollback case above arms a *registered* interval, which is the half
-        // this host does own.
+        expect(run.harness.activeTimerCount()).toBe(0);
+        expect(run.loader.instance(run.id)).toBeNull();
       }
     }, 120_000);
   }

@@ -27,12 +27,23 @@
  * that cannot count its own timers cannot report them.
  */
 
+import { currentPluginId } from "./policy";
 import type { Clock } from "../config";
 
 /** One armed plugin-facing timer, as the module-wide table holds it. */
 interface TimerEntry {
   readonly intervalMs: number;
   readonly repeating: boolean;
+  /**
+   * Whose timer it is, taken from the attribution window at arm time, or `null`
+   * for one the host armed for itself.
+   *
+   * Recorded so that {@link clearTimersOwnedBy} can find a timer a bundle armed
+   * with a **bare** `setInterval` and never handed to `registerInterval`. The
+   * registered ones are disarmed by `Component.unload`; these are the rest, and
+   * without an owner there is no way to tell them from the host's own.
+   */
+  readonly pluginId: string | null;
   /** Disarms it on the clock that armed it. Idempotent. */
   readonly clear: () => void;
 }
@@ -92,6 +103,35 @@ export function liveTimerCount(): number {
 }
 
 /**
+ * Disarm every timer `pluginId` armed that is still armed, and say how many.
+ *
+ * **The bare half of the teardown.** `Component.unload` disarms the timers a
+ * plugin handed to `registerInterval`; this disarms the ones it never did — a
+ * bare `setInterval` in a bundle, which the loader's wrapper routes through
+ * this host's clock and which therefore has an owner even though the plugin
+ * never named it. Called by the loader after the component teardown, so it only
+ * ever sweeps what is left.
+ *
+ * **This goes further than Obsidian, deliberately.** Obsidian cannot disarm an
+ * unregistered timer either, so a plugin that leaked one there leaks it too.
+ * The difference is that this host *owns the clock*: a timer left armed here
+ * goes on firing into a plugin that has been torn down, with no plugin to
+ * attribute it to, and Task 19's idle-cost census would count it against
+ * nobody. Leaving it running is not parity, it is a leak this host can see and
+ * chose not to close.
+ */
+export function clearTimersOwnedBy(pluginId: string): number {
+  let cleared = 0;
+  for (const [id, entry] of [...liveTimers]) {
+    if (entry.pluginId !== pluginId) continue;
+    liveTimers.delete(id);
+    entry.clear();
+    cleared += 1;
+  }
+  return cleared;
+}
+
+/**
  * One host's `window.setTimeout` / `setInterval` pair.
  *
  * Returns **numbers**, because that is what `window.setInterval` returns in a
@@ -119,12 +159,16 @@ export class ShimTimers {
   }
 
   private arm(callback: () => void, ms: number, repeating: boolean): number {
+    // Taken here and not later: this is the one moment the attribution window
+    // is open around the call that armed it.
+    const pluginId = currentPluginId();
     const id = nextTimerId;
     nextTimerId += 1;
     if (repeating) {
       const handle = this.clock.setInterval(callback, ms);
       liveTimers.set(id, {
         intervalMs: ms,
+        pluginId,
         repeating,
         clear: () => {
           this.clock.clearInterval(handle);
@@ -140,6 +184,7 @@ export class ShimTimers {
     }, ms);
     liveTimers.set(id, {
       intervalMs: ms,
+      pluginId,
       repeating,
       clear: () => {
         this.clock.clearTimeout(handle);

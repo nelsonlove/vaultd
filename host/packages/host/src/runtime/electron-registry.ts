@@ -1,5 +1,7 @@
 /**
- * The two module registries the workspace's stand-in packages read through.
+ * The process's module-system cell: the two registries the workspace's stand-in
+ * packages read through, the module objects a bundle is handed, and the
+ * interception layer chain over `Module._load`.
  *
  * `host/node_modules/obsidian` and `host/node_modules/electron` are links to
  * `packages/obsidian` and `packages/electron`, two three-line CommonJS files
@@ -82,6 +84,16 @@ interface ModuleRegistry {
    */
   obsidianModule: ObsidianApi | null;
   electronModule: ElectronStub | null;
+  /**
+   * `runtime/intercept.ts`'s layer chain, bottom first.
+   *
+   * Here rather than module-level in that file for exactly the reason the
+   * registries are: two copies of a module in one process are two independent
+   * chains over **one** `Module._load`, and an out-of-order restore across them
+   * re-opens the stranded-patch bug the chain exists to close. The element type
+   * belongs to `intercept.ts`, which casts; this file only owns the cell.
+   */
+  interceptionLayers: unknown[];
 }
 
 const CELL = Symbol.for("vaultd.host.moduleRegistry");
@@ -95,6 +107,7 @@ function registry(): ModuleRegistry {
     obsidian: null,
     obsidianModule: null,
     electronModule: null,
+    interceptionLayers: [],
   };
   holder[CELL] = fresh;
   return fresh;
@@ -198,6 +211,16 @@ export function obsidianModule(): ObsidianApi {
   const cell = registry();
   cell.obsidianModule ??= forwarding<ObsidianApi>(currentObsidianApi);
   return cell.obsidianModule;
+}
+
+/**
+ * The one interception layer chain in this process. See the field's own note.
+ *
+ * A live array rather than a getter/setter pair, so every copy of
+ * `intercept.ts` mutates the same list rather than each holding its own.
+ */
+export function interceptionLayers(): unknown[] {
+  return registry().interceptionLayers;
 }
 
 /** The `electron` module object, live. Built once per process. */

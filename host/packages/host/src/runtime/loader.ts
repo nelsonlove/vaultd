@@ -40,6 +40,7 @@
 import Module from "node:module";
 import { dirname } from "node:path";
 
+import { clearTimersOwnedBy } from "../shim/timers";
 import { stub } from "../shim/policy";
 import type { App } from "../shim/app";
 import type { DispatchQueue } from "./queue";
@@ -346,6 +347,13 @@ export class BundleLoader implements PluginLoader {
       // `unload` never throws — `Component.unload` is written not to — so the
       // rollback cannot itself bury the cause.
       await this.unload(id);
+      // **And the loader does not hold it either.** `unload` deliberately keeps
+      // its map entry — a plugin the host loaded and then tore down is one it
+      // knows about, and `Component.unload`'s own idempotence is what a second
+      // call is meant to exercise. A plugin that never finished loading is a
+      // different thing: nothing may hand it back, or a caller asking "what is
+      // loaded under this id" gets an instance that was rolled back.
+      this.instances.delete(id);
       this.deps.errors.report(error, id, "onload");
       throw new PluginLoadFailed(id, { cause: error });
     }
@@ -367,6 +375,14 @@ export class BundleLoader implements PluginLoader {
     });
     this.deps.events.detachOwner(id);
     this.deps.harvest.forgetPlugin(id);
+    // **After the component teardown, so it only sweeps what is left.**
+    // `Component.unload` disarms the timers the plugin handed to
+    // `registerInterval`; this disarms the ones it never did — a bare
+    // `setInterval` in a bundle, which the loader's wrapper routes through this
+    // host's clock. Obsidian cannot disarm those either, but this host owns the
+    // clock: one left armed goes on firing into a plugin that is gone, with
+    // nobody to attribute it to. See `shim/timers.ts`.
+    clearTimersOwnedBy(id);
     this.deps.app.plugins.deregister(id);
   }
 

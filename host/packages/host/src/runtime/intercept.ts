@@ -45,7 +45,7 @@
 import Module from "node:module";
 
 import { FS_MODULE_SPECIFIERS } from "./fs-access";
-import { electronModule, obsidianModule } from "./electron-registry";
+import { electronModule, interceptionLayers, obsidianModule } from "./electron-registry";
 import { currentPluginId, declarePolicy, refuseInDryRun } from "../shim/policy";
 import type { Harvest } from "../shim/harvest";
 
@@ -167,8 +167,20 @@ interface Layer {
   patched: LoadFn;
 }
 
-/** Every interception installed and not yet restored, bottom first. */
-const layers: Layer[] = [];
+/**
+ * Every interception installed and not yet restored, bottom first.
+ *
+ * **In the process cell, not module-level**, and for the same reason
+ * `electron-registry.ts` keeps its registries there: a test process holds two
+ * copies of this file — Vitest's transform of `src/`, and Node's `dist/` if a
+ * package pulls it in — and two module-level arrays would be two independent
+ * chains over **one** `Module._load`. Restoring out of order across them is
+ * exactly the stranded-patch failure the chain exists to close, so the chain
+ * has to be the process's, not the module instance's.
+ */
+function layerStack(): Layer[] {
+  return interceptionLayers() as Layer[];
+}
 
 /**
  * One inert stub module per `@codemirror/*` specifier, for the life of the
@@ -238,7 +250,7 @@ export function installModuleInterception(options: InterceptionOptions): Interce
   }
 
   layer.patched = patched;
-  layers.push(layer);
+  layerStack().push(layer);
   slot._load = patched;
 
   return {
@@ -246,13 +258,14 @@ export function installModuleInterception(options: InterceptionOptions): Interce
       if (restored) return;
       restored = true;
       layer.active = false;
-      const at = layers.indexOf(layer);
+      const stack = layerStack();
+      const at = stack.indexOf(layer);
       if (at !== -1) {
-        layers.splice(at, 1);
+        stack.splice(at, 1);
         // After the splice, index `at` is the layer that sat directly above
         // this one. Re-link it past this layer, so a chain that is later
         // unwound from the top reaches Node's own `_load` and nothing else.
-        const above = layers[at];
+        const above = stack[at];
         if (above !== undefined && above.delegate === patched) above.delegate = layer.delegate;
       }
       // Only the top layer owns the slot. Any other position is already handled
