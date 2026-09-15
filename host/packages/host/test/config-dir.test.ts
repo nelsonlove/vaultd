@@ -12,8 +12,22 @@
 
 import { describe, expect, it } from "vitest";
 
-import { HeadlessConfigDir } from "../src/pluginset/config-dir";
+import { HeadlessConfigDir, ManifestIdMismatch } from "../src/pluginset/config-dir";
+import { HostErrors } from "../src/shim/errors";
 import { DaemonHarness } from "../src/testing/daemon-harness";
+import { PluginSetHarness } from "../src/testing/pluginset-harness";
+import type { HostErrorEntry } from "../src/shim/errors";
+
+/** A directory with a collector on its error seam, so a report can be asserted. */
+function withErrorSeam(harness: DaemonHarness): {
+  dir: HeadlessConfigDir;
+  reported: HostErrorEntry[];
+} {
+  const errors = new HostErrors();
+  const reported: HostErrorEntry[] = [];
+  errors.onError((error, pluginId, phase) => reported.push({ error, pluginId, phase }));
+  return { dir: new HeadlessConfigDir(harness.client, harness.config, errors), reported };
+}
 
 describe("HeadlessConfigDir", () => {
   it("creates the two folders idempotently", async () => {
@@ -81,5 +95,111 @@ describe("HeadlessConfigDir", () => {
     expect(gui.request).toEqual({ method: "read_file", params: { path: ".obsidian/app.json" } });
     harness.respondReadFile(gui.id, JSON.stringify({ trashOption: "local" }), "blake3:a1");
     await expect(reading).resolves.toEqual({ trashOption: "local" });
+  });
+
+  /**
+   * A **file** sitting on the directory's name is `target_exists`, and the
+   * daemon answers the *second* create with it too — so swallowing the code,
+   * as the brief instructed, would make both calls look like success and send
+   * the host on to write into a directory that cannot exist. An existing
+   * *folder* is plain success and needs no swallowing at all.
+   */
+  it("surfaces a target_exists out of ensure rather than swallowing it", async () => {
+    const harness = DaemonHarness.create();
+    const dir = new HeadlessConfigDir(harness.client, harness.config);
+    const pending = dir.ensure();
+    const first = await harness.nextRequest();
+    harness.respondErr(first.id, {
+      code: "target_exists",
+      message: ".obsidian-headless is a file",
+    });
+    await expect(pending).rejects.toMatchObject({ code: "target_exists" });
+    // And it stopped there: no second create was sent against a name it already
+    // knows it cannot use.
+    await harness.quiesce();
+    expect(harness.pendingRequests()).toEqual([]);
+  });
+
+  /**
+   * `not_found` is the only code that means "there is no file there". A
+   * `zone_violation`, a `payload_too_large`, a `target_exists` from a read (the
+   * daemon's code for "this path is a directory") each mean something is wrong
+   * that a caller wants to hear about; folding them into an empty answer is how
+   * a host reports an empty plugin set on a broken vault.
+   */
+  it("lets an error that is not not_found through", async () => {
+    const harness = DaemonHarness.create();
+    const dir = new HeadlessConfigDir(harness.client, harness.config);
+    const reading = dir.readEnabledSet();
+    const read = await harness.nextRequest();
+    harness.respondErr(read.id, { code: "zone_violation", message: "refused" });
+    await expect(reading).rejects.toMatchObject({ code: "zone_violation" });
+  });
+
+  /**
+   * A damaged enabled set degrades to `[]` **and says so**, once.
+   *
+   * It cannot throw: this read runs on the 60 s coexistence poll, and a throw
+   * there takes the poll down and leaves the host blind rather than merely
+   * empty. It cannot be silent either — that is the "quietly disabled every
+   * plugin the user had enabled" failure the doc comment argues against. And it
+   * reports once per spell of damage rather than once per read, because the
+   * poll would otherwise report the same broken file 1,440 times a day.
+   */
+  it("reports a corrupt enabled set once and answers empty", async () => {
+    const harness = DaemonHarness.create();
+    const { dir, reported } = withErrorSeam(harness);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const reading = dir.readEnabledSet();
+      const read = await harness.nextRequest();
+      harness.respondReadFile(read.id, '{"not": "an array"}', "blake3:c9");
+      await expect(reading).resolves.toEqual([]);
+    }
+    expect(reported.map((entry) => [entry.pluginId, entry.phase])).toEqual([["host", "config"]]);
+    expect(String((reported[0] as HostErrorEntry).error)).toContain("must be a JSON array");
+  });
+
+  /** A manifest whose id is not its folder is a typed refusal, not a preference. */
+  it("refuses a manifest whose id disagrees with its folder", async () => {
+    const harness = DaemonHarness.create();
+    const dir = new HeadlessConfigDir(harness.client, harness.config);
+    const reading = dir.readManifest("folder-notes");
+    const read = await harness.nextRequest();
+    expect(read.request).toEqual({
+      method: "read_file",
+      params: { path: ".obsidian-headless/plugins/folder-notes/manifest.json" },
+    });
+    harness.respondReadFile(
+      read.id,
+      JSON.stringify({ id: "folder-notes-fork", name: "N", version: "1", minAppVersion: "1" }),
+      "blake3:m1",
+    );
+    await expect(reading).rejects.toBeInstanceOf(ManifestIdMismatch);
+    await reading.catch((error: ManifestIdMismatch) => {
+      expect(error.code).toBe("manifest_id_mismatch");
+      expect(error.pluginId).toBe("folder-notes");
+      expect(error.declaredId).toBe("folder-notes-fork");
+    });
+  });
+
+  /**
+   * `dataPath` and `Plugin.saveData` name the same file.
+   *
+   * Asserted against the bytes a real `saveData` puts on the wire rather than
+   * against a second copy of the literal, because the claim is that the two
+   * agree — and two literals in two files agree right up until someone changes
+   * one of them. They share {@link pluginDataPath} now; this is what holds them
+   * to it.
+   */
+  it("names the same data.json a plugin's saveData writes", async () => {
+    const harness = await PluginSetHarness.create({ hostEnabled: [], guiEnabled: [] });
+    expect(harness.dir.dataPath("demo")).toBe(".obsidian-headless/plugins/demo/data.json");
+    const plugin = harness.instantiate("demo", class extends harness.api.Plugin {});
+    const saving = plugin.saveData({ enabled: true });
+    const sent = await harness.expectRequest("write_file");
+    expect((sent.request.params as { path: string }).path).toBe(harness.dir.dataPath("demo"));
+    harness.respondOk(sent.id, "write_file", { revision: "blake3:d1", semantic: false });
+    await saving;
+    await harness.stop();
   });
 });

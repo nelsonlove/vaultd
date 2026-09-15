@@ -36,6 +36,7 @@
  * have to cover it.
  */
 
+import { HostErrors } from "../shim/errors";
 import type { HostConfig } from "../config";
 import type { PluginManifest } from "../shim/plugin";
 import type { ReadFileResponse, WriteFileResponse } from "../client/protocol";
@@ -46,14 +47,54 @@ export type { PluginManifest };
 /**
  * Obsidian's own config directory: read for the fallback ladder, never written.
  *
- * Exported because `coexistence.ts` reads one file out of it directly, and a
- * second literal `".obsidian"` in the same folder is a second place to have to
- * change it.
+ * **This is the package's one definition of the string.** `shim/vault.ts` and
+ * `shim/internal-plugins.ts` each had a private copy of it — three literals for
+ * one fact — and both now import this one. The dependency runs shim → pluginset
+ * rather than the other way: where a file lives is a lower-level fact than what
+ * the shim does with it, and `config-dir.ts` names nothing from the shim at
+ * runtime (its `PluginManifest` import is type-only, and erased).
  */
 export const OBSIDIAN_CONFIG_DIR = ".obsidian";
 
 /** The one file name the enabled set lives in, in either directory. */
 const COMMUNITY_PLUGINS = "community-plugins.json";
+
+/**
+ * A plugin's folder inside a config directory.
+ *
+ * Exported, and `shim/plugin.ts` calls it, because `Plugin.saveData` and
+ * {@link HeadlessConfigDir.dataPath} must name the same file **by
+ * construction** rather than by two authors agreeing. They were two identical
+ * template strings; a review asked for one, and this is it.
+ */
+export function pluginDirPath(configDirName: string, id: string): string {
+  return `${configDirName}/plugins/${id}`;
+}
+
+/** Where a plugin's settings live. See {@link pluginDirPath}. */
+export function pluginDataPath(configDirName: string, id: string): string {
+  return `${pluginDirPath(configDirName, id)}/data.json`;
+}
+
+/** A `manifest.json` whose `id` is not the folder it sits in. */
+export class ManifestIdMismatch extends Error {
+  readonly code = "manifest_id_mismatch";
+  /** The folder name, which is the id every path this host builds uses. */
+  readonly pluginId: string;
+  /** What the file claims instead. */
+  readonly declaredId: string;
+
+  constructor(pluginId: string, declaredId: string, path: string) {
+    super(
+      `${path} declares id "${declaredId}", which disagrees with its folder "${pluginId}". ` +
+        "Every path this host builds for a plugin — its bundle, its data.json — comes from " +
+        "the folder, so believing the file would give one plugin two identities.",
+    );
+    this.name = "ManifestIdMismatch";
+    this.pluginId = pluginId;
+    this.declaredId = declaredId;
+  }
+}
 
 /** A plugin present in the headless directory, with the manifest it ships. */
 export interface InstalledPlugin {
@@ -69,10 +110,29 @@ export class HeadlessConfigDir {
 
   private readonly client: VaultdClient;
   private readonly config: HostConfig;
+  private readonly errors: HostErrors;
+  /**
+   * Config paths already reported as damaged, so the report happens once.
+   *
+   * The enabled set is re-read on every coexistence poll — once a minute, for
+   * the life of the host — and a file that stays broken would otherwise report
+   * itself 1,440 times a day. Cleared when the path parses again, so a file
+   * that is fixed and then broken a second time reports a second time: "once"
+   * means once per spell of damage, not once per process.
+   */
+  private readonly reportedCorrupt = new Set<string>();
 
-  constructor(client: VaultdClient, config: HostConfig) {
+  /**
+   * `errors` is optional so that the two-argument form the brief pins keeps
+   * working; `assembleShim` passes the host's real sink. Defaulting to a fresh
+   * {@link HostErrors} rather than to nothing means an unwired directory still
+   * prints a damaged config file to stderr instead of losing it — the same
+   * floor `HostErrors.report` describes.
+   */
+  constructor(client: VaultdClient, config: HostConfig, errors: HostErrors = new HostErrors()) {
     this.client = client;
     this.config = config;
+    this.errors = errors;
     this.configDir = config.configDirName;
   }
 
@@ -102,6 +162,20 @@ export class HeadlessConfigDir {
    * there is no number here worth reading, and a caller that needs to know about
    * the indexed segments above the target reads them back with
    * `get_tree_entries` instead of inferring them from this answer.
+   *
+   * **It creates without probing first, which is the answer to a carry from
+   * Task 7.** `adapter.exists` cannot see an unindexed folder, so "is the
+   * directory already there?" is a question this host cannot ask cheaply — it
+   * would have to probe for a file inside it. It never needs to: the create is
+   * the probe, and it is idempotent.
+   *
+   * **The first root-level create costs one resync, once per vault.** Measured
+   * against the release daemon: creating `.obsidian-headless` at the vault root
+   * makes the watcher report `resync_required { watcher_overflow }` and drop to
+   * `catching_up` before returning to `watching`. The nested create, every write
+   * into the directory, and every repeat create are silent. So a caller that
+   * already has a mirror open pays a full re-hydration for it — call `ensure()`
+   * **before** opening the mirror and nobody pays anything.
    */
   async ensure(): Promise<void> {
     await this.client.request<unknown>("create_folder", { path: this.configDir });
@@ -111,19 +185,42 @@ export class HeadlessConfigDir {
   /**
    * The ids this host has enabled: `<configDir>/community-plugins.json`.
    *
-   * **An absent file is `[]`; a corrupt one throws.** The two cases look alike
-   * from a distance and are opposites in practice. A vault this host has never
-   * run in has no such file, and starting with nothing enabled is exactly right.
-   * A file that is there but is not a JSON array of strings is a file somebody
-   * or something damaged, and a host that answered `[]` for it would quietly
-   * disable every plugin the user had enabled — a silent data loss dressed up as
-   * a fresh start. Every error other than `not_found` is let through for the
-   * same reason.
+   * **Absent is `[]` silently. Damaged is `[]` reported.** The two are not the
+   * same fact and must not look the same: a vault this host has never run in has
+   * no such file, and starting with nothing enabled is exactly right; a file
+   * that is there and is not a JSON array of strings is one somebody or
+   * something broke, and answering `[]` for it *silently* would quietly disable
+   * every plugin the user had enabled — a data loss dressed up as a fresh start.
+   *
+   * So it degrades and says so, through the host's error seam, with the plugin
+   * id `"host"` and the phase `config`. The host still starts, because the
+   * alternative — a throw out of a read that runs on a 60 s timer — takes the
+   * coexistence poll down with it and leaves the host blind rather than merely
+   * empty. {@link reportedCorrupt} is what keeps the report to one per spell of
+   * damage.
+   *
+   * A read error that is not `not_found` still propagates: see
+   * {@link readFileOrNull}.
    */
   async readEnabledSet(): Promise<string[]> {
-    const source = await this.readFileOrNull(`${this.configDir}/${COMMUNITY_PLUGINS}`);
+    const path = `${this.configDir}/${COMMUNITY_PLUGINS}`;
+    const source = await this.readFileOrNull(path);
     if (source === null) return [];
-    return parseEnabledSet(source, `${this.configDir}/${COMMUNITY_PLUGINS}`);
+    try {
+      const ids = parseEnabledSet(source, path);
+      this.reportedCorrupt.delete(path);
+      return ids;
+    } catch (error) {
+      this.reportCorrupt(path, error);
+      return [];
+    }
+  }
+
+  /** Report a damaged config file once per spell of damage. See the field. */
+  private reportCorrupt(path: string, error: unknown): void {
+    if (this.reportedCorrupt.has(path)) return;
+    this.reportedCorrupt.add(path);
+    this.errors.report(error, "host", "config");
   }
 
   /**
@@ -234,14 +331,15 @@ export class HeadlessConfigDir {
   /**
    * Where a plugin's settings live: `<configDir>/plugins/<id>/data.json`.
    *
-   * This must agree byte for byte with `Plugin.saveData`'s own path, which is
-   * built from the same two pieces. It is a pure string so that a caller can
+   * This agrees byte for byte with `Plugin.saveData`'s own path because both
+   * call {@link pluginDataPath} — not because two template strings happen to
+   * match. It is a pure string so that a caller can
    * name the file without a round trip — Task 17's config service reads and
    * writes it, and the loader names it in an error long before anything has read
    * it.
    */
   dataPath(id: string): string {
-    return `${this.pluginDir(id)}/data.json`;
+    return pluginDataPath(this.configDir, id);
   }
 
   /** `<configDir>/plugins`. */
@@ -251,7 +349,7 @@ export class HeadlessConfigDir {
 
   /** `<configDir>/plugins/<id>`. */
   pluginDir(id: string): string {
-    return `${this.pluginsDir()}/${id}`;
+    return pluginDirPath(this.configDir, id);
   }
 
   /** `<configDir>/plugins/<id>/manifest.json`. */
@@ -335,11 +433,7 @@ function parseManifest(source: string, id: string, dir: string): PluginManifest 
       throw new Error(`${path} is missing the required string field "${key}"`);
     }
   }
-  if (parsed["id"] !== id) {
-    throw new Error(
-      `${path} declares id "${String(parsed["id"])}", which disagrees with its folder "${id}"`,
-    );
-  }
+  if (parsed["id"] !== id) throw new ManifestIdMismatch(id, String(parsed["id"]), path);
   const manifest: PluginManifest = {
     id,
     name: parsed["name"] as string,

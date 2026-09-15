@@ -150,7 +150,7 @@ export class ShimHarness extends MirrorHarness {
    * point runs through, and the event bus whose attribution window makes a
    * registration the plugin's own.
    */
-  private assembly!: HostAssembly;
+  protected assembly!: HostAssembly;
   /** The plugins this harness has instantiated, by id. */
   private readonly plugins = new Map<string, Plugin>();
   /**
@@ -188,8 +188,16 @@ export class ShimHarness extends MirrorHarness {
     }
   }
 
-  /** Wire the shim around the hydrated mirror. Called once, by a factory. */
-  private assemble(): void {
+  /**
+   * Wire the shim around the hydrated mirror. Called once, by a factory.
+   *
+   * `protected` rather than private because Task 14's `PluginSetHarness` is a
+   * second subclass with its own start sequence: it needs an empty mirror and
+   * a started coexistence monitor, which {@link ShimHarness.start} does not
+   * offer, and a harness that assembled a *second* shim of its own instead
+   * would be testing a wiring production never runs.
+   */
+  protected assemble(): void {
     const assembly = assembleShim({
       config: this.config,
       client: this.client,
@@ -811,7 +819,7 @@ export function sweepStaleDataDirs(root: string): void {
  * request queue and the next `nextRequest()` — which a case expects to be its
  * own write — would hand out a `read_file` instead.
  */
-function configFilePathsFor(harness: ShimHarness): string[] {
+export function configFilePathsFor(harness: ShimHarness): string[] {
   const names = ["app.json", "core-plugins.json", "daily-notes.json", "bookmarks.json"];
   return names.flatMap((name) => [`${harness.config.configDirName}/${name}`, `.obsidian/${name}`]);
 }

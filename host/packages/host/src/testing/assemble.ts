@@ -18,7 +18,9 @@
  */
 
 import { App } from "../shim/app";
+import { CoexistenceMonitor } from "../pluginset/coexistence";
 import { CommandRegistry } from "../shim/commands";
+import { HeadlessConfigDir } from "../pluginset/config-dir";
 import { FileManager } from "../shim/file-manager";
 import { InternalPluginRegistry } from "../shim/internal-plugins";
 import { PluginRegistry } from "../shim/plugin-registry";
@@ -81,6 +83,17 @@ export interface HostAssembly {
    * Task 14b's quarantine listens here.
    */
   readonly errors: HostErrors;
+  /** The headless config directory this host runs plugins out of. */
+  readonly dir: HeadlessConfigDir;
+  /**
+   * The GUI overlap check, wired to the config re-reads and **not started**.
+   *
+   * `start()` is the host lifecycle's call (Task 15), not the assembler's: a
+   * startup overlap refusal has to reach the caller that is about to load
+   * plugins, and an assembler that armed a 60 s timer would also arm one in
+   * every harness that never advances its clock far enough to fire it.
+   */
+  readonly coexistence: CoexistenceMonitor;
   /**
    * The `window`, `document` and prototype extensions this host installed on
    * `globalThis`, and the undo for them.
@@ -296,7 +309,8 @@ export function assembleShim(deps: {
   // before the first synchronous `getPluginById`; `commands` seeds
   // `editor:save-file` and is the map `Plugin.addCommand` delegates into.
   assignOnce(app, "plugins", new PluginRegistry());
-  assignOnce(app, "internalPlugins", new InternalPluginRegistry({ client, mirror, config }));
+  const internalPlugins = new InternalPluginRegistry({ client, mirror, config });
+  assignOnce(app, "internalPlugins", internalPlugins);
   assignOnce(
     app,
     "commands",
@@ -311,6 +325,28 @@ export function assembleShim(deps: {
   // process never read each other's wiring — see `shim/plugin.ts`.
   installPluginHost(app, { config, client, writes, harvest, events, queue, clock, errors });
 
+  // The headless config directory and the GUI overlap check, and the one piece
+  // of wiring that makes the poll worth having.
+  //
+  // **Ruling W7 is the whole reason this is here.** The daemon announces a raw
+  // write into `.obsidian/` that *it* performed; a GUI Obsidian editing those
+  // files is not watched and raises nothing. So there is no event for "the user
+  // changed a setting in the GUI", and the only mechanism left is to look —
+  // once a minute, on this host's clock. Hanging the two config re-reads off
+  // that one tick is what keeps it to one timer for one class of problem.
+  //
+  // `Vault.reprimeConfig` rather than `configReady`: the latter returns
+  // immediately once the cache is warm, so on a poll it would re-read nothing,
+  // ever. `InternalPluginRegistry.refresh()` with no argument re-reads all
+  // three of its files, which is right here — the poll is told nothing about
+  // what changed, because nothing told it anything changed.
+  const dir = new HeadlessConfigDir(client, config, errors);
+  const coexistence = new CoexistenceMonitor(dir, client, config, errors);
+  coexistence.onPoll(async () => {
+    await internalPlugins.refresh();
+    await vault.reprimeConfig();
+  });
+
   const assembled = {
     config,
     clock,
@@ -323,6 +359,8 @@ export function assembleShim(deps: {
     writes,
     harvest,
     errors,
+    dir,
+    coexistence,
     globals,
     noticeLog,
   };
@@ -339,6 +377,10 @@ export function assembleShim(deps: {
     ...assembled,
     api,
     teardown(): void {
+      // Before the registries, because a poll that fired after the globals were
+      // restored would read a vault this host no longer owns. Idempotent, and a
+      // no-op when nothing ever started it.
+      coexistence.stop();
       clearObsidianApi();
       clearElectronStub();
       globals.restore();

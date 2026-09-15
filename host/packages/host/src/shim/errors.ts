@@ -27,6 +27,15 @@
  * the rejection of a command a plugin started has no caller left to reach. It
  * lands here instead of becoming an unhandled rejection with no plugin name on
  * it.
+ *
+ * `config` is the host's own failure rather than any plugin's, and it carries
+ * the plugin id `"host"`: a damaged `community-plugins.json`, a coexistence
+ * poll whose read failed, a subscriber to that poll that threw. It is a
+ * separate phase rather than a stretched `plugin-data` so that Task 14b's
+ * quarantine — which counts failures *per plugin* to decide which one to stop
+ * trusting — can tell "the host could not read its own config" apart from "this
+ * plugin keeps breaking", and never quarantines anything on the strength of the
+ * former.
  */
 export type HostErrorPhase =
   | "onload"
@@ -34,7 +43,8 @@ export type HostErrorPhase =
   | "teardown"
   | "menu-hook"
   | "plugin-data"
-  | "command";
+  | "command"
+  | "config";
 
 export type HostErrorListener = (error: unknown, pluginId: string, phase: HostErrorPhase) => void;
 

@@ -37,6 +37,7 @@
 
 import { declarePolicy, recordUse, stub } from "./policy";
 import { clearTimerById, intervalMsOf } from "./timers";
+import { pluginDataPath } from "../pluginset/config-dir";
 import { VaultdError } from "../client/errors";
 import type { App } from "./app";
 import type { EventRef, ShimEventBus } from "./events";
@@ -681,9 +682,16 @@ export abstract class Plugin extends Component {
     await this.host.writes.send<WriteFileResponse>("write_file", params);
   }
 
-  /** `<hostConfigDir>/plugins/<id>/data.json`. Never `.obsidian/`. */
+  /**
+   * `<hostConfigDir>/plugins/<id>/data.json`. Never `.obsidian/`.
+   *
+   * Through the shared helper rather than a template string of its own, so that
+   * this and `HeadlessConfigDir.dataPath` cannot drift: Task 17's config service
+   * reads the file this method writes, and the two naming it independently is
+   * the kind of agreement that holds until someone changes one of them.
+   */
   private dataPath(): string {
-    return `${this.host.config.configDirName}/plugins/${this.manifest.id}/data.json`;
+    return pluginDataPath(this.host.config.configDirName, this.manifest.id);
   }
 }
 

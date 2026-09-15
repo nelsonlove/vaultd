@@ -51,13 +51,15 @@
  */
 
 import { declarePolicy, recordUse } from "./policy";
+import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
 import type { HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
 import type { ReadFileResponse } from "../client/protocol";
 import type { VaultdClient } from "../client/client";
 
-/** Obsidian's own config directory, which this host reads and never writes. */
-const OBSIDIAN_CONFIG_DIR = ".obsidian";
+// `OBSIDIAN_CONFIG_DIR` — Obsidian's own config directory, which this host reads
+// and never writes — comes from `pluginset/config-dir.ts`, which holds the
+// package's one copy of the string after a review found three.
 
 /** One entry of `app.internalPlugins.plugins`. */
 export interface InternalPluginEntry {

@@ -34,12 +34,21 @@
  * **The poll tick is also where every other external config edit is noticed.**
  * The same silence covers `core-plugins.json`, `daily-notes.json`,
  * `bookmarks.json` and `app.json`: a GUI edit of any of them reaches no
- * subscriber. So {@link CoexistenceMonitor.onPoll} exists for the assembly to
- * hang `InternalPluginRegistry.refresh()` and `Vault.configReady()` off — one
- * timer for one class of problem, rather than three timers that each notice a
- * third of it at a different moment.
+ * subscriber either. So {@link CoexistenceMonitor.onPoll} is a seam, and
+ * `assembleShim` hangs two things off it — `InternalPluginRegistry.refresh()`
+ * and `Vault.reprimeConfig()` — so that one timer covers one class of problem
+ * rather than three timers each noticing a third of it at a different moment.
+ * (`Vault.configReady()` cannot be the one that is hung there: it returns
+ * immediately once the cache is warm, so on a poll it would re-read nothing.)
+ *
+ * **Wired, not started.** `assembleShim` builds the monitor and its
+ * subscriptions; it does not arm the poll, because "this host is now running"
+ * is a lifecycle decision and a startup overlap refusal has to reach the caller
+ * that is about to load plugins. Task 15's host lifecycle calls
+ * {@link CoexistenceMonitor.start}.
  */
 
+import { HostErrors } from "../shim/errors";
 import { OBSIDIAN_CONFIG_DIR } from "./config-dir";
 import type { HeadlessConfigDir } from "./config-dir";
 import type { HostConfig } from "../config";
@@ -99,6 +108,7 @@ export class CoexistenceMonitor {
   private readonly dir: HeadlessConfigDir;
   private readonly client: VaultdClient;
   private readonly config: HostConfig;
+  private readonly errors: HostErrors;
 
   private timer: NodeJS.Timeout | null = null;
   private report: OverlapReport | null = null;
@@ -107,10 +117,23 @@ export class CoexistenceMonitor {
   /** The poll's own check, so two ticks never interleave two reads. */
   private polling: Promise<void> | null = null;
 
-  constructor(dir: HeadlessConfigDir, client: VaultdClient, config: HostConfig) {
+  /**
+   * `errors` is optional so the three-argument form the brief pins keeps
+   * working; `assembleShim` passes the host's real sink. Everything this class
+   * catches is reported there — a failed poll, a subscriber that threw — because
+   * "swallowed" and "reported" look identical from outside and only one of them
+   * is a design.
+   */
+  constructor(
+    dir: HeadlessConfigDir,
+    client: VaultdClient,
+    config: HostConfig,
+    errors: HostErrors = new HostErrors(),
+  ) {
     this.dir = dir;
     this.client = client;
     this.config = config;
+    this.errors = errors;
   }
 
   /**
@@ -225,13 +248,31 @@ export class CoexistenceMonitor {
   }
 
   /**
+   * The tick in flight, or nothing. Await it to let one poll finish.
+   *
+   * A tick fans out into a check and every hook, each of which is several
+   * daemon round trips deep, so "the timer has fired" and "the poll has
+   * happened" are different moments. A harness advancing its clock needs the
+   * second one, and draining a fixed number of event-loop turns is a guess;
+   * this is the answer. Task 15's shutdown has the same question.
+   */
+  settled(): Promise<void> {
+    // `=== null` rather than `??`, which the lint rightly refuses: `??` on a
+    // promise-or-null reads as a boolean test of a promise, and that is the
+    // shape of the bug where an always-truthy thenable is mistaken for a value.
+    return this.polling === null ? Promise.resolve() : this.polling;
+  }
+
+  /**
    * One poll tick: re-check, then run the external-config hooks.
    *
-   * **Nothing here may throw.** A timer callback's rejection has no caller, and
-   * a poll that died on one unreadable file would take the next fifty-nine
-   * minutes' worth of ticks with it. A failed check leaves {@link latest}
-   * holding the previous answer, which is the honest state: the host does not
-   * know any more than it did a minute ago.
+   * **Nothing here may throw, and nothing is swallowed either.** A timer
+   * callback's rejection has no caller, and a poll that died on one unreadable
+   * file would take every later tick with it — the 60 s blind window would
+   * quietly become forever. So each failure is caught *and reported* through the
+   * host's error seam, and the tick continues: a failed check leaves
+   * {@link latest} holding the previous answer, which is the honest state, and
+   * one hook throwing does not cost the others their turn.
    *
    * Ticks do not overlap. A check that is somehow still in flight when the next
    * minute arrives absorbs that tick rather than starting a second read.
@@ -241,14 +282,14 @@ export class CoexistenceMonitor {
     const run = (async (): Promise<void> => {
       try {
         await this.check();
-      } catch {
-        // Deliberate: see above. The previous report stands.
+      } catch (error) {
+        this.errors.report(error, "host", "config");
       }
       for (const hook of this.pollSubscribers) {
         try {
           await hook();
-        } catch {
-          // A subscriber's failure is its own; the next one still runs.
+        } catch (error) {
+          this.errors.report(error, "host", "config");
         }
       }
     })().finally(() => {
@@ -282,13 +323,28 @@ export class CoexistenceMonitor {
     }
   }
 
-  /** Install a report, and notify only if the overlap set really moved. */
+  /**
+   * Install a report, and notify only if the overlap set really moved.
+   *
+   * Each subscriber is isolated the way the poll's hooks are, and for a sharper
+   * reason: `record` runs inside {@link check}, which runs inside
+   * {@link assertCanEnable}, which runs on `host.enable_plugin`. Left bare, a
+   * `host.overlap_changed` broadcaster that threw would fail the enable that
+   * happened to notice the change — a plugin refused because something
+   * downstream of the refusal check was broken.
+   */
   private record(report: OverlapReport): void {
     const previous = this.report;
     this.report = report;
     if (previous === null) return;
     if (sameIds(previous.overlap, report.overlap)) return;
-    for (const subscriber of this.overlapSubscribers) subscriber(report);
+    for (const subscriber of this.overlapSubscribers) {
+      try {
+        subscriber(report);
+      } catch (error) {
+        this.errors.report(error, "host", "config");
+      }
+    }
   }
 }
 

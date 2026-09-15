@@ -46,6 +46,7 @@ import { Events } from "./events";
 import { FileIndex, TFile, TFolder } from "./files";
 import { affectedPathsForRename } from "./rename-paths";
 import { stub } from "./policy";
+import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
 import type { VaultdClient } from "../client/client";
 import type {
   GenerationResponse,
@@ -86,15 +87,13 @@ export interface VaultDeps {
 /** How many times `process` re-reads and re-runs its callback before giving up. */
 const PROCESS_ATTEMPTS = 5;
 
-/**
- * Obsidian's own config directory, which the host reads and never writes.
- *
- * The host writes into `HostConfig.configDirName` (`.obsidian-headless`) and
- * reads config host-directory-first with a fallback to here — so a fresh
- * headless config dir inherits the real settings, which is what makes rollover
- * work on day one, while an explicit override wins.
- */
-const OBSIDIAN_CONFIG_DIR = ".obsidian";
+// `OBSIDIAN_CONFIG_DIR` — Obsidian's own config directory, which the host reads
+// and never writes — is imported from `pluginset/config-dir.ts`, which holds the
+// package's one copy of the string after a review found three. The host writes
+// into `HostConfig.configDirName` (`.obsidian-headless`) and reads config
+// host-directory-first with a fallback to there, so a fresh headless config dir
+// inherits the real settings — which is what makes rollover work on day one —
+// while an explicit override wins.
 
 /**
  * `delete` refused because the folder has something in it.
@@ -234,14 +233,21 @@ export class Vault extends Events {
    * for. A key asked for before the prime has landed records nothing: the cache
    * being cold is this host's state, not a fact about the plugin.
    *
-   * **Three ways the cache reloads, and one gap.** A `config_changed` for an
-   * `.obsidian/` write; a write this host itself makes to either file, through
-   * {@link configWritten}; and {@link configReady} for an explicit prime. Each
-   * of them **re-reads** rather than merely dropping, and each is awaited by
-   * whatever triggered it, so the first synchronous `getConfig` after a change
-   * answers the new value. The gap is an external GUI edit of the *host*
-   * directory, which raises no event — Task 14's 60 s config poll is what
-   * closes it.
+   * **Four ways the cache reloads, and what each one covers.** A
+   * `config_changed` for an `.obsidian/` write **the daemon performed**; a write
+   * this host itself makes to either file, through {@link configWritten};
+   * {@link configReady} for an explicit prime; and {@link reprimeConfig}, which
+   * the coexistence poll calls once a minute. Each of them **re-reads** rather
+   * than merely dropping, and each is awaited by whatever triggered it, so the
+   * first synchronous `getConfig` after a change answers the new value.
+   *
+   * The gap the poll closes is wider than an earlier draft of this paragraph
+   * claimed. It is not only an external edit of the *host* directory: Ruling W7
+   * says the daemon emits `config_changed` for raw writes it performs, and a
+   * review's probe confirmed that an external GUI edit of `.obsidian/app.json`
+   * — watched for eight seconds in the `watching` state — emits nothing at all.
+   * So an edit made by the GUI Obsidian in *either* directory reaches no
+   * subscriber, and the poll is what re-reads both.
    */
   getConfig(key: string): unknown {
     const cache = this.configCache;
@@ -651,8 +657,15 @@ export class Vault extends Events {
    * to install bytes that are known to be old. Without it the race is a cache
    * holding the *previous* contents of a file that has just been rewritten,
    * which is the exact staleness this whole path exists to prevent.
+   *
+   * **Public, and unconditional — that is the difference from
+   * {@link configReady}.** `configReady` returns immediately once the cache is
+   * warm, which is right for a prime and useless for a poll: hanging it off the
+   * 60 s tick would re-read nothing, ever, after the first second of the
+   * host's life. The poll needs the re-read to happen *because* nothing told it
+   * anything changed, so it calls this.
    */
-  private reprimeConfig(): Promise<void> {
+  reprimeConfig(): Promise<void> {
     this.configEpoch += 1;
     this.configCache = null;
     this.configLoading = null;
