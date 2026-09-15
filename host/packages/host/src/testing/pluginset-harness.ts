@@ -69,6 +69,8 @@ export class PluginSetHarness extends ShimHarness {
 
   private guiEnabled: string[] | null;
   private hostEnabled: string[];
+  /** Every plugin folder this harness has served, for the `read_dir` answer. */
+  private readonly installedIds = new Set<string>();
 
   protected constructor(spec: PluginSetSpec) {
     super({
@@ -225,8 +227,20 @@ export class PluginSetHarness extends ShimHarness {
     for (const manifest of installed) {
       files[`${this.config.configDirName}/plugins/${manifest.id}/manifest.json`] =
         JSON.stringify(manifest);
+      this.installedIds.add(manifest.id);
     }
     this.autoServeFiles(files);
+    // `listInstalled` lists the directory rather than the enabled set, so a
+    // spec's `installed` has to put its plugins on both wires: a `read_dir` of
+    // the plugins folder and a `read_file` of each manifest. The folder answers
+    // even when nothing is installed — an empty plugins directory and an absent
+    // one are different states, and a harness that served neither would hang.
+    this.autoServeDirs({
+      [`${this.config.configDirName}/plugins`]: [...this.installedIds].map((id) => ({
+        name: id,
+        kind: "folder" as const,
+      })),
+    });
     if (this.guiEnabled === null) this.unserveFile(GUI_COMMUNITY_PLUGINS);
   }
 

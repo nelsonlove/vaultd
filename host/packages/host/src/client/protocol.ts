@@ -696,6 +696,54 @@ export interface ReadFileResponse {
   revision: string;
 }
 
+/**
+ * A `read_dir` entry's kind, from its own `lstat`.
+ *
+ * Open-ended for the same reason `TreeEntryKindDto` is: `docs/protocol.md`'s
+ * evolution rule names this enum explicitly among the values a client must
+ * treat as *unknown* rather than as a protocol error. `other` is already the
+ * daemon's catch-all for a fifo, a socket or a device, so an unrecognized
+ * spelling here means a later daemon split one of those out — not that the
+ * listing is malformed.
+ *
+ * **`symlink` is its own kind and is never `folder`.** A link to a directory
+ * classifies as `symlink`, because the daemon classifies from `lstat` and does
+ * not follow. A client that wants what is behind one asks for the link's own
+ * path and meets the same containment `read_file` takes.
+ */
+export type ReadDirEntryKindDto = "file" | "folder" | "symlink" | "other" | (string & {});
+
+/**
+ * One entry of a directory listing.
+ *
+ * `name` is the entry's own name and never a path — the request already fixed
+ * where the directory is — and it is the filesystem's own spelling. `size` is
+ * present for a regular file and absent for everything else: a folder has no
+ * size worth reporting, and a symlink's would be the length of its target
+ * string rather than of anything a client could read.
+ */
+export interface ReadDirEntryDto {
+  name: string;
+  kind: ReadDirEntryKindDto;
+  size?: number;
+}
+
+/**
+ * The immediate entries of one directory. No recursion, and no `generation`:
+ * nothing a listing reports is indexed, so there is no generation it could be
+ * true at, and naming one would invite a client to treat a listing as a delta.
+ *
+ * `entries` is sorted by `name` in **byte order** — a directory yields in
+ * whatever order the filesystem stored, and a client diffing two listings needs
+ * one. `path` echoes the spelling the *request* used, never the canonicalized
+ * or case-folded filesystem path, so pairing answers to asks needs no
+ * re-derivation.
+ */
+export interface ReadDirResponse {
+  path: string;
+  entries: ReadDirEntryDto[];
+}
+
 export interface OpenSnapshotResponse {
   snapshot_id: string;
   generation: number;

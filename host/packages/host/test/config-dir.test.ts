@@ -183,6 +183,104 @@ describe("HeadlessConfigDir", () => {
   });
 
   /**
+   * `listInstalled` reads the directory, not the enabled set.
+   *
+   * The whole point of the switch: a plugin that is **installed but disabled**
+   * is on disk and absent from `community-plugins.json`, and before `read_dir`
+   * it was invisible to this host. The wire shape is asserted here — one
+   * `read_dir` of `<configDir>/plugins`, then one `read_file` per folder entry —
+   * against the fake; the real daemon proves the same sequence in
+   * `config-dir-real-daemon.test.ts`.
+   */
+  it("lists the plugins directory and reads a manifest per folder", async () => {
+    const harness = DaemonHarness.create();
+    const dir = new HeadlessConfigDir(harness.client, harness.config);
+    const listing = dir.listInstalled();
+    const read = await harness.nextRequest();
+    expect(read.request).toEqual({
+      method: "read_dir",
+      params: { path: ".obsidian-headless/plugins" },
+    });
+    harness.respondReadDir(read.id, ".obsidian-headless/plugins", [
+      // A file beside the folders, and a folder with no manifest: both are
+      // ordinary leftovers, and neither is an installed plugin.
+      { name: "stale.json", kind: "file", size: 42 },
+      { name: "quickadd", kind: "folder" },
+      { name: "folder-notes", kind: "folder" },
+      { name: "empty", kind: "folder" },
+    ]);
+    // Byte order, which the daemon promises and the harness honours.
+    const first = await harness.nextRequest();
+    expect((first.request.params as { path: string }).path).toBe(
+      ".obsidian-headless/plugins/empty/manifest.json",
+    );
+    harness.respondErr(first.id, { code: "not_found", message: "no manifest" });
+    const second = await harness.nextRequest();
+    expect((second.request.params as { path: string }).path).toBe(
+      ".obsidian-headless/plugins/folder-notes/manifest.json",
+    );
+    harness.respondReadFile(
+      second.id,
+      JSON.stringify({
+        id: "folder-notes",
+        name: "Folder notes",
+        version: "1.7.0",
+        minAppVersion: "1.5.0",
+      }),
+      "blake3:m1",
+    );
+    const third = await harness.nextRequest();
+    expect((third.request.params as { path: string }).path).toBe(
+      ".obsidian-headless/plugins/quickadd/manifest.json",
+    );
+    harness.respondReadFile(
+      third.id,
+      JSON.stringify({ id: "quickadd", name: "QuickAdd", version: "1.0", minAppVersion: "1.0" }),
+      "blake3:m2",
+    );
+    const installed = await listing;
+    expect(installed.map((plugin) => plugin.id)).toEqual(["folder-notes", "quickadd"]);
+    expect(installed[0]?.dir).toBe(".obsidian-headless/plugins/folder-notes");
+    expect(installed[0]?.manifest.dir).toBe(".obsidian-headless/plugins/folder-notes");
+    // No read of `community-plugins.json` anywhere: the enabled set is a
+    // different question, and this method no longer asks it.
+    expect(harness.methodsSeen()).toEqual(["read_dir", "read_file", "read_file", "read_file"]);
+  });
+
+  /** A vault this host has never run in has no plugins directory. Not an error. */
+  it("answers empty when the plugins directory is not there", async () => {
+    const harness = DaemonHarness.create();
+    const dir = new HeadlessConfigDir(harness.client, harness.config);
+    const listing = dir.listInstalled();
+    const read = await harness.nextRequest();
+    harness.respondErr(read.id, { code: "not_found", message: "no such directory" });
+    await expect(listing).resolves.toEqual([]);
+  });
+
+  /**
+   * A symlinked plugin folder is skipped **and reported**.
+   *
+   * The daemon classifies from `lstat`, so a link to a directory arrives as
+   * `symlink` rather than `folder` and this host does not follow it. Reported
+   * rather than silently dropped because the person most likely to have made
+   * one is a plugin developer linking a repository checkout into the vault, and
+   * "my plugin does not load and nothing said why" is the worst possible answer
+   * for them.
+   */
+  it("does not follow a symlinked plugin folder, and says so once", async () => {
+    const harness = DaemonHarness.create();
+    const { dir, reported } = withErrorSeam(harness);
+    const listing = dir.listInstalled();
+    const read = await harness.nextRequest();
+    harness.respondReadDir(read.id, ".obsidian-headless/plugins", [
+      { name: "linked-plugin", kind: "symlink" },
+    ]);
+    await expect(listing).resolves.toEqual([]);
+    expect(reported.map((entry) => [entry.pluginId, entry.phase])).toEqual([["host", "config"]]);
+    expect(String((reported[0] as HostErrorEntry).error)).toContain("linked-plugin");
+  });
+
+  /**
    * `dataPath` and `Plugin.saveData` name the same file.
    *
    * Asserted against the bytes a real `saveData` puts on the wire rather than

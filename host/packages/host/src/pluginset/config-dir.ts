@@ -39,7 +39,12 @@
 import { HostErrors } from "../shim/errors";
 import type { HostConfig } from "../config";
 import type { PluginManifest } from "../shim/plugin";
-import type { ReadFileResponse, WriteFileResponse } from "../client/protocol";
+import type {
+  ReadDirEntryDto,
+  ReadDirResponse,
+  ReadFileResponse,
+  WriteFileResponse,
+} from "../client/protocol";
 import type { VaultdClient } from "../client/client";
 
 export type { PluginManifest };
@@ -112,13 +117,14 @@ export class HeadlessConfigDir {
   private readonly config: HostConfig;
   private readonly errors: HostErrors;
   /**
-   * Config paths already reported as damaged, so the report happens once.
+   * Paths already reported as a problem, so the report happens once.
    *
    * The enabled set is re-read on every coexistence poll — once a minute, for
    * the life of the host — and a file that stays broken would otherwise report
-   * itself 1,440 times a day. Cleared when the path parses again, so a file
-   * that is fixed and then broken a second time reports a second time: "once"
-   * means once per spell of damage, not once per process.
+   * itself 1,440 times a day. The plugins directory is listed as often. Cleared
+   * when a path is well again, so a file that is fixed and then broken a second
+   * time reports a second time: "once" means once per spell of trouble, not once
+   * per process.
    */
   private readonly reportedCorrupt = new Set<string>();
 
@@ -211,16 +217,9 @@ export class HeadlessConfigDir {
       this.reportedCorrupt.delete(path);
       return ids;
     } catch (error) {
-      this.reportCorrupt(path, error);
+      this.reportOnce(path, error);
       return [];
     }
-  }
-
-  /** Report a damaged config file once per spell of damage. See the field. */
-  private reportCorrupt(path: string, error: unknown): void {
-    if (this.reportedCorrupt.has(path)) return;
-    this.reportedCorrupt.add(path);
-    this.errors.report(error, "host", "config");
   }
 
   /**
@@ -242,40 +241,66 @@ export class HeadlessConfigDir {
   }
 
   /**
-   * Every plugin this host can see in its directory, with its manifest.
+   * Every plugin installed in this directory, with its manifest.
    *
-   * **It enumerates the enabled set, because protocol version 1 cannot list a
-   * hidden folder.** `get_tree_entries` answers about paths a client names and
-   * says so plainly: "the index lists neither the `.obsidian` zone nor any
-   * hidden folder", and there is no raw directory-listing verb at all. So the
-   * only ids this host can ask about are the ids something already told it
-   * about, and `community-plugins.json` is that something.
+   * **It lists the directory.** One `read_dir` of `<configDir>/plugins`, then
+   * one `manifest.json` per `folder` entry, in the byte order the daemon sorts
+   * its listing into. The enabled set is a different question and this method no
+   * longer asks it — which is the point of the change: a plugin that is
+   * *installed but disabled* is on disk and absent from `community-plugins.json`,
+   * and enumerating the enabled set could never see one. Protocol version 1 had
+   * no way to list a hidden directory at all (`get_tree_entries` says plainly
+   * that "the index lists neither the `.obsidian` zone nor any hidden folder"),
+   * so the fix was the listing operation rather than a bespoke index file in this
+   * directory — a file that would have been exactly the invented format this
+   * layout exists to avoid, and that would have gone stale the first time
+   * anything else wrote a plugin folder.
    *
-   * The consequence, stated rather than hidden: a plugin folder that is present
-   * on disk but absent from the enabled set is invisible here. That is the
-   * "installed but disabled" case, and this method under-reports it. The fix is
-   * a listing operation in the protocol, not a second index file in this
-   * directory — a bespoke file would be exactly the invented format this layout
-   * exists to avoid, and it would go stale the first time anything else wrote a
-   * plugin folder.
+   * **Three things in the listing are not installed plugins, and each is an
+   * ordinary state rather than an error.** A `file` beside the folders (a stray
+   * `stale.json`); a folder with no `manifest.json` (a half-deleted plugin, an
+   * editor's leftover); and an `other` kind. All three are skipped in silence.
    *
-   * An id in the enabled set whose `manifest.json` is missing is skipped rather
-   * than fatal: an enabled set naming a plugin that was deleted from disk is an
-   * ordinary state, and the list is a list of what is *there*.
+   * **A `symlink` is skipped and reported.** The daemon classifies every entry
+   * from its own `lstat`, so a link to a directory arrives as `symlink` and
+   * never as `folder`, and this host does not follow it — following would mean
+   * loading a bundle from wherever the link happens to point, past the
+   * containment the vault's own path rules give every other read. Reported
+   * rather than dropped in silence because the person most likely to have made
+   * one is a plugin developer linking a repository checkout into their vault,
+   * and "my plugin does not load and nothing said why" is the worst answer
+   * available to them. Once per name, like every other report here.
+   *
+   * **A manifest that lies about its id still refuses**, and the refusal takes
+   * the whole listing with it: see {@link ManifestIdMismatch}. That is
+   * deliberate and it is the one failure here that is not degraded — an
+   * identity this host cannot resolve is not a plugin it can skip past, because
+   * every path it would build for *any* plugin in this directory comes from the
+   * same rule the lying manifest breaks.
    */
   async listInstalled(): Promise<InstalledPlugin[]> {
-    const ids = await this.readEnabledSet();
+    const listing = await this.readDirOrNull(this.pluginsDir());
+    if (listing === null) return [];
     const installed: InstalledPlugin[] = [];
-    const seen = new Set<string>();
-    for (const id of ids) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const source = await this.readFileOrNull(this.manifestPath(id));
+    for (const entry of listing) {
+      if (entry.kind === "symlink") {
+        this.reportOnce(
+          `${this.pluginsDir()}/${entry.name}`,
+          new Error(
+            `${this.pluginsDir()}/${entry.name} is a symlink, and this host does not follow one: ` +
+              "a plugin is loaded from inside the vault or not at all. Copy the plugin's folder " +
+              "in, or point the host at the directory the link targets.",
+          ),
+        );
+        continue;
+      }
+      if (entry.kind !== "folder") continue;
+      const source = await this.readFileOrNull(this.manifestPath(entry.name));
       if (source === null) continue;
       installed.push({
-        id,
-        manifest: parseManifest(source, id, this.pluginDir(id)),
-        dir: this.pluginDir(id),
+        id: entry.name,
+        manifest: parseManifest(source, entry.name, this.pluginDir(entry.name)),
+        dir: this.pluginDir(entry.name),
       });
     }
     return installed;
@@ -363,10 +388,30 @@ export class HeadlessConfigDir {
   }
 
   /**
-   * {@link readFile}, with `not_found` turned into `null`.
+   * One directory's immediate entries, or `null` when there is no such
+   * directory.
    *
-   * **Only `not_found`.** A `target_exists` (the code the daemon answers when a
-   * path is a directory rather than a regular file), a `zone_violation`, a
+   * The same absence rule {@link readFileOrNull} follows, for the same reason: a
+   * vault this host has never run in has no `<configDir>/plugins`, and that is
+   * an answer rather than a failure. A `target_exists` — the daemon's code for
+   * "this path is not a directory", which here would mean a *file* named
+   * `plugins` — propagates, because that is a broken vault and not an empty one.
+   */
+  private async readDirOrNull(path: string): Promise<ReadDirEntryDto[] | null> {
+    try {
+      const response = await this.client.request<ReadDirResponse>("read_dir", { path });
+      return response.entries;
+    } catch (error) {
+      if (isAbsent(error)) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * {@link readFile}, with the two absence codes turned into `null`.
+   *
+   * **Only the absence codes.** A `target_exists` (the code the daemon answers
+   * when a path is a directory rather than a regular file), a `zone_violation`, a
    * `payload_too_large` — each of those means something is wrong that a caller
    * would want to hear about, and folding them all into "there is no file there"
    * is how a host ends up reporting an empty plugin set on a broken vault.
@@ -375,15 +420,38 @@ export class HeadlessConfigDir {
     try {
       return await this.readFile(path);
     } catch (error) {
-      if (isNotFound(error)) return null;
+      if (isAbsent(error)) return null;
       throw error;
     }
   }
+
+  /** Report a path's problem once, and only once. See {@link reportedCorrupt}. */
+  private reportOnce(path: string, error: unknown): void {
+    if (this.reportedCorrupt.has(path)) return;
+    this.reportedCorrupt.add(path);
+    this.errors.report(error, "host", "config");
+  }
 }
 
-/** Is this the daemon's "there is nothing at that path"? */
-function isNotFound(error: unknown): boolean {
-  return (error as { code?: unknown } | null)?.code === "not_found";
+/**
+ * Is this the daemon's "there is nothing at that path"?
+ *
+ * **Two codes, not one**, and the second was found by running this module
+ * against the real daemon rather than a fake: reading
+ * `.obsidian-headless/community-plugins.json` in a vault that has no
+ * `.obsidian-headless` at all answers `parent_not_found`, because the daemon
+ * resolves the parent before it looks for the file. A host that treated only
+ * `not_found` as absence threw on the most ordinary state there is — a vault it
+ * has never run in — which is exactly the case `readEnabledSet` promises to
+ * answer `[]` for.
+ *
+ * They are the same fact from a caller's side: the file is not there. Every
+ * other code still propagates, which is the distinction that matters —
+ * "there is nothing here" against "something is wrong here".
+ */
+function isAbsent(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "not_found" || code === "parent_not_found";
 }
 
 function parseJson<T>(source: string, path: string): T {

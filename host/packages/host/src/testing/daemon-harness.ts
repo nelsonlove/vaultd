@@ -24,7 +24,12 @@ import { defaultHostConfig } from "../config";
 import { testClock } from "./clock";
 import type { HostConfig } from "../config";
 import type { TestClock } from "./clock";
-import type { ProtocolErrorBody, RequestEnvelope, RuntimeEventDto } from "../client/protocol";
+import type {
+  ProtocolErrorBody,
+  ReadDirEntryDto,
+  RequestEnvelope,
+  RuntimeEventDto,
+} from "../client/protocol";
 
 /** Answer a request, or decline it by returning false. */
 export type RequestServer = (request: RequestEnvelope) => boolean;
@@ -43,6 +48,9 @@ export class DaemonHarness {
   private files: Record<string, string> = {};
   /** Paths that must answer `not_found` — see {@link unserveFile}. */
   private readonly absent = new Set<string>();
+  private dirs: Record<string, readonly ReadDirEntryDto[]> = {};
+  /** Directories that must answer `not_found` — see {@link unserveDir}. */
+  private readonly absentDirs = new Set<string>();
   private serving = false;
   private stopped = false;
 
@@ -128,6 +136,24 @@ export class DaemonHarness {
     });
   }
 
+  /**
+   * `ReadDirResponse`'s real shape, in one place for the same reason.
+   *
+   * The `path` echo and the byte-order sort are the daemon's contract, so the
+   * harness honours both rather than leaving each caller to remember them: a
+   * fake that answered entries in the order a test happened to type them would
+   * let a subject depend on an order the daemon does not promise, and a fake
+   * that echoed a canonicalized path would hide a client that re-derives it.
+   */
+  respondReadDir(id: string, path: string, entries: readonly ReadDirEntryDto[]): void {
+    this.respondOk(id, "read_dir", {
+      path,
+      entries: [...entries].sort((a, b) =>
+        Buffer.compare(Buffer.from(a.name, "utf8"), Buffer.from(b.name, "utf8")),
+      ),
+    });
+  }
+
   emit(subscriptionId: string, event: RuntimeEventDto): void {
     this.daemon.emit(subscriptionId, event);
   }
@@ -136,6 +162,31 @@ export class DaemonHarness {
   autoServeFiles(files: Record<string, string>): void {
     this.files = { ...this.files, ...files };
     for (const path of Object.keys(files)) this.absent.delete(path);
+    this.installFileServer();
+  }
+
+  /**
+   * Answer every `read_dir` for a known fixture directory automatically.
+   *
+   * Separate from {@link autoServeFiles} because the two answer different
+   * questions about the same path space, and a directory is not a file with a
+   * listing for contents: the daemon refuses a `read_file` on a directory with
+   * `target_exists` and a `read_dir` on a file the same way, so a harness that
+   * kept one map would have to guess which refusal a path deserved. Merges, the
+   * way its sibling does; {@link unserveDir} is how a directory goes away.
+   */
+  autoServeDirs(dirs: Record<string, readonly ReadDirEntryDto[]>): void {
+    this.dirs = { ...this.dirs, ...dirs };
+    for (const path of Object.keys(dirs)) this.absentDirs.delete(path);
+    this.installFileServer();
+  }
+
+  /** Stop serving `path` as a directory, and answer `not_found` for it. */
+  unserveDir(path: string): void {
+    const remaining = { ...this.dirs };
+    delete remaining[path];
+    this.dirs = remaining;
+    this.absentDirs.add(path);
     this.installFileServer();
   }
 
@@ -174,9 +225,20 @@ export class DaemonHarness {
     if (this.serving) return;
     this.serving = true;
     this.serve((request) => {
-      if (request.request.method !== "read_file") return false;
+      const method = request.request.method;
+      if (method !== "read_file" && method !== "read_dir") return false;
       const path = (request.request.params as { path?: string } | undefined)?.path;
       if (path === undefined) return false;
+      if (method === "read_dir") {
+        if (this.absentDirs.has(path)) {
+          this.respondErr(request.id, { code: "not_found", message: `${path} does not exist` });
+          return true;
+        }
+        const entries = this.dirs[path];
+        if (entries === undefined) return false;
+        this.respondReadDir(request.id, path, entries);
+        return true;
+      }
       if (this.absent.has(path)) {
         this.respondErr(request.id, { code: "not_found", message: `${path} does not exist` });
         return true;
