@@ -205,7 +205,7 @@ Ends a subscription. Events already queued for it reach the client *before* this
 
 ## Mutations
 
-Eight operations write notes and folders, `write_file` writes raw bytes to everything that is not an indexable note, and `read_file` is the raw read half of that pair — ten operations, nine of which write. The filesystem stays authoritative throughout: every write lands as ordinary files through a temporary file and an atomic rename, and the index follows.
+Eight operations write notes and folders, `write_file` writes raw bytes to everything that is not an indexable note, and `read_file` and `read_dir` are the raw read half of that family — eleven operations, nine of which write. The filesystem stays authoritative throughout: every write lands as ordinary files through a temporary file and an atomic rename, and the index follows.
 
 **A mutation response is sent only after its own reconciliation has published**, so a client that completes a write can immediately read its result at the returned `generation`. The matching `generation_committed` event carries `cause: "mutation"` and is a confirmation rather than a barrier — a client must not wait for it, and must not assume it arrives before or after the response line.
 
@@ -381,9 +381,33 @@ A path that exists but is not a regular file — a directory, a fifo, a socket, 
 {"version":1,"id":"rd","outcome":{"status":"ok","value":{"type":"read_file","value":{"content_base64":"eyJrZXkiOiJ2YWx1ZSJ9","revision":"blake3:9c1f0b21…"}}}}
 ```
 
+### `read_dir`
+
+The immediate entries of **one** directory, hidden folders and the `.obsidian` zone included. Like `read_file` it is a read — no lease, no publication, no generation, unaffected by `--read-only` — and like `read_file` it answers off the filesystem rather than out of the index.
+
+That is the whole reason it exists. The tree index excludes every hidden path by design, so `get_tree_entries` and both snapshot pagers can never report `.obsidian/plugins/` or `.obsidian-headless/plugins/`, and `read_file` reads only regular files. Before this operation, a client that had not been told a plugin's folder name had no way to find one. It does not recurse: a host walks the tree by asking again, one directory at a time, which keeps the answer's size bounded by the directory rather than by the vault.
+
+**The empty path names the vault root**, and listing the root is how a client discovers that the configuration folders are there at all — the answer includes the dotfolders the tree index leaves out. Every other operation still refuses an empty path; `read_dir` is the one place the spelling means something.
+
+`entries` is sorted by `name` in **byte order**, because a directory yields in whatever order the filesystem stored and a client diffing two listings needs one. `name` is the entry's own name and never a path — the request already fixed where the directory is. `kind` is `file`, `folder`, `symlink`, or `other` (a fifo, a socket, a device), and a client must treat an unrecognized kind as unknown rather than as an error. `size` is present for a regular file and absent for everything else: a folder has no size worth reporting, and a symlink's is the length of its target string rather than of anything a client could read. An entry whose name is not valid UTF-8 is omitted, because no path in this protocol could name it afterwards.
+
+**A symlink is reported, never followed.** Each entry is classified from its own `lstat`, so a link to a directory is `symlink` and not `folder`. A client that wants what is behind the link asks for the link's own path and meets the same containment `read_file` takes — which refuses a link that leaves the vault with `zone_violation`.
+
+`path` echoes the directory the daemon listed, in the spelling it stores (`""` for the root), never the canonicalized filesystem path. There is no `generation`: nothing a listing reports is indexed, so there is no generation the answer could be true at, and naming one would invite a client to treat a listing as a delta.
+
+A path that exists but is not a directory is refused with `target_exists`, exactly as `read_file` refuses a path that is not a regular file and for the same reason; a path that is not there at all is `not_found`.
+
+```json
+{"version":1,"id":"ls","request":{"method":"read_dir","params":{"path":".obsidian/plugins"}}}
+```
+
+```json
+{"version":1,"id":"ls","outcome":{"status":"ok","value":{"type":"read_dir","value":{"path":".obsidian/plugins","entries":[{"name":"dataview","kind":"folder"},{"name":"obsidian-git","kind":"folder"},{"name":"stale.json","kind":"file","size":42}]}}}}
+```
+
 ### The `.obsidian` zone
 
-`read_file`, `write_file`, and `create_folder` accept paths under `.obsidian/`. **Every other operation refuses them** with `zone_violation` — `write_note`, `patch_frontmatter`, the renames, the copies, the deletes, and the two destructive folder verbs alike. Nothing in the zone is indexed, so a zone write joins no generation and answers `semantic: false`, and the daemon announces it with a `config_changed` event instead of a `generation_committed`.
+`read_file`, `read_dir`, `write_file`, and `create_folder` accept paths under `.obsidian/`. **Every other operation refuses them** with `zone_violation` — `write_note`, `patch_frontmatter`, the renames, the copies, the deletes, and the two destructive folder verbs alike. Nothing in the zone is indexed, so a zone write joins no generation and answers `semantic: false`, and the daemon announces it with a `config_changed` event instead of a `generation_committed`.
 
 The mirror rule holds on the other side: `write_file` refuses an indexable `.md` path outside the zone with `invalid_request`, so the two write verbs partition the vault exactly. Whether a path is in the zone is decided by where it *lands* after symlinks and case folding, never by how the request spelled it.
 
@@ -590,7 +614,7 @@ The write path and the snapshot sessions add ten more. Every one of them means *
 - `revision_conflict` — an `expected` precondition did not match the bytes on disk; carries `current_revision`, the revision the target actually holds, so a retry loop does not have to re-read and race the next writer. It carries no `current_generation`: the conflict is with the filesystem, and the index's generation is not what the retry compares against.
 - `not_found` — the operation's subject does not exist.
 - `parent_not_found` — the parent folder of a path does not exist. Parents are never created implicitly; create it and retry.
-- `target_exists` — something already occupies the destination. Also a non-empty folder deleted without `recursive`, a folder-rename destination that already exists, and a `read_file` whose path is not a regular file.
+- `target_exists` — something already occupies the destination. Also a non-empty folder deleted without `recursive`, a folder-rename destination that already exists, a `read_file` whose path is not a regular file, and a `read_dir` whose path is not a directory.
 - `case_collision` — the path differs only by case from one that already exists on a case-insensitive filesystem. `vaultd` refuses; Obsidian does not.
 - `zone_violation` — a semantic operation named a path under `.obsidian/`. Use `read_file`/`write_file` there.
 - `payload_too_large` — the payload exceeds 16 MiB. Chunked transfer is the deferred alternative and is not in version 1.
@@ -635,10 +659,10 @@ These names document intended boundaries and are not accepted by the version 1 r
 - `commit_transaction`
 - `abort_transaction`
 
-The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above. The reserved `apply_mutation` family is no longer reserved either: it landed as the named operations under "Mutations" above — `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, `write_file`, and `read_file` — rather than as one omnibus verb, because a typed refusal per operation says more than a shared one could.
+The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above. The reserved `apply_mutation` family is no longer reserved either: it landed as the named operations under "Mutations" above — `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, `write_file`, `read_file`, and `read_dir` — rather than as one omnibus verb, because a typed refusal per operation says more than a shared one could.
 
 ## Evolution
 
 Adding optional fields is backward-compatible. Adding operations is backward-compatible for servers and clients that reject unknown tagged variants cleanly. Renaming fields, changing meanings, or removing variants requires a new protocol version.
 
-**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, or a tree entry's `kind` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. Read parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in a read's params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.
+**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, a tree entry's `kind`, or a `read_dir` entry's `kind` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. Read parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in a read's params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.

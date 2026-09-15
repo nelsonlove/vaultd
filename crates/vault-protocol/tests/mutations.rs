@@ -3,10 +3,10 @@
 //! break, not a refactor.
 
 use vault_protocol::{
-    CopyConflictDto, DeleteModeDto, ExpectedDto, GenerationResponse, KeyPathDto,
-    LinkRewriteFailureDto, MutationResponse, PatchValueDto, ReadFileResponse, RenameResponse,
-    Request, RequestEnvelope, Response, ResponseEnvelope, ResponseOutcome, WriteFileResponse,
-    WriteNoteParams,
+    CopyConflictDto, DeleteModeDto, DirEntryDto, DirEntryKindDto, ExpectedDto, GenerationResponse,
+    KeyPathDto, LinkRewriteFailureDto, MutationResponse, PatchValueDto, ReadDirResponse,
+    ReadFileResponse, RenameResponse, Request, RequestEnvelope, Response, ResponseEnvelope,
+    ResponseOutcome, WriteFileResponse, WriteNoteParams,
 };
 
 #[test]
@@ -191,7 +191,7 @@ fn a_rename_response_reports_rewrites_and_the_files_it_skipped() {
 /// The module header claims every wire spelling here is pinned. Before this
 /// test, only `write_note` and `patch_frontmatter` actually were — nothing
 /// guarded `create_folder`, `rename_note`, `rename_folder`, `copy_file`,
-/// `delete_note`, `delete_folder`, `write_file`, or `read_file`, nor their
+/// `delete_note`, `delete_folder`, `write_file`, `read_file`, or `read_dir`, nor their
 /// field names. A rename during a later refactor would otherwise be a
 /// silent protocol break with a green suite.
 #[test]
@@ -207,6 +207,11 @@ fn every_new_method_name_and_field_spelling_round_trips_through_its_exact_json()
         r##"{"version":1,"id":"8","request":{"method":"patch_frontmatter","params":{"path":"a.md","patch":[],"expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"9","request":{"method":"write_file","params":{"path":"a.png","content_base64":"Zm9v","expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"10","request":{"method":"read_file","params":{"path":"a.png"}}}"##,
+        r##"{"version":1,"id":"11","request":{"method":"read_dir","params":{"path":"a"}}}"##,
+        // The root, which is `read_dir`'s alone: no other operation gives the
+        // empty string a meaning, and a decoder that started rejecting it here
+        // would take the one listing that can discover `.obsidian/` with it.
+        r##"{"version":1,"id":"12","request":{"method":"read_dir","params":{"path":""}}}"##,
     ];
     for line in lines {
         let envelope: RequestEnvelope =
@@ -224,7 +229,7 @@ fn every_new_method_name_and_field_spelling_round_trips_through_its_exact_json()
 /// entirely when absent rather than serializing as `null`.
 #[test]
 fn every_new_response_shape_round_trips_through_its_exact_json() {
-    let cases: [(Response, &str); 12] = [
+    let cases: [(Response, &str); 15] = [
         (
             Response::WriteNote(MutationResponse {
                 generation: 1,
@@ -312,6 +317,48 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
                 revision: "r".into(),
             }),
             r#"{"type":"read_file","value":{"content_base64":"Zm9v","revision":"r"}}"#,
+        ),
+        (
+            Response::ReadDir(ReadDirResponse {
+                path: "a".into(),
+                entries: vec![
+                    DirEntryDto {
+                        name: "b".into(),
+                        kind: DirEntryKindDto::Folder,
+                        size: None,
+                    },
+                    DirEntryDto {
+                        name: "c.png".into(),
+                        kind: DirEntryKindDto::File,
+                        size: Some(3),
+                    },
+                ],
+            }),
+            r#"{"type":"read_dir","value":{"path":"a","entries":[{"name":"b","kind":"folder"},{"name":"c.png","kind":"file","size":3}]}}"#,
+        ),
+        // A symlink carries no size: the number a `stat` hands back for one is
+        // the length of its target string, which is not a fact about anything
+        // a client could read, so the key is omitted rather than reported.
+        (
+            Response::ReadDir(ReadDirResponse {
+                path: String::new(),
+                entries: vec![DirEntryDto {
+                    name: "Link".into(),
+                    kind: DirEntryKindDto::Symlink,
+                    size: None,
+                }],
+            }),
+            r#"{"type":"read_dir","value":{"path":"","entries":[{"name":"Link","kind":"symlink"}]}}"#,
+        ),
+        // An empty directory is an empty list, never a refusal: "nothing is in
+        // here" is an answer a host acts on, and a plugin folder a client just
+        // created is exactly that.
+        (
+            Response::ReadDir(ReadDirResponse {
+                path: ".obsidian/plugins".into(),
+                entries: vec![],
+            }),
+            r#"{"type":"read_dir","value":{"path":".obsidian/plugins","entries":[]}}"#,
         ),
     ];
     for (response, expected_value) in cases {

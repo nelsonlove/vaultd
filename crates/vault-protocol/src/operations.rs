@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::events::LiveStateDto;
 use crate::mutations::{
     CopyFileParams, DeleteFolderParams, DeleteNoteParams, FolderParams, GenerationResponse,
-    MutationResponse, PatchFrontmatterParams, ReadFileParams, ReadFileResponse, RenameFolderParams,
-    RenameNoteParams, RenameResponse, WriteFileParams, WriteFileResponse, WriteNoteParams,
+    MutationResponse, PatchFrontmatterParams, ReadDirParams, ReadDirResponse, ReadFileParams,
+    ReadFileResponse, RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams,
+    WriteFileResponse, WriteNoteParams,
 };
 use crate::semantic::{
     DiagnosticDto, IndexStateDto, NoteDto, NoteSummaryDto, ReferenceDto, ResolutionDto, SeverityDto,
@@ -44,6 +45,7 @@ pub enum Request {
     PatchFrontmatter(PatchFrontmatterParams),
     WriteFile(WriteFileParams),
     ReadFile(ReadFileParams),
+    ReadDir(ReadDirParams),
     OpenSnapshot(OpenSnapshotParams),
     SnapshotTree(SnapshotTreeParams),
     SnapshotNotes(SnapshotNotesParams),
@@ -180,6 +182,7 @@ pub enum Response {
     PatchFrontmatter(MutationResponse),
     WriteFile(WriteFileResponse),
     ReadFile(ReadFileResponse),
+    ReadDir(ReadDirResponse),
     OpenSnapshot(OpenSnapshotResponse),
     SnapshotTree(SnapshotTreeResponse),
     SnapshotNotes(SnapshotNotesResponse),

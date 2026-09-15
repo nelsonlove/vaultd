@@ -546,6 +546,25 @@ pub struct ReadFileParams {
     pub path: String,
 }
 
+/// `read_dir`'s parameters: the one directory whose immediate entries a
+/// caller wants.
+///
+/// The **empty string names the vault root**, which is the only spelling it
+/// could have: a `VaultPath` is never empty, so `""` can mean nothing else,
+/// and listing the root is the only way a client learns that `.obsidian/` and
+/// `.obsidian-headless/` are there at all.
+///
+/// `deny_unknown_fields` matches [`ReadFileParams`] rather than the read
+/// family's usual tolerance. The two raw path operations are spelled the same
+/// way on purpose — a client that misspells a key on one must not get a
+/// quietly different answer from the other — and a single-field params object
+/// has no optional key a server could later add without saying so.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDirParams {
+    pub path: String,
+}
+
 /// A content-bearing mutation's answer: the generation containing it, and
 /// the revision it wrote.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -620,4 +639,89 @@ pub struct WriteFileResponse {
 pub struct ReadFileResponse {
     pub content_base64: String,
     pub revision: String,
+}
+
+/// What one entry of a `read_dir` listing is.
+///
+/// Deliberately **not** [`crate::TreeEntryKindDto`]. That vocabulary is the
+/// index's — it separates a `note` from an ordinary `file`, because a note is
+/// a row the index holds — and `read_dir` answers a filesystem question about
+/// paths the index does not hold at all. What a listing must distinguish is
+/// what a host may walk into: a `folder` it can descend, a `file` it can read,
+/// a `symlink` it must not follow blindly, and `other` for everything a
+/// filesystem can still hold. Reusing the tree's kind would have forced a
+/// choice between calling `.obsidian/plugins/x/manifest.json` a `file` (true,
+/// but then `note` is a variant this operation can never emit) and teaching
+/// the index's vocabulary two words about links it has no rows for.
+///
+/// Tolerant on decode, exactly as [`crate::TreeEntryKindDto`] is, and for the
+/// evolution rule's reason: a client must degrade a kind it has never heard of
+/// to [`DirEntryKindDto::Unknown`] rather than fail the whole listing.
+/// `Deserialize` is hand-written because `#[serde(other)]` is rejected on an
+/// externally tagged enum, which is what a plain unit-variant enum is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirEntryKindDto {
+    File,
+    Folder,
+    Symlink,
+    /// A fifo, a socket, a device — anything on disk that is none of the
+    /// three above.
+    Other,
+    /// A kind this build does not know. Never produced by this server, which
+    /// is what separates it from `Other`: `other` is a real answer about a
+    /// real filesystem object, `unknown` is a client's catch-all for a word a
+    /// later `vaultd` might teach it.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for DirEntryKindDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "file" => Self::File,
+            "folder" => Self::Folder,
+            "symlink" => Self::Symlink,
+            "other" => Self::Other,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+/// One immediate entry of a directory.
+///
+/// `name` is the entry's own name, never a path: the request already fixed
+/// where the directory is, and joining the two here would put a second
+/// spelling of that path on the wire.
+///
+/// `size` is present for a regular file and absent for everything else — a
+/// folder has no size worth reporting, and a symlink's is the length of its
+/// target string rather than of anything a client could read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DirEntryDto {
+    pub name: String,
+    pub kind: DirEntryKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// `read_dir`'s answer: one directory's immediate entries, sorted by `name` in
+/// byte order.
+///
+/// `path` echoes the directory the daemon listed, in the spelling it stores —
+/// the request's own vault path, or `""` for the root — so a client pairing
+/// answers to asks never has to re-derive it. It is never the canonicalized
+/// filesystem path: that would leak where the vault lives and could name a
+/// directory outside the client's own vocabulary.
+///
+/// The listing carries no generation. Nothing it reports is indexed — hidden
+/// paths and the configuration zone are exactly what it exists to reach — so
+/// there is no generation this answer could be true at, and naming one would
+/// invite a client to treat a listing as a delta.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReadDirResponse {
+    pub path: String,
+    pub entries: Vec<DirEntryDto>,
 }

@@ -3,17 +3,17 @@ use vault_core::{
     ResolvedReference, Severity, SourceSpan, Subpath,
 };
 use vault_index::{
-    CopyConflict, DeleteMode, FrontmatterEdit, IndexError, IndexState, IndexedNote, NoteSummary,
-    PatchValue, Precondition, VaultInfo,
+    CopyConflict, DeleteMode, DirEntry, DirEntryKind, FrontmatterEdit, IndexError, IndexState,
+    IndexedNote, NoteSummary, PatchValue, Precondition, VaultInfo,
 };
 use vault_protocol::{
-    AliasDto, BlockDto, CopyConflictDto, DeleteModeDto, DiagnosticDto, ErrorCode, ExpectedDto,
-    FrontmatterEditDto, GetVaultInfoResponse, HeadingDto, IndexStateDto, LinkRewriteFailureDto,
-    ListItemDto, LiveStateDto, NoteDto, NoteFacetDto, NoteMetadataDto, NoteSummaryDto,
-    PatchValueDto, PropertyDto, PropertyMappingEntryDto, PropertyValueDto, ProtocolError,
-    ReferenceDto, ReferenceKindDto, ReferenceOriginDto, ResolutionDto, SectionDto, SeverityDto,
-    SnapshotNoteDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto, TreeEntryDto,
-    TreeEntryKindDto,
+    AliasDto, BlockDto, CopyConflictDto, DeleteModeDto, DiagnosticDto, DirEntryDto,
+    DirEntryKindDto, ErrorCode, ExpectedDto, FrontmatterEditDto, GetVaultInfoResponse, HeadingDto,
+    IndexStateDto, LinkRewriteFailureDto, ListItemDto, LiveStateDto, NoteDto, NoteFacetDto,
+    NoteMetadataDto, NoteSummaryDto, PatchValueDto, PropertyDto, PropertyMappingEntryDto,
+    PropertyValueDto, ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto,
+    ResolutionDto, SectionDto, SeverityDto, SnapshotNoteDto, SpanDto, SpannedPropertyValueDto,
+    SubpathDto, TagDto, TreeEntryDto, TreeEntryKindDto,
 };
 
 use crate::runtime::{MutationFailure, RefreshFailure};
@@ -839,6 +839,25 @@ pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ProtocolError> {
             current_generation: None,
             current_revision: None,
         })
+}
+
+/// One directory entry on the wire.
+///
+/// The kind vocabularies are one-to-one and deliberately so: `DirEntryKindDto`
+/// carries an extra `Unknown` only as a *decoder's* catch-all, which this
+/// server never emits, so every engine kind has exactly one wire spelling and
+/// the mapping can never silently widen.
+pub(crate) fn dir_entry(entry: DirEntry) -> DirEntryDto {
+    DirEntryDto {
+        name: entry.name,
+        kind: match entry.kind {
+            DirEntryKind::File => DirEntryKindDto::File,
+            DirEntryKind::Folder => DirEntryKindDto::Folder,
+            DirEntryKind::Symlink => DirEntryKindDto::Symlink,
+            DirEntryKind::Other => DirEntryKindDto::Other,
+        },
+        size: entry.size,
+    }
 }
 
 pub(crate) fn encode_base64(bytes: &[u8]) -> String {

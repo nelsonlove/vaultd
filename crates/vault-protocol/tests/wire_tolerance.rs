@@ -3,8 +3,9 @@
 //! with it, the whole subscription that line belonged to.
 
 use vault_protocol::{
-    ErrorCode, EventEnvelope, GenerationCauseDto, LiveStateDto, ResponseEnvelope, ResponseOutcome,
-    ResyncReasonDto, RuntimeEventDto, TreeEntryDto, TreeEntryKindDto,
+    DirEntryDto, DirEntryKindDto, ErrorCode, EventEnvelope, GenerationCauseDto, LiveStateDto,
+    ResponseEnvelope, ResponseOutcome, ResyncReasonDto, RuntimeEventDto, TreeEntryDto,
+    TreeEntryKindDto,
 };
 
 /// Captured from the shipped live-runtime transport: one line per event
@@ -168,6 +169,10 @@ fn unknown_serializes_to_a_reserved_spelling_this_server_never_emits() {
         serde_json::to_string(&TreeEntryKindDto::Unknown).expect("serialize"),
         r#""unknown""#
     );
+    assert_eq!(
+        serde_json::to_string(&DirEntryKindDto::Unknown).expect("serialize"),
+        r#""unknown""#
+    );
 }
 
 #[test]
@@ -181,4 +186,36 @@ fn an_unknown_tree_entry_kind_degrades_to_unknown() {
         serde_json::from_str(line).expect("an unknown tree entry kind must still parse");
     assert_eq!(entry.kind, TreeEntryKindDto::Unknown);
     assert_eq!(entry.path, "Folder", "the rest of the entry must survive");
+}
+
+#[test]
+fn an_unknown_directory_entry_kind_degrades_to_unknown() {
+    // `DirEntryKindDto` flows server-to-client on `read_dir` listings. Its
+    // four real spellings already describe everything a filesystem can hold,
+    // so it is unlikely to grow — but "unlikely" is the wrong bar for a
+    // decoder: a client built against this version must survive a later one
+    // that found a fifth word, and degrade only the entry it cannot name.
+    let line = r#"{"name":"socket","kind":"from_the_future"}"#;
+    let entry: DirEntryDto =
+        serde_json::from_str(line).expect("an unknown directory entry kind must still parse");
+    assert_eq!(entry.kind, DirEntryKindDto::Unknown);
+    assert_eq!(entry.name, "socket", "the rest of the entry must survive");
+    assert_eq!(entry.size, None, "an absent size stays absent");
+}
+
+/// `other` and `unknown` are different answers and must never collapse into
+/// one. `other` is this server saying "a real thing that is not a file, a
+/// folder, or a link"; `unknown` is a client saying "a word I have never
+/// heard". A decoder that folded the first into the second would turn a fact
+/// into an unknown, and a client would have no way to tell a socket from a
+/// version skew.
+#[test]
+fn the_other_kind_is_a_real_answer_and_not_the_unknown_catch_all() {
+    let entry: DirEntryDto =
+        serde_json::from_str(r#"{"name":"pipe","kind":"other"}"#).expect("decode");
+    assert_eq!(entry.kind, DirEntryKindDto::Other);
+    assert_eq!(
+        serde_json::to_string(&DirEntryKindDto::Other).expect("serialize"),
+        r#""other""#
+    );
 }

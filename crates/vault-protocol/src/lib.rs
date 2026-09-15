@@ -17,8 +17,9 @@ pub use events::{
 };
 pub use mutations::{
     CopyConflictDto, CopyFileParams, DeleteFolderParams, DeleteModeDto, DeleteNoteParams,
-    ExpectedDto, FolderParams, FrontmatterEditDto, GenerationResponse, KeyPathDto,
-    LinkRewriteFailureDto, MutationResponse, PatchFrontmatterParams, PatchValueDto, ReadFileParams,
+    DirEntryDto, DirEntryKindDto, ExpectedDto, FolderParams, FrontmatterEditDto,
+    GenerationResponse, KeyPathDto, LinkRewriteFailureDto, MutationResponse,
+    PatchFrontmatterParams, PatchValueDto, ReadDirParams, ReadDirResponse, ReadFileParams,
     ReadFileResponse, RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams,
     WriteFileResponse, WriteNoteParams,
 };

@@ -121,8 +121,10 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
     }
 
     // One request/response pair per documented operation — the twelve read
-    // and subscription operations, the ten mutation and raw-file operations,
-    // and the four snapshot-session operations — plus the four event examples
+    // and subscription operations, the eleven mutation and raw-path
+    // operations (`read_dir` is the eleventh, the raw listing half of the
+    // pair `read_file` reads bytes through), and the four snapshot-session
+    // operations — plus the four event examples
     // and the three extra error-outcome examples under "Errors"
     // (`generation_mismatch`, `vault_changed_during_refresh`, and the
     // `storage_failure` shape that carries `current_revision` to say a write
@@ -133,12 +135,12 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
     // regression here means an operation lost its documented example, not just
     // that a JSON block became unparseable.
     assert_eq!(
-        requests, 28,
-        "expected 28 request examples, see docs/protocol.md"
+        requests, 29,
+        "expected 29 request examples, see docs/protocol.md"
     );
     assert_eq!(
-        responses, 31,
-        "expected 31 response examples (28 success + 3 error), see docs/protocol.md"
+        responses, 32,
+        "expected 32 response examples (29 success + 3 error), see docs/protocol.md"
     );
     assert_eq!(events, 4, "expected 4 event examples, see docs/protocol.md");
 }

@@ -11,10 +11,10 @@ use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexReader, LiveState, ReferenceStatus};
 use vault_protocol::{
     CloseSnapshotResponse, ErrorCode, GenerationResponse, GetTreeEntriesResponse, MutationResponse,
-    OpenSnapshotResponse, PageResponse, ProtocolError, ReadFileResponse, ReferenceStatusFilter,
-    RefreshIndexResponse, RenameResponse, Request, RequestEnvelope, ResolveLinkResponse, Response,
-    ResponseEnvelope, SeverityDto, SnapshotNotesResponse, SnapshotTreeResponse, WriteFileResponse,
-    validate_version,
+    OpenSnapshotResponse, PageResponse, ProtocolError, ReadDirResponse, ReadFileResponse,
+    ReferenceStatusFilter, RefreshIndexResponse, RenameResponse, Request, RequestEnvelope,
+    ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto, SnapshotNotesResponse,
+    SnapshotTreeResponse, WriteFileResponse, validate_version,
 };
 
 use crate::runtime::{MutationReport, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
@@ -162,6 +162,21 @@ fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
         return Err(invalid(value));
     }
     VaultPath::new(value).map_err(|_| invalid(value))
+}
+
+/// The same parse, plus the one path `read_dir` can name that no other
+/// operation can: the **vault root**, spelled `""`.
+///
+/// `VaultPath::new("")` is an error and must stay one — every other operation
+/// names a file or a folder inside the vault, and an empty path there is a
+/// client bug. `read_dir` is the exception because listing the root is how a
+/// client discovers the configuration folders in the first place, so the empty
+/// string is given a meaning here and nowhere else.
+fn parse_directory_path(value: &str) -> Result<Option<VaultPath>, ProtocolError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_path(value).map(Some)
 }
 
 fn status_filter(value: ReferenceStatusFilter) -> ReferenceStatus {
@@ -333,6 +348,22 @@ impl Server {
             .as_ref()
             .ok_or_else(|| runtime_not_ready("no vault is configured"))?;
         engine.read_file(path).map_err(convert::mutation_error)
+    }
+
+    /// List one directory's immediate entries, off the coordinator thread for
+    /// [`Server::read_file`]'s reasons and through the engine for the same one:
+    /// `resolve` is where containment lives.
+    ///
+    /// `None` is the vault root, which no [`VaultPath`] can spell.
+    fn read_dir(
+        &self,
+        path: Option<&VaultPath>,
+    ) -> Result<Vec<vault_index::DirEntry>, ProtocolError> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| runtime_not_ready("no vault is configured"))?;
+        engine.read_dir(path).map_err(convert::mutation_error)
     }
 
     /// The generation a mutation response reports. `None` means nothing has
@@ -964,6 +995,29 @@ impl Server {
                         Response::ReadFile(ReadFileResponse {
                             content_base64: convert::encode_base64(&bytes),
                             revision,
+                        }),
+                    ),
+                },
+            },
+            Request::ReadDir(params) => match (self.reader(), parse_directory_path(&params.path)) {
+                (None, _) => ResponseEnvelope::error(id, index_unavailable()),
+                (_, Err(error)) => ResponseEnvelope::error(id, error),
+                (Some(_), Ok(path)) => match self.read_dir(path.as_ref()) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(entries) => ResponseEnvelope::success(
+                        id,
+                        Response::ReadDir(ReadDirResponse {
+                            // The daemon's own spelling of the directory it
+                            // listed, not the client's bytes: `VaultPath` is
+                            // what this server holds, and echoing anything
+                            // else would let a request's spelling and the
+                            // answer's drift apart.
+                            path: path
+                                .as_ref()
+                                .map(VaultPath::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            entries: entries.into_iter().map(convert::dir_entry).collect(),
                         }),
                     ),
                 },

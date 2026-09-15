@@ -392,6 +392,9 @@ fn every_request_that_takes_a_path_refuses_a_nul_byte() {
             r#"{{"method":"resolve_link","params":{{"source_path":"{nul}","destination":"Other"}}}}"#
         ),
         format!(r#"{{"method":"read_file","params":{{"path":"{nul}"}}}}"#),
+        // `read_dir` gives the *empty* path a meaning no other operation does,
+        // and that exception must not widen into "any odd path is a root".
+        format!(r#"{{"method":"read_dir","params":{{"path":"{nul}"}}}}"#),
         format!(r#"{{"method":"get_tree_entries","params":{{"paths":["{nul}"]}}}}"#),
         // The write half comes through the same door. `create_folder` also
         // has the engine's own `refuse_nul` behind this, which stays — it
