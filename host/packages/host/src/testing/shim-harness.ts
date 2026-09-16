@@ -794,12 +794,17 @@ let swept = false;
  * Failures are swallowed on purpose. Two forks sweeping the same stale
  * directory at the same time is the ordinary case, not an error, and a harness
  * that could not tidy up must still start.
+ *
+ * `prefix` is a parameter since Task 16a, which leaves a second family behind:
+ * a host harness also makes a short-named socket directory, for Darwin's
+ * ~104-byte socket address limit, and it needs the same collection on the same
+ * terms rather than a second sweep written slightly differently.
  */
-export function sweepStaleDataDirs(root: string): void {
+export function sweepStaleDataDirs(root: string, prefix: string = PREFIX): void {
   const cutoff = Date.now() - STALE_MS;
   try {
     for (const name of fs.readdirSync(root)) {
-      if (!name.startsWith(PREFIX)) continue;
+      if (!name.startsWith(prefix)) continue;
       const full = join(root, name);
       try {
         if (fs.statSync(full).mtimeMs > cutoff) continue;

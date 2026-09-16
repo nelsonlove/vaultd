@@ -57,10 +57,30 @@ export class NoticeLog {
    */
   private firstSeq = 0;
   private nextSeq = 0;
+  private readonly listeners = new Set<(entry: NoticeEntry) => void>();
 
   constructor(deps: { clock: Clock; limit?: number }) {
     this.clock = deps.clock;
     this.limit = deps.limit ?? DEFAULT_LIMIT;
+  }
+
+  /**
+   * Watch every notice as it is recorded. Returns the unsubscribe.
+   *
+   * Task 16a's `host.notice` broadcast is the consumer: a client subscribed to
+   * the host hears what a plugin told the user whether or not that client is the
+   * one that invoked the command which said it — a timer firing at three in the
+   * morning raises a notice nobody asked for, and it is still news.
+   *
+   * **A listener that throws is dropped here.** `new Notice(...)` is plugin code
+   * running inside a dispatch slot, and a broadcaster's bug must not turn a
+   * plugin's message to the user into a failure counted against that plugin.
+   */
+  onRecord(listener: (entry: NoticeEntry) => void): () => void {
+    this.listeners.add(listener);
+    return (): void => {
+      this.listeners.delete(listener);
+    };
   }
 
   /**
@@ -85,6 +105,15 @@ export class NoticeLog {
       const dropped = this.kept.length - this.limit;
       this.kept.splice(0, dropped);
       this.firstSeq += dropped;
+    }
+    for (const listener of this.listeners) {
+      try {
+        listener(entry);
+      } catch {
+        // See {@link NoticeLog.onRecord}: there is nowhere to report to from
+        // inside a plugin's `new Notice(...)`, and a broadcaster's bug must not
+        // become a failure counted against the plugin that raised the notice.
+      }
     }
     return entry;
   }

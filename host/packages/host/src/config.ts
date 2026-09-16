@@ -95,6 +95,32 @@ export interface HostConfig {
   readonly snapshotPageSize: number;
   readonly snapshotPageSizeMax: number;
   /**
+   * How many mirror-served snapshot sessions one host serves at once.
+   *
+   * The host's own cap, not the daemon's. A `host.open_snapshot` pins nothing
+   * daemon-side — Ruling 5 answers the four snapshot ops from the mirror — so
+   * the thing being bounded here is host memory: each session freezes the entry
+   * array and the note path list at its generation. Eight rather than the
+   * daemon's four because a host session costs a pair of arrays rather than a
+   * pinned read transaction and a deferred WAL checkpoint, and because the host
+   * is the door several clients come through at once. The refusal is
+   * `too_many_snapshots`, which is the code the daemon answers for the same
+   * condition, so a client's retry logic is identical through either door.
+   */
+  readonly snapshotSessionCap: number;
+  /**
+   * How many events one subscription may have waiting before the host stops
+   * keeping them.
+   *
+   * The same bounded-queue discipline `vaultd`'s own subscriber registry uses,
+   * and for the same reason: a client that has stopped reading must not be able
+   * to grow the host. Past the limit the queue is dropped whole and the
+   * subscription owes one `resync_required { reason: "subscriber_lag" }` — never
+   * a truncated change set pretending to be a complete one. The host never
+   * blocks on a slow subscriber.
+   */
+  readonly subscriberQueueLimit: number;
+  /**
    * How many times a hydration retries an `open_snapshot` the daemon refused
    * with `too_many_snapshots`.
    *
@@ -274,6 +300,8 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     overlapPollMs: 60_000,
     snapshotPageSize: 500,
     snapshotPageSizeMax: 2_000,
+    snapshotSessionCap: 8,
+    subscriberQueueLimit: 256,
     snapshotCapRetries: 4,
     hydrationPinLossRestarts: 3,
     mirrorDeltaPathLimit: 512,

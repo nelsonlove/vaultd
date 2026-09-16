@@ -96,6 +96,31 @@ import type { ShimEventBus } from "../shim/events";
 import type { Supervisor } from "../supervisor";
 import type { AppliedBatch, TAbstractFile } from "../shim/files";
 
+/**
+ * What this host is doing with one plugin, as `host.list_plugins` reports it.
+ *
+ * Declared here rather than in `server/wire.ts` because the sequencer is what
+ * moves a plugin between these four: it loads one, it refuses one the GUI is
+ * already running, it disables one, and it is the callback the quarantine
+ * reaches when it stops trusting one. The wire module re-exports the type so
+ * that the spelling on the socket and the spelling in the sequencer are one
+ * declaration rather than two that drift.
+ *
+ * `disabled` is the state of an installed plugin this host is not running — it
+ * is not in the enabled set, or it was taken out of it. `failed` is a plugin
+ * this host *tried* to run: its `onload` threw, or the coexistence check refused
+ * it. The difference matters to whoever is reading the list, because the second
+ * one has a reason worth printing.
+ */
+export type PluginRunState = "loaded" | "disabled" | "failed" | "quarantined";
+
+/** One plugin's move between {@link PluginRunState}s, as a broadcast. */
+export interface PluginStateChange {
+  readonly id: string;
+  readonly state: PluginRunState;
+  readonly reason: string | null;
+}
+
 export type LifecyclePhase =
   | "cold"
   | "hydrating"
@@ -217,6 +242,17 @@ export class LifecycleSequencer {
   private readonly detachers: Array<() => void> = [];
   private readonly loadedIds: string[] = [];
   private readonly timings = new Map<string, number>();
+  /**
+   * Why a plugin this host tried to run is not running, by id.
+   *
+   * Kept rather than only returned in the {@link StartupReport}, because
+   * `host.list_plugins` is asked the same question minutes later and the report
+   * has long since been handed to whoever started the host. An id leaves this
+   * map the moment it loads: a plugin that failed at startup and was enabled
+   * successfully afterwards is not a failed plugin any more.
+   */
+  private readonly failures = new Map<string, string>();
+  private readonly stateListeners = new Set<(change: PluginStateChange) => void>();
   /**
    * The highest generation this sequencer has delivered a batch for — **any
    * batch, synthetic or not**.
@@ -349,6 +385,36 @@ export class LifecycleSequencer {
     return this.timings;
   }
 
+  /** The plugins running right now, in the order they loaded. */
+  loadedPlugins(): readonly string[] {
+    return [...this.loadedIds];
+  }
+
+  /**
+   * Why each plugin this host tried and failed to run is not running.
+   *
+   * A snapshot rather than the live map, so a caller building a report cannot
+   * be surprised half way through it by a load that finished.
+   */
+  loadFailures(): ReadonlyMap<string, string> {
+    return new Map(this.failures);
+  }
+
+  /**
+   * Watch plugins move between {@link PluginRunState}s. Returns the unsubscribe.
+   *
+   * This is what `host.plugin_state_changed` is broadcast from. It fires on a
+   * **transition this sequencer performed** — a load, a load that failed, a
+   * disable, a quarantine — and never on a poll of what is already true, so a
+   * subscriber that wants the current picture asks `host.list_plugins` for it.
+   */
+  onPluginStateChanged(listener: (change: PluginStateChange) => void): () => void {
+    this.stateListeners.add(listener);
+    return (): void => {
+      this.stateListeners.delete(listener);
+    };
+  }
+
   /**
    * Resolve once every batch delivery in flight has finished.
    *
@@ -397,11 +463,13 @@ export class LifecycleSequencer {
     const refused = new Set(overlap.overlap.filter((id) => !overlap.forced.includes(id)));
     for (const id of enabled) {
       if (refused.has(id)) {
-        failed.push({
+        const message = new OverlapRefused(
           id,
-          error: new OverlapRefused(id, overlapRefusalMessage(id, this.deps.config.configDirName))
-            .message,
-        });
+          overlapRefusalMessage(id, this.deps.config.configDirName),
+        ).message;
+        failed.push({ id, error: message });
+        this.failures.set(id, message);
+        this.announce(id, "failed", message);
         continue;
       }
       const failure = await this.loadOne(id);
@@ -454,7 +522,7 @@ export class LifecycleSequencer {
    * Nothing here touches the daemon's index: no re-hydration, no refetch. The
    * vault did not change because a plugin was enabled.
    */
-  async enableLate(id: string): Promise<void> {
+  async enableLate(id: string, options: { forceShared?: boolean } = {}): Promise<void> {
     this.deps.onOperation?.("enableLate");
     if (this.phaseValue !== "steady") {
       throw new Error(`enableLate(${id}) needs a started host; the phase is ${this.phaseValue}`);
@@ -463,7 +531,7 @@ export class LifecycleSequencer {
     // this is the path where the answer is about to be acted on, and a
     // minute-old answer is exactly what the poll admits it cannot avoid
     // elsewhere.
-    await this.deps.coexistence.assertCanEnable(id);
+    await this.deps.coexistence.assertCanEnable(id, options.forceShared === true);
     const enabled = await this.deps.dir.readEnabledSet();
     if (!enabled.includes(id)) await this.deps.dir.writeEnabledSet([...enabled, id]);
     const failure = await this.loadOne(id);
@@ -496,6 +564,8 @@ export class LifecycleSequencer {
     await this.deps.plugins.unload(id);
     this.forget(id);
     this.deps.quarantine.forgetPlugin(id);
+    this.failures.delete(id);
+    this.announce(id, "disabled", null);
   }
 
   /**
@@ -611,11 +681,20 @@ export class LifecycleSequencer {
     // The tracker holds them, and `reason(id)` is where a report reads them
     // from. Naming the parameter is what makes the callback's shape obvious at
     // the call site that builds the tracker.
-    void failures;
     await this.deps.plugins.unload(pluginId);
     this.deps.harvest.forgetPlugin(pluginId);
     this.deps.events.detachOwner(pluginId);
     this.forget(pluginId);
+    // The labels rather than the errors: a broadcast reason is a sentence
+    // somebody reads, and the five labels say what kept failing — "onload",
+    // "command:demo:boom", "event:vault:modify" — where five stack traces would
+    // say it at a length no event envelope should carry.
+    this.announce(
+      pluginId,
+      "quarantined",
+      `quarantined after ${String(failures.length)} failures: ` +
+        failures.map((failure) => failure.label).join(", "),
+    );
   }
 
   // --- Internals -------------------------------------------------------------
@@ -634,10 +713,18 @@ export class LifecycleSequencer {
     try {
       await this.deps.plugins.load(id);
     } catch (error) {
-      return error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      this.failures.set(id, message);
+      this.announce(id, "failed", message);
+      return message;
     }
     this.timings.set(id, clock.now() - startedAt);
     if (!this.loadedIds.includes(id)) this.loadedIds.push(id);
+    // A plugin that failed at startup and loads now is not a failed plugin any
+    // more, and a report that still said so would be a report of history rather
+    // than of state.
+    this.failures.delete(id);
+    this.announce(id, "loaded", null);
     return null;
   }
 
@@ -764,6 +851,24 @@ export class LifecycleSequencer {
       // phase it is reported under.
       this.deps.errors.report(error, failure.pluginId, "teardown");
     });
+  }
+
+  /**
+   * Tell every subscriber one plugin moved. Never throws.
+   *
+   * A subscriber that throws is reported to the host's error sink under the
+   * host's own id — so it is visible, and so it is counted against nobody:
+   * quarantining a plugin because the thing *watching* plugin states is broken
+   * would disable working plugins one at a time.
+   */
+  private announce(id: string, state: PluginRunState, reason: string | null): void {
+    for (const listener of [...this.stateListeners]) {
+      try {
+        listener({ id, state, reason });
+      } catch (error) {
+        this.deps.errors.report(error, HOST_PLUGIN_ID, "event");
+      }
+    }
   }
 
   private forget(pluginId: string): void {

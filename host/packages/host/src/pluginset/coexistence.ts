@@ -179,8 +179,13 @@ export class CoexistenceMonitor {
    * a host that refused everything it could not disprove would be unusable in
    * any vault without a GUI Obsidian, which is most headless vaults.
    */
-  async assertCanEnable(id: string): Promise<void> {
-    if (this.config.forceShared.includes(id)) return;
+  async assertCanEnable(id: string, forced = false): Promise<void> {
+    // **Two ways to be forced, and both are the operator's.** `--force-shared`
+    // is the standing one, fixed at startup; `force_shared: true` on a single
+    // `host.enable_plugin` is the one-off, and it has to be a parameter rather
+    // than a mutation of the config because a config a request can rewrite is a
+    // config nothing else in this host can trust for the rest of the process.
+    if (forced || this.config.forceShared.includes(id)) return;
     const report = await this.check();
     if (!report.guiReadable) return;
     if (!report.guiEnabled.includes(id)) return;

@@ -5,10 +5,11 @@
  * **Activated by Task 15**, and reconciled against the modules it names. The
  * body predates every one of them — it was written in Task 6b against interface
  * sketches — so the divergences were real and each is noted at the call site it
- * was found in. The four members belonging to tasks that have not run yet
- * (`server`, `broker`, `dryRun`, `detector`) are kept by **name** and throw when
- * touched, so a case written against one fails with the task number rather than
- * with `undefined is not a function`.
+ * was found in. The members belonging to tasks that have not run yet (`broker`,
+ * `dryRun`, `detector`) are kept by **name** and throw when touched, so a case
+ * written against one fails with the task number rather than with `undefined is
+ * not a function`. `server`, `connectClient` and `serverQuiesce` were three of
+ * those until Task 16a built the socket; they are real now.
  *
  * It extends {@link ShimHarness} rather than wrapping one, so every method a
  * shim test uses is still available to a host test: a case about the event
@@ -34,15 +35,19 @@
 import { connect } from "node:net";
 import type { Socket } from "node:net";
 
+import { join, resolve } from "node:path";
+
 import { DaemonHarness } from "./daemon-harness";
 import { FixtureVault } from "./fixture-vault";
+import { HostServer } from "../server/server";
 import { LifecycleSequencer } from "../runtime/lifecycle";
 import { QuarantineTracker } from "../runtime/quarantine";
-import { ShimHarness, configFilePathsFor } from "./shim-harness";
+import { ShimHarness, configFilePathsFor, sweepStaleDataDirs } from "./shim-harness";
 import { DataDir } from "../datadir";
-import { OBSIDIAN_CONFIG_DIR, pluginDataPath } from "../pluginset/config-dir";
+import { OBSIDIAN_CONFIG_DIR, pluginDataPath, pluginDirPath } from "../pluginset/config-dir";
 import { TFolder } from "../shim/files";
 import { fs } from "../runtime/fs-access";
+import { noteDto } from "./mirror-harness";
 import { revisionOfSource } from "./daemon-harness";
 import type { HostConfig } from "../config";
 import type { App } from "../shim/app";
@@ -121,6 +126,8 @@ export class HostHarness extends ShimHarness {
   /** Every `write_file` this harness answered, by path. See {@link writtenFile}. */
   private readonly written = new Map<string, string>();
   private guiEnabled: string[] | null;
+  /** Built by {@link bindHost}, so it is listening to the mirror from the start. */
+  private serverValue: HostServer | null = null;
 
   /**
    * Reusable plugin factories the tests share instead of restating them.
@@ -205,7 +212,18 @@ export class HostHarness extends ShimHarness {
     // — so a harness that flipped it during construction would make the
     // assertion pass for the wrong reason. `suppressLayoutReady` is passed to
     // the sequencer instead, where it means "never flip it at all".
-    const options: ShimHarnessOptions = { config: spec.config ?? {}, layoutReady: false };
+    const options: ShimHarnessOptions = {
+      // **A short socket path, and it has to be short.** A Unix socket address
+      // is capped at about 104 bytes on Darwin, and `socketPathFor`'s
+      // `<dataDir>/run/<digest>/host.sock` under a checked-out worktree is
+      // already past it — the failure is an `EINVAL` from `listen` that names no
+      // limit and reads like a bug in the host. `ShimHarness` derives the socket
+      // from the data dir precisely so a harness cannot bind one in the user's
+      // home directory; this keeps that property (the path is inside the
+      // repository's own `target/tmp`) and buys back the twenty-odd characters.
+      config: { socketPath: freshSocketPath(), ...(spec.config ?? {}) },
+      layoutReady: false,
+    };
     if (spec.configFiles !== undefined) options.configFiles = spec.configFiles;
     super(options);
     this.guiEnabled = spec.guiEnabled ?? null;
@@ -288,6 +306,33 @@ export class HostHarness extends ShimHarness {
       },
       ...(spec.suppressLayoutReady === true ? { skipLayoutReady: true } : {}),
     });
+    // **Built here, not on the first `connectClient`.** The server subscribes to
+    // the mirror, the notice log, the sequencer and the coexistence monitor the
+    // moment it exists, so a case that commits a generation before any client
+    // connects still has a host whose event sources are wired — and a client
+    // that connects afterwards sees a host that has been watching all along
+    // rather than one that started watching when it knocked.
+    if (spec.config?.wireLateOps === true) {
+      throw new Error(
+        "wireLateOps: true needs Task 20b's broker, plugin config service and detector, none of " +
+          "which exist yet. Leave it false (or unset) and the six late ops answer host_not_ready.",
+      );
+    }
+    this.serverValue = new HostServer({
+      config: this.config,
+      lifecycle: this.lifecycle,
+      harvest: this.harvest,
+      mirror: this.mirror,
+      client: this.assembly.client,
+      quarantine: this.quarantine,
+      coexistence: this.assembly.coexistence,
+      noticeLog: this.noticeLog,
+      app: this.app,
+      dir: this.assembly.dir,
+      queue: this.assembly.queue,
+      errors: this.assembly.errors,
+      policyRecorder: this.policyRecorder,
+    });
   }
 
   /**
@@ -314,25 +359,38 @@ export class HostHarness extends ShimHarness {
   }
 
   /**
-   * Connect a client to the host's socket.
+   * Connect a client to the host's socket, and say hello with the nonce.
    *
-   * **Activated by Task 16a**, which builds the server there is nothing to
-   * connect to yet. {@link HostTestClient} below is real and stays: it is the
-   * client that task's cases drive.
+   * **Activated by Task 16a.** It listens first if nothing has: a case about
+   * `host.list_commands` should not have to remember that a socket has to be
+   * bound before anything can knock on it, and `listen()` is idempotent.
+   *
+   * `stalled: true` pauses the socket **after** the hello handshake, which is
+   * the only order that works: a paused socket delivers no `data` events, so a
+   * client that was paused from the first byte could never read the answer to
+   * its own hello. A case that wants to subscribe before stalling calls
+   * {@link HostTestClient.stall} instead, which is what the lag case does.
    */
-  connectClient(options: { stalled?: boolean } = {}): Promise<HostTestClient> {
-    void options;
-    throw notActivated("connectClient", "16a");
+  async connectClient(options: { stalled?: boolean } = {}): Promise<HostTestClient> {
+    const socketPath = await this.server.listen();
+    const client = await HostTestClient.open(socketPath);
+    this.clients.push(client);
+    await client.call("host.hello", { nonce: this.readNonce() });
+    if (options.stalled === true) client.stall();
+    return client;
   }
 
-  /** Resolve once the server has flushed every queued event. Task 16a. */
+  /** Resolve once the server has flushed every queued event. */
   serverQuiesce(): Promise<void> {
-    throw notActivated("serverQuiesce", "16a");
+    return this.server.quiesce();
   }
 
-  /** The JSON-RPC server. **Activated by Task 16a.** */
-  get server(): never {
-    throw notActivated("server", "16a");
+  /** The host's protocol server, wired to this harness's mirror and lifecycle. */
+  get server(): HostServer {
+    if (this.serverValue === null) {
+      throw new Error("this harness has not been assembled yet");
+    }
+    return this.serverValue;
   }
 
   /** The modal/suggester broker. **Activated by Task 18.** */
@@ -580,9 +638,19 @@ export class HostHarness extends ShimHarness {
     this.clearMethodLog();
   }
 
-  /** Loosen the socket directory's mode, so the host's refusal can be tested. */
+  /**
+   * Loosen the socket directory's mode, so the host's refusal can be tested.
+   *
+   * It **makes** the directory first, because the case that widens it runs
+   * before `listen()` — which is the whole point, since `listen()` is what has
+   * to refuse — and there would otherwise be nothing to `chmod`. The creation is
+   * at `0700`, the mode the host would have used, so the only difference between
+   * this and an ordinary startup is the widening the case asks for.
+   */
   chmodSocketDir(mode: number): void {
-    fs.chmodSync(socketDirOf(this.config.socketPath), mode);
+    const directory = new DataDir(socketDirOf(this.config.socketPath));
+    directory.ensureSecureDir(".");
+    directory.chmod(".", mode);
   }
 
   noncePath(): string {
@@ -605,6 +673,10 @@ export class HostHarness extends ShimHarness {
   override async stop(): Promise<void> {
     for (const client of this.clients) await client.disconnect();
     this.clients.length = 0;
+    // Before the lifecycle, so nothing is broadcasting into sockets that are
+    // being torn down — and it is safe on a harness that never listened, which
+    // most of them are.
+    await this.serverValue?.close();
     await this.lifecycle.stop();
     await super.stop();
   }
@@ -639,6 +711,28 @@ export class HostHarness extends ShimHarness {
     for (const [id, data] of Object.entries(spec.pluginData ?? {})) {
       this.setConfigFile(pluginDataPath(this.config.configDirName, id), JSON.stringify(data));
     }
+    // **The plugins directory, as a directory.** `host.list_plugins` and
+    // `host.enable_plugin` read the installed set through `read_dir` plus one
+    // `manifest.json` per folder, and a harness that served neither would leave
+    // those reads sitting in the request queue forever — a hang, not a failure,
+    // which is the worst way for a harness to be incomplete. Every plugin the
+    // spec supplies a factory for is installed here, with the manifest
+    // `manifestFor` would give it, so "installed" means the same thing to the
+    // host as it does to the case.
+    const ids = [...this.factories.keys()].sort();
+    for (const id of ids) {
+      const { dir, ...manifest } = this.manifestFor(id);
+      void dir;
+      this.setConfigFile(
+        `${pluginDirPath(this.config.configDirName, id)}/manifest.json`,
+        JSON.stringify(manifest),
+      );
+    }
+    this.autoServeDirs({
+      [`${this.config.configDirName}/plugins`]: ids.map((id) => ({ name: id, kind: "folder" })),
+    });
+    this.serveVaultInfo();
+    this.serveEditorNotes();
     this.serveFixtures([]);
     for (const path of configFilePathsFor(this)) {
       if (spec.configFiles?.[path] === undefined) this.unserveFile(path);
@@ -658,6 +752,63 @@ export class HostHarness extends ShimHarness {
     for (const path of gone) {
       if (!(path in this.fixtures.files)) this.unserveFile(path);
     }
+  }
+
+  /**
+   * Answer the `get_note` an `Editor.open` issues, and only that one.
+   *
+   * **The `include` field is what separates the two callers**, exactly as it
+   * does in `ShimHarness.serveNotes`: the mirror's refetch always asks for
+   * `include: ["sections", "list_items"]` and an editor read asks for neither.
+   * A `get_note` with an `include` is left for `answerRefetch` to answer.
+   *
+   * It is repeated here rather than inherited because `HostHarness` assembles
+   * itself — it opens its own mirror rather than going through
+   * `ShimHarness.start`, which is what fills that harness's note rows — so
+   * without this an editor command hangs on a read nothing ever answers. Task
+   * 16a's `host.invoke_command` with an `active_file` is the first caller to
+   * find out.
+   */
+  private serveEditorNotes(): void {
+    this.serve((request) => {
+      if (request.request.method !== "get_note") return false;
+      const params = request.request.params as { path?: string; include?: unknown };
+      if (params.include !== undefined) return false;
+      const path = params.path;
+      if (path === undefined) return false;
+      const row = this.fixtures.notes().find((note) => note.path === path);
+      const source = this.fixtures.files[path];
+      if (row === undefined || source === undefined) return false;
+      this.respondOk(request.id, "get_note", {
+        generation: this.mirror.generation(),
+        note: { ...noteDto(row), source },
+      });
+      return true;
+    });
+  }
+
+  /**
+   * Answer `get_vault_info` from what this harness actually holds.
+   *
+   * The daemon op a client is most likely to send first, and the one Task 16a's
+   * forwarding case uses to prove that a non-`host.` method reaches the daemon
+   * verbatim: a harness that did not answer it would leave that case hanging on
+   * a request nothing ever replies to, which proves nothing about forwarding.
+   */
+  private serveVaultInfo(): void {
+    this.serve((request) => {
+      if (request.request.method !== "get_vault_info") return false;
+      this.respondOk(request.id, "get_vault_info", {
+        generation: this.mirror.generation(),
+        canonical_root: this.config.vaultRoot,
+        vault_identity: "fake-vaultd",
+        state: "ready",
+        note_count: this.mirror.entries().filter((entry) => entry.kind === "note").length,
+        refreshed_at_unix_ms: this.config.clock.now(),
+        live_state: "watching",
+      });
+      return true;
+    });
   }
 
   /**
@@ -703,6 +854,33 @@ function socketDirOf(socketPath: string): string {
   return cut === -1 ? "." : socketPath.slice(0, cut);
 }
 
+/** The prefix every harness socket directory starts with, and the sweep matches. */
+const SOCKET_PREFIX = "host-sock-";
+
+/**
+ * A socket directory no other harness has, under the repository's `target/tmp`.
+ *
+ * `mkdtemp` makes it at `0700` — which is what the host asserts — and the short
+ * name is deliberate: everything after `target/tmp/` counts against Darwin's
+ * ~104-byte socket address limit, so the file inside it is called `s`.
+ *
+ * Swept on the same terms `ShimHarness` sweeps its data dirs: a six-hour floor,
+ * so no live run's directory can be caught by another fork's sweep, and failures
+ * are ignored because two forks tidying the same stale directory at once is the
+ * ordinary case rather than an error.
+ */
+function freshSocketPath(): string {
+  const root = resolve(__dirname, "..", "..", "..", "..", "..", "target", "tmp");
+  fs.mkdirSync(root, { recursive: true });
+  if (!sweptSockets) {
+    sweptSockets = true;
+    sweepStaleDataDirs(root, SOCKET_PREFIX);
+  }
+  return join(fs.mkdtempSync(join(root, SOCKET_PREFIX)), "s");
+}
+
+let sweptSockets = false;
+
 /**
  * A refusal the host answered with, as an `Error`.
  *
@@ -741,27 +919,41 @@ export class HostTestClient {
   > = [];
   private buffered = "";
   private sequence = 0;
-  private stalled: boolean;
+  private stalled = false;
 
-  private constructor(
-    private readonly socket: Socket,
-    stalled: boolean,
-  ) {
-    this.stalled = stalled;
-    if (stalled) socket.pause();
+  private constructor(private readonly socket: Socket) {
     socket.on("data", (chunk: Buffer) => {
       this.absorb(chunk.toString("utf8"));
     });
   }
 
-  static open(socketPath: string, stalled: boolean): Promise<HostTestClient> {
+  static open(socketPath: string): Promise<HostTestClient> {
     return new Promise((resolve, reject) => {
       const socket = connect(socketPath);
       socket.once("connect", () => {
-        resolve(new HostTestClient(socket, stalled));
+        resolve(new HostTestClient(socket));
       });
       socket.once("error", reject);
     });
+  }
+
+  /**
+   * Stop reading, so the host's bounded queue is what backs up.
+   *
+   * **A stall is not a state a connection can open in**, which is the one place
+   * the phase brief's sketch could not work: a socket paused from the first byte
+   * delivers no `data` events at all, so a client that stalled before its own
+   * `host.hello` could never read the answer and every `call` on it would hang
+   * forever. Attaching a `data` listener does not rescue it either — Node
+   * re-resumes a stream on `on("data")` only when it was not explicitly paused.
+   *
+   * So a case does the handshake, subscribes, and *then* stalls, which is also
+   * the honest shape of the failure being reproduced: a client that was working
+   * and stopped reading. Nothing may be awaited until {@link resume}.
+   */
+  stall(): void {
+    this.stalled = true;
+    this.socket.pause();
   }
 
   call<T = unknown>(method: string, params?: unknown): Promise<T> {

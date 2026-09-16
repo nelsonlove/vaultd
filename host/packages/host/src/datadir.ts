@@ -41,6 +41,59 @@ export class DataDir {
     fs.mkdirSync(this.resolve(relative), { recursive: true });
   }
 
+  /**
+   * Create a directory only this user may enter, at mode `0700`.
+   *
+   * **This is the layer the socket's trust model rests on.** A `0700` directory
+   * is what stops another user reaching anything inside it, on every Unix,
+   * because traversal requires execute permission on the directory — unlike the
+   * mode on an `AF_UNIX` socket file, which Darwin and the BSDs historically
+   * ignore at `connect()` time.
+   *
+   * The mode is passed to `mkdir` **and** applied afterwards, for the same two
+   * reasons {@link DataDir.writeSecret} sets a file's mode twice: `mkdir`'s mode
+   * is masked by the process umask and applies only at creation, so a directory
+   * created under a permissive umask would be born wider than asked, and a
+   * directory that already exists would keep whatever mode it already had.
+   * Neither residual is acceptable for the directory that is doing the
+   * enforcing, and the caller still `stat`s it afterwards rather than trusting
+   * this to have worked.
+   *
+   * **A directory that is already there is left exactly as it is.** Widening it
+   * back to `0700` here would be this host quietly repairing the very condition
+   * it is about to refuse to start on — and the refusal is the point: a socket
+   * directory somebody has opened up is a fact the operator needs to be told,
+   * not one a `chmod` should paper over.
+   */
+  ensureSecureDir(relative: string): string {
+    const full = this.resolve(relative);
+    if (fs.existsSync(full)) return full;
+    fs.mkdirSync(full, { recursive: true, mode: 0o700 });
+    fs.chmodSync(full, 0o700);
+    return full;
+  }
+
+  /** The permission bits and owner of `relative`, or `null` when it is absent. */
+  ownership(relative: string): { mode: number; uid: number } | null {
+    const full = this.resolve(relative);
+    if (!fs.existsSync(full)) return null;
+    const stats = fs.statSync(full);
+    return { mode: stats.mode & 0o777, uid: stats.uid };
+  }
+
+  chmod(relative: string, mode: number): void {
+    fs.chmodSync(this.resolve(relative), mode);
+  }
+
+  /** Remove `relative` if it is there. A path that is not there is not an error. */
+  remove(relative: string): void {
+    fs.rmSync(this.resolve(relative), { force: true });
+  }
+
+  exists(relative: string): boolean {
+    return fs.existsSync(this.resolve(relative));
+  }
+
   writeJson(relative: string, value: unknown, mode?: number): void {
     const full = this.resolve(relative);
     fs.mkdirSync(dirname(full), { recursive: true });

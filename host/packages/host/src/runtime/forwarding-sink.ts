@@ -40,8 +40,17 @@ import type { VaultdClient } from "../client/client";
  */
 export function forwardingSink(supplier: () => VaultdClient): RequestSink {
   return {
-    request<T>(method: string, params?: unknown): Promise<T> {
-      return supplier().request<T>(method, params);
+    // **`async`, so a supplier throw becomes a rejection.** The supervisor's
+    // `client()` throws when there is no engine at all, and a synchronous throw
+    // out of a method whose type says it answers a promise is a shape no caller
+    // guards against: every call site in the shim is `await sink.request(...)`
+    // inside a `try`, which catches a rejection and does catch this one too —
+    // but a caller that stores the promise first (`const p = sink.request(...)`)
+    // or hands it to `Promise.all` gets the throw at the call rather than in the
+    // chain, and Task 15's re-review found exactly that shape being relied on.
+    // One keyword makes the declared contract the real one.
+    async request<T>(method: string, params?: unknown): Promise<T> {
+      return await supplier().request<T>(method, params);
     },
   };
 }
