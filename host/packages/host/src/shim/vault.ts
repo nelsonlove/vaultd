@@ -125,6 +125,24 @@ export class Vault extends Events {
    */
   readonly index: FileIndex;
 
+  /**
+   * Folder moves **this host performed**, waiting for the batch that describes
+   * them.
+   *
+   * A folder has no content revision, so `FileIndex.applyBatch` cannot pair one
+   * out of the delete and the create the wire sends — see that module's header.
+   * The pair is nonetheless known exactly here, at the call site that sent
+   * `rename_folder`, so it is written down and Task 15's sequencer drains it
+   * when the batch arrives. Only folders: a note pairs by revision and needs no
+   * record.
+   *
+   * It is drained, not accumulated. A recorded move whose batch never arrives —
+   * the mutation escalated to a resync, say — is dropped by the next drain, and
+   * `applyBatch` ignores a pair whose ends the batch does not name, so a stale
+   * record is inert rather than wrong.
+   */
+  private readonly folderMoves: Array<{ from: string; to: string }> = [];
+
   private configCache: Record<string, unknown> | null = null;
   private configLoading: Promise<void> | null = null;
   /** Bumped by every invalidation, so a read in flight across one is discarded. */
@@ -215,6 +233,26 @@ export class Vault extends Events {
    */
   applyBatch(batch: MirrorChangeBatch, options: ApplyBatchOptions = {}): AppliedBatch {
     return this.index.applyBatch(batch, options);
+  }
+
+  /**
+   * Write down a folder move this host just performed.
+   *
+   * @internal Host seam. Called by {@link rename} and by
+   * `FileManager.renameFile`, and drained by {@link takeFolderMoves}. See
+   * {@link folderMoves}.
+   */
+  recordFolderMove(from: string, to: string): void {
+    this.folderMoves.push({ from, to });
+  }
+
+  /**
+   * Every folder move recorded since the last drain, and forget them.
+   *
+   * @internal Host seam. Task 15's lifecycle sequencer calls it once per batch.
+   */
+  takeFolderMoves(): Array<{ from: string; to: string }> {
+    return this.folderMoves.splice(0, this.folderMoves.length);
   }
 
   /**
@@ -471,21 +509,31 @@ export class Vault extends Events {
    * **Neither path is synchronized into the tree here.** The daemon models a
    * move as a delete plus a create, `FileIndex.applyBatch` pairs those back into
    * one rename by revision, and an index that had already moved the node would
-   * leave that pairing nothing to reuse — so the batch is what moves it. Until
-   * Task 15 subscribes the mirror to that batch, the tree keeps the old path
-   * until something replays the batch: `applyMutation` emits it as the last
-   * thing it does, inside the `await` this method holds, so a Task 15 subscriber
-   * closes the window entirely rather than narrowing it.
+   * leave that pairing nothing to reuse — so the batch is what moves it. The
+   * window that used to leave is closed: `applyMutation` emits the batch as the
+   * last thing it does, inside the `await` below, and Task 15's sequencer is
+   * subscribed to it, so the tree has moved by the time this method resolves.
+   *
+   * **A folder move is recorded before the apply**, because a folder has no
+   * content revision for the pairing to work from. See {@link folderMoves}.
    */
   async rename(file: TAbstractFile, newPath: string): Promise<void> {
     const folder = file instanceof TFolder;
     // Read before the send: afterwards `from` is gone and so is its backlink
     // entry, so the same call would answer with a smaller set and say nothing.
     const affected = affectedPathsForRename(this, this.deps.mirror, file, newPath);
+    const from = file.path;
     const result = await this.deps.writes.send<RenameResponse>(
       folder ? "rename_folder" : "rename_note",
-      { from: file.path, to: newPath, rewrite_links: true },
+      { from, to: newPath, rewrite_links: true },
     );
+    // **Before the apply, because the apply is what emits the batch.** A folder
+    // has no revision to pair on, so this record is the only thing that lets the
+    // sequencer report the move as one `rename` rather than a delete and a
+    // create — and `applyMutation` emits the batch inside the await below, so a
+    // record written afterwards would arrive one batch too late. See
+    // {@link folderMoves}.
+    if (folder) this.recordFolderMove(from, newPath);
     await this.deps.mirror.applyMutation(result.generation, affected);
   }
 
@@ -498,13 +546,11 @@ export class Vault extends Events {
    * typed refusal rather than a recursive wipe. It means nothing for a file.
    *
    * The emptiness test reads the mirror rather than the tree, because the tree
-   * is the thing that can be behind: as with {@link rename}, the node stays in
-   * the tree until a batch removes it, and until Task 15 subscribes the mirror
-   * to those batches a plugin that deletes a note and immediately calls
-   * `getFiles()` still sees it. `applyMutation` emits the batch inside the
-   * `await` this method holds, so a Task 15 subscriber closes that window
-   * rather than narrowing it — the folder case is the one that could not wait,
-   * and it is closed here and in the mirror.
+   * is the thing that can be behind: the node stays in the tree until a batch
+   * removes it. `applyMutation` emits the batch inside the `await` this method
+   * holds and Task 15's sequencer is subscribed to it, so the window is closed
+   * rather than narrowed — but the emptiness test runs *before* any of that, so
+   * it still has to ask the mirror.
    */
   async delete(file: TAbstractFile, force?: boolean): Promise<void> {
     const recursive = force ?? false;

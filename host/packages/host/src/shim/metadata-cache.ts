@@ -301,9 +301,16 @@ export class MetadataCache extends Events {
    * Fire `changed` for one note, in Obsidian's argument order: `(file, data,
    * cache)`.
    *
-   * `data` is the note's new source, which the mirror has already read to
-   * rebuild the position index, so the event costs no extra round trip. The
-   * retained entry is dropped first, so a handler that calls `getFileCache`
+   * `data` is the note's new source, and the caller is the one that has to
+   * fetch it. An earlier draft of this paragraph claimed the event costs no
+   * extra round trip because the mirror had already read those bytes to rebuild
+   * the position index — it reads them and then discards them, which is the
+   * whole point of `PositionIndex`, so there was nothing to hand over. Task 15's
+   * sequencer reads the note through `Vault.cachedRead` before it fires this,
+   * which is one `read_file` per changed note per batch and is the price of a
+   * `data` argument that is not a lie.
+   *
+   * The retained entry is dropped first, so a handler that calls `getFileCache`
    * inside the event sees the same object the event carried rather than the
    * previous one.
    *
@@ -330,9 +337,13 @@ export class MetadataCache extends Events {
    * **A note nothing ever read has nothing to carry, and answers `null`.** That
    * is a real hole rather than a shrug — `CachedMetadata | null` is what
    * Obsidian's own typing permits, but a handler that wants to un-index a note
-   * it never asked about gets nothing. Task 15 closes it, if it wants it closed,
-   * by reading the cache before it applies the delete; this surface cannot,
-   * because it is not told a note is about to go.
+   * it never asked about gets nothing. **Task 15 left it open, deliberately.**
+   * Closing it means assembling every note's `CachedMetadata` up front so there
+   * is always a previous one to hand over, which is the whole-vault retention
+   * this mirror exists to avoid — `PositionIndex` keeps line tables and link
+   * slices precisely so a 100k-note vault does not keep 100k parses in memory.
+   * A plugin that cares reads the cache while the note is still there, which is
+   * what every plugin in the census that un-indexes on `deleted` already does.
    *
    * **The read happens before any eviction, and nothing else evicts.** A reader
    * meeting a gone row leaves the retained assembly alone (see `cacheFor`), so a
@@ -347,6 +358,27 @@ export class MetadataCache extends Events {
     const previous = this.assembled.get(file.path)?.cache ?? null;
     this.assembled.delete(file.path);
     this.trigger("deleted", ...([file, previous] as never[]));
+  }
+
+  /**
+   * Fire `resolved` at **one plugin's** listeners. Answers how many ran.
+   *
+   * The synthetic `resolved` a late-enabled plugin is owed (Ruling 6): six
+   * plugins in the census gate their whole startup on this event, and one
+   * enabled onto a quiet vault would otherwise wait for a change that never
+   * comes. Broadcasting it instead would re-fire `resolved` at every plugin
+   * already running — several of which rebuild an index on it — for a fact that
+   * is true of none of them.
+   *
+   * The event name is composed here rather than by the caller, because this
+   * class owns its bus prefix and a caller spelling `metadataCache:resolved` by
+   * hand would be a second place that has to change if it ever moves.
+   *
+   * @internal Host seam. Not part of Obsidian's `MetadataCache`; Task 15's
+   * lifecycle sequencer is the only caller.
+   */
+  notifyResolvedTo(pluginId: string): number {
+    return this.deps.events.triggerFor(pluginId, this.scoped("resolved"));
   }
 
   /**

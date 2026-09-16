@@ -28,6 +28,13 @@
  * lands here instead of becoming an unhandled rejection with no plugin name on
  * it.
  *
+ * `event` is a listener that threw while the host was fanning a vault or
+ * metadata change out to it. Nobody is waiting on one either: `ShimEventBus`
+ * catches per listener so that one plugin's exception cannot skip every other
+ * plugin's handler, and the report is what turns "swallowed" into "attributed".
+ * Task 15's sequencer pairs it with the event's own name — the detail
+ * `vault:rename` gives the quarantine the label `event:vault:rename`.
+ *
  * `config` is the host's own failure rather than any plugin's, and it carries
  * the plugin id `"host"`: a damaged `community-plugins.json`, a coexistence
  * poll whose read failed, a subscriber to that poll that threw. It is a
@@ -44,7 +51,25 @@ export type HostErrorPhase =
   | "menu-hook"
   | "plugin-data"
   | "command"
+  | "event"
   | "config";
+
+/**
+ * The plugin id the host reports its own failures under.
+ *
+ * **One definition, named here because this is where a report's `pluginId`
+ * field is declared.** It had three: `shim/commands.ts` used it for a command
+ * invoked with no plugin on the stack, `pluginset/config-dir.ts` for a config
+ * file it could not read, and `runtime/quarantine.ts` for the id it refuses to
+ * count against. Three string literals for one fact is three chances for a
+ * rename to leave the quarantine counting the host's own bugs against a plugin
+ * called `"host"`, which would disable working plugins one at a time until
+ * somebody noticed. `runtime/quarantine.ts` re-exports it, so a caller that
+ * thinks of it as a quarantine concept still finds it there.
+ *
+ * Nothing under this id is ever a plugin, so nothing under it is ever counted.
+ */
+export const HOST_PLUGIN_ID = "host";
 
 export type HostErrorListener = (error: unknown, pluginId: string, phase: HostErrorPhase) => void;
 

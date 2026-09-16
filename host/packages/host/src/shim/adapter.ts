@@ -272,6 +272,13 @@ export class DataAdapter {
     // Neither path is synchronized here: the pair is what Task 15's sequencer
     // turns into one `rename` event, and an index that had already moved the
     // node would leave it nothing to pair.
+    //
+    // A **folder** move is recorded, for the same reason `Vault.rename` records
+    // one: a folder carries no content revision, so nothing downstream could
+    // pair it, and this is the call site that knows both ends. Three rename
+    // surfaces that disagreed about what a folder move looks like to a plugin
+    // would be three answers to one question.
+    if (folder) this.vault().recordFolderMove(normalizedPath, normalizedNewPath);
     await this.settle(result.generation, null, affected);
   }
 

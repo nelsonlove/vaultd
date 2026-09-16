@@ -118,6 +118,19 @@ export class DaemonHarness {
     this.methods.length = 0;
   }
 
+  /**
+   * Put a label of your own into the method log.
+   *
+   * "What did this operation ask the daemon for?" is a question with no answer
+   * unless something marks where the operation began — a clock reading cannot,
+   * because nothing here sleeps, and clearing the log instead would throw away
+   * the context a failure message needs. A label is never a method name, so a
+   * search for one cannot collide with a real request.
+   */
+  mark(label: string): void {
+    this.methods.push(label);
+  }
+
   respondOk(id: string, type: string, value: unknown): void {
     this.answered.add(id);
     this.daemon.respondOk(id, type, value);

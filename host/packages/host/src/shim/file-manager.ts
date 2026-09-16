@@ -320,11 +320,19 @@ export class FileManager {
     // its backlink entry is gone with it, so a set computed afterwards would be
     // silently emptier.
     const affected = affectedPathsForRename(this.deps.vault, this.deps.mirror, file, newPath);
+    const folder = file instanceof TFolder;
+    const from = file.path;
     const result = await this.deps.writes.send<RenameResponse>(
-      file instanceof TFolder ? "rename_folder" : "rename_note",
-      { from: file.path, to: newPath, rewrite_links: true },
+      folder ? "rename_folder" : "rename_note",
+      { from, to: newPath, rewrite_links: true },
     );
     this.lastFailures = result.link_rewrite_failures;
+    // The same record `Vault.rename` writes, for the same reason: a folder has
+    // no revision to pair on, so this is the only thing that lets Task 15's
+    // sequencer report the move as one `rename`. Two rename surfaces that
+    // disagreed about what a rename *is* would be exactly the divergence
+    // `rename-paths.ts` exists to prevent.
+    if (folder) this.deps.vault.recordFolderMove(from, newPath);
     await this.deps.mirror.applyMutation(result.generation, affected);
   }
 

@@ -36,7 +36,7 @@
  * have to cover it.
  */
 
-import { HostErrors } from "../shim/errors";
+import { HOST_PLUGIN_ID, HostErrors } from "../shim/errors";
 import type { HostConfig } from "../config";
 import type { PluginManifest } from "../shim/plugin";
 import type {
@@ -98,6 +98,29 @@ export class ManifestIdMismatch extends Error {
     this.name = "ManifestIdMismatch";
     this.pluginId = pluginId;
     this.declaredId = declaredId;
+  }
+}
+
+/**
+ * The enabled set was not written, because the copy on disk is damaged.
+ *
+ * Typed rather than a bare `Error` because a caller can do something with it:
+ * an enable that refuses for this reason has left the user's file exactly as it
+ * was, which is the point, and the message is what tells them where to look.
+ * See {@link HeadlessConfigDir.writeEnabledSet}.
+ */
+export class EnabledSetDamaged extends Error {
+  readonly code = "enabled_set_damaged";
+  readonly path: string;
+
+  constructor(path: string) {
+    super(
+      `refusing to write ${path}: this host read it and found it damaged, so the set it would ` +
+        "write back is not the set that is in there. Repair or remove the file and the next " +
+        "successful read lifts this refusal.",
+    );
+    this.name = "EnabledSetDamaged";
+    this.path = path;
   }
 }
 
@@ -217,7 +240,7 @@ export class HeadlessConfigDir {
       this.reportedCorrupt.delete(path);
       return ids;
     } catch (error) {
-      this.reportOnce(path, "host", error);
+      this.reportOnce(path, HOST_PLUGIN_ID, error);
       return [];
     }
   }
@@ -232,17 +255,26 @@ export class HeadlessConfigDir {
    * a round trip that buys nothing. `Plugin.saveData` omits it for the same
    * reason.
    *
-   * **Carry, for whichever task first calls this.** Nothing calls it yet. When
-   * an "enable a plugin" path does — Task 15's lifecycle, Task 16b's
-   * `host.enable_plugin` — it will read the set, append an id, and write it
+   * **It refuses to write over a file it has already reported as damaged**, and
+   * that guard is the whole reason this method has a failure mode at all. The
+   * caller is an "enable a plugin" path — Task 15's `enableLate`, Task 16b's
+   * `host.enable_plugin` — which reads the set, appends an id and writes it
    * back; and {@link readEnabledSet} answers `[]` for a *damaged* file, having
    * reported the damage only to the error seam. Read-append-write over that `[]`
    * would overwrite a file the user may still want, silently, on the strength of
    * a report nobody was obliged to read. The two halves are each correct and
-   * only dangerous together, so the guard belongs at the write: refuse to write
-   * a path this directory currently holds in {@link reportedCorrupt}.
+   * only dangerous together, so the guard lives at the write: a path this
+   * directory currently holds in {@link reportedCorrupt} is refused with
+   * {@link EnabledSetDamaged} rather than replaced.
+   *
+   * The refusal is narrow on purpose. It fires only after *this* directory has
+   * read the file and found it damaged, so a host that has never read it writes
+   * freely — and one spell of damage is cleared by the next successful read, so
+   * repairing the file by hand is all it takes to lift the refusal.
    */
   async writeEnabledSet(ids: readonly string[]): Promise<void> {
+    const enabledSetPath = `${this.configDir}/${COMMUNITY_PLUGINS}`;
+    if (this.reportedCorrupt.has(enabledSetPath)) throw new EnabledSetDamaged(enabledSetPath);
     const body = `${JSON.stringify([...ids], null, 2)}\n`;
     await this.client.request<WriteFileResponse>("write_file", {
       path: `${this.configDir}/${COMMUNITY_PLUGINS}`,

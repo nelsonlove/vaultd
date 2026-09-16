@@ -48,7 +48,7 @@
  * {@link CoexistenceMonitor.start}.
  */
 
-import { HostErrors } from "../shim/errors";
+import { HOST_PLUGIN_ID, HostErrors } from "../shim/errors";
 import { OBSIDIAN_CONFIG_DIR } from "./config-dir";
 import type { HeadlessConfigDir } from "./config-dir";
 import type { HostConfig } from "../config";
@@ -184,7 +184,7 @@ export class CoexistenceMonitor {
     const report = await this.check();
     if (!report.guiReadable) return;
     if (!report.guiEnabled.includes(id)) return;
-    throw new OverlapRefused(id, refusalMessage(id, this.config.configDirName));
+    throw new OverlapRefused(id, overlapRefusalMessage(id, this.config.configDirName));
   }
 
   /**
@@ -283,13 +283,13 @@ export class CoexistenceMonitor {
       try {
         await this.check();
       } catch (error) {
-        this.errors.report(error, "host", "config");
+        this.errors.report(error, HOST_PLUGIN_ID, "config");
       }
       for (const hook of this.pollSubscribers) {
         try {
           await hook();
         } catch (error) {
-          this.errors.report(error, "host", "config");
+          this.errors.report(error, HOST_PLUGIN_ID, "config");
         }
       }
     })().finally(() => {
@@ -342,7 +342,7 @@ export class CoexistenceMonitor {
       try {
         subscriber(report);
       } catch (error) {
-        this.errors.report(error, "host", "config");
+        this.errors.report(error, HOST_PLUGIN_ID, "config");
       }
     }
   }
@@ -360,8 +360,15 @@ function sameIds(a: readonly string[], b: readonly string[]): boolean {
  * reasons are not obvious from the outside: a user who has just been told the
  * two copies have separate settings files has every reason to assume the
  * separation is complete.
+ *
+ * **Exported since Task 15**, which refuses a whole overlapping set at startup
+ * from one {@link CoexistenceMonitor.check} rather than re-checking per id: a
+ * host loading twenty plugins would otherwise pay two config reads per
+ * already-answered question. It builds its own {@link OverlapRefused} from this,
+ * so the sentence a startup refusal carries and the sentence a late enable
+ * carries are the same sentence rather than two that drift.
  */
-function refusalMessage(id: string, configDirName: string): string {
+export function overlapRefusalMessage(id: string, configDirName: string): string {
   return (
     `refusing to enable "${id}": Obsidian has it enabled too ` +
     `(.obsidian/community-plugins.json), and a separate ${configDirName}/ directory ` +

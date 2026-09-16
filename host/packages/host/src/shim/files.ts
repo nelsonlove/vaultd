@@ -43,12 +43,17 @@
  * folder, and folder-notes — the plugin this whole rename path exists for — is
  * a folder plugin.
  *
- * **Task 15 decides what to do about it**, and this is the shape of the
- * decision rather than the decision itself. Two facts it must not blur: for a
- * **host-initiated** move the folder pair is known exactly, at the call site
- * that sent `rename_folder`; for an **external** one it can only be inferred
- * from the folder paths sitting in `AppliedBatch.created` and `deleted`. Those
- * are different confidence levels and one rule must not produce both.
+ * **Task 15 decided, and the decision keeps the two confidence levels apart.**
+ * For a **host-initiated** move the folder pair is known exactly, at the call
+ * site that sent `rename_folder`: `Vault.rename` and `FileManager.renameFile`
+ * record both ends, the lifecycle sequencer drains that record when the batch
+ * arrives, and it hands the pairs down as {@link ApplyBatchOptions.renames} —
+ * so the folder keeps its `TFolder` instance and fires one `vault.on("rename")`
+ * like every other move. For an **external** one there is no record and nothing
+ * here infers one: the descendants pair by revision as they always did, and the
+ * folder row itself is reported as a plain delete plus a plain create. Which of
+ * the two Obsidian does for the folder *object* under an external move is
+ * uncaptured, so this host does not guess at it.
  */
 
 import type { MirrorChangeBatch, MirrorEntry, MirrorQuery } from "../mirror/types";
@@ -126,6 +131,29 @@ export interface AppliedBatch {
  */
 export interface ApplyBatchOptions {
   sizes?: Readonly<Record<string, number>>;
+  /**
+   * Moves the **caller already knows about**, paired without consulting a
+   * revision.
+   *
+   * Revision pairing cannot see a folder move: a folder has no content
+   * revision, so `Folder` → `Folder2` reaches the index as a plain delete and a
+   * plain create however obviously it is one move (see the module header). A
+   * *host-initiated* move is the one case where the pair is known exactly — the
+   * shim itself sent `rename_folder` and recorded both ends — so the sequencer
+   * hands those pairs down here rather than leaving the index to guess.
+   *
+   * **A pair is honoured only when the batch really names both ends**: `from`
+   * in `deleted`, `to` in `created`. A recorded move whose batch never arrived
+   * (the mutation escalated to a resync, say) therefore pairs nothing rather
+   * than moving a node the mirror has not moved.
+   *
+   * These are applied **before** the revision-paired ones and shallowest first,
+   * so a moved folder is in the tree by the time its descendants re-parent into
+   * it — otherwise each descendant would materialise a second folder at the new
+   * path and the original `TFolder` instance a plugin is holding would be
+   * orphaned.
+   */
+  renames?: readonly { from: string; to: string }[];
 }
 
 /** The vault root's path, as Obsidian spells it. */
@@ -180,7 +208,7 @@ export class FileIndex {
     const renamedFrom = new Set<string>();
     const renamedTo = new Set<string>();
 
-    for (const pair of this.pairRenames(batch)) {
+    for (const pair of this.renamePairs(batch, options)) {
       const file = this.nodes.get(pair.from);
       if (file === undefined) continue;
       this.detach(file);
@@ -295,6 +323,40 @@ export class FileIndex {
   }
 
   // --- Internals ------------------------------------------------------------
+
+  /**
+   * Every pair this batch is to replay as a move: the caller's own first, then
+   * the ones the revisions prove.
+   *
+   * The caller's are the host-initiated folder moves (see
+   * {@link ApplyBatchOptions.renames}) and they are filtered against the batch
+   * rather than trusted: a pair whose ends the batch does not name is dropped,
+   * and so is one whose `from` a revision pair has already claimed — two rules
+   * that between them make a stale record inert instead of wrong.
+   *
+   * Shallowest first, so a folder is at its new path before anything under it
+   * re-parents into it.
+   */
+  private renamePairs(
+    batch: MirrorChangeBatch,
+    options: ApplyBatchOptions,
+  ): Array<{ from: string; to: string }> {
+    const known = options.renames ?? [];
+    if (known.length === 0) return this.pairRenames(batch);
+    const created = new Set(batch.created);
+    const deleted = new Set(batch.deleted);
+    const explicit = known
+      .filter((pair) => pair.from !== pair.to && deleted.has(pair.from) && created.has(pair.to))
+      .sort((a, b) => depthOf(a.from) - depthOf(b.from));
+    const claimed = new Set(explicit.map((pair) => pair.from));
+    const alsoClaimed = new Set(explicit.map((pair) => pair.to));
+    return [
+      ...explicit,
+      ...this.pairRenames(batch).filter(
+        (pair) => !claimed.has(pair.from) && !alsoClaimed.has(pair.to),
+      ),
+    ];
+  }
 
   /**
    * The delete/create pairs this batch's revisions prove are moves.
@@ -450,6 +512,13 @@ function append(index: Map<string, string[]>, key: string, value: string): void 
 
 function isNotePath(path: string): boolean {
   return path.toLowerCase().endsWith(".md");
+}
+
+/** How many separators a path has — its depth below the vault root. */
+function depthOf(path: string): number {
+  let depth = 0;
+  for (const character of path) if (character === "/") depth += 1;
+  return depth;
 }
 
 function parentOf(path: string): string {

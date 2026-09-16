@@ -42,6 +42,7 @@
  */
 
 import { Editor } from "./editor";
+import { HOST_PLUGIN_ID } from "./errors";
 import { declarePolicy, recordUse } from "./policy";
 import type { App } from "./app";
 import type { Command } from "./plugin";
@@ -333,8 +334,14 @@ function kindOf(command: Command): CommandKind {
   return "callback";
 }
 
-/** What a failure in one of the host's own commands is reported against. */
-const HOST_COMMAND_OWNER = "host";
+/**
+ * What a failure in one of the host's own commands is reported against.
+ *
+ * The host's one id, imported rather than spelled again — see
+ * {@link HOST_PLUGIN_ID}. The alias is kept because this file's call sites read
+ * as a statement about command ownership rather than about the quarantine.
+ */
+const HOST_COMMAND_OWNER = HOST_PLUGIN_ID;
 
 /** The ids this host seeds itself, which belong to no plugin. */
 const HOST_COMMAND_IDS = new Set<string>([SAVE_COMMAND_ID]);

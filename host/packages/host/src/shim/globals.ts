@@ -77,6 +77,7 @@ import { currentPluginId, declarePolicy, recordUse, stub, unsupported } from "./
 import type { App } from "./app";
 import type { Clock, HostConfig } from "../config";
 import type { Harvest, HarvestedUnreachable } from "./harvest";
+import { HOST_PLUGIN_ID } from "./errors";
 import type { HostErrors } from "./errors";
 import type { StubDocument } from "./dom";
 
@@ -238,7 +239,7 @@ export class HostLocalStorage {
       // `plugin-data` is the phase for stored data that will not parse, which
       // is exactly what this is; the plugin whose call hit it is named when
       // there is one, and the host owns it otherwise.
-      this.errors.report(error, currentPluginId() ?? "host", "plugin-data");
+      this.errors.report(error, currentPluginId() ?? HOST_PLUGIN_ID, "plugin-data");
       return;
     }
     // Absent is not corrupt: an empty store is what a host that has never
@@ -253,7 +254,7 @@ export class HostLocalStorage {
     if (typeof stored !== "object" || Array.isArray(stored)) {
       this.errors.report(
         new Error(`${this.file} is not a JSON object; the stored values are unreadable`),
-        currentPluginId() ?? "host",
+        currentPluginId() ?? HOST_PLUGIN_ID,
         "plugin-data",
       );
       return;

@@ -140,6 +140,33 @@ export class ShimEventBus {
   }
 
   /**
+   * Fan `data` out to **one plugin's** listeners of `name`, in registration
+   * order. Returns how many were called.
+   *
+   * The narrow twin of {@link trigger}, and it exists for exactly one event:
+   * the synthetic `metadataCache:resolved` a late-enabled plugin is given so it
+   * does not sit waiting for a vault change that a quiet vault never has
+   * (Ruling 6). Broadcasting that would re-fire `resolved` at every plugin
+   * already running, for a fact that is true of none of them — several plugins
+   * in the corpus rebuild an index on every `resolved`, so the broadcast would
+   * be real work done for nothing every time anything was enabled.
+   *
+   * A failing listener is caught and reported exactly as {@link trigger}'s is:
+   * the delivery is narrower, the failure policy is not.
+   */
+  triggerFor(pluginId: string, name: string, ...data: never[]): number {
+    const set = this.registrations.get(name);
+    if (set === undefined) return 0;
+    let delivered = 0;
+    for (const registration of [...set]) {
+      if (registration.owner !== pluginId) continue;
+      delivered += 1;
+      this.tryTrigger(registration, data);
+    }
+    return delivered;
+  }
+
+  /**
    * Every listener a plugin registered, dropped in one call.
    *
    * Surfaces that keep their own record of a registration — the workspace keeps

@@ -34,8 +34,21 @@
  * working plugins one at a time until somebody noticed.
  */
 
+import { HOST_PLUGIN_ID } from "../shim/errors";
 import type { HostConfig } from "../config";
 import type { HostErrorEntry } from "../shim/errors";
+
+/**
+ * Re-exported, not re-declared.
+ *
+ * The one definition lives in `shim/errors.ts`, beside the `pluginId` field it
+ * is a value of — it had three copies before Task 15 hoisted it, and three
+ * literals for one fact is three chances for a rename to leave this file
+ * counting the host's own bugs against a plugin. Re-exported here because a
+ * caller that thinks of it as a quarantine concept looks for it here, and
+ * `test/quarantine.test.ts` already imports it from this module.
+ */
+export { HOST_PLUGIN_ID };
 
 /**
  * One failure, attributed.
@@ -56,15 +69,6 @@ export interface HandlerFailure {
   readonly error: Error;
   readonly atUnixMs: number;
 }
-
-/**
- * The plugin id the host reports its own failures under.
- *
- * `shim/commands.ts` uses it for a command invoked with no plugin on the
- * stack, and `pluginset/config-dir.ts` for a config file it could not read.
- * Nothing under this id is ever a plugin, so nothing under it is ever counted.
- */
-export const HOST_PLUGIN_ID = "host";
 
 interface PluginRecord {
   /** The failures still inside the window, oldest first. */
