@@ -8081,6 +8081,8 @@ git commit -m "feat(host): add dry-run with an explicit intercepted-surface list
 
 ### Task 20: The compatibility detector
 
+> **Amended 2026-09-16 (RULINGS, Task 20 reviews).** (1) The harness runs inside the host's own dry-run assembly by windowing the gate and the recorder, and requires `--dry-run` (typed `detector_requires_dry_run`); "a fresh gate and recorder" is windowing, not a second assembly. (2) A probe must leave the host as it found it: the restore is decided from the enabled SET read before the load, the probe's own gate rows are dropped by identity (tagged), never by position, and a probe-caused load failure is recorded visible but never counts toward the quarantine window. (3) The verdict enum gains a fourth value — `runs | degrades | fails | unknown` — where `unknown` means a harness was attempted and refused (quarantined, or a probe error); "not in dry-run" keeps the tier-mapped verdict; the row carries `harnessAttempted`. (4) The event bus attributes each handler run to the listener's plugin, which corrected quarantine attribution too. (5) `ScanResult` separates generic-member hits (`genericSymbols`) from `apiSymbols`.
+
 **Files:**
 
 - Create: `host/packages/host/src/detector/scanner.ts`
