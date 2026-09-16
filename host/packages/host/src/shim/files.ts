@@ -112,6 +112,13 @@ export class TFolder extends TAbstractFile {
 /**
  * What one applied batch did to the tree, in the shape Task 15's sequencer
  * turns into events.
+ *
+ * **One path can be in both {@link created} and {@link deleted}**, and that
+ * pairing means a replacement: the thing that was there was removed and a
+ * *different* thing took its name. It arrives two ways — Ruling W6's
+ * created-and-deleted change set, and a `modified` path whose kind changed,
+ * which is the spelling the real wire uses — and the sequencer replays both the
+ * same way, delete first. The two entries are different instances.
  */
 export interface AppliedBatch {
   created: TAbstractFile[];
@@ -195,7 +202,8 @@ export class FileIndex {
    * 1. Pair renames, and re-parent those instances in place.
    * 2. Splice out the remaining deleted paths.
    * 3. Attach the remaining created paths.
-   * 4. Re-stat the modified ones.
+   * 4. Re-stat the modified ones — **except one whose kind changed**, which is
+   *    a replacement and comes out as a delete plus a create.
    *
    * **Deletes run before creates**, which is the opposite of the order a
    * reader might expect and is required by Ruling W6: a folder replaced by a
@@ -239,6 +247,40 @@ export class FileIndex {
       applied.deleted.push(node);
     }
 
+    // **Before the creates, and that ordering is load-bearing.** A path whose
+    // kind changed is a replacement (see below); if the batch also creates
+    // something *inside* the new folder — `Swap` becomes a folder and
+    // `Swap/Inner.md` appears with it — then materializing that child first
+    // makes `ensureFolder` meet a `TFile` at `Swap`, quietly put a fresh
+    // `TFolder` over it, and leave nothing for this pass to notice. The old
+    // node then left the tree with no event at all.
+    //
+    // **A path whose kind changed is a replacement, not a modification**, and
+    // this is the spelling the real wire uses. Ruling W6 describes a path in
+    // `created` and `deleted` at once; a folder replaced by a file of the same
+    // name reaches this host as `modified` every time it was measured, and
+    // `Mirror.synthesizeDiff` structurally cannot report it any other way,
+    // because it compares one stamp per path. Left as a modification it fell
+    // through the `TFile` test in the modified pass: no event reached any
+    // plugin, and the tree kept a `TFolder` at a path the daemon says is a file
+    // for the rest of the session.
+    //
+    // So it is reported as the same two steps W6 asks for — a delete of the old
+    // node and a create of a new one — and the instance really is new, because
+    // identity is a promise about *this file* and the file is gone.
+    const replacedPaths = new Set<string>();
+    for (const path of batch.modified) {
+      const held = this.nodes.get(path);
+      const entry = this.mirror.entry(path);
+      if (held === undefined || entry === undefined || !changedKind(held, entry)) continue;
+      replacedPaths.add(path);
+      this.detach(held);
+      this.nodes.delete(path);
+      applied.deleted.push(held);
+      const replacement = this.materialize(path, batch, options);
+      if (replacement !== null) applied.created.push(replacement);
+    }
+
     for (const path of batch.created) {
       if (renamedTo.has(path)) continue;
       const node = this.materialize(path, batch, options);
@@ -246,6 +288,7 @@ export class FileIndex {
     }
 
     for (const path of batch.modified) {
+      if (replacedPaths.has(path)) continue;
       const node = this.nodes.get(path) ?? this.materialize(path, batch, options);
       if (!(node instanceof TFile)) continue;
       const stat = this.statFor(path, batch, options);
@@ -512,6 +555,18 @@ function append(index: Map<string, string[]>, key: string, value: string): void 
 
 function isNotePath(path: string): boolean {
   return path.toLowerCase().endsWith(".md");
+}
+
+/**
+ * Does this node's kind disagree with the row the mirror now holds?
+ *
+ * Folder-ness is the whole of the question: a `TFolder` has children and no
+ * `stat`, a `TFile` has a `stat` and no children, and nothing else about a row's
+ * kind changes what class the shim hands a plugin. A note that becomes an
+ * attachment is still a `TFile`.
+ */
+function changedKind(node: TAbstractFile, entry: MirrorEntry): boolean {
+  return node instanceof TFolder !== (entry.kind === "folder");
 }
 
 /** How many separators a path has — its depth below the vault root. */

@@ -202,7 +202,10 @@ describe("lifecycle traps", () => {
   it("delivers a host-initiated folder move as one rename for the folder", async () => {
     const seen: string[] = [];
     const harness = await HostHarness.create({
-      vault: { "Folder/Note.md": "note\n" },
+      // `Folder2` is here to be left alone. The subtree test is by path
+      // segment, not by string prefix — the same bug class Task 6 fixed in the
+      // mirror's child index, where `Deeper.md` is not under `Deep`.
+      vault: { "Folder/Note.md": "note\n", "Folder2/Other.md": "other\n" },
       enabled: ["watcher"],
       plugins: {
         watcher: (api) =>
@@ -230,11 +233,13 @@ describe("lifecycle traps", () => {
     });
     await harness.lifecycle.start();
     const folder = harness.vault.getFolderByPath("Folder");
+    const sibling = harness.vault.getFileByPath("Folder2/Other.md");
     seen.length = 0;
     await harness.renameViaShim("Folder", "Moved");
-    // The folder itself and the note under it, each once. A folder carries no
-    // content revision, so nothing could have paired the folder by revision —
-    // the pair comes from `Vault.rename`'s own record of the move.
+    // The folder itself and the note under it, each once — and nothing about
+    // `Folder2`. A folder carries no content revision, so nothing could have
+    // paired the folder by revision; the pair comes from `Vault.rename`'s own
+    // record of the move.
     expect([...seen].sort()).toEqual([
       "rename:Folder->Moved",
       "rename:Folder/Note.md->Moved/Note.md",
@@ -242,6 +247,7 @@ describe("lifecycle traps", () => {
     // And it is the same `TFolder` a plugin was already holding, which is what
     // a delete-plus-create would have thrown away.
     expect(harness.vault.getFolderByPath("Moved")).toBe(folder);
+    expect(harness.vault.getFileByPath("Folder2/Other.md")).toBe(sibling);
     await harness.stop();
   });
 

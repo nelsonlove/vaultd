@@ -72,7 +72,14 @@ export class LiveHost {
       installPlugin(config, spec.installPlugin.id, spec.installPlugin.from);
     }
     if (spec.data !== undefined && spec.installPlugin !== undefined) {
-      const dir = join(config.dataDir, "plugins", spec.installPlugin.id);
+      // **Inside the vault, not in the host's state directory.** Task 10 settled
+      // that a plugin's settings live at
+      // `<vault>/<configDir>/plugins/<id>/data.json` and that `Plugin.loadData`
+      // reads exactly that path through the daemon; this file seeded
+      // `config.dataDir/plugins/<id>/` — the XDG state directory — where no
+      // plugin could ever find it. Corrected by Task 15's fix round, which hit
+      // the same defect in `host-harness.ts`.
+      const dir = join(config.vaultRoot, config.configDirName, "plugins", spec.installPlugin.id);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(join(dir, "data.json"), JSON.stringify(spec.data), "utf8");
     }
@@ -100,7 +107,12 @@ export class LiveHost {
     mirror = await Mirror.open(() => client, config);
 
     const assembly = assembleShim({ config, client, mirror, clock: config.clock });
-    const quarantine = new QuarantineTracker({ config, clock: config.clock });
+    // `(config, onQuarantine)` since Task 14b, and the callback is Task 15's
+    // sequencer method. Task 22 wires a real `LifecycleSequencer` here and
+    // passes `(id, failures) => sequencer.onQuarantine(id, failures)`; until it
+    // does, a tracker that counts and decides but disables nothing is the
+    // honest stand-in rather than a second implementation of the teardown.
+    const quarantine = new QuarantineTracker(config, () => Promise.resolve());
     const server = new HostServer({ config, clock: config.clock, broker: assembly.api.broker });
     await server.start({ wireLateOps: true });
     return new LiveHost(engine, client, mirror, server, assembly, quarantine);

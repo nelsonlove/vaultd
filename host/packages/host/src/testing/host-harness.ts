@@ -457,47 +457,24 @@ export class HostHarness extends ShimHarness {
   }
 
   /**
-   * Replace the engine under the host: a new daemon, a new generation, a new
-   * vault, and the same plugins.
+   * **There is no `restartEngine` here, and there must not be one.**
    *
-   * Ruling 7: an engine restart does not reload plugins. The mirror
-   * re-hydrates and publishes one synthetic batch; nothing calls `onunload`.
+   * The draft of this harness had one: it handed the mirror a
+   * `resync_required { runtime_recovered }` with a wholesale new fixture vault,
+   * which is the one shape that *guarantees* a synthetic batch. A real engine
+   * replacement does not guarantee one. Measured against the real daemon —
+   * SIGKILL the engine under a running sequencer, mutate the vault while it is
+   * down, let the supervisor bring a new one up — the mirror re-hydrates to an
+   * empty diff and then catches up through **ordinary delta batches**, and the
+   * duplicate guard that was written against the other shape replayed every one
+   * of those events a second time.
    *
-   * **Driven by the daemon's own signal, not by a method call.** An engine that
-   * restarted tells its clients `resync_required { runtime_recovered }` — the
-   * marker Task 4's supervisor synthesizes for exactly this — and the mirror's
-   * answer to that is a fresh hydration walk plus one synthetic batch. The event
-   * is handed to the mirror rather than emitted on a subscription, because
-   * nothing in this harness subscribes: the sequencer is the mirror's only
-   * consumer, and a hard-coded subscription id would be a wire detail the test
-   * invented.
-   *
-   * The revision map is taken **before** anything moves, and handed to
-   * {@link LifecycleSequencer.onEngineRestart} afterwards, which is the shape
-   * the real wiring has: whoever notices the restart is holding the map from
-   * before it.
+   * A fake daemon cannot produce that: there is no process to kill, no
+   * supervisor to restart it, and no race between a re-hydration and a
+   * subscription catching up. So restart continuity is pinned where it is real,
+   * in `test/lifecycle-restart-real-daemon.test.ts`, and this harness does not
+   * offer a method that would make a green run mean less than it looks.
    */
-  async restartEngine(spec: { generation: number; vault: Record<string, string> }): Promise<void> {
-    const previous = this.mirror.snapshotRevisions();
-    const gone = Object.keys(this.fixtures.files).filter((path) => !(path in spec.vault));
-    // The new engine's vault replaces this harness's, so a change set committed
-    // after the restart is answered from what the engine now serves.
-    this.fixtures = new FixtureVault(spec.vault);
-    this.serveFixtures(gone);
-    const resyncing = this.mirror.applyEvent({
-      type: "resync_required",
-      value: { current_generation: spec.generation, reason: "runtime_recovered" },
-    });
-    await this.answerHydration({
-      generation: spec.generation,
-      entries: this.fixtures.entries(),
-      notes: this.fixtures.notes(),
-    });
-    await resyncing;
-    await this.settleHost();
-    await this.lifecycle.onEngineRestart(previous);
-    await this.settleHost();
-  }
 
   async advanceClock(ms: number): Promise<void> {
     await this.clock.advance(ms);
@@ -527,8 +504,10 @@ export class HostHarness extends ShimHarness {
    * operation logs its name through `onOperation` — so `mirrorRequestsSince("enableLate")`
    * is "what did the enable ask the index for", and the honest answer for an
    * enable is nothing at all: the vault did not change because a plugin was
-   * switched on. Config reads are not mirror requests and are filtered out; see
-   * {@link MIRROR_METHODS}.
+   * switched on. Config reads are not mirror requests and are filtered out, so
+   * "no mirror requests" means "no *indexed* mirror requests" — the assertion
+   * still has teeth, because a re-hydration would send `open_snapshot` and a
+   * refetch `get_tree_entries`. See {@link MIRROR_METHODS}.
    */
   mirrorRequestsSince(marker: string): readonly string[] {
     const seen = this.methodsSeen();

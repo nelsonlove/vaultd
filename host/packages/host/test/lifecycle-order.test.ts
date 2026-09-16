@@ -225,4 +225,172 @@ describe("lifecycle order", () => {
     expect(harness.lifecycle.loadTimings().has("fine")).toBe(true);
     await harness.stop();
   });
+
+  it("groups each file's cache event with its own vault event", async () => {
+    const seen: string[] = [];
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n", "B.md": "# B\n" },
+      enabled: ["watcher"],
+      plugins: {
+        watcher: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              // Read B's cache while B still exists, so the `deleted` event has
+              // a previous cache to carry. By the time the event fires the
+              // mirror's row is gone and nothing can rebuild it — the retained
+              // assembly is the only copy left.
+              this.app.metadataCache.getCache("B.md");
+              this.registerEvent(
+                this.app.vault.on("modify", (f) =>
+                  seen.push(`modify:${(f as { path: string }).path}`),
+                ),
+              );
+              this.registerEvent(
+                this.app.metadataCache.on("changed", (f) =>
+                  seen.push(`changed:${(f as { path: string }).path}`),
+                ),
+              );
+              this.registerEvent(
+                this.app.vault.on("delete", (f) =>
+                  seen.push(`delete:${(f as { path: string }).path}`),
+                ),
+              );
+              this.registerEvent(
+                this.app.metadataCache.on("deleted", (f, prev) =>
+                  seen.push(
+                    `deleted:${(f as { path: string }).path}:${prev === null ? "null" : "cache"}`,
+                  ),
+                ),
+              );
+              this.registerEvent(
+                this.app.metadataCache.on("resolved", () => seen.push("resolved")),
+              );
+              return Promise.resolve();
+            }
+          },
+      },
+    });
+    await harness.lifecycle.start();
+    seen.length = 0;
+    await harness.commitGeneration({ modified: ["A.md"], deleted: ["B.md"] });
+    // **The discriminating assertion.** Two different notes, one modified and
+    // one deleted, so the two candidate orders differ: this one groups each
+    // file's cache event with that file's vault event, where the plan's earlier
+    // prose put every `metadataCache` event after every `vault` event. Ruled for
+    // the grouping on 2026-09-15 — Obsidian's documented model is per file
+    // ("called when a file has been indexed, and its updated cache is now
+    // available"), and the plan's only stated reason (one event per move) is
+    // satisfied either way.
+    expect(seen).toEqual([
+      "modify:A.md",
+      "changed:A.md",
+      "delete:B.md",
+      "deleted:B.md:cache",
+      "resolved",
+    ]);
+    await harness.stop();
+  });
+
+  it("fires resolve in path order, and exactly one startup resolved behind all of them", async () => {
+    const seen: string[] = [];
+    const harness = await HostHarness.create({
+      vault: { "b/Deep.md": "# D\n", "A.md": "# A\n", "a/Nested.md": "# N\n" },
+      enabled: ["watcher"],
+      plugins: {
+        watcher: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              this.registerEvent(
+                this.app.metadataCache.on("resolve", (f) =>
+                  seen.push(`resolve:${(f as { path: string }).path}`),
+                ),
+              );
+              this.registerEvent(
+                this.app.metadataCache.on("resolved", () => seen.push("resolved")),
+              );
+              return Promise.resolve();
+            }
+          },
+      },
+    });
+    await harness.lifecycle.start();
+    expect(seen).toEqual([
+      "resolve:A.md",
+      "resolve:a/Nested.md",
+      "resolve:b/Deep.md",
+      "resolved",
+    ]);
+    await harness.stop();
+  });
+
+  it("holds a batch raised during onload until the startup resolve run is done", async () => {
+    const seen: string[] = [];
+    let fire: (() => Promise<void>) | null = null;
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: ["observer", "writer"],
+      plugins: {
+        observer: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              this.registerEvent(
+                this.app.vault.on("create", (f) =>
+                  seen.push(`create:${(f as { path: string }).path}`),
+                ),
+              );
+              this.registerEvent(
+                this.app.metadataCache.on("resolve", (f) =>
+                  seen.push(`resolve:${(f as { path: string }).path}`),
+                ),
+              );
+              this.registerEvent(
+                this.app.metadataCache.on("resolved", () => seen.push("resolved")),
+              );
+              return Promise.resolve();
+            }
+          },
+        writer: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              // A plugin that writes from its own `onload` — several in the
+              // census do, to seed a folder or a settings note.
+              await fire?.();
+            }
+          },
+      },
+    });
+    fire = () => harness.commitGeneration({ created: ["FromOnload.md"] });
+    await harness.lifecycle.start();
+    // The startup `resolved` fires **once**, after every `resolve`. Delivered
+    // where it landed, the onload batch's own `resolved` came first — before a
+    // single `resolve` — and the six plugins in the census that read `resolved`
+    // as "the cache is complete now" would have opened their gate on a cache
+    // nothing had resolved yet.
+    expect(seen).toEqual([
+      "resolve:A.md",
+      "resolve:FromOnload.md",
+      "resolved",
+      "create:FromOnload.md",
+      "resolved",
+    ]);
+    await harness.stop();
+  });
+
+  it("arms the coexistence poll during the hydrating phase", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      guiEnabled: [],
+    });
+    await harness.lifecycle.start();
+    expect(harness.coexistence.latest()?.guiEnabled).toEqual([]);
+    // Nothing tells this host that a GUI Obsidian enabled a plugin — the daemon
+    // watches no write it did not make — so the poll is the whole mechanism,
+    // and starting it is the lifecycle's call rather than the assembler's.
+    harness.setGuiEnabled(["late-from-the-gui"]);
+    await harness.advanceClock(harness.config.overlapPollMs);
+    await harness.coexistence.settled();
+    expect(harness.coexistence.latest()?.guiEnabled).toEqual(["late-from-the-gui"]);
+    await harness.stop();
+  });
 });

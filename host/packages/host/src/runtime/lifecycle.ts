@@ -80,6 +80,7 @@ import { HOST_PLUGIN_ID } from "../shim/errors";
 import { OverlapRefused, overlapRefusalMessage } from "../pluginset/coexistence";
 import { TFile } from "../shim/files";
 import { failureFromReport } from "./quarantine";
+import { mapConcurrent } from "../mirror/mirror";
 import type { App } from "../shim/app";
 import type { BundleLoader } from "./loader";
 import type { CoexistenceMonitor } from "../pluginset/coexistence";
@@ -93,7 +94,7 @@ import type { Mirror } from "../mirror/mirror";
 import type { MirrorChangeBatch } from "../mirror/types";
 import type { ShimEventBus } from "../shim/events";
 import type { Supervisor } from "../supervisor";
-import type { TAbstractFile } from "../shim/files";
+import type { AppliedBatch, TAbstractFile } from "../shim/files";
 
 export type LifecyclePhase =
   | "cold"
@@ -184,6 +185,23 @@ export interface StartupReport {
 /** The scoped bus name of `metadataCache`'s events, for the labels below. */
 const METADATA_PREFIX = "metadataCache";
 
+/**
+ * One batch as it arrived, and what applying it did to the tree.
+ *
+ * **The tree moves at arrival; only the telling is deferred.** Applying at
+ * delivery instead would leave the shim's file index behind the mirror for as
+ * long as a batch is queued or held — and the startup resolve run, which walks
+ * the index, would then fire `resolve` for a vault that is one change out of
+ * date. Obsidian updates its own tree before it fires the matching event too.
+ *
+ * The folder-move pairs are consumed here as well, for the same reason: they
+ * are a drain, and delivery happens behind an async chain.
+ */
+interface BatchArrival {
+  readonly batch: MirrorChangeBatch;
+  readonly applied: AppliedBatch;
+}
+
 export class LifecycleSequencer {
   private phaseValue: LifecyclePhase = "cold";
   /**
@@ -200,13 +218,43 @@ export class LifecycleSequencer {
   private readonly loadedIds: string[] = [];
   private readonly timings = new Map<string, number>();
   /**
-   * The generation of the last **synthetic** batch this sequencer delivered.
+   * The highest generation this sequencer has delivered a batch for — **any
+   * batch, synthetic or not**.
    *
-   * {@link onEngineRestart} reads it to tell "the mirror already replayed this
-   * re-hydration" from "the mirror emitted nothing and the diff is mine to
-   * replay". See that method.
+   * {@link onEngineRestart} reads it to tell "the plugins have already been
+   * told about everything in this diff" from "the mirror moved and nobody was
+   * told, so the diff is mine to replay".
+   *
+   * **It used to watermark synthetic batches alone, and that was wrong in both
+   * directions.** Measured against a real daemon: SIGKILL the engine, mutate
+   * the vault while it is down, let the supervisor bring a new one up — the
+   * mirror re-hydrates, its synthetic diff comes back *empty* because the
+   * re-hydration landed before the writes were indexed, and it then catches up
+   * through ordinary delta batches at generations 2 and 3. The synthetic
+   * watermark never moved, the guard passed, and every event the plugin had
+   * just been given was delivered a second time: a `create` for a file it
+   * already holds, which is the shape that double-inserts into a plugin's own
+   * index. And because `synthesizeDiff` always stamps `synthetic: true`, the
+   * sequencer's *own* replay then moved the watermark, so a later legitimate
+   * call at the same generation was suppressed. One watermark over every batch
+   * is both halves at once.
    */
-  private lastSyntheticGeneration = -1;
+  private lastDeliveredGeneration = -1;
+  /**
+   * Batches that arrived before the host reached {@link LifecyclePhase} steady.
+   *
+   * A plugin that writes from its own `onload` produces one, and delivering it
+   * where it lands fires a `resolved` **before any `resolve` has been fired at
+   * all** — measured: two `resolved` events at startup, the first of them
+   * first. Six plugins in the census read `resolved` as "the cache is complete
+   * now", so that first one opens their gate on a premise that is not yet true.
+   *
+   * So they are held and flushed by {@link start} after the resolve run, in
+   * arrival order, each still getting its own `resolved`. Nothing is dropped —
+   * the subscription is opened in the constructor precisely so that nothing can
+   * be — and nothing is merged, because two changes are two changes.
+   */
+  private readonly pending: BatchArrival[] = [];
 
   constructor(private readonly deps: LifecycleDeps) {
     // In the constructor rather than in `start()`, so nothing can arrive in the
@@ -215,7 +263,24 @@ export class LifecycleSequencer {
     // drop it.
     this.detachers.push(
       deps.mirror.onBatch((batch) => {
-        void this.enqueue(() => this.deliver(batch));
+        // **The folder-move record is drained here, synchronously, and carried
+        // with the batch.** It used to be drained at the head of `deliver`,
+        // which runs behind the async delivery chain — so an unrelated batch
+        // delivered in the window between `Vault.rename`'s record and the
+        // rename's own batch would drain the pair and discard it, and the
+        // folder move would silently degrade to a delete plus a create. The
+        // window is short and the race was never reproduced; closing it costs
+        // one line.
+        const renames = expandFolderMoves(deps.app.vault.takeFolderMoves(), batch);
+        const arrival: BatchArrival = {
+          batch,
+          applied: deps.app.vault.applyBatch(batch, { renames }),
+        };
+        if (this.phaseValue !== "steady") {
+          this.pending.push(arrival);
+          return;
+        }
+        void this.enqueue(() => this.deliver(arrival));
       }),
     );
     // The mirror's own answer to an application it could not complete is
@@ -330,7 +395,13 @@ export class LifecycleSequencer {
 
     this.phaseValue = "resolving";
     await this.resolveEveryNote();
+    // Steady first, then the buffer, in one synchronous step: a batch arriving
+    // between the two would otherwise be queued behind nothing or held behind
+    // everything, and both orders are wrong.
+    const held = this.pending.splice(0);
     this.phaseValue = "steady";
+    for (const arrival of held) void this.enqueue(() => this.deliver(arrival));
+    await this.settled();
 
     return {
       generation: this.deps.mirror.generation(),
@@ -386,6 +457,12 @@ export class LifecycleSequencer {
    * later starts from nothing. Keeping four stale failures would quarantine it
    * on its first failure after being re-enabled, which is not a rolling window
    * but a grudge.
+   *
+   * **No phase guard, unlike {@link enableLate}**, and that is deliberate: a
+   * disable is a removal, and every phase a host can be in is one in which
+   * removing a plugin is a legal thing to want. `enableLate` needs the guard
+   * because it fires `layoutReady` and `resolved` at the plugin it loads, and
+   * neither is true before the host has started.
    */
   async disable(id: string): Promise<void> {
     this.deps.onOperation?.("disable");
@@ -421,20 +498,32 @@ export class LifecycleSequencer {
    */
   async onEngineRestart(previousRevisions: ReadonlyMap<string, string>): Promise<void> {
     this.deps.onOperation?.("onEngineRestart");
+    // **A restart notice is a notification, not a command.** One arriving after
+    // `stop()` used to put a stopped host back into `steady` with its
+    // subscriptions already detached — a host that says it is running and can
+    // never hear anything again. A host that is not running has nothing to tell
+    // its plugins about a restart, so this is quietly nothing.
+    if (this.phaseValue !== "steady") return;
     // Whatever the re-hydration already produced is delivered before anything
     // below looks at what is left to do.
     await this.settled();
     if (this.deps.config.reloadPluginsOnEngineRestart) {
       await this.reloadEveryPlugin();
-      this.phaseValue = "steady";
       return;
     }
     const diff = this.deps.mirror.synthesizeDiff(previousRevisions);
     const moved = diff.created.length + diff.modified.length + diff.deleted.length;
-    if (moved > 0 && this.lastSyntheticGeneration !== diff.generation) {
-      await this.enqueue(() => this.deliver(diff));
+    // **Strictly greater, over every batch.** The mirror usually gets there
+    // first — by a synthetic batch when it re-hydrated, by ordinary deltas when
+    // the new engine simply caught up — and either way those events are already
+    // with the plugins. Only a diff that reaches past everything delivered is
+    // news, which is the caller whose revision map predates a change this host
+    // never told anyone about. See {@link lastDeliveredGeneration}.
+    if (moved > 0 && diff.generation > this.lastDeliveredGeneration) {
+      await this.enqueue(() =>
+        this.deliver({ batch: diff, applied: this.deps.app.vault.applyBatch(diff, {}) }),
+      );
     }
-    this.phaseValue = "steady";
   }
 
   /**
@@ -452,6 +541,10 @@ export class LifecycleSequencer {
     for (const detach of this.detachers) detach();
     this.detachers.length = 0;
     this.deps.coexistence.stop();
+    // A batch that arrived before the host finished starting and is still held
+    // belongs to a host that is now stopping. Delivering it would fire events
+    // at plugins being torn down; keeping it would leak.
+    this.pending.length = 0;
     // Anything already in flight still finishes: a delivery abandoned halfway
     // would leave half a batch's events fired and no `resolved` behind them.
     await this.settled();
@@ -476,6 +569,13 @@ export class LifecycleSequencer {
    * already does all three, and they are repeated here because the load seam is
    * injectable — a seam that only ran `onunload` would leave a quarantined
    * plugin still invokable by name and still woken by every vault change.
+   *
+   * **The enabled set is not touched**, which is the difference from
+   * {@link disable} and is the point rather than an omission: a quarantine is a
+   * judgement about this session — five failures inside a rolling minute — and
+   * the next host start deserves to form its own. Writing the plugin out of
+   * `community-plugins.json` would turn a transient fault into a setting the
+   * user never chose and would have to undo by hand.
    */
   async onQuarantine(pluginId: string, failures: readonly HandlerFailure[]): Promise<void> {
     // The tracker holds them, and `reason(id)` is where a report reads them
@@ -556,23 +656,35 @@ export class LifecycleSequencer {
    * plugin's commands behind a read; then the whole fan-out happens in one
    * queued slot, so nothing else runs in the middle of a batch.
    */
-  private async deliver(batch: MirrorChangeBatch): Promise<void> {
-    if (batch.synthetic) this.lastSyntheticGeneration = batch.generation;
+  private async deliver(arrival: BatchArrival): Promise<void> {
+    const { batch, applied } = arrival;
+    this.lastDeliveredGeneration = Math.max(this.lastDeliveredGeneration, batch.generation);
     const vault = this.deps.app.vault;
     const cache = this.deps.app.metadataCache;
-    const renames = expandFolderMoves(vault.takeFolderMoves(), batch);
-    const applied = vault.applyBatch(batch, { renames });
 
-    // Ruling W6: a path in both lists is a thing replaced by a different thing
-    // under the same name, and the two steps have to reach a handler in that
-    // order or it concludes the path is gone.
-    const replaced = new Set(batch.created.filter((path) => batch.deleted.includes(path)));
+    // **A replacement is a path the batch both removed and put something new
+    // at**, and the two steps have to reach a handler in that order or it
+    // concludes the path is gone. Read off the *applied* lists rather than off
+    // the change set, because the two spellings of a replacement arrive
+    // differently: Ruling W6's is a path in `created` and `deleted` at once,
+    // and a kind change is a `modified` path the index turned into a delete
+    // plus a create (the only spelling the real wire has been measured to use).
+    // One rule covers both.
+    const createdPaths = new Set(applied.created.map((node) => node.path));
+    const replaced = new Set(
+      applied.deleted.filter((node) => createdPaths.has(node.path)).map((node) => node.path),
+    );
     const replacedDeletes = applied.deleted.filter((node) => replaced.has(node.path));
     const plainDeletes = applied.deleted.filter((node) => !replaced.has(node.path));
 
     const modifiedNotes = applied.modified.filter(isNote);
     const sources = new Map<string, string>();
-    for (const file of modifiedNotes) {
+    // **Bounded, not serial.** One round trip per changed note, and a bulk
+    // external edit — a git checkout, a sync landing — is a two-hundred-note
+    // batch: in series that is two hundred round trips of dead time with the
+    // tree already moved and no plugin told. `mirrorWarmConcurrency` is the
+    // bound the mirror's own whole-vault read uses, and this is the same shape.
+    await mapConcurrent(modifiedNotes, this.deps.config.mirrorWarmConcurrency, async (file) => {
       try {
         sources.set(file.path, await vault.cachedRead(file));
       } catch (error) {
@@ -583,7 +695,7 @@ export class LifecycleSequencer {
         // way.
         this.deps.errors.report(error, HOST_PLUGIN_ID, "event");
       }
-    }
+    });
 
     await this.deps.queue.run(null, `vault:batch:${String(batch.generation)}`, () => {
       for (const node of replacedDeletes) {

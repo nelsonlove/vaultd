@@ -2110,8 +2110,14 @@ function* chunked<T>(items: readonly T[], size: number): Generator<T[]> {
  *
  * The bound is the point: the daemon answers as fast as it is asked, and an
  * unbounded fan-out over a large vault holds every answer in memory at once.
+ *
+ * **Exported since Task 15**, which has the same shape and the same bound to
+ * respect: the sequencer reads one source per changed note before it fires that
+ * note's `changed` event, and a two-hundred-note batch done in series is two
+ * hundred round trips of dead time with the tree already moved and no plugin
+ * told. One implementation of "bounded fan-out" rather than two that drift.
  */
-async function mapConcurrent<T>(
+export async function mapConcurrent<T>(
   items: readonly T[],
   limit: number,
   task: (item: T) => Promise<void>,
