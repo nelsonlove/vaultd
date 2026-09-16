@@ -699,12 +699,12 @@ class Connection {
       owner: {},
       label: deps.label,
       subscriptions: this.subscriptions,
-      // Down **this** socket and no other. The broker addresses a prompt to the
-      // one client that said it would answer; `HostServer.broadcast` is the
-      // other shape, for things every subscriber is owed a copy of.
-      deliver: (event) => {
-        this.subscriptions.deliver(event);
-      },
+      // Down **this** socket and no other, and the answer travels back. The
+      // broker addresses a prompt to the one client that said it would answer;
+      // `HostServer.broadcast` is the other shape, for things every subscriber
+      // is owed a copy of and where a collapsed delivery is the client's to
+      // recover from by re-reading.
+      deliver: (event) => this.subscriptions.deliver(event),
     };
     socket.setNoDelay(true);
     socket.setEncoding("utf8");

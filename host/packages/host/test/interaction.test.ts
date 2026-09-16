@@ -20,8 +20,14 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { ClientSubscriptions } from "../src/server/subscriptions";
 import { HeadlessUnsupported } from "../src/shim/policy";
+import { HostErrors } from "../src/shim/errors";
 import { HostHarness } from "../src/testing/host-harness";
+import { InteractionBroker } from "../src/interaction/broker";
+import { defaultHostConfig } from "../src/config";
+import { testClock } from "../src/testing/clock";
+import type { HostTestClient, PluginFactory } from "../src/testing/host-harness";
 
 /**
  * Turn the event loop until `check` holds, or give up and let the assertion
@@ -231,6 +237,255 @@ describe("interaction brokerage", () => {
     } finally {
       await harness.stop();
     }
+  });
+
+  /**
+   * A plugin whose command raises a fuzzy prompt and leaves it pending.
+   *
+   * The callback deliberately does **not** await `open()` — that is the shape
+   * the overwhelming majority of real plugins take, since Obsidian's `open()`
+   * returns `void` — so the prompt outlives the `host.invoke_command` response
+   * and a case can act on a question that is genuinely still open.
+   */
+  function pendingPicker(
+    chosen: string[],
+    options: { throwOnChoose?: boolean } = {},
+  ): PluginFactory {
+    return (api) =>
+      class extends api.Plugin {
+        override onload(): void {
+          this.addCommand({
+            id: "pick",
+            name: "Pick",
+            callback: () => {
+              class Picker extends api.FuzzySuggestModal<string> {
+                override getItems(): string[] {
+                  return ["Alpha", "Beta", "Gamma"];
+                }
+                override getItemText(item: string): string {
+                  return item;
+                }
+                override onChooseItem(item: string): void {
+                  if (options.throwOnChoose === true) throw new Error("handler exploded");
+                  chosen.push(item);
+                }
+              }
+              void new Picker(this.app).open();
+            },
+          });
+        }
+      };
+  }
+
+  /** Raise a prompt and hand back the request the client was sent. */
+  async function raisePrompt(
+    harness: HostHarness,
+    client: HostTestClient,
+  ): Promise<{ prompt_id: string }> {
+    void client.call("host.invoke_command", { command_id: "picker:pick" });
+    const request = (await client.nextEvent("host.interaction_request")) as { prompt_id: string };
+    await settleUntil(() => harness.broker.pending().length > 0);
+    return request;
+  }
+
+  it("disarms the prompt timer on an answer and on a detach", async () => {
+    const chosen: string[] = [];
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["picker"],
+      plugins: { picker: pendingPicker(chosen) },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.attach_interaction", {});
+      // **The timeout case cannot prove this.** On that path `TestClock` deletes
+      // the fired timer itself, so an `armed()` assertion there holds whether or
+      // not anything called `clearTimeout`. These two paths are the ones where
+      // the host has to disarm it, and deleting that call makes them red.
+      const baseline = harness.clock.armed();
+
+      const answered = await raisePrompt(harness, client);
+      expect(harness.clock.armed()).toBe(baseline + 1);
+      await client.call("host.respond_interaction", {
+        prompt_id: answered.prompt_id,
+        choice_index: 0,
+      });
+      await settleUntil(() => chosen.length > 0);
+      expect(chosen).toEqual(["Alpha"]);
+      expect(harness.broker.pending()).toEqual([]);
+      expect(harness.clock.armed()).toBe(baseline);
+
+      await raisePrompt(harness, client);
+      expect(harness.clock.armed()).toBe(baseline + 1);
+      await client.call("host.detach_interaction", {});
+      expect(harness.broker.pending()).toEqual([]);
+      expect(harness.clock.armed()).toBe(baseline);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("refuses a non-holder's answer to a prompt that is genuinely pending", async () => {
+    const chosen: string[] = [];
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["picker"],
+      plugins: { picker: pendingPicker(chosen) },
+    });
+    try {
+      await harness.lifecycle.start();
+      const holder = await harness.connectClient();
+      const other = await harness.connectClient();
+      await holder.call("host.attach_interaction", {});
+      const request = await raisePrompt(harness, holder);
+      // **A real prompt, outstanding.** Answering an id that names nothing is
+      // refused by a different mechanism, so a case built on one would stay
+      // green with the holder check deleted.
+      await expect(
+        other.call("host.respond_interaction", {
+          prompt_id: request.prompt_id,
+          choice_index: 2,
+        }),
+      ).rejects.toMatchObject({ code: "interaction_unavailable" });
+      // Untouched by the refusal: the question is still the holder's to answer.
+      expect(harness.broker.pending()).toHaveLength(1);
+      await holder.call("host.respond_interaction", {
+        prompt_id: request.prompt_id,
+        choice_index: 1,
+      });
+      await settleUntil(() => chosen.length > 0);
+      expect(chosen).toEqual(["Beta"]);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("refuses an out-of-range choice_index and leaves the prompt answerable", async () => {
+    const chosen: string[] = [];
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["picker"],
+      plugins: { picker: pendingPicker(chosen) },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.attach_interaction", {});
+      const request = await raisePrompt(harness, client);
+      // A client miscounting is the **client's** error, not the plugin's: it is
+      // refused the way a missing `command_id` is, and the question survives it.
+      for (const index of [3, -1, 1.5]) {
+        await expect(
+          client.call("host.respond_interaction", {
+            prompt_id: request.prompt_id,
+            choice_index: index,
+          }),
+        ).rejects.toMatchObject({ code: "invalid_request" });
+        expect(harness.broker.pending()).toHaveLength(1);
+      }
+      await client.call("host.respond_interaction", {
+        prompt_id: request.prompt_id,
+        choice_index: 2,
+      });
+      await settleUntil(() => chosen.length > 0);
+      expect(chosen).toEqual(["Gamma"]);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("counts a choice handler's own throw against the plugin", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["picker"],
+      plugins: { picker: pendingPicker([], { throwOnChoose: true }) },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.attach_interaction", {});
+      const request = await raisePrompt(harness, client);
+      await client.call("host.respond_interaction", {
+        prompt_id: request.prompt_id,
+        choice_index: 0,
+      });
+      await settleUntil(() => harness.lastHandlerError("picker") !== null);
+      // **Counted.** The uncounted `interaction` phase is for the channel
+      // failing — nobody attached, nobody answered — and a plugin's own throw
+      // from its choice handler is not that. Filing this one under `interaction`
+      // would leave a plugin that throws on every choice unquarantinable.
+      expect(harness.lastHandlerError("picker")?.message).toContain("handler exploded");
+      expect(harness.quarantine.failuresFor("picker")).toBe(1);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("leaves no subscription behind a refused attach, and closes the one it opened", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const holder = await harness.connectClient();
+      const refused = await harness.connectClient();
+      await holder.call("host.attach_interaction", {});
+      await expect(refused.call("host.attach_interaction", {})).rejects.toMatchObject({
+        code: "interaction_unavailable",
+      });
+      // Being told no must not sign a client up for the whole event firehose.
+      harness.noticeLog.record("after the refusal", null);
+      await harness.serverQuiesce();
+      expect(await refused.drainEvents()).toEqual([]);
+
+      // And a detach gives back exactly what the attach took out.
+      await holder.call("host.detach_interaction", {});
+      harness.noticeLog.record("after the detach", null);
+      await harness.serverQuiesce();
+      const seen = (await holder.drainEvents()).map((event) => event.value);
+      expect(seen).not.toContainEqual(expect.objectContaining({ message: "after the detach" }));
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("fails a prompt whose delivery was collapsed, rather than waiting for the timeout", async () => {
+    // **The delivery seam, driven directly.** A client that has stopped reading
+    // fills the kernel buffer, then the socket's, and then its subscription
+    // overflows its bound and is collapsed into one `resync_required` standing
+    // in for everything it missed. An ordinary event is recovered by re-reading;
+    // a prompt is a question with a plugin waiting on it, so a prompt nobody
+    // received has to fail now rather than in two minutes.
+    const clock = testClock();
+    const config = { ...defaultHostConfig("/nonexistent/interaction-probe"), clock };
+    const errors = new HostErrors();
+    errors.onError(() => undefined);
+    const subscriptions = new ClientSubscriptions({
+      // Backed up from the first line, so nothing is ever written and the
+      // queue is the only place an event can go.
+      writer: { write: () => false, onceDrain: () => undefined },
+      limit: 4,
+      currentGeneration: () => 1,
+      mintId: () => "probe-sub-1",
+    });
+    subscriptions.open();
+    for (let i = 0; i < 5; i += 1) subscriptions.deliver({ type: "host.notice", value: { i } });
+
+    const broker = new InteractionBroker({ config, errors });
+    broker.attach({
+      owner: {},
+      label: "host-conn-probe",
+      deliver: (event) => subscriptions.deliver(event),
+    });
+    const asking = broker.ask({
+      pluginId: "picker",
+      kind: "suggest",
+      prompt: "Pick",
+      items: ["one", "two"],
+    });
+    await expect(asking).rejects.toMatchObject({ code: "interaction_unavailable" });
+    expect(broker.pending()).toEqual([]);
+    // Nothing armed, so nothing to wait 120 seconds for and nothing to leak.
+    expect(clock.armed()).toBe(0);
   });
 
   it("refuses a second attach, releases on detach, and refuses an unknown answer", async () => {

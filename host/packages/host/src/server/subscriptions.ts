@@ -122,14 +122,38 @@ export class ClientSubscriptions {
     return this.flushing;
   }
 
-  /** Queue one event for every subscription this client holds, then flush. */
-  deliver(event: HostEvent): void {
+  /**
+   * Queue one event for every subscription this client holds, then flush.
+   *
+   * **Answers whether the event actually reached somebody.** `false` means this
+   * client will not see it: either it holds no subscriptions at all, or at
+   * least one of them was collapsed into a `resync_required` and this event is
+   * part of the gap that collapse stands in for.
+   *
+   * Almost every caller ignores the answer, and should: a broadcast describes
+   * something that happened to the vault, the client has been told its view is
+   * void, and re-reading is how it catches up. The one caller that cannot
+   * ignore it is the interaction broker, because a prompt is not a fact about
+   * the vault a client can re-read — it is a question with a plugin waiting on
+   * the answer, and a question nobody received has to fail **now** rather than
+   * two minutes later on its timeout. See `interaction/broker.ts`.
+   */
+  deliver(event: HostEvent): boolean {
     const resyncAt = resyncWatermarkOf(event, this.deps.currentGeneration);
     const committedAt = event.type === "generation_committed" ? generationOf(event) : null;
+    // Vacuously "every subscription took it" is the wrong answer for a client
+    // with none: what the caller is asking is whether the event reached
+    // anybody, and nobody is not somebody.
+    let reached = this.subscriptions.size > 0;
     for (const subscription of this.subscriptions.values()) {
       // Void: this subscription has already been told to re-read at a generation
-      // at or past this one. See {@link Subscription.resyncedThrough}.
-      if (committedAt !== null && committedAt <= subscription.resyncedThrough) continue;
+      // at or past this one. See {@link Subscription.resyncedThrough}. Not
+      // delivered, so not reached — which only a `generation_committed` can be,
+      // and no caller that reads the answer ever sends one.
+      if (committedAt !== null && committedAt <= subscription.resyncedThrough) {
+        reached = false;
+        continue;
+      }
       if (resyncAt !== null) {
         subscription.resyncedThrough = Math.max(subscription.resyncedThrough, resyncAt);
       }
@@ -137,15 +161,20 @@ export class ClientSubscriptions {
       // gap is one `resync_required`. Queueing more would only postpone the
       // moment the client is told, and would deliver events *older* than the
       // generation that resync is about to name.
-      if (subscription.dropped) continue;
+      if (subscription.dropped) {
+        reached = false;
+        continue;
+      }
       if (subscription.queue.length >= this.deps.limit) {
         subscription.dropped = true;
         subscription.queue.length = 0;
+        reached = false;
         continue;
       }
       subscription.queue.push(event);
     }
     this.flush();
+    return reached;
   }
 
   /** Forget every subscription. The client is gone, or has been torn down. */

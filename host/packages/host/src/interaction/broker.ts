@@ -83,8 +83,12 @@ export interface ClientSession {
   readonly owner: object;
   /** What a refusal calls this connection. Never parsed. */
   readonly label: string;
-  /** Deliver one event to this connection alone. */
-  deliver(event: { type: string; value: unknown }): void;
+  /**
+   * Deliver one event to this connection alone. `false` means it did not land
+   * — the client holds no subscription, or the one it holds was collapsed into
+   * a `resync_required` and this event is part of the gap.
+   */
+  deliver(event: { type: string; value: unknown }): boolean;
 }
 
 /**
@@ -220,10 +224,26 @@ export class InteractionBroker {
       }, full.timeoutMs);
       this.prompts.set(full.promptId, { request: full, resolve, reject, timer });
       try {
-        session.deliver({
-          type: "host.interaction_request",
-          value: toWireInteractionRequest(full),
-        });
+        // **A prompt that was not delivered fails now, not in two minutes.**
+        // An ordinary event a lagging client missed is recovered by re-reading
+        // — that is what the `resync_required` it was given instead is for. A
+        // prompt is not recoverable that way: it is a question with a plugin
+        // waiting on the answer, and nobody received it, so the honest outcome
+        // is the same typed refusal a detach gives, immediately.
+        if (
+          !session.deliver({
+            type: "host.interaction_request",
+            value: toWireInteractionRequest(full),
+          })
+        ) {
+          this.settle(full.promptId);
+          reject(
+            new InteractionUnavailable(
+              `${session.label} did not receive the prompt: its event subscription is behind and ` +
+                "was collapsed into a resync, so the question reached nobody",
+            ),
+          );
+        }
       } catch (error) {
         // The socket went between the attach and this write. Fail now rather
         // than waiting two minutes to discover it, and keep the cause.
@@ -273,9 +293,33 @@ export class InteractionBroker {
    * is still attributed and still visible to `harness.lastHandlerError`, which
    * is the difference between "uncounted" and "swallowed" — see
    * `runtime/quarantine.ts` and the `config`-phase precedent it names.
+   *
+   * **Only a broker failure belongs here.** The caller narrows to
+   * {@link InteractionUnavailable} and {@link InteractionTimeout} before
+   * calling; a plugin's own throw from its choice handler travels the counting
+   * path like any other handler failure. See `shim/components.ts`.
+   *
+   * The arguments are in `HostErrors.report`'s order — error first, plugin
+   * second — because this forwards straight to it and both are loose enough
+   * that a transposition would type-check.
    */
-  reportUnobserved(pluginId: string | null, error: unknown): void {
+  reportUnobserved(error: unknown, pluginId: string | null): void {
     this.deps.errors.report(error, pluginId ?? HOST_PLUGIN_ID, "interaction");
+  }
+
+  /**
+   * Report a **plugin's own** failure raised inside a brokered prompt, with
+   * nobody awaiting it.
+   *
+   * The counterpart to {@link reportUnobserved}, and the reason that one is
+   * narrowed: a prompt's promise covers two pieces of plugin code — an `async`
+   * `getSuggestions()` and the choice handler — and a throw from either is the
+   * plugin failing, not the channel. Phase `command`, which is where an
+   * unawaited command callback's rejection already goes, so it is counted
+   * toward a quarantine exactly as that one is.
+   */
+  reportHandlerFailure(error: unknown, pluginId: string | null): void {
+    this.deps.errors.report(error, pluginId ?? HOST_PLUGIN_ID, "command");
   }
 
   /** Take a prompt out of the map and disarm its timer. */

@@ -27,7 +27,11 @@ import { Component } from "./plugin";
 import { Scope } from "./keymap";
 import { StubEl } from "./dom";
 import { HOST_PLUGIN_ID } from "./errors";
-import { InteractionUnavailable, interactionBrokerFor } from "../interaction/broker";
+import {
+  InteractionTimeout,
+  InteractionUnavailable,
+  interactionBrokerFor,
+} from "../interaction/broker";
 import { currentPluginId, declarePolicy, recordUse, stub, unsupported } from "./policy";
 import { prepareFuzzySearch, sortSearchResults } from "./search";
 import type { App } from "./app";
@@ -862,10 +866,15 @@ export class SuggestModal<T> extends Modal {
    * before anybody types — hands it to whoever is attached, and runs the
    * subclass's own choice handler with the item that came back.
    *
+   * **The plugin's own lifecycle hooks run, in Obsidian's order**: `onOpen()`
+   * before the question is asked, then `close()` — and therefore `onClose()` —
+   * before the choice handler, on a cancellation as much as on a choice. A
+   * brokered open that skipped `onOpen` would run a plugin's cleanup with no
+   * matching setup, and its `onChooseItem` against state that was never built.
+   *
    * The promise settles when the choice handler has run, so a plugin that
    * awaits it resumes after its own `onChooseSuggestion`, exactly as it would
-   * after Obsidian's dialog closed. `onClose()` runs either way, because a
-   * plugin's cleanup is on it.
+   * after Obsidian's dialog closed.
    *
    * It returns a promise where Obsidian's returns `void`, which is a **widening
    * a caller cannot notice**: `void` accepts a promise, an `open()` nobody
@@ -1033,10 +1042,36 @@ function brokerChoice<T>(
   const pluginId = currentPluginId();
   recordUse(symbol);
   const broker = interactionBrokerFor(modal.app);
+  if (broker === null) {
+    // **Refused synchronously, before a promise exists.** The one path where
+    // there is no broker is a modal built against an `App` this host never
+    // assembled — a plugin's own business — and there is no sink to report to
+    // either, so a rejected promise here would be a failure nothing records.
+    // A throw is the honest shape: it reaches the plugin's own `catch`, or the
+    // command path, which does record it.
+    throw new InteractionUnavailable(
+      `${modal.constructor.name} was built against an App this host never assembled, so there ` +
+        "is no channel to ask a human through",
+    );
+  }
   const settled = askAndChoose(modal, kind, pluginId, broker, choices);
   // Never a floating rejection. See the note above: this does not consume it.
   void settled.catch((error: unknown) => {
-    broker?.reportUnobserved(pluginId, error);
+    // **Only the broker's own failures are reported here**, and the narrowing
+    // is the point rather than a tidy-up. `askAndChoose` runs two pieces of
+    // plugin code — an `async getSuggestions()` and the choice handler behind
+    // `selectSuggestion` — and a throw from either is the plugin failing, which
+    // must reach the counting path like any other handler failure. Reporting
+    // those under the uncounted `interaction` phase would have been a hole in
+    // the quarantine: a plugin whose `onChooseItem` throws every time could
+    // never be quarantined for it.
+    if (error instanceof InteractionUnavailable || error instanceof InteractionTimeout) {
+      broker.reportUnobserved(error, pluginId);
+      return;
+    }
+    // The plugin's own failure, with nobody awaiting it. Same phase and same
+    // sink an unawaited command callback's rejection takes, so it counts.
+    broker.reportHandlerFailure(error, pluginId);
   });
   return settled;
 }
@@ -1045,15 +1080,15 @@ async function askAndChoose<T>(
   modal: SuggestModal<T>,
   kind: PromptKind,
   pluginId: string | null,
-  broker: InteractionBroker | null,
+  broker: InteractionBroker,
   choices: BrokeredChoices<T>,
 ): Promise<void> {
-  if (broker === null) {
-    throw new InteractionUnavailable(
-      `${modal.constructor.name} was built against an App this host never assembled, so there ` +
-        "is no channel to ask a human through",
-    );
-  }
+  // **`onOpen()` before the question, which is Obsidian's order.** Its
+  // `Modal.open()` shows the modal and calls `onOpen`, and a suggester subclass
+  // that sets state there and reads it in `onChooseItem` is an ordinary shape —
+  // so a brokered open that skipped it would run the plugin's `onClose` with no
+  // matching setup, and its choice handler against state that was never built.
+  modal.onOpen();
   const values = await choices.values;
   const answer = await broker.ask({
     pluginId: pluginId ?? HOST_PLUGIN_ID,

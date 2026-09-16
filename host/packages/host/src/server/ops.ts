@@ -133,14 +133,15 @@ export interface OpSession {
   readonly label: string;
   readonly subscriptions: ClientSubscriptions;
   /**
-   * Deliver one event to **this** connection alone.
+   * Deliver one event to **this** connection alone, and say whether it landed.
    *
    * Everything else the host emits is a broadcast: an event describes something
    * that happened to the vault and every subscriber is owed a copy. A prompt is
    * the other kind — a question addressed to the one client that said it would
-   * answer — so the broker needs a way down one socket rather than all of them.
+   * answer — so the broker needs a way down one socket rather than all of them,
+   * and it needs to be told when that way was blocked.
    */
-  deliver(event: HostEvent): void;
+  deliver(event: HostEvent): boolean;
 }
 
 export type OpHandler = (params: Record<string, unknown>, session: OpSession) => Promise<unknown>;
@@ -193,6 +194,16 @@ export class HostOps {
    * window the coexistence poll already documents for the enabled set.
    */
   private installedCache: readonly InstalledPlugin[] | null = null;
+  /**
+   * The subscription `host.attach_interaction` opened for a client that held
+   * none, by that client's identity — so a detach closes exactly what the
+   * attach opened, and nothing the client opened for itself.
+   *
+   * A `WeakMap` keyed by the session's `owner`, which is the same identity the
+   * snapshot store keys by: a connection that goes without detaching takes its
+   * entry with it and nothing has to remember to clean up.
+   */
+  private readonly attachSubscriptions = new WeakMap<object, string>();
 
   constructor(private readonly deps: HostServerDeps) {
     this.snapshots = new SnapshotStore(deps.mirror, deps.config);
@@ -237,6 +248,26 @@ export class HostOps {
   connectionGone(session: OpSession): void {
     this.snapshots.closeAll(session.owner);
     this.wiring?.broker?.detach(session);
+    // The connection's own subscriptions go with it either way; this keeps the
+    // bookkeeping from outliving the client it describes.
+    this.closeAttachSubscription(session);
+  }
+
+  /**
+   * Close the subscription `host.attach_interaction` opened for this client, if
+   * it opened one.
+   *
+   * **Only the one it opened.** A client that subscribed for itself and then
+   * attached keeps every subscription it asked for: the host gave it nothing,
+   * so the host takes nothing back. Detaching is "stop sending me prompts", not
+   * "stop sending me events", and a detach that closed a channel the client was
+   * using for `host.notice` would be a surprise with no way to see it coming.
+   */
+  private closeAttachSubscription(session: OpSession): void {
+    const opened = this.attachSubscriptions.get(session.owner);
+    if (opened === undefined) return;
+    this.attachSubscriptions.delete(session.owner);
+    session.subscriptions.close(opened);
   }
 
   /** Every `host.*` method this build answers, for the protocol document's sake. */
@@ -454,18 +485,26 @@ export class HostOps {
 
     table.set("host.attach_interaction", (_params, session) => {
       const broker = this.broker("host.attach_interaction");
-      // **A subscription, if this connection holds none.** Events reach a
+      // **The attach is taken first, and the subscription only on success.** A
+      // refusal must leave nothing behind: a client refused the channel and
+      // handed a subscription it never asked for would start receiving the
+      // whole event firehose as a side effect of being told no, with no id to
+      // close it by until an event arrived and named one.
+      try {
+        broker.attach(session);
+      } catch (error) {
+        throwInteractionRefusal(error);
+      }
+      // **Then a subscription, if this connection holds none.** Events reach a
       // client through its subscriptions and nowhere else, so a client that
       // attached without subscribing would have asked for prompts down a
       // channel it had not opened — and would sit waiting for an event the host
       // had nowhere to put. Opening one here is what makes "attached" mean
       // "reachable"; a client that already subscribed keeps the subscriptions
-      // it has and gets no second one.
-      if (session.subscriptions.count() === 0) session.subscriptions.open();
-      try {
-        broker.attach(session);
-      } catch (error) {
-        throw asInteractionRefusal(error);
+      // it has and gets no second one. Remembered, so the detach can close
+      // exactly what this opened and nothing the client opened for itself.
+      if (session.subscriptions.count() === 0) {
+        this.attachSubscriptions.set(session.owner, session.subscriptions.open().id);
       }
       return Promise.resolve({ attached: true });
     });
@@ -476,6 +515,7 @@ export class HostOps {
       // same request ("I am not answering prompts") answered by a host that
       // already agreed. Every disconnect runs this path too.
       broker.detach(session);
+      this.closeAttachSubscription(session);
       return Promise.resolve({ attached: broker.attached() });
     });
 
@@ -873,6 +913,16 @@ function answerOf(
   const value = optionalStringOf(params, "value");
   const cancelled = boolOf(params, "cancelled");
   if (choiceIndex !== null && request !== null) {
+    if (request.items.length === 0) {
+      // "from 0 to -1" is not a range, and telling a client to pick from one
+      // would be telling it to do something impossible. A prompt with no items
+      // — a `text` prompt — is answered with `value`, and that is what to say.
+      throw new HostError(
+        "invalid_request",
+        `prompt "${promptId}" offers no items to choose from, so it takes no "choice_index": ` +
+          'answer it with "value", or with "cancelled": true',
+      );
+    }
     if (!Number.isInteger(choiceIndex) || choiceIndex < 0 || choiceIndex >= request.items.length) {
       throw new HostError(
         "invalid_request",
@@ -890,18 +940,24 @@ function answerOf(
 }
 
 /**
- * The broker's own refusal, as a wire refusal.
+ * Re-raise the broker's own refusal as a wire refusal.
+ *
+ * It **throws** rather than returning something to throw, and the difference is
+ * the honesty of the signature: only one of the two paths produces a
+ * `HostError`, so a function returning the pair would have to be typed
+ * `HostError | unknown` — which is just `unknown`, and says nothing. `never`
+ * says exactly what happens.
  *
  * Anything that is not an {@link InteractionUnavailable} is a bug in this host
- * rather than something the client did, and is re-thrown so it travels the
- * ordinary internal-error path instead of being dressed up as a refusal the
- * client could act on.
+ * rather than something the client did, and is re-thrown unchanged so it
+ * travels the ordinary internal-error path instead of being dressed up as a
+ * refusal the client could act on.
  */
-function asInteractionRefusal(error: unknown): unknown {
+function throwInteractionRefusal(error: unknown): never {
   if (error instanceof InteractionUnavailable) {
-    return new HostError("interaction_unavailable", error.message);
+    throw new HostError("interaction_unavailable", error.message);
   }
-  return error;
+  throw error;
 }
 
 function stringMapOf(params: Record<string, unknown>, key: string): Record<string, string> {
