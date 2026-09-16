@@ -71,7 +71,7 @@ async function shimOn(config: HostConfig): Promise<{ app: App; vault: Vault; mir
   const mirror = await Mirror.open(() => supervisor.client(), config);
   const assembly = assembleShim({
     config,
-    client: supervisor.client(),
+    client: () => supervisor.client(),
     mirror,
     clock: systemClock(),
   });

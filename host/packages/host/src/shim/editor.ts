@@ -42,7 +42,7 @@ import type { Mirror } from "../mirror/mirror";
 import type { MutationResponse } from "../client/protocol";
 import type { PositionIndex } from "../mirror/positions";
 import type { TFile } from "./files";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 import type { WriteGate } from "./vault";
 
 /** Obsidian's `EditorPosition`: a zero-based line and a UTF-16 column. */
@@ -77,7 +77,7 @@ export type EditorCursorEnd = "from" | "to" | "head" | "anchor";
 
 /** What one editor needs to read its note and to write it back. */
 export interface EditorDeps {
-  readonly client: VaultdClient;
+  readonly client: RequestSink;
   readonly mirror: Mirror;
   readonly writes: WriteGate;
   readonly file: TFile;

@@ -200,7 +200,11 @@ export class ShimHarness extends MirrorHarness {
   protected assemble(): void {
     const assembly = assembleShim({
       config: this.config,
-      client: this.client,
+      // A supplier, like production's: this harness's client never changes, so
+      // the indirection buys it nothing — but taking the same signature is what
+      // makes the harness exercise the wiring production runs rather than a
+      // second one that happens to work.
+      client: () => this.client,
       mirror: this.mirror,
       clock: this.clock,
       dataDir: this.config.dataDir,

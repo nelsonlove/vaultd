@@ -99,38 +99,35 @@ describe("engine restart continuity", () => {
     await harness.stop();
   });
 
-  it("ignores a restart notice that arrives after the host has stopped", async () => {
-    const events: string[] = [];
+  it("delivers nothing for a restart notice that arrives after stop", async () => {
+    const seen: string[] = [];
     const harness = await HostHarness.create({
-      vault: { "A.md": "# A\n" },
-      enabled: ["observer"],
-      plugins: {
-        observer: (api) =>
-          class extends api.Plugin {
-            override async onload(): Promise<void> {
-              this.registerEvent(
-                this.app.vault.on("create", (f) =>
-                  events.push(`create:${(f as { path: string }).path}`),
-                ),
-              );
-              return Promise.resolve();
-            }
-          },
-      },
+      vault: { "A.md": "# A\n", "B.md": "# B\n" },
+      enabled: [],
     });
     await harness.lifecycle.start();
+    // **A host-owned listener, deliberately.** A stopped host has unloaded its
+    // plugins, so a plugin's listener is gone either way and an assertion built
+    // on one proves nothing about the guard. This one is registered outside any
+    // attribution window, so it has no owner and `detachOwner` does not touch
+    // it — which is what lets it see a delivery that should not have happened.
+    harness.bus.on("vault:create", (...data: never[]) => {
+      const file = data[0] as unknown as { path: string };
+      seen.push(`create:${file.path}`);
+    });
     await harness.lifecycle.stop();
-    events.length = 0;
+
+    // An empty map makes every path in the vault news, so without the guard
+    // this replays a `create` for every file the tree already holds — the exact
+    // shape that double-inserts into a plugin's own index, delivered by a host
+    // that has already said it is stopped.
     await harness.lifecycle.onEngineRestart(new Map());
-    // A stopped host has detached its subscriptions and torn its plugins down.
-    // Without the guard this moved it back to `steady` — a host that claims to
-    // be running and can never hear anything again.
-    expect(events).toEqual([]);
+    expect(seen).toEqual([]);
     expect(harness.lifecycle.phase()).toBe("stopped");
     await harness.stop();
   });
 
-  it("stops delivering the moment it is stopped", async () => {
+  it("stops delivering, and stops queueing, the moment it is stopped", async () => {
     const events: string[] = [];
     const harness = await HostHarness.create({
       vault: { "A.md": "# A\n" },
@@ -154,6 +151,12 @@ describe("engine restart continuity", () => {
     events.length = 0;
     await harness.commitGeneration({ created: ["After.md"] });
     expect(events).toEqual([]);
+    // **The half that "no events" cannot see.** A stopped host's phase is not
+    // `steady`, so a batch that still reached the subscription would be pushed
+    // into the pre-steady buffer and sit there — silent, and one entry per batch
+    // for the life of the process. Detaching is what stops that, and this is the
+    // only place it is observable.
+    expect(harness.lifecycle.pendingBatchCount()).toBe(0);
     await harness.stop();
   });
 });

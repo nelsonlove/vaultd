@@ -45,7 +45,7 @@ import type {
   ReadFileResponse,
   WriteFileResponse,
 } from "../client/protocol";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 
 export type { PluginManifest };
 
@@ -136,7 +136,7 @@ export class HeadlessConfigDir {
   /** `.obsidian-headless`, or whatever `configDirName` was configured to. */
   readonly configDir: string;
 
-  private readonly client: VaultdClient;
+  private readonly client: RequestSink;
   private readonly config: HostConfig;
   private readonly errors: HostErrors;
   /**
@@ -158,7 +158,7 @@ export class HeadlessConfigDir {
    * prints a damaged config file to stderr instead of losing it — the same
    * floor `HostErrors.report` describes.
    */
-  constructor(client: VaultdClient, config: HostConfig, errors: HostErrors = new HostErrors()) {
+  constructor(client: RequestSink, config: HostConfig, errors: HostErrors = new HostErrors()) {
     this.client = client;
     this.config = config;
     this.errors = errors;

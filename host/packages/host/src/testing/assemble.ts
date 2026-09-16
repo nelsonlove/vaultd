@@ -36,6 +36,8 @@ import { Workspace } from "../shim/workspace";
 import { createObsidianApi } from "../shim/api";
 import { installGlobals } from "../shim/globals";
 import { installPluginHost } from "../shim/plugin";
+import { forwardingSink } from "../runtime/forwarding-sink";
+import type { RequestSink } from "../client/request-sink";
 import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
@@ -69,7 +71,17 @@ import type { OsSpawn } from "../runtime/electron-stub";
 export interface HostAssembly {
   readonly config: HostConfig;
   readonly clock: Clock;
-  readonly client: VaultdClient;
+  /**
+   * How every shim surface asks the daemon a question — **a forwarding sink,
+   * not a connection**.
+   *
+   * It resolves the current engine's client at every call, so the assembly
+   * survives a restart. See `runtime/forwarding-sink.ts` for the defect that
+   * made this the type: a captured client left `Vault.cachedRead` talking to a
+   * dead socket, and metadata-change events stopped reaching plugins for the
+   * life of the process.
+   */
+  readonly client: RequestSink;
   readonly mirror: Mirror;
   readonly events: ShimEventBus;
   readonly queue: DispatchQueue;
@@ -146,7 +158,7 @@ export interface HostAssembly {
  * `main.ts` passes `DryRunGate` here instead when `--dry-run` is on, and
  * nothing between the two knows which it got.
  */
-export function forwardingWriteGate(client: VaultdClient): WriteGate {
+export function forwardingWriteGate(client: RequestSink): WriteGate {
   return {
     send<T>(method: string, params: unknown): Promise<T> {
       return client.request<T>(method, params);
@@ -208,7 +220,17 @@ export function memoryPolicyRecorder(): PolicyRecorder {
  */
 export function assembleShim(deps: {
   config: HostConfig;
-  client: VaultdClient;
+  /**
+   * The engine's client, **as a supplier read per request**.
+   *
+   * The same signature `Mirror.open` has, and for the same reason: a connection
+   * dies with its engine, so anything that captured one would go on asking a
+   * socket nobody is listening to after the first restart. The supplier is
+   * resolved here, once, into the {@link RequestSink} every module below takes
+   * — never handed down, because a module given a supplier can resolve it into
+   * a field and a module given a sink cannot.
+   */
+  client: () => VaultdClient;
   mirror: Mirror;
   clock: Clock;
   /**
@@ -232,7 +254,8 @@ export function assembleShim(deps: {
    */
   spawn?: OsSpawn;
 }): HostAssembly {
-  const { config, client, mirror, clock } = deps;
+  const { config, mirror, clock } = deps;
+  const client = forwardingSink(deps.client);
   const dataDir = deps.dataDir ?? config.dataDir;
   // **First**, before anything that could load a plugin bundle: a bundle that
   // resolves `electron` before the stub is in place gets the real module or a

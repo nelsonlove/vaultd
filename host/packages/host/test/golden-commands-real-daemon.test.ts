@@ -105,7 +105,7 @@ async function stagedHost(): Promise<Staged> {
   const mirror = await Mirror.open(() => supervisor.client(), config);
   const assembly = assembleShim({
     config,
-    client: supervisor.client(),
+    client: () => supervisor.client(),
     mirror,
     clock: systemClock(),
   });

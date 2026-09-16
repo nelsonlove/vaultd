@@ -47,7 +47,7 @@ import { FileIndex, TFile, TFolder } from "./files";
 import { affectedPathsForRename } from "./rename-paths";
 import { stub } from "./policy";
 import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 import type {
   GenerationResponse,
   MutationResponse,
@@ -77,7 +77,7 @@ export interface WriteGate {
 
 export interface VaultDeps {
   mirror: Mirror;
-  client: VaultdClient;
+  client: RequestSink;
   config: HostConfig;
   events: ShimEventBus;
   writes: WriteGate;

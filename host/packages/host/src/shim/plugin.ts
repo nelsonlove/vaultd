@@ -44,7 +44,7 @@ import type { EventRef, ShimEventBus } from "./events";
 import type { Harvest } from "./harvest";
 import type { HostErrorPhase, HostErrors } from "./errors";
 import type { ReadFileResponse, WriteFileResponse } from "../client/protocol";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 import type { Clock, HostConfig } from "../config";
 import type { DispatchQueue } from "../runtime/queue";
 import type { WriteGate } from "./vault";
@@ -127,7 +127,7 @@ export interface HeadlessElement {
 /** Everything a `Plugin` needs from the host, installed against its `App`. */
 export interface PluginHostContext {
   readonly config: HostConfig;
-  readonly client: VaultdClient;
+  readonly client: RequestSink;
   readonly writes: WriteGate;
   readonly harvest: Harvest;
   readonly events: ShimEventBus;

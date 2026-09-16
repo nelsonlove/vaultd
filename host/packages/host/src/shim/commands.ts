@@ -51,7 +51,7 @@ import type { EditorRange } from "./editor";
 import type { HostErrors } from "./errors";
 import type { Mirror } from "../mirror/mirror";
 import type { TFile } from "./files";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 import type { WriteGate } from "./vault";
 import type { Workspace } from "./workspace";
 
@@ -60,7 +60,7 @@ export type { Command } from "./plugin";
 /** What the registry needs to run a command, and to build an editor for one. */
 export interface CommandDeps {
   readonly queue: DispatchQueue;
-  readonly client: VaultdClient;
+  readonly client: RequestSink;
   readonly mirror: Mirror;
   readonly writes: WriteGate;
   readonly workspace: Workspace;

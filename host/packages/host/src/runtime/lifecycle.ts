@@ -253,6 +253,15 @@ export class LifecycleSequencer {
    * arrival order, each still getting its own `resolved`. Nothing is dropped —
    * the subscription is opened in the constructor precisely so that nothing can
    * be — and nothing is merged, because two changes are two changes.
+   *
+   * **One residual, named rather than hidden.** The tree moves at arrival, so a
+   * held batch's paths are announced twice at startup: once by the resolve run,
+   * which walks the index and therefore sees them, and once by the flushed
+   * batch's own `create` or `modify`. A plugin that builds an index on `resolve`
+   * and adds to it on `create` meets that note twice. Every such plugin in the
+   * corpus keys by path, so it is idempotent in practice — and the alternative,
+   * merging the two, is the "two changes are two changes" conflation this
+   * deliberately refuses.
    */
   private readonly pending: BatchArrival[] = [];
 
@@ -319,6 +328,20 @@ export class LifecycleSequencer {
 
   phase(): LifecyclePhase {
     return this.phaseValue;
+  }
+
+  /**
+   * How many batches are held, waiting for the host to finish starting.
+   *
+   * @internal Host accessor, so two claims are assertions rather than beliefs:
+   * that the buffer really drains at `steady`, and that a stopped host is not
+   * quietly accumulating one entry per batch for the life of the process. The
+   * second is the only observable consequence of {@link stop} detaching the
+   * mirror subscription — with the buffer in place, "no events after stop" is
+   * true whether or not the detach happened.
+   */
+  pendingBatchCount(): number {
+    return this.pending.length;
   }
 
   /** How long each plugin's `onload` took, by id, in the order they loaded. */
@@ -520,9 +543,16 @@ export class LifecycleSequencer {
     // news, which is the caller whose revision map predates a change this host
     // never told anyone about. See {@link lastDeliveredGeneration}.
     if (moved > 0 && diff.generation > this.lastDeliveredGeneration) {
-      await this.enqueue(() =>
-        this.deliver({ batch: diff, applied: this.deps.app.vault.applyBatch(diff, {}) }),
-      );
+      // Applied **here**, not inside the queued arrow, so this diff behaves like
+      // every other batch: the tree moves at arrival and the telling follows.
+      // Evaluated inside the arrow it would be applied whenever the chain got to
+      // it, so an ordinary batch landing in between would be applied first and
+      // the diff would then land on a tree it does not describe.
+      const arrival: BatchArrival = {
+        batch: diff,
+        applied: this.deps.app.vault.applyBatch(diff, { renames: [] }),
+      };
+      await this.enqueue(() => this.deliver(arrival));
     }
   }
 

@@ -55,7 +55,7 @@ import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
 import type { HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
 import type { ReadFileResponse } from "../client/protocol";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 
 // `OBSIDIAN_CONFIG_DIR` — Obsidian's own config directory, which this host reads
 // and never writes — comes from `pluginset/config-dir.ts`, which holds the
@@ -94,7 +94,7 @@ export interface BookmarksInstance {
 }
 
 export interface InternalPluginDeps {
-  readonly client: VaultdClient;
+  readonly client: RequestSink;
   readonly mirror: Mirror;
   readonly config: HostConfig;
 }

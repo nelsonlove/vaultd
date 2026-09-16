@@ -470,7 +470,7 @@ describe("the injected data dir and clock", () => {
     // them apart a host reading the config instead would pass every test.
     const assembly = assembleShim({
       config: harness.config,
-      client: harness.client,
+      client: () => harness.client,
       mirror: harness.mirror,
       clock: otherClock,
       dataDir: elsewhere,

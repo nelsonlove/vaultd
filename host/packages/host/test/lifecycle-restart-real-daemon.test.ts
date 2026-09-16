@@ -105,13 +105,14 @@ function put(root: string, path: string, contents: string): void {
 /**
  * The whole host over a real engine, with one real plugin installed.
  *
- * The client handed to `assembleShim` **forwards to the supervisor's current
- * one** rather than being captured. That is a test-side repair for a real gap:
- * `Mirror.open` takes a client *supplier* precisely because a connection dies
- * with its engine, and `assembleShim` takes a client. Captured, every shim read
- * after a restart — including the source the sequencer reads for a `changed`
- * event — goes to a socket nobody is listening on. Carried to Task 22, which
- * owns the production wiring.
+ * `assembleShim` is handed the supervisor's **supplier**, which is what it takes
+ * since round 2 and what production passes too. It resolves it once into a
+ * `RequestSink` that looks the current client up per call, so every shim read
+ * after a restart reaches the engine that is actually running. Captured
+ * instead — which is what this was until the re-review measured it — the
+ * sequencer's read of a note's source reaches a dead socket, the `changed`
+ * event is skipped rather than fired with data the host does not have, and
+ * metadata-change events stop reaching plugins for the life of the process.
  */
 async function liveHost(spec: LiveSpec): Promise<LiveHost> {
   const root = scratchRoot("t15-lifecycle-");
@@ -151,12 +152,12 @@ async function liveHost(spec: LiveSpec): Promise<LiveHost> {
     void mirror.applyEvent(event).catch(() => undefined);
   });
 
-  // See this function's docstring: forwarding, never captured.
-  const client = {
-    request: <T>(method: string, params?: unknown): Promise<T> =>
-      clientOf().request<T>(method, params),
-  } as unknown as VaultdClient;
-  const assembly = assembleShim({ config, client, mirror, clock: config.clock, dataDir });
+  // The supplier, which is what `assembleShim` takes since round 2 — production
+  // and this test alike. Handed a captured client instead, this case goes red
+  // twice over: no `changed:A.md` after the restart, because the sequencer's
+  // read of the note's source reaches a dead socket, and no second `onload`
+  // under the reload knob, because the bundle is read through the same socket.
+  const assembly = assembleShim({ config, client: clientOf, mirror, clock: config.clock, dataDir });
   const loader = new BundleLoader({
     app: assembly.app,
     queue: assembly.queue,
@@ -321,6 +322,10 @@ describe.skipIf(!BINARY_EXISTS)("engine restart continuity, against a real vault
     expect(timesSeen("delete:Swap")).toBe(1);
     expect(timesSeen("create:Swap")).toBe(1);
     expect(timesSeen("delete:Swap/Inner.md")).toBe(1);
+    // **The order is the content of Ruling W6**, not a detail: a handler told
+    // "created" and then "deleted" about one path concludes the path is gone.
+    // Counts alone stay green with the hoist removed.
+    expect(log().indexOf("delete:Swap")).toBeLessThan(log().indexOf("create:Swap"));
     expect(host.assembly.app.vault.getAbstractFileByPath("Swap")).toBeInstanceOf(TFile);
   }, 60_000);
 
@@ -348,6 +353,7 @@ describe.skipIf(!BINARY_EXISTS)("engine restart continuity, against a real vault
     expect(timesSeen("delete:Swap")).toBe(1);
     expect(timesSeen("create:Swap")).toBe(1);
     expect(timesSeen("create:Swap/Inner.md")).toBe(1);
+    expect(log().indexOf("delete:Swap")).toBeLessThan(log().indexOf("create:Swap"));
     expect(host.assembly.app.vault.getAbstractFileByPath("Swap")).toBeInstanceOf(TFolder);
   }, 60_000);
 });

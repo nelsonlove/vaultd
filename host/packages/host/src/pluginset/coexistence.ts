@@ -53,7 +53,7 @@ import { OBSIDIAN_CONFIG_DIR } from "./config-dir";
 import type { HeadlessConfigDir } from "./config-dir";
 import type { HostConfig } from "../config";
 import type { ReadFileResponse } from "../client/protocol";
-import type { VaultdClient } from "../client/client";
+import type { RequestSink } from "../client/request-sink";
 
 /** What the two enabled sets say, and what that implies, at one instant. */
 export interface OverlapReport {
@@ -106,7 +106,7 @@ export type PollHook = () => void | Promise<void>;
 
 export class CoexistenceMonitor {
   private readonly dir: HeadlessConfigDir;
-  private readonly client: VaultdClient;
+  private readonly client: RequestSink;
   private readonly config: HostConfig;
   private readonly errors: HostErrors;
 
@@ -126,7 +126,7 @@ export class CoexistenceMonitor {
    */
   constructor(
     dir: HeadlessConfigDir,
-    client: VaultdClient,
+    client: RequestSink,
     config: HostConfig,
     errors: HostErrors = new HostErrors(),
   ) {
