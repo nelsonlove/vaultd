@@ -159,8 +159,41 @@ export function refuseInDryRun(symbol: string, surface: string, detail?: string)
  * what makes the report readable.
  */
 export interface PolicyRecorder {
-  record(symbol: string, policy: ApiPolicy, pluginId: string | null): void;
+  record(symbol: string, policy: ApiPolicy, pluginId: string | null, threw?: string | null): void;
   entries(): readonly { symbol: string; policy: ApiPolicy; pluginId: string | null; hits: number }[];
+  /**
+   * The ordered call log, when this recorder keeps one — Task 20's detector is
+   * the only reader, and `memoryPolicyRecorder({ recordCalls: true })` the only
+   * writer.
+   *
+   * **Optional, and both halves together.** A tally answers "what did this
+   * plugin reach for", which is what a compatibility report prints; a sequence
+   * answers "in what order, and which of them threw", which is what a harness
+   * run is. They are different questions and the second one costs memory that
+   * grows with the length of a session, so a recorder is allowed not to have
+   * one — see {@link PolicyRecorder.callMark} for how a reader windows it.
+   */
+  callMark?(): number;
+  callsSince?(mark: number): readonly RecordedApiCall[];
+}
+
+/**
+ * One call into the shim, as the detector reads it back.
+ *
+ * `threw` is the message of the refusal, or `null` for a call that answered.
+ * It is set on the `absent`/{@link unsupported} path, which is the throw that
+ * says something about *this host's surface*. A `DryRunRefused` is deliberately
+ * **not** recorded as a throw: it says something about the run — the same call
+ * on the same host succeeds with the flag off — and a detector that reported it
+ * as a failed symbol would read every dry run as a list of missing surfaces,
+ * which is the exact confusion {@link DryRunRefused} exists to prevent.
+ */
+export interface RecordedApiCall {
+  readonly symbol: string;
+  readonly pluginId: string | null;
+  readonly policy: ApiPolicy;
+  readonly threw: string | null;
+  readonly atUnixMs: number;
 }
 
 const declarations = new Map<string, ApiPolicy>();
@@ -273,10 +306,18 @@ export function stub<T>(symbol: string, value: T): T {
   return value;
 }
 
-/** Records the hit against the current plugin, then throws HeadlessUnsupported. */
+/**
+ * Records the hit against the current plugin, then throws HeadlessUnsupported.
+ *
+ * The error is built **before** the record so the message can go into it: a
+ * detector reading the ordered call log is answering "what happened when this
+ * plugin reached for that", and "it threw" without the sentence is half an
+ * answer. The plugin sees exactly the error it always did.
+ */
 export function unsupported(symbol: string, detail?: string): never {
-  recorder?.record(symbol, "absent", pluginId);
-  throw new HeadlessUnsupported(symbol, pluginId, detail);
+  const refusal = new HeadlessUnsupported(symbol, pluginId, detail);
+  recorder?.record(symbol, "absent", pluginId, refusal.message);
+  throw refusal;
 }
 
 /**

@@ -49,7 +49,7 @@ import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
 import type { ObsidianApi } from "../shim/api";
-import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
+import type { ApiPolicy, PolicyRecorder, RecordedApiCall } from "../shim/policy";
 import type { GlobalInstallation } from "../shim/globals";
 import { DryRunGate, forwardingWriteGate } from "../dryrun/dry-run";
 import type { WriteGate } from "../dryrun/dry-run";
@@ -185,7 +185,7 @@ export { forwardingWriteGate } from "../dryrun/dry-run";
  * Task 7 owns `shim/policy.ts`; it may relocate this there without changing a
  * caller, since the type is the interface and not this function.
  */
-export function memoryPolicyRecorder(): PolicyRecorder {
+export function memoryPolicyRecorder(options: MemoryRecorderOptions = {}): PolicyRecorder {
   interface Tally {
     symbol: string;
     policy: ApiPolicy;
@@ -195,17 +195,66 @@ export function memoryPolicyRecorder(): PolicyRecorder {
   // Insertion-ordered, so `entries()` reports surfaces in the order a plugin
   // first reached for them — which reads as a trace of what it tried to do.
   const tallies = new Map<string, Tally>();
-  return {
-    record(symbol: string, policy: ApiPolicy, pluginId: string | null): void {
+  const now = options.clock?.now.bind(options.clock) ?? (() => 0);
+  const calls: RecordedApiCall[] = [];
+  // The sequence number of `calls[0]`, so a window survives the trim below: a
+  // caller marks at 40,000, the log drops the oldest 1,000 while the plugin
+  // runs, and `callsSince(40_000)` still answers the right rows rather than
+  // rows shifted by whatever fell off the front.
+  let firstSeq = 0;
+  let nextSeq = 0;
+  const recorder: PolicyRecorder = {
+    record(symbol: string, policy: ApiPolicy, pluginId: string | null, threw?: string | null): void {
       const key = `${symbol}\0${pluginId ?? ""}`;
       const existing = tallies.get(key);
       if (existing === undefined) tallies.set(key, { symbol, policy, pluginId, hits: 1 });
       else existing.hits += 1;
+      if (options.recordCalls !== true) return;
+      calls.push({ symbol, pluginId, policy, threw: threw ?? null, atUnixMs: now() });
+      nextSeq += 1;
+      // **Bounded, oldest first.** A host left running for a week under
+      // `--dry-run` would otherwise grow a row per shim call for ever, and the
+      // only reader wants the last few hundred of them. The tally is not
+      // trimmed: it is one row per `(symbol, plugin)` pair whatever the traffic.
+      if (calls.length > CALL_LOG_LIMIT) {
+        const dropped = calls.length - CALL_LOG_LIMIT;
+        calls.splice(0, dropped);
+        firstSeq += dropped;
+      }
     },
     entries() {
       return [...tallies.values()].map((tally) => ({ ...tally }));
     },
   };
+  if (options.recordCalls === true) {
+    recorder.callMark = (): number => nextSeq;
+    recorder.callsSince = (mark: number): readonly RecordedApiCall[] =>
+      calls.slice(Math.max(mark - firstSeq, 0));
+  }
+  return recorder;
+}
+
+/**
+ * How many ordered calls a recorder keeps. See {@link memoryPolicyRecorder}.
+ *
+ * Large enough that no plugin's `onload` comes near it — the widest surface in
+ * the corpus reaches for fifteen distinct symbols — and small enough that the
+ * log is a few megabytes at worst rather than a leak.
+ */
+const CALL_LOG_LIMIT = 20_000;
+
+/**
+ * **`recordCalls` is off by default, and that is the flag the brief asks for.**
+ *
+ * The tally is cheap and every host pays for it; the ordered log is the thing
+ * "the ordinary host does not pay for a log nobody reads" is about. The
+ * assembly turns it on exactly when `--dry-run` is on, because that is the only
+ * mode in which `Detector.runHarness` runs at all (Task 20, ruling 1) and so
+ * the only mode with a reader.
+ */
+export interface MemoryRecorderOptions {
+  readonly clock?: Clock;
+  readonly recordCalls?: boolean;
 }
 
 /**
@@ -277,7 +326,11 @@ export function assembleShim(deps: {
   // the bus holds nobody, and every cross-surface read happens later, from a
   // method.
   const events = new ShimEventBus();
-  const policyRecorder = deps.policyRecorder ?? memoryPolicyRecorder();
+  // **`recordCalls` follows `--dry-run`**, which is the honest place for it:
+  // `Detector.runHarness` refuses outside dry-run, so outside dry-run the
+  // ordered log has no reader and the host should not be keeping one.
+  const policyRecorder =
+    deps.policyRecorder ?? memoryPolicyRecorder({ clock, recordCalls: config.dryRun });
   // The policy table is module-level — a lookup happens inside a getter on a
   // frozen barrel, far below anything holding the host — so the recorder every
   // `stub`/`unsupported` hit lands in is installed rather than passed.

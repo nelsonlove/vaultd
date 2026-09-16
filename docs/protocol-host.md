@@ -315,7 +315,9 @@ Notices are recorded, but in **every** mode — `host.invoke_command` reports th
 
 The host's codes, **additive to `vaultd`'s** — a forwarded operation's refusal is the daemon's, unchanged:
 
-`host_not_ready`, `plugin_not_found`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `config_key_refused`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `not_owner`, `snapshot_not_found`.
+`host_not_ready`, `plugin_not_found`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `config_key_refused`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `detector_requires_dry_run`, `not_owner`, `snapshot_not_found`.
+
+`detector_requires_dry_run` is the compatibility detector's own refusal (Task 20). Its scan half reads the shipped bundle and is always available; its harness half **loads the plugin for real**, so the host performs it only under `--dry-run`, where every write the plugin makes is recorded instead of performed. A `host.compat_report` against a host that is not in dry-run therefore answers with `harness: null` per plugin rather than refusing — the refusal is for a harness run asked for by name.
 
 Daemon codes the host also answers on its own behalf: `incompatible_version` (a `version` that is not `1`, carrying `supported_version`), `invalid_request` (a malformed request on an authenticated connection, or a `host.` method this build does not have), `invalid_cursor` (a snapshot cursor this host did not issue, or one from another session), `generation_mismatch` and `too_many_snapshots` (snapshot sessions, above), `subscription_not_found` (`host.unsubscribe` for an id this connection does not hold), `not_found` (a path that names nothing), and `internal` (a plugin's own code threw — the message names the command and the failure is counted against that plugin's quarantine).
 

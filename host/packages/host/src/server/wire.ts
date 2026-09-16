@@ -63,6 +63,9 @@ export type HostErrorCode =
   | "interaction_unavailable"
   | "interaction_timeout"
   | "dry_run_refused"
+  // A harness run loads the plugin for real, so the detector does it only
+  // under `--dry-run` (Task 20). The scan half has no such condition.
+  | "detector_requires_dry_run"
   | "not_owner"
   | "snapshot_not_found";
 

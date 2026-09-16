@@ -79,7 +79,7 @@
  */
 
 import seed from "./key-registry.json";
-import type { CachedSchema, SchemaControl, SchemaLadder } from "./ladder";
+import type { CachedSchema, SchemaControl, SchemaLadder, SchemaSource } from "./ladder";
 import type { DispatchQueue } from "../runtime/queue";
 import type { HeadlessConfigDir } from "../pluginset/config-dir";
 import type { HostConfig } from "../config";
@@ -445,6 +445,21 @@ export class PluginConfigService {
    * loaded therefore serves `"none"` — which refuses no write and redacts every
    * secret, the right way round for the case where the host knows least.
    */
+  /**
+   * Which rung of the ladder produced this plugin's schema, and nothing else.
+   *
+   * The smallest honest surface for Task 20's compatibility report: a report
+   * describes a plugin, it never copies its settings, so a detector that could
+   * reach {@link schemaFor} could reach the items and the values with it.
+   * `"none"` here means **not yet described** — the schema was never climbed,
+   * or the plugin is installed and not loaded — and never "this plugin has no
+   * settings", which is a different fact this host cannot see. Every prose
+   * rendering of this value has to say so.
+   */
+  schemaSourceFor(id: string): SchemaSource {
+    return this.schemaFor(id).source;
+  }
+
   private schemaFor(id: string): CachedSchema {
     const version = this.deps.plugins?.manifests[id]?.version;
     if (version !== undefined) {

@@ -5,11 +5,12 @@
  * **Activated by Task 15**, and reconciled against the modules it names. The
  * body predates every one of them — it was written in Task 6b against interface
  * sketches — so the divergences were real and each is noted at the call site it
- * was found in. The members belonging to tasks that have not run yet (`broker`,
- * `dryRun`, `detector`) are kept by **name** and throw when touched, so a case
- * written against one fails with the task number rather than with `undefined is
- * not a function`. `server`, `connectClient` and `serverQuiesce` were three of
- * those until Task 16a built the socket; they are real now.
+ * was found in. Members belonging to tasks that had not run yet were kept by
+ * **name** and threw when touched, so a case written against one failed with
+ * the task number rather than with `undefined is not a function`. There are
+ * none left: `server`, `connectClient` and `serverQuiesce` became real at Task
+ * 16a, `broker` at 18, `dryRun` at 19 and `detector` at 20, and the helper that
+ * raised the refusal went with the last of them.
  *
  * It extends {@link ShimHarness} rather than wrapping one, so every method a
  * shim test uses is still available to a host test: a case about the event
@@ -45,6 +46,9 @@ import { QuarantineTracker } from "../runtime/quarantine";
 import { ShimHarness, configFilePathsFor, sweepStaleDataDirs } from "./shim-harness";
 import { DataDir } from "../datadir";
 import { DryRunGate } from "../dryrun/dry-run";
+import { Detector } from "../detector/harness";
+import { DEFAULT_KEY_REGISTRY, PluginConfigService } from "../settings/plugin-config";
+import { SchemaLadder } from "../settings/ladder";
 import { HeadlessConfigDir, OBSIDIAN_CONFIG_DIR, pluginDataPath, pluginDirPath } from "../pluginset/config-dir";
 import { TFolder } from "../shim/files";
 import { fs } from "../runtime/fs-access";
@@ -130,6 +134,8 @@ export class HostHarness extends ShimHarness {
   private guiEnabled: string[] | null;
   /** Built by {@link bindHost}, so it is listening to the mirror from the start. */
   private serverValue: HostServer | null = null;
+  /** Built by {@link bindHost}, over the sequencer it loads plugins through. */
+  private detectorValue: Detector | null = null;
 
   /**
    * Reusable plugin factories the tests share instead of restating them.
@@ -323,6 +329,32 @@ export class HostHarness extends ShimHarness {
       },
       ...(spec.suppressLayoutReady === true ? { skipLayoutReady: true } : {}),
     });
+    // **After the sequencer, because it drives one.** The detector loads the
+    // plugin it probes through `lifecycle.enableLate`, so it cannot be part of
+    // `assembleShim` — the assembly is built before the sequencer exists.
+    // Task 22 builds it in the same place for the real host, and hands it to
+    // `HostServer.attachWiring` there.
+    this.detectorValue = new Detector({
+      config: this.config,
+      clock: this.config.clock,
+      dir: this.assembly.dir,
+      lifecycle: this.lifecycle,
+      harvest: this.harvest,
+      recorder: this.policyRecorder,
+      writes: this.assembly.writes,
+      quarantine: this.quarantine,
+      // The same shape Task 20b will wire: the ladder over this harness's own
+      // data directory, so a schema cached by one case cannot be read by
+      // another, and the plugin registry so a loaded plugin's version is the
+      // one the cache is keyed by.
+      pluginConfig: new PluginConfigService(
+        this.assembly.dir,
+        new SchemaLadder(this.config.dataDir, this.config.clock),
+        DEFAULT_KEY_REGISTRY,
+        this.config,
+        { plugins: this.app.plugins, queue: this.assembly.queue },
+      ),
+    });
     // **Built here, not on the first `connectClient`.** The server subscribes to
     // the mirror, the notice log, the sequencer and the coexistence monitor the
     // moment it exists, so a case that commits a generation before any client
@@ -463,9 +495,18 @@ export class HostHarness extends ShimHarness {
     return this.assembly.dir;
   }
 
-  /** The compatibility detector. **Activated by Task 20.** */
-  get detector(): never {
-    throw notActivated("detector", "20");
+  /**
+   * The compatibility detector. **Activated by Task 20.**
+   *
+   * The same object the server's `host.compat_report` will be wired to, over
+   * this harness's own lifecycle and dry-run gate: a case reading a harness
+   * result is reading what the running host recorded, not a second reckoning.
+   */
+  get detector(): Detector {
+    if (this.detectorValue === null) {
+      throw new Error("this harness has not been assembled yet");
+    }
+    return this.detectorValue;
   }
 
   setGuiEnabled(ids: string[] | null): void {
@@ -827,6 +868,18 @@ export class HostHarness extends ShimHarness {
     this.autoServeDirs({
       [`${this.config.configDirName}/plugins`]: ids.map((id) => ({ name: id, kind: "folder" })),
     });
+    // **And `main.js` answers `not_found`, deliberately.** A harness plugin is
+    // a class the case wrote, not a compiled bundle, so there is no bundle
+    // source to serve and the honest answer is the daemon's own answer for a
+    // file that is not there. It has to be *an* answer: Task 20's detector
+    // scans the shipped bundle through `readBundleSource`, and a path nothing
+    // answers leaves that read sitting in the request queue forever — a hang
+    // rather than a failure, which is the worst way for a harness to be
+    // incomplete. The scan then reports an empty result whose `tierReasons`
+    // say why, which is the truth about a plugin with no bundle.
+    for (const id of ids) {
+      this.unserveFile(`${pluginDirPath(this.config.configDirName, id)}/main.js`);
+    }
     this.serveVaultInfo();
     this.serveEditorNotes();
     this.serveFixtures([]);
@@ -934,14 +987,6 @@ export class HostHarness extends ShimHarness {
       return true;
     });
   }
-}
-
-/** The refusal a member belonging to a later task answers with. */
-function notActivated(member: string, task: string): Error {
-  return new Error(
-    `HostHarness.${member} is activated by Task ${task}, which has not run yet. The member is ` +
-      "kept by name so a case written against it fails here rather than somewhere else.",
-  );
 }
 
 /** The socket's own directory — the one whose mode the host checks. */
