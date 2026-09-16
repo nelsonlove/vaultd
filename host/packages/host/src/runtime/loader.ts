@@ -313,6 +313,13 @@ export class BundleLoader implements PluginLoader {
     const bundle = await this.deps.queue.run(id, `${id}:compile`, () =>
       this.deps.events.attributingTo(id, () => loadPluginBundle(source.request)),
     );
+    // Kept before the plugin is constructed, because a bundle whose `onload`
+    // throws is still a bundle whose settings this host can describe — and
+    // because Task 17's ladder reads `SETTINGS_CATALOG` / `DEFAULT_SETTINGS`
+    // off exactly this object, which nothing else in the process holds once
+    // the plugin class has been read out of it. Dropped again by
+    // `Harvest.forgetPlugin` when the plugin is torn down.
+    this.deps.harvest.recordModuleExports(id, bundle.exports);
     const plugin = new bundle.pluginClass(this.deps.app, source.manifest);
     await this.load(plugin);
     return plugin;

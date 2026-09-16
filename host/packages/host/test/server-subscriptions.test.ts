@@ -36,6 +36,28 @@ async function drainUntil(
   return events;
 }
 
+/**
+ * One `generation_committed` as the daemon sends it, relayed into the host.
+ *
+ * A helper rather than a fifth copy of the payload: the two fields a host
+ * cannot honestly produce (`affected_reference_count` and the daemon's `cause`)
+ * are what the relay is promising to pass through untouched, so every case that
+ * drives one should be driving the same shape.
+ */
+function commit(harness: HostHarness, generation: number, previous: number): void {
+  harness.server.relayDaemonEvent({
+    type: "generation_committed",
+    value: {
+      previous_generation: previous,
+      generation,
+      cause: "watcher",
+      changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+      affected_note_count: 1,
+      affected_reference_count: 0,
+    },
+  });
+}
+
 describe("host subscriptions", () => {
   it("delivers one generation_committed to each of two connected clients", async () => {
     const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
@@ -551,6 +573,53 @@ describe("host subscriptions", () => {
       await harness.stop();
     }
   }, 30_000);
+
+  it("re-arms the hold collapse once the mirror has really released something", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      config: { subscriberQueueLimit: 4 },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+
+      /** Five commits at a limit of four: the fifth is the overflow. */
+      const overflow = (): void => {
+        // Far enough ahead that this host's mirror can never reach them, which
+        // is what keeps them held rather than delivered on arrival.
+        const ahead = harness.mirror.generation() + 1_000;
+        for (let i = 0; i < 5; i += 1) commit(harness, ahead + i + 1, ahead + i);
+      };
+
+      overflow();
+      await harness.serverQuiesce();
+
+      // **The release is the whole case.** One collapse per episode is right
+      // only if an episode can end, and the single thing that ends one is the
+      // mirror actually moving: a latch that was set and never cleared would
+      // say "your view is void" once and then stay silent for the life of the
+      // process, however far behind the mirror fell afterwards — the failure
+      // that looks exactly like a healthy host from the client's side.
+      const generation = harness.mirror.generation() + 1;
+      commit(harness, generation, harness.mirror.generation());
+      await harness.commitGeneration({ generation, modified: ["A.md"], announce: false });
+      await harness.serverQuiesce();
+
+      overflow();
+      await harness.serverQuiesce();
+
+      const events = await client.drainEvents();
+      // Two episodes, two collapses — and the commit the mirror caught up to,
+      // relayed in between, which is the evidence the first episode ended.
+      expect(events.filter((event) => event.type === "resync_required")).toHaveLength(2);
+      expect(events.filter((event) => event.type === "generation_committed")).toHaveLength(1);
+      await client.disconnect();
+    } finally {
+      await harness.stop();
+    }
+  });
 
   it("does not lag a reading client with a burst larger than the queue", async () => {
     const harness = await HostHarness.create({

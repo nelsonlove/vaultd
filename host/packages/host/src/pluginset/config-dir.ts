@@ -436,6 +436,67 @@ export class HeadlessConfigDir {
     return pluginDataPath(this.configDir, id);
   }
 
+  /**
+   * A plugin's settings document, or `null` when it has never saved one.
+   *
+   * The counterpart of `Plugin.loadData` for a caller that is **not** the
+   * plugin, and it is stricter than that method on purpose. `loadData` answers
+   * `null` for a file that will not parse, because the alternative is a throw
+   * inside `onload` that costs the plugin everything after it; nobody's `onload`
+   * is at stake here, and a config service that silently reported "no settings"
+   * for a `data.json` a human damaged would invite the caller to write a fresh
+   * document over it and eat the user's settings.
+   *
+   * A document that parses to something other than an object is refused for the
+   * same reason: every key-level operation above this — redaction, the state-key
+   * refusal, the merge that preserves unmentioned keys — is defined over an
+   * object's keys, and an array or a bare number has none.
+   */
+  async readPluginData(id: string): Promise<Record<string, unknown> | null> {
+    const path = this.dataPath(id);
+    const source = await this.readFileOrNull(path);
+    if (source === null) return null;
+    // An empty file is Obsidian's own "nothing saved yet" — a plugin that wrote
+    // one and a plugin that never wrote at all are the same state to a reader.
+    if (source.trim() === "") return null;
+    const parsed = parseJson<unknown>(source, path);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`${path} must be a JSON object`);
+    }
+    return parsed as Record<string, unknown>;
+  }
+
+  /**
+   * Replace a plugin's settings document, in **one** `write_file`.
+   *
+   * One write rather than a key-at-a-time patch because `data.json` has no
+   * partial-update verb and never will: the file is the unit Obsidian reads and
+   * a plugin's own `saveData` rewrites whole. A caller preserving keys it did
+   * not mean to change does so by merging *before* it calls this — which is
+   * what `PluginConfigService.set` does, over the document it has just read.
+   *
+   * The folder is created **on the refusal** rather than ahead of every write,
+   * exactly as `Plugin.saveData` does it and for the same reason: the folder
+   * exists for every write after the first, and `create_folder` walks its own
+   * segments, so one call covers however much of the chain is missing.
+   */
+  async writePluginData(id: string, data: Record<string, unknown>): Promise<void> {
+    const path = this.dataPath(id);
+    const params = {
+      path,
+      content_base64: Buffer.from(`${JSON.stringify(data, null, 2)}\n`, "utf8").toString("base64"),
+    };
+    try {
+      await this.client.request<WriteFileResponse>("write_file", params);
+      return;
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code !== "parent_not_found") throw error;
+    }
+    await this.client.request<unknown>("create_folder", { path: this.pluginDir(id) });
+    await this.client.request<WriteFileResponse>("write_file", params);
+  }
+
   /** `<configDir>/plugins`. */
   pluginsDir(): string {
     return `${this.configDir}/plugins`;

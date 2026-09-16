@@ -213,6 +213,22 @@ export class Harvest {
    */
   private readonly hookOrdinals = new Map<string, number>();
   private readonly ribbonOrdinals = new Map<string, number>();
+  /**
+   * What each plugin's bundle exported from its module scope.
+   *
+   * Recorded here rather than held by the loader because the harvest is what a
+   * caller holding a `Plugin` can reach — `pluginHostFor(plugin.app).harvest` —
+   * and rungs 2 and 3 of Task 17's schema ladder read a plugin's own
+   * `SETTINGS_CATALOG` or `DEFAULT_SETTINGS` off exactly this object. Obsidian
+   * throws the exports away after it has read the plugin class out of them; a
+   * host that did the same could not climb either rung, because nothing else
+   * in the process would still hold them.
+   *
+   * It is **never** sent: `server/wire.ts` builds its rows from the reading
+   * methods above, and this one is not among them. See {@link HarvestedSettingTab}
+   * for the same argument about the live tab.
+   */
+  private readonly moduleExportRows = new Map<string, unknown>();
 
   constructor(private readonly deps: HarvestDeps = {}) {}
 
@@ -244,6 +260,11 @@ export class Harvest {
 
   unreachable(): readonly HarvestedUnreachable[] {
     return [...this.unreachableRows];
+  }
+
+  /** What this plugin's bundle exported, or `undefined`. See {@link moduleExportRows}. */
+  moduleExports(pluginId: string): unknown {
+    return this.moduleExportRows.get(pluginId);
   }
 
   // --- Recording -------------------------------------------------------------
@@ -292,6 +313,11 @@ export class Harvest {
 
   recordSettingTab(row: HarvestedSettingTab): void {
     this.settingTabRows.push(row);
+  }
+
+  /** Keep one plugin's module exports. See {@link moduleExportRows}. */
+  recordModuleExports(pluginId: string, exports: unknown): void {
+    this.moduleExportRows.set(pluginId, exports);
   }
 
   recordRibbonIcon(
@@ -416,6 +442,11 @@ export class Harvest {
     keepOthers(this.ribbonRecords, (record) => record.row.pluginId !== pluginId);
     keepOthers(this.timerRows, (row) => row.pluginId !== pluginId);
     keepOthers(this.unreachableRows, (row) => row.pluginId !== pluginId);
+    // The exports go with everything else: a quarantined plugin's module scope
+    // is a live object graph — its prototypes, its closures, whatever it built
+    // at load — and keeping it would hold the whole bundle in memory for a
+    // plugin this host has decided is gone.
+    this.moduleExportRows.delete(pluginId);
     for (const key of [...this.hookOrdinals.keys()]) {
       if (key.startsWith(`${pluginId}\0`)) this.hookOrdinals.delete(key);
     }
