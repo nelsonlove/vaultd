@@ -85,14 +85,22 @@ Every field below is `snake_case`. The **Task** column says which task implement
 | `host.snapshot_tree` | `{ snapshot_id, cursor, limit? }` | `{ snapshot_id, generation, entries, next_cursor }` | 16a |
 | `host.snapshot_notes` | `{ snapshot_id, cursor, limit?, include? }` | `{ snapshot_id, generation, notes, next_cursor }` | 16a |
 | `host.close_snapshot` | `{ snapshot_id }` | `{ snapshot_id }` | 16a |
-| `host.get_plugin_config` | `{ id, reveal_secrets?: bool }` | `{ id, values, schema: { source, items }, redacted_keys, state_keys }` | **wired in 20b** |
-| `host.set_plugin_config` | `{ id, patch: Record<string, unknown> }` | `{ id, applied: string[], refused: { key, reason }[] }` | **wired in 20b** |
+| `host.get_plugin_config` | `{ id, reveal_secrets?: bool }` | `{ id, values, schema: { source, items }, redacted_keys: Path[], state_keys }` | **wired in 20b** |
+| `host.set_plugin_config` | `{ id, patch: Record<string, unknown> }` | `{ id, applied: string[], refused: { key, reason, path?: Path }[] }` | **wired in 20b** |
 | `host.compat_report` | `{ plugin_id?: string }` | `{ report: CompatReport }` | **wired in 20b** |
 | `host.attach_interaction` | `{}` | `{ attached: bool }` | **wired in 20b** |
 | `host.detach_interaction` | `{}` | `{ attached: bool }` | **wired in 20b** |
 | `host.respond_interaction` | `{ prompt_id, choice_index?: number, value?: string, cancelled?: bool }` | `{ prompt_id }` | **wired in 20b** |
 
 `host.invoke_command`'s `selection` is a range — `{ from: { line, ch }, to: { line, ch } }`, both fields zero-based — rather than a string. **This is a ratified deviation from the phase brief's pinned table**, which spells the row `selection?: string`: an `editorCallback` is handed an `Editor`, whose `setSelection` takes two positions, so a string would have to be *searched* for in the note — a different operation, with a different failure mode (no match, several matches) and a different answer for each. The controller ratified the range in Task 16a's fix round and the brief's table is amended to match. A client that sends a string is told so by name rather than having it silently ignored. The shape is pinned as `SelectionWire` in `host/packages/host/src/server/wire.ts`.
+
+The plugin-config rows carry **two ratified amendments** from Task 17's fix rounds, both settled before 20b wires the handlers so the shape is frozen rather than discovered.
+
+**A fourth refusal reason, `redacted_value`.** The brief pins three — `state_key`, `unknown_key`, `type_mismatch`. The fourth refuses the literal string `[redacted]` written back into a key the host would redact, at any depth, and it exists because the most ordinary client there is reads a config, changes one field and writes the whole thing back: without it, that saves the placeholder over the user's real token, on a file with no history. The refusal is per key like the other three, the rest of the patch still lands, and a client that really means to store `[redacted]` in an ordinary key still can.
+
+**`redacted_keys` and a refusal's `path` are `Path = (string | number)[]`** — one segment per hop, a number for an array index (`["accounts", 0, "refreshToken"]`, `["apiAuthToken"]` for a top-level key) — rather than dotted strings. This is the daemon's own `patch_frontmatter` `key_path` grammar, chosen for the reason that grammar exists: a key name may contain a dot, so `{"a.b": {...}}` and `{"a": {"b": {...}}}` are two different documents that dot-joining spells the same way, and a client acting on a path cannot recover from the ambiguity. `refused[].key` stays the **top-level** patch key — what the caller sent, and what it would re-send — with `path` beside it naming where the reason actually is; only `redacted_value` carries one. The shapes are pinned as `ConfigPath` and `ConfigRefusal` in `host/packages/host/src/settings/plugin-config.ts`.
+
+**Two failures in this pair are errors rather than refusal rows**, and 20b maps both to error responses: `payload_too_large` when the merged document exceeds the host's write cap, and `plugin_data_too_deep` when a document or a patch is nested deeper than 64 levels — the depth this host inspects. Neither writes anything. The second fails closed on purpose: a redactor that cannot read a document to the bottom must not serve the half it inspected.
 
 ### Readiness
 

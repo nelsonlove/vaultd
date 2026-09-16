@@ -543,6 +543,32 @@ describe("the loader's plugin lifecycle", () => {
     expect(String(reported[0]?.error)).toMatch(/onload blew up/);
   });
 
+  it("drops the recorded module exports when a plugin's constructor throws", async () => {
+    const harness = await ShimHarness.withVault({});
+    const loader = new BundleLoader(harness.loaderDeps());
+    const { filename, source } = bundle("throwing-constructor");
+    const manifest = harness.manifestFor("doomed");
+
+    const loading = loader.loadBundle({
+      request: { pluginId: "doomed", filename, source, hostModulePaths: harness.hostModulePaths },
+      manifest,
+    });
+    await expect(loading).rejects.toThrow(/constructor blew up/);
+
+    // The bundle's exports are recorded **before** the class is constructed,
+    // because Task 17's schema ladder reads a loaded plugin's own
+    // `SETTINGS_CATALOG` / `DEFAULT_SETTINGS` off exactly that object and
+    // nothing else in the process holds it. Every other failure gives them back
+    // through `unload` → `forgetPlugin`; a constructor that throws reaches
+    // neither, so a whole module scope would be held for the life of the host
+    // for a plugin that never existed.
+    expect(harness.harvest.moduleExports("doomed")).toBeUndefined();
+    // And nothing else survives either: registration happens inside `load()`,
+    // which was never reached.
+    expect(harness.app.plugins.getPlugin("doomed")).toBeNull();
+    expect(loader.instance("doomed")).toBeNull();
+  });
+
   it("names the plugin when a bundle will not evaluate at all", () => {
     const filename = join(__dirname, "fixtures", "bundles", "cjs-plugin", "main.js");
     const broken = (): unknown =>

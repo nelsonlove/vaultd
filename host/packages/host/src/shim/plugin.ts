@@ -673,6 +673,15 @@ export abstract class Plugin extends Component {
    * callers believe they succeeded. Obsidian has no such race because it has
    * one writer; a host with a socket door has two.
    *
+   * **The lock is not re-entrant, so do not await this from inside one.**
+   * `DispatchQueue.runExclusivePath` is a promise chain per path (Task 7), so
+   * code already holding *this file's* path lock that then **awaits** a
+   * `saveData` waits for itself, for ever. The two holders in the host are this
+   * method and `PluginConfigService.set`, and `set` releases the lock before it
+   * calls `onExternalSettingsChange` so that a handler may save. The shape to
+   * avoid is a plugin running `Vault.process` — the other user of this lock —
+   * against its own `data.json` and saving inside the callback.
+   *
    * **The trailing newline is deliberate and matches
    * `HeadlessConfigDir.writeEnabledSet` and `writePluginData`.** Two writers of
    * one file that disagree about the last byte flip it on every alternation,

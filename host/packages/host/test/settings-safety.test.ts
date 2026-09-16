@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
 import seed from "../src/settings/key-registry.json";
-import { DEFAULT_KEY_REGISTRY, PluginDataTooLarge } from "../src/settings/plugin-config";
+import {
+  DEFAULT_KEY_REGISTRY,
+  MAX_CONFIG_DEPTH,
+  PluginDataTooDeep,
+  PluginDataTooLarge,
+} from "../src/settings/plugin-config";
 import { SettingsHarness } from "../src/testing/settings-harness";
+
+/** A document `depth` levels deep: `{"a":{"a":…{"a":1}}}`. */
+function nested(depth: number): Record<string, unknown> {
+  let node: unknown = 1;
+  for (let i = 0; i < depth; i += 1) node = { a: node };
+  return node as Record<string, unknown>;
+}
 
 describe("plugin config safety", () => {
   it("redacts secret-shaped keys by default and reveals them on request", async () => {
@@ -15,7 +27,7 @@ describe("plugin config safety", () => {
     expect(guarded.values["apiAuthToken"]).toBe("[redacted]");
     expect(guarded.values["googleCalendarSyncTokens"]).toBe("[redacted]");
     expect(guarded.values["taskTag"]).toBe("task");
-    expect(guarded.redacted_keys.sort()).toEqual(["apiAuthToken", "googleCalendarSyncTokens"]);
+    expect(guarded.redacted_keys).toEqual([["apiAuthToken"], ["googleCalendarSyncTokens"]]);
     expect(guarded.state_keys).toContain("pomodoroState");
     const revealed = await harness.service.get("tasknotes", true);
     expect(revealed.values["apiAuthToken"]).toBe("s3cret");
@@ -129,7 +141,7 @@ describe("plugin config safety", () => {
     const guarded = await harness.service.get("unknown-plugin", false);
     expect(guarded.values["nested"]).toEqual({ deep: { apiToken: "[redacted]", ordinary: 1 } });
     expect(guarded.values["label"]).toBe("fine");
-    expect(guarded.redacted_keys).toEqual(["nested.deep.apiToken"]);
+    expect(guarded.redacted_keys).toEqual([["nested", "deep", "apiToken"]]);
   });
 
   it("redacts a secret inside an array of objects, with the index in the path", async () => {
@@ -141,7 +153,7 @@ describe("plugin config safety", () => {
       { name: "a", refreshToken: "[redacted]" },
       { name: "b" },
     ]);
-    expect(guarded.redacted_keys).toEqual(["accounts.0.refreshToken"]);
+    expect(guarded.redacted_keys).toEqual([["accounts", 0, "refreshToken"]]);
   });
 
   it("reveals a nested secret on request, and still names every path", async () => {
@@ -155,9 +167,9 @@ describe("plugin config safety", () => {
     // A caller holding plaintext still needs to know which of these values are
     // credentials — that is the more useful question, and the guarded answer's
     // paths are the answer to it.
-    expect(revealed.redacted_keys.sort()).toEqual([
-      "accounts.0.refreshToken",
-      "nested.deep.apiToken",
+    expect(revealed.redacted_keys).toEqual([
+      ["nested", "deep", "apiToken"],
+      ["accounts", 0, "refreshToken"],
     ]);
   });
 
@@ -169,7 +181,7 @@ describe("plugin config safety", () => {
     expect(guarded.values["googleCalendarSyncTokens"]).toBe("[redacted]");
     // One path, not one per token inside the bag: a caller cannot reconstruct
     // the bag's shape from what it was told.
-    expect(guarded.redacted_keys).toEqual(["googleCalendarSyncTokens"]);
+    expect(guarded.redacted_keys).toEqual([["googleCalendarSyncTokens"]]);
   });
 
   // --- The round trip that used to destroy a token ----------------------------
@@ -186,7 +198,9 @@ describe("plugin config safety", () => {
     const view = await harness.service.get("tasknotes", false);
     const result = await harness.service.set("tasknotes", view.values);
     expect(result.applied).toEqual(["taskTag"]);
-    expect(result.refused).toEqual([{ key: "apiAuthToken", reason: "redacted_value" }]);
+    expect(result.refused).toEqual([
+      { key: "apiAuthToken", reason: "redacted_value", path: ["apiAuthToken"] },
+    ]);
     expect(await harness.readData("tasknotes")).toEqual({
       apiAuthToken: "real-token",
       taskTag: "t",
@@ -205,7 +219,9 @@ describe("plugin config safety", () => {
       label: "after",
     });
     expect(result.applied).toEqual(["label"]);
-    expect(result.refused).toEqual([{ key: "nested.deep.apiToken", reason: "redacted_value" }]);
+    expect(result.refused).toEqual([
+      { key: "nested", reason: "redacted_value", path: ["nested", "deep", "apiToken"] },
+    ]);
     expect(await harness.readData("unknown-plugin")).toEqual({
       nested: { deep: { apiToken: "real" } },
       label: "after",
@@ -224,7 +240,11 @@ describe("plugin config safety", () => {
     const result = await harness.service.set("unknown-plugin", view.values);
     expect(result.applied).toEqual([]);
     expect(result.refused).toEqual([
-      { key: "refreshTokenIntervalMinutes", reason: "redacted_value" },
+      {
+        key: "refreshTokenIntervalMinutes",
+        reason: "redacted_value",
+        path: ["refreshTokenIntervalMinutes"],
+      },
     ]);
     expect(await harness.readData("unknown-plugin")).toEqual({
       refreshTokenIntervalMinutes: 30,
@@ -331,6 +351,133 @@ describe("plugin config safety", () => {
       await expect(harness.service.set("demo", { alpha: 1 })).rejects.toThrow();
       expect(harness.rawData("demo")).toBe(source);
     }
+  });
+
+  // --- The path grammar, and why it is an array --------------------------------
+
+  // A key name may contain a dot — path-keyed maps, `"folder/note.md"`,
+  // `"section.field"` settings — so a dotted string spells two different
+  // documents the same way. A client highlighting the field a refusal names
+  // cannot recover from that; segments can.
+  it("tells a dotted key name apart from two nested ones", async () => {
+    const flat = await SettingsHarness.withData("unknown-plugin", {
+      "a.b": { apiToken: "FLAT" },
+    });
+    expect((await flat.service.get("unknown-plugin", false)).redacted_keys).toEqual([
+      ["a.b", "apiToken"],
+    ]);
+    const deep = await SettingsHarness.withData("unknown-plugin", {
+      a: { b: { apiToken: "DEEP" } },
+    });
+    expect((await deep.service.get("unknown-plugin", false)).redacted_keys).toEqual([
+      ["a", "b", "apiToken"],
+    ]);
+  });
+
+  // --- A document deeper than this host inspects -------------------------------
+
+  // A plugin's own `saveData` will serialize a 200,000-deep document quite
+  // happily and the daemon stores bytes, so an unbounded walk answers
+  // `RangeError: Maximum call stack size exceeded` for ever on a file the
+  // plugin considers ordinary. Failing closed with a typed error is the only
+  // safe direction for a redactor: what it could not inspect it must not serve.
+  it("refuses to read a document nested deeper than the budget", async () => {
+    const harness = await SettingsHarness.withRawData(
+      "demo",
+      `${JSON.stringify(nested(2_500))}\n`,
+    );
+    await expect(harness.service.get("demo", false)).rejects.toBeInstanceOf(PluginDataTooDeep);
+    await expect(harness.service.get("demo", false)).rejects.toThrow(
+      new RegExp(`deeper than ${String(MAX_CONFIG_DEPTH)} levels`),
+    );
+    // Typed, not a stack overflow: the walk stops at the budget and never
+    // recurses to the bottom.
+    await expect(harness.service.get("demo", false)).rejects.not.toBeInstanceOf(RangeError);
+  });
+
+  it("refuses a patch nested deeper than the budget before any write", async () => {
+    const harness = await SettingsHarness.withData("opaque", { alpha: 1 }, {
+      schema: { source: "none", items: [] },
+    });
+    const before = harness.rawData("opaque");
+    harness.clearMethodLog();
+    await expect(harness.service.set("opaque", { deep: nested(2_500) })).rejects.toBeInstanceOf(
+      PluginDataTooDeep,
+    );
+    expect(harness.methodsSeen()).not.toContain("write_file");
+    expect(harness.rawData("opaque")).toBe(before);
+  });
+
+  it("reads and writes a document at the edge of the budget", async () => {
+    // The budget is a bound on what this host inspects, not a bound on what a
+    // plugin may store: a document inside it round-trips normally.
+    const harness = await SettingsHarness.withData("opaque", { deep: nested(40) }, {
+      schema: { source: "none", items: [] },
+    });
+    const guarded = await harness.service.get("opaque", false);
+    expect(guarded.values["deep"]).toEqual(nested(40));
+    const result = await harness.service.set("opaque", { alpha: 1 });
+    expect(result.applied).toEqual(["alpha"]);
+  });
+
+  // --- The placeholder reconstructed by hand -----------------------------------
+
+  // `get` withholds a secret's whole subtree as one scalar, so a client that
+  // round-trips a read sends a string and is caught by the first test. A client
+  // that rebuilds the shape by hand is writing the placeholder into the same
+  // credential, and the guard is for the value rather than for the shape it
+  // arrives in.
+  it("refuses a redacted placeholder inside an array under a secret-named key", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      apiTokens: ["t1", "t2"],
+    });
+    const result = await harness.service.set("unknown-plugin", {
+      apiTokens: ["[redacted]", "[redacted]"],
+    });
+    expect(result.applied).toEqual([]);
+    // The first offending element, named by index.
+    expect(result.refused).toEqual([
+      { key: "apiTokens", reason: "redacted_value", path: ["apiTokens", 0] },
+    ]);
+    expect(await harness.readData("unknown-plugin")).toEqual({ apiTokens: ["t1", "t2"] });
+  });
+
+  it("refuses a redacted placeholder nested under a secret-named key", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      apiToken: { inner: "real" },
+    });
+    const result = await harness.service.set("unknown-plugin", {
+      apiToken: { inner: "[redacted]" },
+    });
+    expect(result.refused).toEqual([
+      { key: "apiToken", reason: "redacted_value", path: ["apiToken", "inner"] },
+    ]);
+    expect(await harness.readData("unknown-plugin")).toEqual({ apiToken: { inner: "real" } });
+  });
+
+  it("still stores the literal string under a key it would not redact", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", { label: "before" });
+    const result = await harness.service.set("unknown-plugin", { label: "[redacted]" });
+    expect(result.applied).toEqual(["label"]);
+    expect(await harness.readData("unknown-plugin")).toEqual({ label: "[redacted]" });
+  });
+
+  // --- The lock is released before the plugin is told ---------------------------
+
+  // `runExclusivePath` is not re-entrant, and `saveData` takes the same lock as
+  // `set`. A handler that saves — the natural answer to "your file changed" —
+  // would wait on a lock nothing releases if the notify ran inside the window.
+  it("lets an onExternalSettingsChange handler save without deadlocking", async () => {
+    const harness = await SettingsHarness.withData("demo", { alpha: 1 }, {
+      schema: { source: "none", items: [] },
+    });
+    let saved: Promise<void> = Promise.resolve();
+    harness.plugin.onExternalSettingsChange = (): void => {
+      saved = harness.plugin.saveData({ alpha: 2, savedByHandler: true });
+    };
+    await harness.service.set("demo", { alpha: 2 });
+    await saved;
+    expect(await harness.readData("demo")).toEqual({ alpha: 2, savedByHandler: true });
   });
 
   it("exports the key registry as a deep-frozen copy, not the module object", async () => {

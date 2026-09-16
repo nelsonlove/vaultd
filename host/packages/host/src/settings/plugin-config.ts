@@ -13,10 +13,16 @@
  *
  * **Redaction goes all the way down.** A secret-named key is withheld wherever
  * it appears — inside a nested object, inside an array of objects — and
- * `redacted_keys` names it by its **dotted path** (`nested.deep.apiToken`,
- * `accounts.0.refreshToken`); a top-level key's path is its own name, so the
- * shallow shape is a subset of this one. A fallback that only looked at depth
- * zero would offer a floor that is not there: the audited corpus's four
+ * `redacted_keys` names it by a **{@link ConfigPath}**: one segment per hop,
+ * with a number for an array index (`["nested","deep","apiToken"]`,
+ * `["accounts",0,"refreshToken"]`, `["apiAuthToken"]` for a top-level key). A
+ * path is an array rather than a dotted string because a key name may contain a
+ * dot: `{"a.b":{apiToken}}` and `{"a":{"b":{apiToken}}}` are two documents one
+ * string spells one way, and a client highlighting the field a refusal names
+ * cannot recover from that. It is the daemon's own `key_path` grammar.
+ *
+ * A fallback that only looked at depth zero would offer a floor that is not
+ * there: the audited corpus's four
  * credentials are all top-level, but the fallback exists precisely for the
  * plugins nobody has audited, and `{"providers":{"openai":{"apiKey":"sk-…"}}}`
  * is an ordinary shape for one of them. A registry-listed or name-shaped key
@@ -44,8 +50,14 @@
  *   service would redact. The most natural client there is reads a config,
  *   changes one field and writes the whole thing back — which is what a settings
  *   form does — and without this refusal that saves the string `[redacted]` over
- *   the user's real token, with no history and no way back. The refusal names
- *   the dotted path, and the rest of the patch still lands.
+ *   the user's real token, with no history and no way back. The row carries the
+ *   top-level `key` and a `path` to where the placeholder actually is, and the
+ *   rest of the patch still lands.
+ *
+ * A **fifth** failure is not a refusal row at all: a document or a patch nested
+ * deeper than {@link MAX_CONFIG_DEPTH} throws {@link PluginDataTooDeep} from
+ * either call, because neither walk can answer for a document it did not finish
+ * reading. See that class for why failing closed is the only safe direction.
  *
  * **The write is one `write_file` of the whole document**, merged over what is
  * on disk, so every key the patch did not mention survives — the file is the
@@ -131,28 +143,64 @@ const SECRET_SHAPED = /token|secret|password|apikey|api_key|credential/i;
  */
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+/**
+ * Where a value sits in a settings document: one segment per hop, a **number**
+ * for an array index.
+ *
+ * The daemon's own `patch_frontmatter` `key_path` grammar (Task 1e), for the
+ * reason that grammar exists: it is injective, and a dotted string is not. A
+ * plugin may name a key `"a.b"` — path-keyed maps, `"folder/note.md"`, a
+ * `"section.field"` setting — and `{"a.b":{apiToken}}` and
+ * `{"a":{"b":{apiToken}}}` are two different documents that dot-joining spells
+ * the same way. A client acting on a path (highlighting the field a refusal
+ * names) cannot recover from that ambiguity, and escaping the separator only
+ * moves it.
+ */
+export type ConfigPath = Array<string | number>;
+
+/** How deep a settings document or a patch may be. See {@link PluginDataTooDeep}. */
+export const MAX_CONFIG_DEPTH = 64;
+
 export type RefusalReason = "state_key" | "unknown_key" | "type_mismatch" | "redacted_value";
 
 export interface PluginConfigView {
   values: Record<string, unknown>;
   schema: CachedSchema;
   /**
-   * The **dotted paths** this answer treats as secret, in document order.
+   * The {@link ConfigPath} of everything this answer treats as secret, in
+   * document order.
    *
-   * A top-level key is its own name; a nested one is `nested.deep.apiToken`, and
-   * an array element carries its index (`accounts.0.refreshToken`). Named for
-   * what it does in the guarded answer, and reported in the revealed one too: a
-   * caller that asked for the plaintext still needs to know which of the values
-   * it is now holding are credentials.
+   * A top-level key is a one-segment path (`["apiAuthToken"]`); a nested one
+   * carries every hop (`["nested","deep","apiToken"]`), and an array element
+   * carries its index as a **number** (`["accounts",0,"refreshToken"]`). Named
+   * for what it does in the guarded answer, and reported in the revealed one
+   * too: a caller that asked for the plaintext still needs to know which of the
+   * values it is now holding are credentials.
    */
-  redacted_keys: string[];
+  redacted_keys: ConfigPath[];
   /** The keys `set` will refuse, from the registry. */
   state_keys: string[];
 }
 
+export interface ConfigRefusal {
+  /** Always the **top-level** patch key, whatever depth the reason was found at. */
+  key: string;
+  reason: RefusalReason;
+  /**
+   * Where the reason actually is, when it is not the key itself.
+   *
+   * Carried by `redacted_value`, whose cause can be a leaf several hops down;
+   * the other three reasons are properties of the top-level key and carry
+   * nothing. `key` stays the addressable thing — it is what the caller sent and
+   * what it would re-send — and the path is the detail beside it, so a client
+   * that ignores `path` still has a well-formed answer.
+   */
+  path?: ConfigPath;
+}
+
 export interface PluginConfigWrite {
   applied: string[];
-  refused: Array<{ key: string; reason: RefusalReason }>;
+  refused: ConfigRefusal[];
 }
 
 /**
@@ -182,6 +230,44 @@ export class PluginDataTooLarge extends Error {
     );
     this.name = "PluginDataTooLarge";
     this.pluginId = pluginId;
+  }
+}
+
+/**
+ * A settings document or a patch nested deeper than {@link MAX_CONFIG_DEPTH}.
+ *
+ * **A throw, in the same family as {@link PluginDataTooLarge}, and not a
+ * per-key refusal**: the two walks that meet this are the redactor and the
+ * `[redacted]` scan, and neither can answer for a document it did not finish
+ * reading. Failing closed is the only safe direction for a redactor — serving
+ * the half it inspected with the other half attached is how a credential
+ * reaches a socket — and `set` refuses before the lock and before any write, so
+ * the file on disk is untouched.
+ *
+ * The budget exists at all because the walks would otherwise outrun the stack
+ * long before `JSON.parse` complains: a plugin's own `saveData` will serialize a
+ * 200,000-deep document quite happily, and the daemon stores bytes. Without a
+ * budget, `get` would answer `RangeError: Maximum call stack size exceeded` for
+ * ever on a file the plugin considers ordinary — the same failure the literal
+ * `null` used to produce, one layer up.
+ *
+ * 64 because no settings document in the corpus comes close: the deepest is
+ * quickadd at 11, and folder-notes and tasknotes sit at 3–4.
+ */
+export class PluginDataTooDeep extends Error {
+  readonly code = "plugin_data_too_deep";
+  /** Where the walk gave up, as far as it had got. */
+  readonly path: ConfigPath;
+
+  constructor(path: ConfigPath) {
+    super(
+      `this settings document is nested deeper than ${String(MAX_CONFIG_DEPTH)} levels, which is ` +
+        "as far as this host inspects one. Nothing was read out and nothing was written, because " +
+        `a document that cannot be inspected to the bottom cannot be redacted. Gave up at ` +
+        `${path.map((segment) => String(segment)).join(" → ")}.`,
+    );
+    this.name = "PluginDataTooDeep";
+    this.path = path;
   }
 }
 
@@ -216,7 +302,7 @@ export class PluginConfigService {
   async get(id: string, revealSecrets: boolean): Promise<PluginConfigView> {
     const stored = (await this.dir.readPluginData(id)) ?? {};
     const entry = this.registry[id];
-    const paths: string[] = [];
+    const paths: ConfigPath[] = [];
     const values = redactDocument(stored, this.secretTest(id), revealSecrets, paths);
     return {
       values,
@@ -269,7 +355,7 @@ export class PluginConfigService {
       // unexamined. Either way the user's token would be gone.
       const redactedAt = redactedValuePath(key, value, isSecret);
       if (redactedAt !== null) {
-        refused.push({ key: redactedAt, reason: "redacted_value" });
+        refused.push({ key, reason: "redacted_value", path: redactedAt });
         continue;
       }
       const control = declared.get(key);
@@ -298,8 +384,8 @@ export class PluginConfigService {
     });
     // **Outside the lock.** `onExternalSettingsChange` is a plugin entry point,
     // and a plugin's natural response to "your file changed" is to re-read and
-    // sometimes to save: called while this call still held the path lock, that
-    // save would wait on a lock nothing will release.
+    // sometimes to save — which takes this same path lock. See `locked` for
+    // what exactly deadlocks and what merely resolves late.
     await this.notify(id);
     return { applied, refused };
   }
@@ -319,6 +405,23 @@ export class PluginConfigService {
    * the brief's four-argument constructor: a service built that way still
    * guards every key, and two concurrent `set` calls on it can still lose an
    * update. Pass the host's queue — `assembleShim` has one — for the guarantee.
+   *
+   * **`runExclusivePath` is not re-entrant** (Task 7's design: it is a promise
+   * chain per path, and a second acquire waits on the first). Two things follow
+   * and both are deliberate. Nothing inside this task may take the lock again —
+   * the task here reads and writes through `HeadlessConfigDir`, which does not.
+   * And `onExternalSettingsChange` is called **after** this returns, outside the
+   * lock, because a plugin's natural answer to "your file changed" is to re-read
+   * and save, and a `saveData` from inside the handler takes this same lock.
+   *
+   * Stated precisely, because the margin is narrower than it looks: today
+   * {@link PluginConfigService.notify} does not await what the handler returns,
+   * so a handler that saves would resolve late rather than hang even if the
+   * notify ran inside the window. What deadlocks — for ever, not late — is any
+   * holder of this path's lock that **awaits** a `saveData` inside it. Calling
+   * the handler outside the lock is what keeps this service from becoming one
+   * the day someone decides an `async onExternalSettingsChange` deserves to be
+   * awaited, which is a change that should not have to re-derive this.
    */
   private locked<T>(id: string, task: () => Promise<T>): Promise<T> {
     const queue = this.deps.queue;
@@ -382,95 +485,166 @@ export class PluginConfigService {
 /**
  * The document with every secret-named key's subtree withheld, at any depth.
  *
- * `paths` is filled in document order with the dotted path of each key that was
- * treated as a secret — whether or not `reveal` handed the value back, because
- * "which of these are credentials" is the question a caller holding plaintext
- * most needs answered.
+ * `paths` is filled in document order with the {@link ConfigPath} of each key
+ * that was treated as a secret — whether or not `reveal` handed the value back,
+ * because "which of these are credentials" is the question a caller holding
+ * plaintext most needs answered.
  *
  * The walk does not descend into a key it has already withheld: the subtree is
  * the unit, so `googleCalendarSyncTokens` is one path rather than one per token
  * inside it, and a caller cannot reconstruct the bag's shape from the paths.
+ *
+ * **Throws {@link PluginDataTooDeep} past {@link MAX_CONFIG_DEPTH}, rather than
+ * serving what it did not inspect.** A redactor that cannot see to the bottom of
+ * a document must not answer it: the one thing worse than refusing a settings
+ * file is handing back the half of it that was checked with the other half
+ * attached. The budget is also what makes the recursion bounded — see the
+ * constant.
  */
 function redactDocument(
   document: Record<string, unknown>,
   isSecret: (key: string) => boolean,
   reveal: boolean,
-  paths: string[],
+  paths: ConfigPath[],
 ): Record<string, unknown> {
-  const walkObject = (
-    node: Record<string, unknown>,
-    prefix: string,
-    ancestors: Set<unknown>,
-  ): Record<string, unknown> => {
+  // **One mutable stack, pushed and popped**, rather than a fresh `Set` per
+  // level: copying the ancestors at every object node made the walk quadratic
+  // in depth for a guard that only ever asks "is this node on the path I am
+  // standing on".
+  const ancestors = new Set<unknown>([document]);
+  const path: Array<string | number> = [];
+  const walkObject = (node: Record<string, unknown>): Record<string, unknown> => {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(node)) {
-      const path = prefix === "" ? key : `${prefix}.${key}`;
+      path.push(key);
       if (isSecret(key)) {
-        paths.push(path);
+        paths.push([...path]);
         out[key] = reveal ? value : REDACTED;
-        continue;
+      } else {
+        out[key] = walkValue(value);
       }
-      out[key] = walkValue(value, path, ancestors);
+      path.pop();
     }
     return out;
   };
-  const walkValue = (value: unknown, path: string, ancestors: Set<unknown>): unknown => {
-    // A JSON document has no cycles, and both callers hand over one — but `set`
-    // is also reachable in-process with an object literal, and a stack overflow
-    // is a worse answer to a cyclic one than leaving it for `JSON.stringify` to
+  const walkValue = (value: unknown): unknown => {
+    if (typeof value !== "object" || value === null) return value;
+    // A JSON document has no cycles, and `get`'s always is one — but `set` is
+    // also reachable in-process with an object literal, and a stack overflow is
+    // a worse answer to a cyclic one than leaving it for `JSON.stringify` to
     // refuse by name.
-    if (typeof value === "object" && value !== null) {
-      if (ancestors.has(value)) return value;
-      const inner = new Set(ancestors).add(value);
+    if (ancestors.has(value)) return value;
+    if (path.length >= MAX_CONFIG_DEPTH) throw new PluginDataTooDeep([...path]);
+    ancestors.add(value);
+    try {
       if (Array.isArray(value)) {
-        return value.map((entry, index) => walkValue(entry, `${path}.${String(index)}`, inner));
+        return value.map((entry, index) => {
+          path.push(index);
+          try {
+            return walkValue(entry);
+          } finally {
+            path.pop();
+          }
+        });
       }
-      return walkObject(value as Record<string, unknown>, path, inner);
+      return walkObject(value as Record<string, unknown>);
+    } finally {
+      ancestors.delete(value);
     }
-    return value;
   };
-  return walkObject(document, "", new Set([document]));
+  return walkObject(document);
 }
 
 /**
- * The dotted path at which this patch value writes the literal `[redacted]`
- * into a key that would be withheld, or `null` when it does not.
+ * The {@link ConfigPath} at which this patch value writes the literal
+ * `[redacted]` into a key that would be withheld, or `null` when it does not.
  *
  * The first hit in document order, because one is enough to refuse the key and
  * a caller fixing it will re-read anyway.
+ *
+ * **Under a secret-named key the whole subtree is suspect**, not just the node
+ * the name sits on. `get` withholds that subtree as one scalar, so a client
+ * round-tripping a read sends a string and is caught by the first test — but a
+ * client that reconstructs the shape by hand (`{apiTokens: ["[redacted]",
+ * "[redacted]"]}`) is writing the placeholder into the same credential, and the
+ * guard exists for the value rather than for the shape it arrives in.
+ *
+ * Throws {@link PluginDataTooDeep} past the budget, like its sibling: a patch
+ * this walk cannot finish is one `set` must not apply.
  */
 function redactedValuePath(
   key: string,
   value: unknown,
   isSecret: (key: string) => boolean,
-): string | null {
-  const walk = (name: string, node: unknown, path: string, ancestors: Set<unknown>): string | null => {
-    if (isSecret(name) && node === REDACTED) return path;
+): ConfigPath | null {
+  const ancestors = new Set<unknown>();
+  const path: Array<string | number> = [];
+  /** The children of an object or array, or `null` for a leaf or a cycle. */
+  const childrenOf = (node: unknown): Array<[string | number, unknown]> | null => {
     if (typeof node !== "object" || node === null || ancestors.has(node)) return null;
-    const inner = new Set(ancestors).add(node);
-    if (Array.isArray(node)) {
-      for (const [index, entry] of node.entries()) {
-        // An array index is not a key name, so the element itself is never a
-        // secret by name — only the keys inside it can be.
-        const hit = walk("", entry, `${path}.${String(index)}`, inner);
-        if (hit !== null) return hit;
+    return Array.isArray(node)
+      ? node.map((entry, index): [string | number, unknown] => [index, entry])
+      : Object.entries(node as Record<string, unknown>);
+  };
+  /** Visit every child in order, with its segment pushed. */
+  const each = (
+    node: unknown,
+    entries: Array<[string | number, unknown]>,
+    visit: (segment: string | number, child: unknown) => ConfigPath | null,
+  ): ConfigPath | null => {
+    if (path.length >= MAX_CONFIG_DEPTH) throw new PluginDataTooDeep([...path]);
+    ancestors.add(node);
+    try {
+      for (const [segment, child] of entries) {
+        path.push(segment);
+        try {
+          const hit = visit(segment, child);
+          if (hit !== null) return hit;
+        } finally {
+          path.pop();
+        }
       }
       return null;
+    } finally {
+      ancestors.delete(node);
     }
-    for (const [childKey, childValue] of Object.entries(node as Record<string, unknown>)) {
-      const hit = walk(childKey, childValue, `${path}.${childKey}`, inner);
-      if (hit !== null) return hit;
-    }
-    return null;
   };
-  return walk(key, value, key, new Set());
+  /** Anywhere at or under a node that is already known to be a secret's value. */
+  const findRedacted = (node: unknown): ConfigPath | null => {
+    if (node === REDACTED) return [...path];
+    const entries = childrenOf(node);
+    if (entries === null) return null;
+    return each(node, entries, (_segment, child) => findRedacted(child));
+  };
+  /** Looking for a secret-named key. An array index is never one. */
+  const scan = (name: string | number, node: unknown): ConfigPath | null => {
+    if (typeof name === "string" && isSecret(name)) return findRedacted(node);
+    const entries = childrenOf(node);
+    if (entries === null) return null;
+    return each(node, entries, scan);
+  };
+  path.push(key);
+  return scan(key, value);
 }
 
-/** Freeze an object and everything reachable from it. */
+/**
+ * Freeze an object and everything reachable from it.
+ *
+ * Iterative, with its own stack: nothing under `settings/` walks a structure by
+ * unbounded recursion, and "it only ever sees a checked-in file three levels
+ * deep" is an argument that stops being true the day someone points it at
+ * something else.
+ */
 function deepFreeze<T>(value: T): T {
-  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
-  Object.freeze(value);
-  for (const entry of Object.values(value as Record<string, unknown>)) deepFreeze(entry);
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (typeof node !== "object" || node === null || Object.isFrozen(node)) continue;
+    Object.freeze(node);
+    // The frozen check above is also the cycle guard: a node already frozen is
+    // never pushed a second time.
+    for (const entry of Object.values(node as Record<string, unknown>)) pending.push(entry);
+  }
   return value;
 }
 
