@@ -10,7 +10,20 @@ import type { HarnessResult } from "./harness";
 import type { ScanResult } from "./scanner";
 import type { SchemaSource } from "../settings/ladder";
 
-export type Verdict = "runs" | "degrades" | "fails";
+/**
+ * What this host can say about running the plugin.
+ *
+ * `unknown` is the fourth, added in fix round 2 and ledgered as a plan
+ * amendment. Task 20b's B3 fix made `harness === null` mean two different
+ * things — "this host is not in dry-run, so no harness ran" and "this host
+ * **refuses to run this plugin**" — and the tier mapping was applied to both,
+ * so a quarantined plugin's row read `runs`. A verdict field exists so a
+ * client can render one word; that word may not be green for a plugin the host
+ * will not start. See {@link verdictFor} for which case is which, and
+ * {@link CompatReportRow.harnessAttempted} for the discriminator that carries
+ * it. Task 20b puts both the enum and `harness_attempted` on the wire.
+ */
+export type Verdict = "runs" | "degrades" | "fails" | "unknown";
 
 export interface CompatReportRow {
   readonly id: string;
@@ -19,6 +32,16 @@ export interface CompatReportRow {
   readonly harness: HarnessResult | null;
   readonly schemaSource: SchemaSource;
   readonly verdict: Verdict;
+  /**
+   * Whether this host tried to run the plugin, whatever came of it.
+   *
+   * The discriminator between the two ways `harness` is null: `false` is "this
+   * host is not in dry-run, so nothing was attempted" — the scan is all there
+   * is and the verdict is the tier's — and `true` with a null harness is "the
+   * attempt was refused", which is `unknown` and a sentence in {@link notes}.
+   * Task 20b carries it as `harness_attempted`.
+   */
+  readonly harnessAttempted: boolean;
   /**
    * Why this row's `harness` is null or partial, in the host's words.
    *
@@ -46,12 +69,25 @@ export interface CompatReport {
  * rest. A verdict is never asserted — {@link HarnessResult.calls} and
  * {@link ScanResult.tierReasons} are what a reader argues with.
  *
- * With no harness (the host is not in dry-run) the tier estimate is all there
- * is, and it is mapped rather than invented: tiers 1 and 2 are the ones whose
- * entry points a headless host can reach, so they read `runs`, and 3 and 4 read
- * `degrades`. Never `fails` — nothing was run, so nothing failed.
+ * `unknown` is the fourth and the narrowest: a harness was **attempted and
+ * refused** — the plugin is quarantined, or the probe itself failed. The row
+ * says why in its `notes`.
+ *
+ * With no harness and none attempted (the host is not in dry-run) the tier
+ * estimate is all there is, and it is mapped rather than invented: tiers 1 and
+ * 2 are the ones whose entry points a headless host can reach, so they read
+ * `runs`, and 3 and 4 read `degrades`. Never `fails` — nothing was run, so
+ * nothing failed.
  */
-export function verdictFor(scan: ScanResult, harness: HarnessResult | null): Verdict {
+export function verdictFor(
+  scan: ScanResult,
+  harness: HarnessResult | null,
+  harnessAttempted: boolean,
+): Verdict {
+  // Attempted and refused: the host would not run this plugin, so it has no
+  // verdict about running it. Never the tier mapping — that mapping says
+  // "nothing was tried here", and something was.
+  if (harness === null && harnessAttempted) return "unknown";
   if (harness === null) return scan.tierEstimate <= 2 ? "runs" : "degrades";
   if (!harness.loaded) return "fails";
   const absent = harness.calls.some((call) => call.policy === "absent");
@@ -91,7 +127,7 @@ export function summaryLine(row: CompatReportRow): string {
   const settings = describeSchemaSource(row.schemaSource);
   const detail =
     row.harness === null
-      ? (row.notes[0] ?? "harness not run")
+      ? (row.notes[0] ?? (row.harnessAttempted ? "harness attempted and refused" : "harness not run"))
       : row.harness.loaded
         ? `${String(row.harness.calls.length)} calls, ` +
           `${String(row.harness.throws.length)} refused, ` +

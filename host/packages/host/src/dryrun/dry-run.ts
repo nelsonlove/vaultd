@@ -113,6 +113,7 @@
 
 import { VaultdError } from "../client/errors";
 import { currentDryRunRefusalSink, currentPluginId, setDryRunRefusalSink } from "../shim/policy";
+import { enabledSetPath } from "../pluginset/config-dir";
 import type { ReadFileResponse } from "../client/protocol";
 import type { RequestSink } from "../client/request-sink";
 import type { HostConfig } from "../config";
@@ -338,12 +339,6 @@ export interface RecordedWrite {
   readonly params: unknown;
   readonly pluginId: string | null;
   readonly atUnixMs: number;
-}
-
-/** A position in a {@link DryRunGate}'s two logs. See {@link DryRunGate.mark}. */
-export interface DryRunMark {
-  readonly writes: number;
-  readonly refusals: number;
 }
 
 /** One refusal a dry run answered, as a report tallies them. */
@@ -683,6 +678,20 @@ export class DryRunGate implements WriteGate {
    */
   private startMark: number;
   private installed = true;
+  /**
+   * The compatibility probe running right now, and the rows it has caused.
+   *
+   * Sets of the row objects themselves, so removal is by identity: two writes
+   * of the same bytes to the same path are two rows, and only the one the
+   * probe caused may go. See {@link beginProbe}.
+   */
+  private probe: {
+    readonly token: string;
+    readonly pluginId: string;
+    readonly writes: Set<RecordedWrite>;
+    readonly refusals: Set<RecordedRefusal>;
+  } | null = null;
+  private probeSeq = 0;
 
   /**
    * `mirror` is optional, and the optionality is the brief's constructor
@@ -721,7 +730,7 @@ export class DryRunGate implements WriteGate {
       const offending = offendingZonePath(params);
       if (offending !== null) return Promise.reject(zoneViolation(offending));
     }
-    this.recorded.push({
+    const row: RecordedWrite = {
       kind: this.kindOf(method, params),
       method,
       // **Cloned, not aliased.** A recorded write is read after the fact — by a
@@ -732,7 +741,9 @@ export class DryRunGate implements WriteGate {
       params: clone(params),
       pluginId: currentPluginId(),
       atUnixMs: this.config.clock.now(),
-    });
+    };
+    this.recorded.push(row);
+    this.tagForProbe(row, params);
     const answer = this.syntheticAnswer(method, params);
     // **After the answer, because the answer is where the revision comes
     // from.** Ruling 4: the synthetic revision this call hands back is the one
@@ -754,34 +765,64 @@ export class DryRunGate implements WriteGate {
   }
 
   /**
-   * Where the two logs stand right now, for a caller about to do something and
-   * read back only what it caused. **The compatibility detector is the only
-   * caller**, and {@link dropSince} is the other half of the pair.
+   * Start tagging the rows a compatibility probe of `pluginId` causes.
+   *
+   * **Tagged at record time, never selected by position afterwards.** The
+   * first version of this pair marked the two logs and truncated back to the
+   * mark, which deleted every row *anybody* recorded in between: a bystander
+   * plugin's write from a handler the probed plugin's load woke, and a second
+   * client's `write_note` sent while the probe was open, both measured. A
+   * probe's window is not a period of time the detector owns — the host goes
+   * on serving everyone through it.
+   *
+   * What the tag claims, exactly:
+   *
+   * - **any row whose `pluginId` is the probed plugin.** That is the plugin
+   *   nobody asked to run, so its writes are the detector's doing.
+   * - **a write to `<configDir>/community-plugins.json`.** The lifecycle's own
+   *   bookkeeping on the way in and out, which carries `pluginId: null`
+   *   because it belongs to the host rather than to a plugin. This is the one
+   *   part that is a shape rather than an identity, and the residual is
+   *   stated: a *client* rewriting the enabled set itself while a probe is
+   *   open would be tagged with it. Nothing else the host does writes that
+   *   path, and the alternative — leaving the two rewrites in — tells the
+   *   operator this host intends to change the enabled set, which it does not.
+   *
+   * Everything else recorded while a probe is open is somebody else's and
+   * stays. Returns the token {@link dropProbe} takes.
    */
-  mark(): DryRunMark {
-    return { writes: this.recorded.length, refusals: this.refused.length };
+  beginProbe(pluginId: string): string {
+    const token = `probe-${String(this.probeSeq++)}-${pluginId}`;
+    this.probe = { token, pluginId, writes: new Set(), refusals: new Set() };
+    return token;
   }
 
   /**
-   * Forget everything recorded since `mark`. **Harness-only.**
+   * Stop tagging, and remove the rows this probe's token carries. **Harness-only.**
    *
    * Not a general undo, and it must not become one: a dry run's write log is
    * what an operator reads to decide whether the run is safe to perform for
    * real, and a caller that could delete rows from it could hide a write the
    * host would make. The one caller that may is the detector, because the rows
-   * it deletes are rows *it* caused by loading a plugin nobody asked to run —
-   * an enabled-set rewrite the restore undoes, and whatever the probed
-   * plugin's `onload` did. Leaving them in would tell the operator this host
-   * intends to rewrite `community-plugins.json` twice, which it does not.
+   * it removes are rows *it* caused by loading a plugin nobody asked to run —
+   * and {@link beginProbe} is where "it caused" is decided, at record time,
+   * one row at a time.
    *
    * **What it cannot take back is the overlay.** A recorded write also put
    * bytes in {@link DryRunGate.overlay}, and those have no per-row removal:
    * for the rest of the session a note the probe modified reads back modified.
    * The detector says so in its own result rather than pretending otherwise.
+   *
+   * A token that is not the open probe's removes nothing: a probe whose rows
+   * were already dropped has nothing left to drop, and a stale token must not
+   * reach into a later probe's window.
    */
-  dropSince(mark: DryRunMark): void {
-    this.recorded.length = Math.min(this.recorded.length, mark.writes);
-    this.refused.length = Math.min(this.refused.length, mark.refusals);
+  dropProbe(token: string): void {
+    const probe = this.probe;
+    if (probe === null || probe.token !== token) return;
+    this.probe = null;
+    keepUntagged(this.recorded, probe.writes);
+    keepUntagged(this.refused, probe.refusals);
   }
 
   /**
@@ -818,7 +859,15 @@ export class DryRunGate implements WriteGate {
 
   /** The {@link setDryRunRefusalSink} contract. Not called by hand. */
   record(surface: string, detail: string): void {
-    this.refused.push({ surface, detail });
+    const row: RecordedRefusal = { surface, detail };
+    this.refused.push(row);
+    // A refusal carries no plugin id of its own, so the attribution is taken
+    // here, where `currentPluginId()` still names whoever is running. Only the
+    // probed plugin's refusals are the probe's; a bystander refused inside the
+    // window keeps its row, exactly as its writes do.
+    if (this.probe !== null && currentPluginId() === this.probe.pluginId) {
+      this.probe.refusals.add(row);
+    }
   }
 
   /**
@@ -836,6 +885,19 @@ export class DryRunGate implements WriteGate {
     if (!this.installed) return;
     this.installed = false;
     if (currentDryRunRefusalSink() === this) setDryRunRefusalSink(null);
+  }
+
+  /** See {@link beginProbe} for what the tag claims and what it deliberately does not. */
+  private tagForProbe(row: RecordedWrite, params: unknown): void {
+    const probe = this.probe;
+    if (probe === null) return;
+    if (row.pluginId === probe.pluginId || pathOf(params) === this.enabledSetPath()) {
+      probe.writes.add(row);
+    }
+  }
+
+  private enabledSetPath(): string {
+    return enabledSetPath(this.config.configDirName);
   }
 
   /**
@@ -1129,5 +1191,20 @@ function clone(params: unknown): unknown {
     return structuredClone(params);
   } catch {
     return params;
+  }
+}
+
+/**
+ * Drop the rows in `tagged` from `rows`, in place, by identity.
+ *
+ * In place because both logs are `readonly` fields on the gate — which is what
+ * keeps a caller from swapping one out — and by identity because two writes of
+ * the same bytes to the same path are two rows and only one of them may go.
+ */
+function keepUntagged<T>(rows: T[], tagged: ReadonlySet<T>): void {
+  if (tagged.size === 0) return;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (row !== undefined && tagged.has(row)) rows.splice(i, 1);
   }
 }

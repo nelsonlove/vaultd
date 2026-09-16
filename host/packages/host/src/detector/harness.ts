@@ -46,6 +46,14 @@ export type { CompatReport, CompatReportRow, Verdict } from "./report";
 /** The refusal code for a harness run asked of a host that is not pretending. */
 export const DETECTOR_REQUIRES_DRY_RUN = "detector_requires_dry_run";
 
+/**
+ * The codes that mean "this host declined before it touched the plugin".
+ *
+ * Anything else a probe throws means it started, which is a different sentence
+ * in the report row and a different thing for a reader to do about it.
+ */
+const REFUSALS: ReadonlySet<string> = new Set([DETECTOR_REQUIRES_DRY_RUN, "plugin_quarantined"]);
+
 export interface HarnessResult {
   readonly pluginId: string;
   readonly loaded: boolean;
@@ -194,11 +202,20 @@ export class Detector {
       // broken manifest.
       let harness: HarnessResult | null = null;
       const notes: string[] = [];
-      if (this.inDryRun()) {
+      const harnessAttempted = this.inDryRun();
+      if (harnessAttempted) {
         try {
           harness = await this.runHarness(id);
         } catch (error) {
-          notes.push(`harness not run: ${messageOf(error)}`);
+          // **"Not run" and "failed mid-run" are different sentences**, and the
+          // second one is a warning about this host rather than about the
+          // plugin: a refusal means the host declined before touching it, and
+          // anything else means the probe started and broke, having already
+          // loaded it. The restore runs either way (see {@link restore}).
+          const refused = error instanceof HostError && REFUSALS.has(error.code);
+          notes.push(
+            `${refused ? "harness not run" : "harness failed mid-run"}: ${messageOf(error)}`,
+          );
         }
       } else {
         notes.push("harness not run: this host is not in dry-run");
@@ -209,7 +226,8 @@ export class Detector {
         scan,
         harness,
         schemaSource: this.deps.pluginConfig?.schemaSourceFor(id) ?? "none",
-        verdict: verdictFor(scan, harness),
+        verdict: verdictFor(scan, harness, harnessAttempted),
+        harnessAttempted,
         notes,
       });
     }
@@ -237,7 +255,15 @@ export class Detector {
     // what the host was asked to run, which is this set.
     const wasEnabled = (await this.deps.dir.readEnabledSet()).includes(pluginId);
     const wasLoaded = this.deps.lifecycle.loadedPlugins().includes(pluginId);
-    const mark = gate.mark();
+    // Two different things, and the difference is the point. The **marks** say
+    // where to start *reading*, so this run reports its own rows and not a row
+    // the same plugin left behind at startup. The **token** says which rows to
+    // *remove* afterwards, and that is decided at record time, one row at a
+    // time, because everything else recorded while the probe is open belongs
+    // to somebody the detector must not edit out — see `DryRunGate.beginProbe`.
+    const writeMark = gate.writes().length;
+    const refusalMark = gate.refusals().length;
+    const token = gate.beginProbe(pluginId);
     const callMark = this.deps.recorder.callMark?.() ?? null;
     const harnessLimits: string[] = [];
     if (callMark === null) {
@@ -246,78 +272,123 @@ export class Detector {
       );
     }
 
-    let loaded = false;
-    let loadError: string | null = null;
+    // **Everything below is guarded**: the restore runs whatever happens.
     try {
-      if (wasLoaded) {
-        // Already running, so there is nothing to load and nothing to restore.
-        // The window is still taken, and it is honestly empty: what this
-        // plugin touched during *its* load happened before the detector was
-        // asked, and inventing rows for it would be reporting a run that did
-        // not happen.
-        loaded = true;
-        harnessLimits.push(
-          `${pluginId} was already loaded, so this run records nothing it did at load time — ` +
-            "`calls`, `throws` and `writes` are empty for that reason and not because the plugin " +
-            "touched nothing, while the `harvest` counts below are its real registrations, so the " +
-            "verdict for this row rides on those alone",
-        );
-      } else {
-        await this.deps.lifecycle.enableLate(pluginId);
-        loaded = true;
-      }
-    } catch (error) {
-      // **The plugin's own message, added back.** The sequencer turns a load
-      // failure into a sentence before it throws — `loadOne` keeps the message
-      // and builds a fresh `Error` from it — so the cause chain ends at "threw
-      // during onload and has been rolled back" and the plugin's own words are
-      // gone by the time they reach here. The quarantine tracker still holds
-      // them: it records every failure it is handed whether or not the
-      // threshold is reached, and `lastError` is that record. Reading it here
-      // is what makes `loadError` name the bug rather than the layer that
-      // caught it.
-      loadError = withLastError(messageOf(error), this.deps.quarantine.lastError(pluginId));
-    }
-
-    // **Read before the restore.** The restore's unload forgets the plugin's
-    // harvest, so a count taken afterwards would report zero registrations for
-    // every plugin the detector itself switched off.
-    const calls =
-      callMark === null
-        ? []
-        : (this.deps.recorder.callsSince?.(callMark) ?? []).filter(
-            (call) => call.pluginId === pluginId,
+      let loaded = false;
+      let loadError: string | null = null;
+      try {
+        if (wasLoaded) {
+          // Already running, so there is nothing to load and nothing to restore.
+          // The window is still taken, and it is honestly empty: what this
+          // plugin touched during *its* load happened before the detector was
+          // asked, and inventing rows for it would be reporting a run that did
+          // not happen.
+          loaded = true;
+          harnessLimits.push(
+            `${pluginId} was already loaded, so this run records nothing it did at load time — ` +
+              "`calls`, `throws` and `writes` are empty for that reason and not because the plugin " +
+              "touched nothing, while the `harvest` counts below are its real registrations, so the " +
+              "verdict for this row rides on those alone",
           );
-    const result: HarnessResult = {
-      pluginId,
-      loaded,
-      loadError,
-      calls,
-      throws: calls.filter((call) => call.threw !== null),
-      writes: gate
-        .writes()
-        .slice(mark.writes)
-        // The enabled-set write the lifecycle makes on the way in carries
-        // `pluginId: null` — it is this host's bookkeeping, not the plugin's —
-        // and so does the one the restore makes on the way out.
-        .filter((write) => write.pluginId === pluginId),
-      // **Windowed, not attributed**, because a `RecordedRefusal` carries no
-      // plugin id: the refusal is raised below every surface that knows one.
-      // The window is the whole attribution available, and the detector
-      // serializes its runs, so what it holds is what this load provoked.
-      refusals: gate.refusals().slice(mark.refusals),
-      harvest: {
-        commands: this.deps.harvest.commands().filter((row) => row.pluginId === pluginId).length,
-        menuHooks: this.deps.harvest.menuHooks().filter((row) => row.pluginId === pluginId).length,
-        protocolHandlers: this.deps.harvest
-          .protocolHandlers()
-          .filter((row) => row.pluginId === pluginId).length,
-        unreachable: this.deps.harvest.unreachable().filter((row) => row.pluginId === pluginId)
-          .length,
-      },
-      harnessLimits,
-    };
+        } else {
+          // **`probe: true`, which is the difference between preserving a
+          // diagnosis and writing one.** A probe's load failure is the same
+          // failure a real enable would produce and is worth seeing, so it is
+          // recorded — but five compatibility reports inside a minute must not
+          // quarantine a plugin no user action touched, which is what counting
+          // them toward the rolling window did. See `LifecycleSequencer.enableLate`.
+          await this.deps.lifecycle.enableLate(pluginId, { probe: true });
+          loaded = true;
+        }
+      } catch (error) {
+        // **The plugin's own message, added back.** The sequencer turns a load
+        // failure into a sentence before it throws — `loadOne` keeps the message
+        // and builds a fresh `Error` from it — so the cause chain ends at "threw
+        // during onload and has been rolled back" and the plugin's own words are
+        // gone by the time they reach here. The quarantine tracker still holds
+        // them: it records every failure it is handed whether or not the
+        // threshold is reached, and `lastError` is that record. Reading it here
+        // is what makes `loadError` name the bug rather than the layer that
+        // caught it.
+        loadError = withLastError(messageOf(error), this.deps.quarantine.lastError(pluginId));
+        harnessLimits.push(
+          `${pluginId} failed to load under this probe, and the failure is recorded as its last ` +
+            "error but counted against nothing: a probe never advances a plugin toward " +
+            "quarantine, because asking for a report is not asking to run the plugin",
+        );
+      }
 
+      // **Read before the restore.** The restore's unload forgets the plugin's
+      // harvest, so a count taken afterwards would report zero registrations for
+      // every plugin the detector itself switched off.
+      const calls =
+        callMark === null
+          ? []
+          : (this.deps.recorder.callsSince?.(callMark) ?? []).filter(
+              (call) => call.pluginId === pluginId,
+            );
+      const result: HarnessResult = {
+        pluginId,
+        loaded,
+        loadError,
+        calls,
+        throws: calls.filter((call) => call.threw !== null),
+        writes: gate
+          .writes()
+          .slice(writeMark)
+          // The enabled-set write the lifecycle makes on the way in carries
+          // `pluginId: null` — it is this host's bookkeeping, not the plugin's —
+          // and so does the one the restore makes on the way out.
+          .filter((write) => write.pluginId === pluginId),
+        // **Windowed, not attributed**, because a `RecordedRefusal` carries no
+        // plugin id: the refusal is raised below every surface that knows one.
+        // The window is the whole attribution available, and the detector
+        // serializes its runs, so what it holds is what this load provoked.
+        refusals: gate.refusals().slice(refusalMark),
+        harvest: {
+          commands: this.deps.harvest.commands().filter((row) => row.pluginId === pluginId).length,
+          menuHooks: this.deps.harvest.menuHooks().filter((row) => row.pluginId === pluginId).length,
+          protocolHandlers: this.deps.harvest
+            .protocolHandlers()
+            .filter((row) => row.pluginId === pluginId).length,
+          unreachable: this.deps.harvest.unreachable().filter((row) => row.pluginId === pluginId)
+            .length,
+        },
+        harnessLimits,
+      };
+      const recordedWrites = result.writes.length;
+      if (recordedWrites > 0) {
+        harnessLimits.push(
+          "this run's recorded writes were taken back out of the host's dry-run log, but the " +
+            "dry-run overlay still reflects them: a note this probe modified reads back modified " +
+            "for the rest of the session",
+        );
+      }
+      return result;
+    } finally {
+      await this.restore(gate, token, pluginId, wasEnabled, harnessLimits);
+    }
+  }
+
+  /**
+   * Put the host back, whatever happened above. Runs in a `finally`.
+   *
+   * **In a `finally` because the stretch it guards can throw.** Everything
+   * between the load and the result — reading the call window, four harvest
+   * filters — is this host's own code and does not throw in practice, but
+   * `report()` catches a probe's throw and turns it into a row, so a throw
+   * there used to leave the probed plugin loaded and in the enabled set with a
+   * report that said the harness had not run. The two properties B1 and B4 are
+   * about have to hold on the way out of a failure too, or they are properties
+   * of the happy path only.
+   */
+  private async restore(
+    gate: DryRunGate,
+    token: string,
+    pluginId: string,
+    wasEnabled: boolean,
+    harnessLimits: string[],
+  ): Promise<void> {
     if (!wasEnabled) {
       // Put the enabled set back, whether or not the load worked: a failed
       // `enableLate` has already written the plugin into it (that order is the
@@ -337,22 +408,13 @@ export class Detector {
         harnessLimits.push(`could not disable ${pluginId} after the run: ${messageOf(error)}`);
       }
     }
-    // **Last, and only this run's rows.** The gate is the host's, and its log
-    // is what an operator reads to decide whether a dry run is safe to perform
-    // for real. Everything between the two marks was caused by the detector
-    // loading a plugin nobody asked to run — two enabled-set rewrites that
-    // cancel out, and whatever the probed plugin's `onload` did — so leaving
-    // them would tell that operator the host intends writes it does not. The
-    // rows are already copied into `result`, which is where they belong.
-    gate.dropSince(mark);
-    if (result.writes.length > 0) {
-      harnessLimits.push(
-        "this run's recorded writes were taken back out of the host's dry-run log, but the " +
-          "dry-run overlay still reflects them: a note this probe modified reads back modified " +
-          "for the rest of the session",
-      );
-    }
-    return result;
+    // **Last, and only the rows this probe was tagged for.** The gate is the
+    // host's, and its log is what an operator reads to decide whether a dry
+    // run is safe to perform for real. The detector removes the two enabled-set
+    // rewrites that cancel out and whatever the probed plugin's `onload` did —
+    // and nothing else recorded in the same window, which belongs to plugins
+    // and clients the detector has no business editing out.
+    gate.dropProbe(token);
   }
 
   private inDryRun(): boolean {

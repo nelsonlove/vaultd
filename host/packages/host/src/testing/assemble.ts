@@ -521,15 +521,28 @@ export function assembleShim(deps: {
  * symbol-and-plugin pair, so a second reading for the same call could not have
  * been recorded alongside the first in any case.)
  *
- * Attribution is the queue's, falling back to the ambient plugin id: a
- * `promptForDeletion` is `async` all the way down, so the synchronous window
- * `currentPluginId()` reads may have closed by the time the confirm is raised,
- * while the dispatch queue still names the entry point it is inside.
+ * **Attribution is the ambient plugin id, like every other prompt path.** It
+ * used to prefer `queue.inFlight()?.pluginId`, on the argument that a
+ * `promptForDeletion` is `async` all the way down and the synchronous window
+ * may have closed by the time the confirm is raised. That argument is still
+ * true and the preference was still wrong, because the queue names the *entry
+ * point* — the plugin whose slot is open — and since Task 20's fix to
+ * `ShimEventBus.tryTrigger` a handler runs inside the entry point of whoever
+ * *raised* the event. So a bystander's `promptForDeletion`, fired from a
+ * handler during another plugin's load, was attributed to that other plugin,
+ * while a modal raised on the same line was attributed to the bystander: two
+ * prompt paths disagreeing about who is asking, inside one handler turn.
+ * `components.ts`'s `open()` reads `currentPluginId()`, so this does too.
+ *
+ * The residual the old comment named is real and is the honest cost: a confirm
+ * raised after an `await` is outside every attribution window and falls back to
+ * {@link HOST_PLUGIN_ID}. Naming the host is at least true; naming whichever
+ * plugin's slot happened to be open is not.
  */
 function confirmAdapter(broker: InteractionBroker, queue: DispatchQueue): ConfirmBroker {
   return {
     async confirm(request): Promise<boolean> {
-      const pluginId = queue.inFlight()?.pluginId ?? currentPluginId() ?? HOST_PLUGIN_ID;
+      const pluginId = currentPluginId() ?? queue.inFlight()?.pluginId ?? HOST_PLUGIN_ID;
       try {
         const answer = await broker.ask({
           pluginId,

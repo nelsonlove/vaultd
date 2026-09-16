@@ -64,7 +64,12 @@ export type { PluginManifest };
 export const OBSIDIAN_CONFIG_DIR = ".obsidian";
 
 /** The one file name the enabled set lives in, in either directory. */
-const COMMUNITY_PLUGINS = "community-plugins.json";
+export const COMMUNITY_PLUGINS = "community-plugins.json";
+
+/** `<configDir>/community-plugins.json` — the enabled set's own path. */
+export function enabledSetPath(configDirName: string): string {
+  return `${configDirName}/${COMMUNITY_PLUGINS}`;
+}
 
 /**
  * A plugin's folder inside a config directory.

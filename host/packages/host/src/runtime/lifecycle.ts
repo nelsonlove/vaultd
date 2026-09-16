@@ -230,6 +230,13 @@ interface BatchArrival {
 export class LifecycleSequencer {
   private phaseValue: LifecyclePhase = "cold";
   /**
+   * The plugin whose load is a compatibility probe right now, or `null`.
+   *
+   * See {@link LifecycleSequencer.enableLate}'s `probe` option for what it
+   * changes and why it is a field rather than an argument.
+   */
+  private probing: string | null = null;
+  /**
    * The one chain every batch delivery runs on.
    *
    * Batches arrive from a synchronous fan-out inside the mirror, each becomes
@@ -522,7 +529,10 @@ export class LifecycleSequencer {
    * Nothing here touches the daemon's index: no re-hydration, no refetch. The
    * vault did not change because a plugin was enabled.
    */
-  async enableLate(id: string, options: { forceShared?: boolean } = {}): Promise<void> {
+  async enableLate(
+    id: string,
+    options: { forceShared?: boolean; probe?: boolean } = {},
+  ): Promise<void> {
     this.deps.onOperation?.("enableLate");
     if (this.phaseValue !== "steady") {
       throw new Error(`enableLate(${id}) needs a started host; the phase is ${this.phaseValue}`);
@@ -534,7 +544,28 @@ export class LifecycleSequencer {
     await this.deps.coexistence.assertCanEnable(id, options.forceShared === true);
     const enabled = await this.deps.dir.readEnabledSet();
     if (!enabled.includes(id)) await this.deps.dir.writeEnabledSet([...enabled, id]);
-    const failure = await this.loadOne(id);
+    // **A probe's load is visible and uncounted**, and the two halves are not
+    // the same question. *Visible*: a compatibility probe's failure is the same
+    // failure a real enable would produce, so `lastError` and `loadFailures()`
+    // must hold it — that is what a report is for. *Uncounted*: the rolling
+    // quarantine window is a judgement about what the **user's** host has been
+    // doing, and five compat reports inside a minute must not quarantine a
+    // plugin no user action touched. Measured before this flag existed:
+    // exactly that, five probes and the plugin was gone.
+    //
+    // Set around `loadOne` rather than passed into it because the failure does
+    // not come back through the return value — the loader reports it to the
+    // error sink, this class's listener catches it, and {@link recordFailure}
+    // is where the counting decision is made. The window is synchronous from
+    // the loader's `catch` to that listener, and a load is serialized by the
+    // dispatch queue, so nothing else can be inside it.
+    if (options.probe === true) this.probing = id;
+    let failure: string | null;
+    try {
+      failure = await this.loadOne(id);
+    } finally {
+      this.probing = null;
+    }
     if (failure !== null) throw new Error(`plugin ${id} could not be enabled: ${failure}`);
     await this.deps.queue.run(null, `${METADATA_PREFIX}:resolved:${id}`, () => {
       this.deps.app.metadataCache.notifyResolvedTo(id);
@@ -864,6 +895,14 @@ export class LifecycleSequencer {
 
   /** Count one failure against a plugin — unless it is the host's own. */
   private recordFailure(report: HostErrorEntry, detail?: string): void {
+    // A probe's own failure: recorded as this plugin's last error, counted
+    // against nothing. `note` is the tracker's existing half-record — the same
+    // one an uncounted phase takes — so the diagnosis is there and the
+    // threshold is not advanced by a question the operator asked.
+    if (report.pluginId === this.probing) {
+      this.deps.quarantine.note(report.pluginId, report.error);
+      return;
+    }
     const failure = failureFromReport(report, this.deps.config.clock.now(), detail);
     if (failure === null) {
       // An uncounted phase — a brokered prompt that nobody answered — is still

@@ -158,6 +158,11 @@ describe("Detector.runHarness", () => {
     const report = await harness.detector.report("quiet");
     expect(report.plugins[0]?.harness).toBeNull();
     expect(report.plugins[0]?.scan.pluginId).toBe("quiet");
+    // Nothing was attempted, so the tier mapping is the honest answer and the
+    // verdict is not `unknown`: the two ways `harness` is null are different
+    // facts and `harnessAttempted` is what tells them apart.
+    expect(report.plugins[0]?.harnessAttempted).toBe(false);
+    expect(report.plugins[0]?.verdict).toBe("runs");
   });
 
   it("leaves a plugin that was enabled but never loaded enabled", async () => {
@@ -212,12 +217,67 @@ describe("Detector.runHarness", () => {
     await harness.lifecycle.start();
     const result = await harness.detector.runHarness("broken");
     expect(result.loaded).toBe(false);
-    // One failure from this load, and it survives the restore.
-    expect(harness.quarantine.failuresFor("broken")).toBe(1);
+    // Visible: the failure this probe provoked is the plugin's own, and the
+    // host's answer to "why isn't this running" survives the restore.
     expect(harness.lastHandlerError("broken")?.message).toBe("boom during onload");
     expect(harness.lifecycle.loadFailures().get("broken")).toContain("rolled back");
+    // Uncounted: see the next case. A question the operator asked must not
+    // move a plugin toward quarantine.
+    expect(harness.quarantine.failuresFor("broken")).toBe(0);
     // And the plugin is back out of the enabled set, which is the other half.
     expect(await harness.dir.readEnabledSet()).toEqual([]);
+  });
+
+  it("never advances a plugin toward quarantine by probing it", async () => {
+    // Before the probe flag: five compat reports inside the rolling minute
+    // quarantined a plugin no user action had touched, and the sixth then
+    // answered `harness: null` for a reason the detector itself manufactured.
+    const harness = await HostHarness.create({
+      vault: {}, enabled: [], config: { dryRun: true },
+      plugins: {
+        broken: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            throw new Error("boom during onload");
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+    for (let run = 0; run < 5; run += 1) {
+      const result = await harness.detector.runHarness("broken");
+      expect(result.loaded).toBe(false);
+    }
+    expect(harness.quarantine.failuresFor("broken")).toBe(0);
+    expect(harness.quarantine.isQuarantined("broken")).toBe(false);
+    expect(harness.lastHandlerError("broken")?.message).toBe("boom during onload");
+
+    // A real enable still counts: the flag narrows what a probe does, not what
+    // the quarantine is for.
+    await expect(harness.lifecycle.enableLate("broken")).rejects.toThrow("could not be enabled");
+    expect(harness.quarantine.failuresFor("broken")).toBe(1);
+  });
+
+  it("forgets on an operator's plain disable, which is the other half of the ruling", async () => {
+    // The detector's restore preserves; a user switching a plugin off still
+    // starts the next enable from nothing. Both halves, or neither is pinned.
+    const harness = await HostHarness.create({
+      vault: {}, enabled: ["broken"], config: { dryRun: true },
+      plugins: {
+        broken: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            throw new Error("boom during onload");
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+    expect(harness.lifecycle.loadFailures().get("broken")).toContain("rolled back");
+    expect(harness.quarantine.failuresFor("broken")).toBe(1);
+
+    await harness.lifecycle.disable("broken");
+    expect(harness.quarantine.failuresFor("broken")).toBe(0);
+    expect(harness.lastHandlerError("broken")).toBeNull();
+    expect(harness.lifecycle.loadFailures().size).toBe(0);
   });
 
   it("credits a bystander's event handler to the bystander, not to the probed plugin", async () => {
@@ -318,6 +378,156 @@ describe("Detector.runHarness", () => {
     // and a note mutation that no ordinary run of this host would produce.
     expect(harness.dryRun.writes()).toEqual([]);
     expect(result.harnessLimits.join(" ")).toContain("overlay still reflects them");
+  });
+
+  it("removes only the rows the probe caused, and leaves a bystander's alone", async () => {
+    // The first version of this dropped by position and deleted everything any
+    // caller recorded inside the window. A probed plugin's load wakes every
+    // other loaded plugin's handlers, so a bystander writing from one is not
+    // exotic — and the operator's dry-run report is the artifact that decides
+    // whether the run is safe to perform for real.
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n", "B.md": "# B\n" }, enabled: ["bystander"], config: { dryRun: true },
+      plugins: {
+        bystander: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            this.registerEvent(
+              this.app.workspace.on("probe-ping", () => {
+                const file = this.app.vault.getFileByPath("B.md")!;
+                void this.app.vault.modify(file, "# bystander was here\n");
+              }),
+            );
+          }
+        },
+        probed: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            const file = this.app.vault.getFileByPath("A.md")!;
+            await this.app.vault.modify(file, "# probed was here\n");
+            this.app.workspace.trigger("probe-ping");
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+    const result = await harness.detector.runHarness("probed");
+    expect(result.writes.map((write) => write.pluginId)).toEqual(["probed"]);
+    // The probe's own rows are gone; the bystander's survives, correctly
+    // attributed (which is B2's fix doing the work this one depends on).
+    expect(harness.dryRun.writes().map((write) => [write.method, write.pluginId])).toEqual([
+      ["write_note", "bystander"],
+    ]);
+  });
+
+  it("drops by tag and not by position, so a row nobody attributed survives", async () => {
+    // **At the gate, deliberately.** The reviewer's case is a second client's
+    // `write_note` landing inside the probe's window with `pluginId: null` —
+    // the same shape the host's own enabled-set bookkeeping has, so a rule
+    // that dropped null rows would take the client's with it. It cannot be
+    // staged through the detector: a plugin's attribution window is ambient
+    // and stays open across its awaits, so *any* write made while a probed
+    // plugin's `onload` is parked carries that plugin's id (a pre-existing
+    // property of the design, not of this change). The rule the case is about
+    // is the gate's, so this pins it there, on the real gate the assembly
+    // built.
+    const harness = await HostHarness.create({ vault: {}, enabled: [], config: { dryRun: true } });
+    await harness.lifecycle.start();
+    const gate = harness.dryRun;
+    const write = async (path: string): Promise<void> => {
+      await gate.send("write_note", { path, content: "# x\n", expected: { absent: true } });
+    };
+
+    await write("Before.md");
+    const token = gate.beginProbe("probed");
+    await write("Client.md");
+    // The host's own bookkeeping on the way in and out: `pluginId: null` and
+    // the enabled set's own path, which is the one shape the tag claims
+    // without an identity behind it.
+    await gate.send("write_file", {
+      path: ".obsidian-headless/community-plugins.json",
+      content_base64: Buffer.from('["probed"]', "utf8").toString("base64"),
+    });
+    gate.dropProbe(token);
+
+    expect(gate.writes().map((row) => (row.params as { path: string }).path)).toEqual([
+      "Before.md",
+      "Client.md",
+    ]);
+  });
+
+  it("restores even when the run throws after the load", async () => {
+    const harness = await HostHarness.create({
+      vault: {}, enabled: [], config: { dryRun: true },
+      plugins: {
+        one: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            this.addCommand({ id: "go", name: "Go", callback: () => {} });
+          }
+        },
+        two: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            this.addCommand({ id: "go", name: "Go", callback: () => {} });
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+    // The stretch between the load and the result is the host's own code and
+    // does not throw in practice; a throw injected into it is how the property
+    // — the restore holds on the way out of a failure too — gets asserted.
+    const commands = harness.harvest.commands.bind(harness.harvest);
+    let thrown = false;
+    harness.harvest.commands = (): never[] => {
+      if (thrown) return commands() as never[];
+      thrown = true;
+      throw new Error("harvest exploded mid-run");
+    };
+    const report = await harness.detector.report();
+    harness.harvest.commands = commands;
+
+    const one = report.plugins.find((row) => row.id === "one");
+    expect(one?.harness).toBeNull();
+    expect(one?.notes.join(" ")).toContain("harness failed mid-run: harvest exploded");
+    expect(one?.verdict).toBe("unknown");
+    // The probed plugin is not left running, and not left enabled.
+    expect(harness.lifecycle.loadedPlugins()).not.toContain("one");
+    expect(await harness.dir.readEnabledSet()).toEqual([]);
+    // And the rest of the report still ran.
+    expect(report.plugins.find((row) => row.id === "two")?.harness).not.toBeNull();
+  });
+
+  it("attributes a confirm prompt the way a modal is attributed", async () => {
+    // Two prompt paths, one handler turn: the modal reads `currentPluginId()`
+    // and named the bystander, while the confirm preferred the dispatch
+    // queue's entry point and named the plugin whose load had raised the
+    // event. Consistent, or one of them is lying about who is asking.
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" }, enabled: ["bystander"], config: { dryRun: true },
+      plugins: {
+        bystander: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            this.registerEvent(
+              this.app.workspace.on("probe-ping", () => {
+                const file = this.app.vault.getFileByPath("A.md")!;
+                void this.app.fileManager.promptForDeletion(file);
+              }),
+            );
+          }
+        },
+        probed: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            this.app.workspace.trigger("probe-ping");
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+    const session = { owner: {}, label: "test-client", deliver: (): boolean => true };
+    harness.broker.attach(session);
+    await harness.detector.runHarness("probed");
+    expect(harness.broker.pending().map((request) => request.pluginId)).toEqual(["bystander"]);
+    // Detaching fails the pending prompt, which `promptForDeletion` swallows
+    // into `false` — nothing is left armed.
+    harness.broker.detach(session);
   });
 
   it("carries a dry-run refusal into the result without moving the verdict", async () => {
@@ -427,7 +637,15 @@ describe("Detector.runHarness", () => {
     const jailed = report.plugins.find((row) => row.id === "jailed");
     expect(jailed?.harness).toBeNull();
     expect(jailed?.notes.join(" ")).toContain("quarantined");
-    expect(report.plugins.find((row) => row.id === "healthy")?.harness).not.toBeNull();
+    // **Not `runs`.** The tier mapping means "nothing was tried here", and
+    // something was: the host refuses to run this plugin, so the field a
+    // client renders on its own must not read green.
+    expect(jailed?.verdict).toBe("unknown");
+    expect(jailed?.harnessAttempted).toBe(true);
+    expect(summaryLine(jailed!)).toContain("unknown");
+    const healthy = report.plugins.find((row) => row.id === "healthy");
+    expect(healthy?.harness).not.toBeNull();
+    expect(healthy?.verdict).toBe("runs");
   });
 
   it("renders an undescribed schema as not yet described, never as no settings", async () => {

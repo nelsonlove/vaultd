@@ -365,13 +365,24 @@ export async function enterPlugin<T>(
 }
 
 /**
- * The synchronous counterpart, for an entry point that **must** answer without
- * awaiting.
+ * The synchronous counterpart, for a window that **must** open and close inside
+ * one turn.
  *
- * There is exactly one: `app.commands.executeCommandById`, which is synchronous
- * in Obsidian and whose boolean plugins branch on. Its attribution window has to
- * open and close inside one turn, and `enterPlugin` cannot do that — an `async`
- * function returns to its caller at the first `await`, with the id still set.
+ * Three callers, each for its own reason:
+ *
+ * - `app.commands.executeCommandById` (`shim/commands.ts`), which is
+ *   synchronous in Obsidian and whose boolean plugins branch on;
+ * - `ShimEventBus.tryTrigger` (`shim/events.ts`), because a fan-out is
+ *   synchronous and each handler has to run attributed to the plugin that
+ *   **registered** it rather than to whoever raised the event — Task 20 found
+ *   the hole, where a bystander's API hits were recorded against the plugin
+ *   whose `onload` had triggered the event;
+ * - `DispatchQueue.runInline` (`runtime/queue.ts`), the nesting arm of the
+ *   queue, which dispatches inside another entry point rather than awaiting a
+ *   slot of its own.
+ *
+ * `enterPlugin` cannot do this: an `async` function returns to its caller at
+ * the first `await`, with the id still set.
  *
  * A promise the body returns is **not** covered by this window: the id is
  * restored when the body returns, not when its promise settles. That is the
