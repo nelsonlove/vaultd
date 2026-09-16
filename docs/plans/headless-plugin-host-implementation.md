@@ -7676,6 +7676,8 @@ git commit -m "feat(host): serve plugin configuration with a schema ladder and s
 
 ### Task 18: Interaction brokerage
 
+> **Amended 2026-09-16 (RULING, Task 18, wiring and files).** This task's tests drive `host.attach_interaction`, `host.respond_interaction` and the `host.interaction_request` event over the wire, but 16a gated all six late ops behind one `attachWiring({ broker, pluginConfig, detector })` that Task 20b calls. The ruling: `HostServerWiring` is a partial that `attachWiring` merges, each late op answers `host_not_ready` naming its own missing service, and Task 18 wires the three interaction ops and the event itself; Task 20b keeps its attach/detach/respond cases as pins and wires the config service and the detector. Also: `Modal`, `SuggestModal` and `FuzzySuggestModal` already live in `shim/components.ts` (Tasks 10/11a), so there is no `shim/modals.ts` — `open()` changes in place — and `SuggestModal.open()` returns a promise that never surfaces an unhandled rejection, because real plugins do not await it.
+
 **Files:**
 
 - Create: `host/packages/host/src/interaction/broker.ts`
@@ -8384,6 +8386,8 @@ git commit -m "feat(host): detect plugin compatibility by bundle scan and runtim
 ---
 
 ### Task 20b: Host server wiring — interaction, config, detector, and overlap ops
+
+> **Amended 2026-09-16 (RULING, Task 18).** The three interaction ops and the `host.interaction_request` event are wired by Task 18 (see its amendment); this task attaches `{ pluginConfig, detector }` and its interaction cases are pins of Task 18's behaviour, so only the config and detector cases fail with `host_not_ready` on the first run.
 
 This completes Task 16a. The six ops below all need a service that did not exist at 16a: the broker (Task 18), the config service (Task 17), and the detector (Task 20). Rather than let 16a take forward references, the server exposes `attachWiring(...)` and those ops answer `host_not_ready` until it is called; this task calls it and makes them real. Nothing about the wire contract changes — it was pinned in full at 16a and this task implements the rows it marked.
 
