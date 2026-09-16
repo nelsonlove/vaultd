@@ -16,6 +16,15 @@
  *    recognized name ({@link DESCRIPTOR_EXPORTS}). automatic-linker's
  *    `SETTINGS_CATALOG` is 31 entries of key/control/name/description/options,
  *    with a test in that repository keeping it in parity with the real fields.
+ *    **Measured against this repository's corpus, rungs 2 and 3 read nothing:**
+ *    not one of the eight golden bundles exports `SETTINGS_CATALOG`,
+ *    `settingsDefinitions`, `configFields` or `DEFAULT_SETTINGS` — esbuild ships
+ *    `{ default }` (rollover ships a bare function) and those names live in the
+ *    plugins' sources. The two rungs are correctly specified and serve a
+ *    source-checkout or hand-built plugin that does re-export its catalogue; for
+ *    a shipped bundle the ladder answers rung 1 or `none`, and rung 4 is the
+ *    only path to a schema. A `none` therefore means "not described yet", never
+ *    "this plugin has no settings".
  * 3. **`types`** — the keys and defaults of an exported `DEFAULT_SETTINGS`.
  *    Complete for keys and defaults (execute-code 211/211, automatic-linker
  *    31/31) and carries no human description at all, which is exactly why it
@@ -336,8 +345,17 @@ function optionsOf(raw: unknown): Array<{ value: string; label: string }> | null
   return options.length === 0 ? null : options;
 }
 
-/** A plain object to read keys off, or `null`. An array is not one. */
+/**
+ * Something to read keys off, or `null`. An array is not one; a **function** is.
+ *
+ * The function case is the plain CommonJS idiom — `module.exports = MyPlugin`,
+ * then `MyPlugin.DEFAULT_SETTINGS = {…}` — and `obsidian-rollover-daily-todos`
+ * ships exactly that export shape. A helper that refused a function made both
+ * lower rungs structurally blind to it for no reason: own properties read off a
+ * function exactly as they do off an object.
+ */
 function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === "function") return value as unknown as Record<string, unknown>;
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
 }

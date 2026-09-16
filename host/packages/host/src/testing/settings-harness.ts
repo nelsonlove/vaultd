@@ -68,7 +68,12 @@ import type { PluginManifest, PluginSettingTab } from "../shim/plugin";
 export interface SettingsTabSpec {
   getSettingDefinitions?: () => unknown[];
   display?: () => void;
-  moduleExports?: Record<string, unknown>;
+  /**
+   * What the bundle exported. `unknown` rather than a record, because the plain
+   * CommonJS idiom exports a **function** (`module.exports = MyPlugin`) and both
+   * lower rungs read own properties off one.
+   */
+  moduleExports?: unknown;
   onExternalSettingsChange?: () => void;
 }
 
@@ -88,13 +93,25 @@ export class SettingsHarness extends DaemonHarness {
 
   readonly app: App;
   readonly harvest: Harvest;
-  private readonly dir: HeadlessConfigDir;
+  /**
+   * The headless config directory the service reads and writes through.
+   *
+   * Public because a case sometimes has to ask the layer *below* the service
+   * what it answered: "a `data.json` holding the literal `null` reads as an
+   * empty document" is a claim about this method, and every caller above it
+   * collapses `null` and `{}` with a `??`.
+   */
+  readonly dir: HeadlessConfigDir;
   private readonly queue = new DispatchQueue();
   /** Every vault path this harness's daemon serves, by content. */
   private readonly stored = new Map<string, string>();
 
-  protected constructor(pluginId: string, spec: SettingsTabSpec) {
-    super(configFor(freshDataDir()));
+  protected constructor(
+    pluginId: string,
+    spec: SettingsTabSpec,
+    overrides: Partial<HostConfig> = {},
+  ) {
+    super({ ...configFor(freshDataDir()), ...overrides });
     this.dataDir = this.config.dataDir;
     this.manifest = {
       id: pluginId,
@@ -159,13 +176,17 @@ export class SettingsHarness extends DaemonHarness {
   static withData(
     pluginId: string,
     data: Record<string, unknown>,
-    options: { schema?: SeededSchema; onExternalSettingsChange?: () => void } = {},
+    options: {
+      schema?: SeededSchema;
+      onExternalSettingsChange?: () => void;
+      config?: Partial<HostConfig>;
+    } = {},
   ): Promise<SettingsHarness> {
     const spec: SettingsTabSpec = {};
     if (options.onExternalSettingsChange !== undefined) {
       spec.onExternalSettingsChange = options.onExternalSettingsChange;
     }
-    const harness = new SettingsHarness(pluginId, spec);
+    const harness = new SettingsHarness(pluginId, spec, options.config ?? {});
     harness.stored.set(harness.dir.dataPath(pluginId), `${JSON.stringify(data, null, 2)}\n`);
     if (options.schema !== undefined) {
       harness.ladder.write({
@@ -178,11 +199,37 @@ export class SettingsHarness extends DaemonHarness {
     return Promise.resolve(harness);
   }
 
+  /**
+   * A plugin whose `data.json` holds exactly these **bytes**.
+   *
+   * {@link withData}'s counterpart for the documents a JSON value cannot
+   * express: a file a human damaged, a bare `null`, an array where an object
+   * belongs. What a config service does with each of those is a decision, and a
+   * decision needs a case.
+   */
+  static withRawData(pluginId: string, source: string): Promise<SettingsHarness> {
+    const harness = new SettingsHarness(pluginId, {});
+    harness.stored.set(harness.dir.dataPath(pluginId), source);
+    return Promise.resolve(harness);
+  }
+
   /** What is on disk right now — not what the plugin believes it wrote. */
   readData(pluginId: string): Promise<Record<string, unknown>> {
     const source = this.stored.get(this.dir.dataPath(pluginId));
     if (source === undefined) return Promise.resolve({});
     return Promise.resolve(JSON.parse(source) as Record<string, unknown>);
+  }
+
+  /**
+   * The exact bytes of `data.json`, or `undefined` when there is no file.
+   *
+   * {@link readData} answers the parsed document, which is the right question
+   * for "did the merge preserve that key" and the wrong one for "did this call
+   * leave the file alone": a rewrite that changes nothing but the last byte is
+   * invisible to a parse and obvious here.
+   */
+  rawData(pluginId: string): string | undefined {
+    return this.stored.get(this.dir.dataPath(pluginId));
   }
 
   /**

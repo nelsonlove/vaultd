@@ -313,14 +313,27 @@ export class BundleLoader implements PluginLoader {
     const bundle = await this.deps.queue.run(id, `${id}:compile`, () =>
       this.deps.events.attributingTo(id, () => loadPluginBundle(source.request)),
     );
-    // Kept before the plugin is constructed, because a bundle whose `onload`
-    // throws is still a bundle whose settings this host can describe — and
-    // because Task 17's ladder reads `SETTINGS_CATALOG` / `DEFAULT_SETTINGS`
-    // off exactly this object, which nothing else in the process holds once
-    // the plugin class has been read out of it. Dropped again by
-    // `Harvest.forgetPlugin` when the plugin is torn down.
+    // **Why the exports are kept at all:** Task 17's schema ladder reads
+    // `SETTINGS_CATALOG` / `DEFAULT_SETTINGS` off exactly this object, for a
+    // plugin that is loaded and running, and nothing else in the process holds
+    // it once the plugin class has been read out of it — Obsidian throws it
+    // away. `Harvest.forgetPlugin` drops it again on teardown.
+    //
+    // **The placement is not about surviving a failure.** A plugin whose
+    // `onload` throws is rolled back through `unload`, which forgets its whole
+    // harvest including this, and deregisters it — so the ladder would answer
+    // `"none"` for it either way. What the placement does cover is a
+    // **constructor** that throws, which reaches no `unload` at all: the
+    // recording is undone by hand below so a plugin that never existed does not
+    // leave a whole module scope held for the life of the host.
     this.deps.harvest.recordModuleExports(id, bundle.exports);
-    const plugin = new bundle.pluginClass(this.deps.app, source.manifest);
+    let plugin: Plugin;
+    try {
+      plugin = new bundle.pluginClass(this.deps.app, source.manifest);
+    } catch (error: unknown) {
+      this.deps.harvest.forgetModuleExports(id);
+      throw error;
+    }
     await this.load(plugin);
     return plugin;
   }

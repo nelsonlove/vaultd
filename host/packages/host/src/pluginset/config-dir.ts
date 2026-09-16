@@ -447,10 +447,17 @@ export class HeadlessConfigDir {
    * for a `data.json` a human damaged would invite the caller to write a fresh
    * document over it and eat the user's settings.
    *
-   * A document that parses to something other than an object is refused for the
-   * same reason: every key-level operation above this — redaction, the state-key
+   * A document that parses to an **array or a scalar** is refused for the same
+   * reason: every key-level operation above this — redaction, the state-key
    * refusal, the merge that preserves unmentioned keys — is defined over an
    * object's keys, and an array or a bare number has none.
+   *
+   * **The literal `null` is the one exception, and it reads as an empty
+   * document.** A plugin that calls `saveData(null)` writes exactly that file —
+   * `Plugin.loadData` answers `null` for it and every plugin in the corpus
+   * handles that as "nothing saved yet" — so refusing it would make a config
+   * service throw forever on a file the plugin considers ordinary. It is the
+   * only JSON value with an unambiguous "there is nothing here" reading.
    */
   async readPluginData(id: string): Promise<Record<string, unknown> | null> {
     const path = this.dataPath(id);
@@ -460,7 +467,8 @@ export class HeadlessConfigDir {
     // one and a plugin that never wrote at all are the same state to a reader.
     if (source.trim() === "") return null;
     const parsed = parseJson<unknown>(source, path);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    if (parsed === null) return {};
+    if (typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error(`${path} must be a JSON object`);
     }
     return parsed as Record<string, unknown>;
@@ -474,6 +482,17 @@ export class HeadlessConfigDir {
    * a plugin's own `saveData` rewrites whole. A caller preserving keys it did
    * not mean to change does so by merging *before* it calls this — which is
    * what `PluginConfigService.set` does, over the document it has just read.
+   *
+   * **What it preserves is keys and values under JSON semantics, not bytes.**
+   * A caller that merged over a document this class parsed gets every key and
+   * every value back, and the serialization is deterministic — the same
+   * document written twice is byte-identical — but the round trip is a parse
+   * and a re-serialize, so a hand-written file is normalized on its first write
+   * through here: indentation becomes two spaces, a trailing newline is added,
+   * `1.0` and `1e3` become `1` and `1000`, non-ASCII escapes are rewritten to
+   * the characters they name, and an integer past 2^53 is rounded by the parse
+   * before this method ever sees it. Same values, sometimes different bytes,
+   * and once rather than on every write.
    *
    * The folder is created **on the refusal** rather than ahead of every write,
    * exactly as `Plugin.saveData` does it and for the same reason: the folder

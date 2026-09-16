@@ -320,6 +320,19 @@ export class Harvest {
     this.moduleExportRows.set(pluginId, exports);
   }
 
+  /**
+   * Drop them again on their own.
+   *
+   * {@link forgetPlugin} is the ordinary way, and it covers every plugin that
+   * reached `onload`. This is for the one that did not: a plugin **constructor**
+   * that throws leaves a loader with exports recorded, no instance, and no
+   * teardown to run — a whole module scope held for the life of the host, for a
+   * plugin that never existed.
+   */
+  forgetModuleExports(pluginId: string): void {
+    this.moduleExportRows.delete(pluginId);
+  }
+
   recordRibbonIcon(
     pluginId: string,
     title: string,

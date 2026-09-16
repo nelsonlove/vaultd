@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import seed from "../src/settings/key-registry.json";
+import { DEFAULT_KEY_REGISTRY, PluginDataTooLarge } from "../src/settings/plugin-config";
 import { SettingsHarness } from "../src/testing/settings-harness";
 
 describe("plugin config safety", () => {
@@ -111,5 +113,236 @@ describe("plugin config safety", () => {
     );
     await harness.service.set("demo", { alpha: 2 });
     expect(notified).toBe(1);
+  });
+
+  // --- Redaction reaches every depth -----------------------------------------
+
+  // The audited corpus's four credentials are all top-level. The fallback exists
+  // for the plugins nobody has audited, and a nested provider map is an entirely
+  // ordinary shape for one of them — so a floor that stopped at depth zero would
+  // be a floor that is not there.
+  it("redacts a secret nested inside an object, and names its dotted path", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      nested: { deep: { apiToken: "NESTED-LEAK", ordinary: 1 } },
+      label: "fine",
+    });
+    const guarded = await harness.service.get("unknown-plugin", false);
+    expect(guarded.values["nested"]).toEqual({ deep: { apiToken: "[redacted]", ordinary: 1 } });
+    expect(guarded.values["label"]).toBe("fine");
+    expect(guarded.redacted_keys).toEqual(["nested.deep.apiToken"]);
+  });
+
+  it("redacts a secret inside an array of objects, with the index in the path", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      accounts: [{ name: "a", refreshToken: "ARRAY-LEAK" }, { name: "b" }],
+    });
+    const guarded = await harness.service.get("unknown-plugin", false);
+    expect(guarded.values["accounts"]).toEqual([
+      { name: "a", refreshToken: "[redacted]" },
+      { name: "b" },
+    ]);
+    expect(guarded.redacted_keys).toEqual(["accounts.0.refreshToken"]);
+  });
+
+  it("reveals a nested secret on request, and still names every path", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      nested: { deep: { apiToken: "NESTED-LEAK" } },
+      accounts: [{ refreshToken: "ARRAY-LEAK" }],
+    });
+    const revealed = await harness.service.get("unknown-plugin", true);
+    expect(revealed.values["nested"]).toEqual({ deep: { apiToken: "NESTED-LEAK" } });
+    expect(revealed.values["accounts"]).toEqual([{ refreshToken: "ARRAY-LEAK" }]);
+    // A caller holding plaintext still needs to know which of these values are
+    // credentials — that is the more useful question, and the guarded answer's
+    // paths are the answer to it.
+    expect(revealed.redacted_keys.sort()).toEqual([
+      "accounts.0.refreshToken",
+      "nested.deep.apiToken",
+    ]);
+  });
+
+  it("withholds a registry-listed key's whole subtree as one path", async () => {
+    const harness = await SettingsHarness.withData("tasknotes", {
+      googleCalendarSyncTokens: { refresh: "r", access: "a" },
+    });
+    const guarded = await harness.service.get("tasknotes", false);
+    expect(guarded.values["googleCalendarSyncTokens"]).toBe("[redacted]");
+    // One path, not one per token inside the bag: a caller cannot reconstruct
+    // the bag's shape from what it was told.
+    expect(guarded.redacted_keys).toEqual(["googleCalendarSyncTokens"]);
+  });
+
+  // --- The round trip that used to destroy a token ----------------------------
+
+  // The most natural client there is: read a config, change one field, write the
+  // whole thing back. Without the refusal that saves the literal "[redacted]"
+  // over the user's real token, and `data.json` has no history.
+  it("refuses a redacted value written back, and leaves the real token byte-identical", async () => {
+    const harness = await SettingsHarness.withData("tasknotes", {
+      apiAuthToken: "real-token",
+      taskTag: "t",
+    });
+    const before = harness.rawData("tasknotes");
+    const view = await harness.service.get("tasknotes", false);
+    const result = await harness.service.set("tasknotes", view.values);
+    expect(result.applied).toEqual(["taskTag"]);
+    expect(result.refused).toEqual([{ key: "apiAuthToken", reason: "redacted_value" }]);
+    expect(await harness.readData("tasknotes")).toEqual({
+      apiAuthToken: "real-token",
+      taskTag: "t",
+    });
+    expect(harness.rawData("tasknotes")).toBe(before);
+  });
+
+  it("refuses a nested redacted value and names its path, applying the rest", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      nested: { deep: { apiToken: "real" } },
+      label: "before",
+    });
+    const view = await harness.service.get("unknown-plugin", false);
+    const result = await harness.service.set("unknown-plugin", {
+      ...view.values,
+      label: "after",
+    });
+    expect(result.applied).toEqual(["label"]);
+    expect(result.refused).toEqual([{ key: "nested.deep.apiToken", reason: "redacted_value" }]);
+    expect(await harness.readData("unknown-plugin")).toEqual({
+      nested: { deep: { apiToken: "real" } },
+      label: "after",
+    });
+  });
+
+  // The fallback matches a substring, so an ordinary *numeric* setting is
+  // redacted to a string. Writing that back would put "[redacted]" into a
+  // number field — and with `source: "none"` nothing else would stop it.
+  it("refuses a redacted number written back under a none schema", async () => {
+    const harness = await SettingsHarness.withData("unknown-plugin", {
+      refreshTokenIntervalMinutes: 30,
+    });
+    const view = await harness.service.get("unknown-plugin", false);
+    expect(view.values["refreshTokenIntervalMinutes"]).toBe("[redacted]");
+    const result = await harness.service.set("unknown-plugin", view.values);
+    expect(result.applied).toEqual([]);
+    expect(result.refused).toEqual([
+      { key: "refreshTokenIntervalMinutes", reason: "redacted_value" },
+    ]);
+    expect(await harness.readData("unknown-plugin")).toEqual({
+      refreshTokenIntervalMinutes: 30,
+    });
+  });
+
+  // --- Keys that must never be reported applied -------------------------------
+
+  it("refuses a value of undefined rather than reporting a key it would delete", async () => {
+    const harness = await SettingsHarness.withData("opaque", { alpha: 1, keep: "me" }, {
+      schema: { source: "none", items: [] },
+    });
+    const result = await harness.service.set("opaque", { alpha: undefined });
+    expect(result.applied).toEqual([]);
+    expect(result.refused).toEqual([{ key: "alpha", reason: "type_mismatch" }]);
+    expect(await harness.readData("opaque")).toEqual({ alpha: 1, keep: "me" });
+  });
+
+  it("refuses __proto__, constructor and prototype whatever the schema says", async () => {
+    const harness = await SettingsHarness.withData("opaque", { alpha: 1 }, {
+      schema: { source: "none", items: [] },
+    });
+    const result = await harness.service.set("opaque", {
+      ["__proto__"]: { polluted: true },
+      constructor: "no",
+      prototype: "no",
+      alpha: 2,
+    });
+    expect(result.applied).toEqual(["alpha"]);
+    expect(result.refused).toEqual([
+      { key: "__proto__", reason: "unknown_key" },
+      { key: "constructor", reason: "unknown_key" },
+      { key: "prototype", reason: "unknown_key" },
+    ]);
+    expect(await harness.readData("opaque")).toEqual({ alpha: 2 });
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  // --- What a refused call does to the file, and what the cap does ------------
+
+  it("writes nothing at all when every key is refused", async () => {
+    const harness = await SettingsHarness.withData("demo", { flag: true }, {
+      schema: { source: "definitions", items: [{ key: "flag", control: "toggle" }] },
+    });
+    const before = harness.rawData("demo");
+    harness.clearMethodLog();
+    const result = await harness.service.set("demo", { flag: "yes" });
+    expect(result.applied).toEqual([]);
+    expect(harness.methodsSeen()).not.toContain("write_file");
+    expect(harness.rawData("demo")).toBe(before);
+  });
+
+  it("refuses an oversized document before any write, leaving the file alone", async () => {
+    const harness = await SettingsHarness.withData("opaque", { alpha: 1 }, {
+      schema: { source: "none", items: [] },
+      config: { writeFileCapBytes: 64 },
+    });
+    const before = harness.rawData("opaque");
+    harness.clearMethodLog();
+    await expect(harness.service.set("opaque", { beta: "x".repeat(200) })).rejects.toBeInstanceOf(
+      PluginDataTooLarge,
+    );
+    expect(harness.methodsSeen()).not.toContain("write_file");
+    expect(harness.rawData("opaque")).toBe(before);
+  });
+
+  // --- The two writers of data.json agree --------------------------------------
+
+  it("leaves one trailing newline whichever writer wrote last", async () => {
+    const harness = await SettingsHarness.withData("demo", { alpha: 1 }, {
+      schema: { source: "none", items: [] },
+    });
+    await harness.plugin.saveData({ alpha: 1, fromPlugin: true });
+    const afterSave = harness.rawData("demo") ?? "";
+    expect(afterSave.endsWith("}\n")).toBe(true);
+    await harness.service.set("demo", { beta: 2 });
+    const afterSet = harness.rawData("demo") ?? "";
+    expect(afterSet.endsWith("}\n")).toBe(true);
+    await harness.plugin.saveData({ alpha: 3 });
+    const afterSecondSave = harness.rawData("demo") ?? "";
+    expect(afterSecondSave.endsWith("}\n")).toBe(true);
+    // And the host's write really did see what the plugin saved.
+    expect(JSON.parse(afterSet)).toEqual({ alpha: 1, fromPlugin: true, beta: 2 });
+  });
+
+  // --- The documents a JSON value cannot express -------------------------------
+
+  it("reads a data.json holding the literal null as an empty document", async () => {
+    const harness = await SettingsHarness.withRawData("demo", "null\n");
+    // Asserted at the layer that decides it: every caller above collapses
+    // `null` and `{}` with a `??`, so only this says which one was answered.
+    expect(await harness.dir.readPluginData("demo")).toEqual({});
+    const guarded = await harness.service.get("demo", false);
+    expect(guarded.values).toEqual({});
+    const result = await harness.service.set("demo", { alpha: 1 });
+    expect(result.applied).toEqual(["alpha"]);
+    expect(await harness.readData("demo")).toEqual({ alpha: 1 });
+  });
+
+  it("refuses an array, a scalar and a damaged file, and touches none of them", async () => {
+    for (const source of ["[1, 2]\n", "42\n", "{not json\n"]) {
+      const harness = await SettingsHarness.withRawData("demo", source);
+      await expect(harness.service.get("demo", false)).rejects.toThrow();
+      await expect(harness.service.set("demo", { alpha: 1 })).rejects.toThrow();
+      expect(harness.rawData("demo")).toBe(source);
+    }
+  });
+
+  it("exports the key registry as a deep-frozen copy, not the module object", async () => {
+    expect(DEFAULT_KEY_REGISTRY).toEqual(seed);
+    expect(DEFAULT_KEY_REGISTRY).not.toBe(seed);
+    expect(Object.isFrozen(DEFAULT_KEY_REGISTRY)).toBe(true);
+    expect(Object.isFrozen(DEFAULT_KEY_REGISTRY["tasknotes"])).toBe(true);
+    expect(Object.isFrozen(DEFAULT_KEY_REGISTRY["tasknotes"]?.state_keys)).toBe(true);
+    expect(() => DEFAULT_KEY_REGISTRY["tasknotes"]?.state_keys.push("invented")).toThrow();
+    // And the seed a caller could not have edited still guards.
+    const harness = await SettingsHarness.withData("tasknotes", { pomodoroState: { on: true } });
+    const result = await harness.service.set("tasknotes", { pomodoroState: { on: false } });
+    expect(result.refused).toEqual([{ key: "pomodoroState", reason: "state_key" }]);
   });
 });

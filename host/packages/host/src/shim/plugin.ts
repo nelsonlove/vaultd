@@ -664,22 +664,39 @@ export abstract class Plugin extends Component {
    * `create_folder` per save for a folder that has existed since the first one.
    * `create_folder` walks its own segments, so one call is enough however much
    * of the chain is missing.
+   *
+   * **It holds the file's path lock**, which is the same lock Task 17's
+   * `PluginConfigService.set` takes, keyed by the same path string. The host's
+   * `set` is a read-modify-write and this is a blind whole-file write, so with
+   * no lock between them a save landing in the middle of a `set` is lost
+   * silently — the `set` writes the document it read before the save, and both
+   * callers believe they succeeded. Obsidian has no such race because it has
+   * one writer; a host with a socket door has two.
+   *
+   * **The trailing newline is deliberate and matches
+   * `HeadlessConfigDir.writeEnabledSet` and `writePluginData`.** Two writers of
+   * one file that disagree about the last byte flip it on every alternation,
+   * which is diff noise on the file this layout exists to keep diffable.
    */
-  async saveData(data: unknown): Promise<void> {
+  saveData(data: unknown): Promise<void> {
     recordUse("Plugin.saveData");
     const path = this.dataPath();
-    const params = {
-      path,
-      content_base64: Buffer.from(JSON.stringify(data, null, 2), "utf8").toString("base64"),
-    };
-    try {
+    return this.host.queue.runExclusivePath(path, async () => {
+      const params = {
+        path,
+        content_base64: Buffer.from(`${JSON.stringify(data, null, 2)}\n`, "utf8").toString(
+          "base64",
+        ),
+      };
+      try {
+        await this.host.writes.send<WriteFileResponse>("write_file", params);
+        return;
+      } catch (error) {
+        if (!isParentMissing(error)) throw error;
+      }
+      await this.host.writes.send<unknown>("create_folder", { path: parentOf(path) });
       await this.host.writes.send<WriteFileResponse>("write_file", params);
-      return;
-    } catch (error) {
-      if (!isParentMissing(error)) throw error;
-    }
-    await this.host.writes.send<unknown>("create_folder", { path: parentOf(path) });
-    await this.host.writes.send<WriteFileResponse>("write_file", params);
+    });
   }
 
   /**
