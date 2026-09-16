@@ -190,6 +190,14 @@ export class HostServer {
    * rather than delivered on arrival.
    */
   private readonly heldCommits: Array<{ generation: number; event: HostEvent }> = [];
+  /**
+   * Has this episode of holding already been collapsed?
+   *
+   * Re-armed by {@link HostServer.releaseHeldCommits} when the mirror actually
+   * releases something — which is the only evidence that the condition the
+   * collapse described has changed. See {@link HostServer.hold}.
+   */
+  private holdCollapsed = false;
   /** Uninstalls the process-level unhandled-rejection guard. */
   private readonly unguard: () => void;
 
@@ -371,6 +379,16 @@ export class HostServer {
     this.heldCommits.push({ generation, event });
     if (this.heldCommits.length <= this.deps.config.subscriberQueueLimit) return;
     this.heldCommits.length = 0;
+    // **One collapse per episode, not one per overflow.** A mirror that stays
+    // still under a committing daemon overflows the held set again every
+    // `subscriberQueueLimit` commits, and announcing each one told a subscriber
+    // the same true thing three hundred times over twenty thousand commits —
+    // three hundred re-hydrations for one condition. The queue's own discipline
+    // is *one message, not a prefix of the truth*, and this is that rule for the
+    // layer above it: say it once, and say nothing more until the mirror has
+    // actually moved. {@link releaseHeldCommits} is what re-arms it.
+    if (this.holdCollapsed) return;
+    this.holdCollapsed = true;
     const reason: ResyncReasonDto = "subscriber_lag";
     this.broadcast({
       type: "resync_required",
@@ -402,6 +420,9 @@ export class HostServer {
       this.heldCommits.length,
       ...this.heldCommits.filter((held) => held.generation > appliedThrough),
     );
+    // The mirror moved, so the episode is over: a later overflow is a new
+    // condition and is worth saying once more.
+    this.holdCollapsed = false;
     ready.sort((left, right) => left.generation - right.generation);
     for (const held of ready) this.broadcast(held.event);
   }
@@ -439,6 +460,7 @@ export class HostServer {
     this.unguard();
     this.outbox.length = 0;
     this.heldCommits.length = 0;
+    this.holdCollapsed = false;
     for (const connection of [...this.connections]) connection.destroy();
     this.connections.clear();
     const server = this.server;

@@ -124,7 +124,7 @@ export class ClientSubscriptions {
 
   /** Queue one event for every subscription this client holds, then flush. */
   deliver(event: HostEvent): void {
-    const resyncAt = resyncGenerationOf(event);
+    const resyncAt = resyncWatermarkOf(event, this.deps.currentGeneration);
     const committedAt = event.type === "generation_committed" ? generationOf(event) : null;
     for (const subscription of this.subscriptions.values()) {
       // Void: this subscription has already been told to re-read at a generation
@@ -209,7 +209,7 @@ export class ClientSubscriptions {
         // covers a commit the server releases from its held set afterwards.
         subscription.resyncedThrough = Math.max(
           subscription.resyncedThrough,
-          resyncGenerationOf(collapse) ?? -1,
+          resyncWatermarkOf(collapse, this.deps.currentGeneration) ?? -1,
         );
         return frame(subscription.id, collapse);
       }
@@ -248,13 +248,23 @@ function generationOf(event: HostEvent): number {
  * The generation a `resync_required` tells a subscriber to re-read at, or `null`
  * for any other event.
  *
- * A daemon that could not name one sends `null`, which is the strongest form of
- * "start over": everything is void, so it reads as infinity here.
+ * **A resync that names no generation is read as the one the host knows now, and
+ * never as infinity.** The daemon sends `current_generation: null` when it
+ * cannot name one, and the two things this host does with a resync want
+ * different answers to that. Voiding the *held* set is a one-shot "everything
+ * currently held is void", and infinity is right for it. This watermark is a
+ * **standing** rule — nothing ever lowers it — so infinity here meant every
+ * future `generation_committed`, at any generation, was dropped for the life of
+ * the subscription: the client kept being answered, kept receiving host events,
+ * and was never told the vault had changed again. It did not crash and it did
+ * not refuse; it lied by silence.
+ *
+ * The host's current generation is the honest standing answer: everything the
+ * host could still release for a generation already passed is void, and the
+ * next commit is not.
  */
-function resyncGenerationOf(event: HostEvent): number | null {
+function resyncWatermarkOf(event: HostEvent, now: () => number): number | null {
   if (event.type !== "resync_required") return null;
   const value = event.value as { current_generation?: unknown } | null;
-  return typeof value?.current_generation === "number"
-    ? value.current_generation
-    : Number.POSITIVE_INFINITY;
+  return typeof value?.current_generation === "number" ? value.current_generation : now();
 }

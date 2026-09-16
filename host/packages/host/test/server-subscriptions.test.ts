@@ -211,6 +211,113 @@ describe("host subscriptions", () => {
     }
   }, 30_000);
 
+  /**
+   * A subscription over a writer a case drives by hand.
+   *
+   * The per-subscription void rule is deterministic and needs no socket — every
+   * assertion below is about **what the client is written**, which is the only
+   * thing that matters and the thing `heldCommitCount()` cannot see.
+   */
+  function queueProbe(generation: number): {
+    subscriptions: ClientSubscriptions;
+    written: Array<{ type: string; generation: number | null }>;
+    stall: () => void;
+    resume: () => void;
+  } {
+    const written: Array<{ type: string; generation: number | null }> = [];
+    let backedUp = false;
+    let drain: (() => void) | null = null;
+    const subscriptions = new ClientSubscriptions({
+      limit: 2,
+      currentGeneration: () => generation,
+      mintId: () => "s-1",
+      writer: {
+        write: (line) => {
+          const frame = JSON.parse(line) as {
+            event: { type: string; value: { generation?: number } };
+          };
+          written.push({ type: frame.event.type, generation: frame.event.value.generation ?? null });
+          return !backedUp;
+        },
+        onceDrain: (listener) => {
+          drain = listener;
+        },
+      },
+    });
+    subscriptions.open();
+    return {
+      subscriptions,
+      written,
+      stall: () => {
+        backedUp = true;
+      },
+      resume: () => {
+        backedUp = false;
+        drain?.();
+      },
+    };
+  }
+
+  const committed = (generation: number): { type: string; value: unknown } => ({
+    type: "generation_committed",
+    value: { generation },
+  });
+
+  it("voids a commit at or below a relayed resync, and lets the next one through", () => {
+    const { subscriptions, written } = queueProbe(10);
+    subscriptions.deliver({
+      type: "resync_required",
+      value: { current_generation: 10, reason: "oversized_change_set" },
+    });
+    // A client told "re-read at generation 10" that then applied a change set
+    // for 9 or 10 would move its own state backwards.
+    subscriptions.deliver(committed(9));
+    subscriptions.deliver(committed(10));
+    subscriptions.deliver(committed(11));
+    expect(written).toEqual([
+      { type: "resync_required", generation: null },
+      { type: "generation_committed", generation: 11 },
+    ]);
+  });
+
+  it("voids a commit at or below the collapse it synthesized for itself", () => {
+    const { subscriptions, written, stall, resume } = queueProbe(10);
+    // Back the writer up and overflow the queue, so the subscription owes
+    // itself a collapse; the drain is what writes it.
+    stall();
+    for (let i = 0; i < 6; i += 1) subscriptions.deliver(committed(100 + i));
+    resume();
+    expect(written.at(-1)).toEqual({ type: "resync_required", generation: null });
+    // The collapse names generation 10, so a commit released from the server's
+    // held set afterwards at 9 or 10 is void for this subscription — which no
+    // server-side prune can see, because the collapse was this subscription's
+    // own.
+    written.length = 0;
+    subscriptions.deliver(committed(9));
+    subscriptions.deliver(committed(10));
+    subscriptions.deliver(committed(11));
+    expect(written).toEqual([{ type: "generation_committed", generation: 11 }]);
+  });
+
+  it("stores the generation it knows for a resync that names none", () => {
+    const { subscriptions, written } = queueProbe(10);
+    subscriptions.deliver({
+      type: "resync_required",
+      value: { current_generation: null, reason: "runtime_recovered" },
+    });
+    written.length = 0;
+    // Everything up to what the host knows now is void — and **everything after
+    // it is not**. A watermark of infinity would deafen this subscription for
+    // the life of the connection.
+    subscriptions.deliver(committed(10));
+    subscriptions.deliver(committed(11));
+    subscriptions.deliver(committed(12));
+    expect(written).toEqual([
+      { type: "generation_committed", generation: 11 },
+      { type: "generation_committed", generation: 12 },
+    ]);
+  });
+
   it("bounds the queue at the configured limit, whatever the socket buffers", () => {
     const written: string[] = [];
     let backedUp = false;
@@ -350,6 +457,48 @@ describe("host subscriptions", () => {
     }
   });
 
+  it("keeps delivering after a resync that names no generation", async () => {
+    const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+      const delivered: number[] = [];
+      client.onEvent((envelope) => {
+        if (envelope.event.type !== "generation_committed") return;
+        delivered.push((envelope.event.value as { generation: number }).generation);
+      });
+
+      // `current_generation: null` is what the daemon sends when it cannot name
+      // one — `ResyncRequiredEventDto.current_generation` is `number | null`,
+      // written from the shipped Rust — and it is the strongest form of "start
+      // over". It voids what is held **once**; it must not become a standing
+      // watermark, or every future commit on this subscription is dropped for
+      // the life of the connection and the client is never told the vault
+      // changed again. It does not crash and it does not refuse: it lies by
+      // silence, which is the failure class this door's lens exists for.
+      harness.server.relayDaemonEvent({
+        type: "resync_required",
+        value: { current_generation: null, reason: "runtime_recovered" },
+      });
+      await harness.serverQuiesce();
+      expect(delivered).toEqual([]);
+
+      for (let i = 0; i < 3; i += 1) {
+        await harness.commitGeneration({
+          modified: ["A.md"],
+          sources: { "A.md": `# A\n${String(i)}\n` },
+        });
+      }
+      await harness.serverQuiesce();
+      expect(delivered).toHaveLength(3);
+      expect(delivered[2]).toBe(harness.mirror.generation());
+      await client.disconnect();
+    } finally {
+      await harness.stop();
+    }
+  });
+
   it("bounds the held commits and collapses the hold rather than growing", async () => {
     const harness = await HostHarness.create({
       vault: { "A.md": "# A\n" },
@@ -388,6 +537,12 @@ describe("host subscriptions", () => {
         reason: "subscriber_lag",
         current_generation: harness.mirror.generation(),
       });
+      // **One collapse for the episode, not one per overflow.** The held set
+      // overflows again every 32 commits while the mirror stands still, and
+      // announcing each one told the subscriber the same true thing three
+      // hundred times — three hundred re-hydrations for one condition.
+      const events = await client.drainEvents();
+      expect(events.filter((event) => event.type === "resync_required")).toHaveLength(1);
       // The client is still served: a collapse is a message, not a broken
       // connection.
       await expect(client.call("host.list_plugins", {})).resolves.toMatchObject({ plugins: [] });

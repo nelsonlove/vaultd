@@ -243,6 +243,12 @@ The delay is bounded by how long the mirror takes to apply a change it has alrea
 
 **The held set is bounded, like every other buffer on this door.** Its bound is `subscriber_queue_limit`, the same number the subscriber queue uses, and overflow takes the same road: the held set is dropped whole and the subscriber is owed one `resync_required { reason: "subscriber_lag" }`. The condition is a mirror that has fallen a long way behind a committing daemon — a slow re-hydration, a stalled engine connection, a vault import — and a mirror that far behind is going to re-hydrate anyway, so a client being told to re-read needs none of the detail that was being held for it.
 
+Two things about that particular collapse are worth knowing, because a client author meets them without an obvious explanation.
+
+**It is announced once per episode, not once per overflow.** While the mirror stands still the held set fills again every `subscriber_queue_limit` commits, and saying it each time would tell a client the same true thing hundreds of times. The host says it once and stays quiet until the mirror has actually released something.
+
+**It reaches every subscriber, including one that is reading promptly and whose own queue is empty**, and it says `subscriber_lag` — a reason that names the subscriber. The reason is accurate about who lagged, just not about which subscriber: the thing that fell behind is **this host's own view of the vault**, and the host is the daemon's lagging subscriber. Every client reads that view, so every client is told. Nothing in `vaultd`'s `ResyncReasonDto` says it more precisely, and inventing a host-only reason would give a client a code it has no handler for.
+
 `config_changed` comes from the mirror's own seam rather than from the relay, so a raw write into the config zone is announced once rather than twice — the mirror's seam is also the one that invalidates this host's cached config, so the announcement and the invalidation cannot disagree. `runtime_state_changed` and `resync_required` pass through untouched and unheld: both are statements about the engine rather than about this host's view.
 
 ### A subscriber that stops reading
