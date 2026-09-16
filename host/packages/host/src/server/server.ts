@@ -180,6 +180,14 @@ export class HostServer {
   private listening: Promise<string> | null = null;
   private nonce: Buffer | null = null;
   private subscriptionSequence = 0;
+  /**
+   * Names connections, so a refusal can say *which* client holds something.
+   *
+   * "Another client already holds the interaction channel" is not actionable;
+   * "`host-conn-2` holds it" is, because the operator can see which of their
+   * clients that is. Never reused within a process, and never parsed.
+   */
+  private connectionSequence = 0;
   /** Events waiting for a turn of the loop. See {@link HostServer.broadcast}. */
   private readonly outbox: HostEvent[] = [];
   private pumping = false;
@@ -553,7 +561,9 @@ export class HostServer {
   // --- Connections -----------------------------------------------------------
 
   private accept(socket: Socket): void {
+    this.connectionSequence += 1;
     const connection = new Connection(socket, {
+      label: `host-conn-${String(this.connectionSequence)}`,
       limit: this.deps.config.subscriberQueueLimit,
       lineCap: lineCapFor(this.deps.config),
       currentGeneration: () => this.deps.mirror.generation(),
@@ -566,10 +576,12 @@ export class HostServer {
       dispatch: (method, params, session) => this.ops.dispatch(method, params, session),
       gone: (closed) => {
         this.connections.delete(closed);
-        // A disconnect releases everything the client held: its subscriptions
-        // and its snapshot sessions. A crashed client must not leave a frozen
-        // view of the vault in this host's memory for the life of the process.
-        this.ops.snapshots.closeAll(closed.session.owner);
+        // A disconnect releases everything the client held: its subscriptions,
+        // its snapshot sessions, and the interaction channel if it was holding
+        // that. A crashed client must not leave a frozen view of the vault in
+        // this host's memory for the life of the process — nor a plugin waiting
+        // two minutes on a prompt nobody is left to answer.
+        this.ops.connectionGone(closed.session);
       },
     });
     this.connections.add(connection);
@@ -635,6 +647,8 @@ export class HostServer {
 
 /** What a {@link Connection} needs of the server that owns it. */
 interface ConnectionDeps {
+  /** What a refusal calls this connection — `host-conn-3`. See `connectionSequence`. */
+  readonly label: string;
   readonly limit: number;
   /** Bytes of UTF-8 one request line may reach. See {@link lineCapFor}. */
   readonly lineCap: number;
@@ -681,7 +695,17 @@ class Connection {
         },
       },
     });
-    this.session = { owner: {}, subscriptions: this.subscriptions };
+    this.session = {
+      owner: {},
+      label: deps.label,
+      subscriptions: this.subscriptions,
+      // Down **this** socket and no other. The broker addresses a prompt to the
+      // one client that said it would answer; `HostServer.broadcast` is the
+      // other shape, for things every subscriber is owed a copy of.
+      deliver: (event) => {
+        this.subscriptions.deliver(event);
+      },
+    };
     socket.setNoDelay(true);
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {

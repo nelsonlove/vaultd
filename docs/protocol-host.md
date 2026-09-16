@@ -88,11 +88,23 @@ Every field below is `snake_case`. The **Task** column says which task implement
 | `host.get_plugin_config` | `{ id, reveal_secrets?: bool }` | `{ id, values, schema: { source, items }, redacted_keys: Path[], state_keys }` | **wired in 20b** |
 | `host.set_plugin_config` | `{ id, patch: Record<string, unknown> }` | `{ id, applied: string[], refused: { key, reason, path?: Path }[] }` | **wired in 20b** |
 | `host.compat_report` | `{ plugin_id?: string }` | `{ report: CompatReport }` | **wired in 20b** |
-| `host.attach_interaction` | `{}` | `{ attached: bool }` | **wired in 20b** |
-| `host.detach_interaction` | `{}` | `{ attached: bool }` | **wired in 20b** |
-| `host.respond_interaction` | `{ prompt_id, choice_index?: number, value?: string, cancelled?: bool }` | `{ prompt_id }` | **wired in 20b** |
+| `host.attach_interaction` | `{}` | `{ attached: bool }` | 18 |
+| `host.detach_interaction` | `{}` | `{ attached: bool }` | 18 |
+| `host.respond_interaction` | `{ prompt_id, choice_index?: number, value?: string, cancelled?: bool }` | `{ prompt_id }` | 18 |
 
 `host.invoke_command`'s `selection` is a range — `{ from: { line, ch }, to: { line, ch } }`, both fields zero-based — rather than a string. **This is a ratified deviation from the phase brief's pinned table**, which spells the row `selection?: string`: an `editorCallback` is handed an `Editor`, whose `setSelection` takes two positions, so a string would have to be *searched* for in the note — a different operation, with a different failure mode (no match, several matches) and a different answer for each. The controller ratified the range in Task 16a's fix round and the brief's table is amended to match. A client that sends a string is told so by name rather than having it silently ignored. The shape is pinned as `SelectionWire` in `host/packages/host/src/server/wire.ts`.
+
+### Interaction, and the one-holder rule
+
+**One client holds the interaction channel at a time, and holding it is what makes prompts reachable.** A plugin that opens a `SuggestModal` or a `FuzzySuggestModal`, or calls `FileManager.promptForDeletion`, raises a question the host has no window to ask — so the host asks whoever attached. `host.attach_interaction` takes the channel; while it is held, a second client asking is refused `interaction_unavailable` naming the connection that holds it, rather than silently taking prompts away from the client a human is looking at. `host.detach_interaction` releases it, and a client that disconnects releases it implicitly.
+
+**Attaching opens a subscription if the connection holds none.** An event reaches a client through its subscriptions and nowhere else, so a client that attached without subscribing would have asked for prompts down a channel it never opened. The host opens one for it; a client that already subscribed keeps the subscriptions it has and is given no second one. The `host.interaction_request` events then arrive on that subscription like every other event, and go to the attached connection alone — never to other clients, however many are subscribed.
+
+**Every way a prompt can fail is typed, and none of them waits forever.** No client attached: the plugin's call rejects `interaction_unavailable` immediately, rather than hanging on a human who is not there. The holder detaches or disconnects: every prompt it had not answered fails `interaction_unavailable` at once, rather than running down its timeout against a socket that is gone. Nobody answers within `prompt_timeout_ms` (120 000): `interaction_timeout`. The plugin sees each as a rejected promise on its own error path; a prompt that fails with nobody awaiting it is attributed to the plugin in the host's error log and **never counts toward a quarantine**, because a human who closed their laptop is not evidence that a plugin is broken.
+
+**Answering.** `choice_index` is an index into the `items` the request carried, and `cancelled: true` closes the prompt with no choice at all — the plugin's `onClose` runs and no choice handler is called. A `choice_index` outside the range of that prompt's `items` is `invalid_request`, and the prompt **stays pending** so the client can answer it properly; a `prompt_id` that names nothing still waiting — already answered, or timed out — is `interaction_unavailable`. For a `confirm` prompt the items are `["confirm", "cancel"]`: index 0 is yes and anything else, cancellation included, is no.
+
+**`Modal.open()` on a bespoke modal is `headless_unsupported`, and is not brokered.** The suggester family is interceptable because the base class owns the rendering and the subclass supplies only `getItems`/`getItemText`/`getSuggestions`/`onChoose…` — a list of strings and an index, which is exactly what fits down a socket. A modal that builds its own UI in `onOpen()` has no such seam: it can be *constructed* (building the `contentEl` is ordinary work that must not throw) and opening it refuses, naming the actual subclass so the report says which plugin's which modal.
 
 The plugin-config rows carry **two ratified amendments** from Task 17's fix rounds, both settled before 20b wires the handlers so the shape is frozen rather than discovered.
 
@@ -235,7 +247,7 @@ Host events:
 | `host.plugin_state_changed` | `{ id, state, reason }` |
 | `host.notice` | `{ plugin_id, message, at_unix_ms }` |
 | `host.overlap_changed` | `{ overlap, gui_enabled }` |
-| `host.interaction_request` | `{ prompt_id, plugin_id, kind, prompt, items, timeout_ms }` — **emitted by 20b** |
+| `host.interaction_request` | `{ prompt_id, plugin_id, kind, prompt, items, timeout_ms }` — to the **attached** client only |
 
 Daemon-shaped events carry their `vaultd` payloads **unchanged**: `generation_committed`, `runtime_state_changed`, `resync_required` and `config_changed`. Nothing is recomputed here, so a client correlating this door with a direct daemon subscription sees the same numbers.
 

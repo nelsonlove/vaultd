@@ -778,7 +778,7 @@ describe("FileManager: the rest of the surface", () => {
     expect((await pending).path).toBe("Untitled 1");
   });
 
-  it("resolves promptForDeletion false with no handler, and deletes nothing", async () => {
+  it("resolves promptForDeletion false with nobody attached, and deletes nothing", async () => {
     const harness = await ShimHarness.withVault(TRASH_VAULT);
     const file = harness.vault.getFileByPath("A.md") as TFile;
     // Real API, real signature: `Promise<boolean>`, public since 0.15.0.
@@ -786,11 +786,16 @@ describe("FileManager: the rest of the surface", () => {
     await harness.quiesce();
     expect(harness.pendingRequests()).toHaveLength(0);
     expect(harness.vault.getFileByPath("A.md")).not.toBeNull();
-    // The report has to be able to say the plugin asked.
+    // The report has to be able to say the plugin asked. Since Task 18 the
+    // confirm broker is part of every assembly, so "no handler" means "no
+    // client attached to answer": the surface is really reached and really
+    // asks, which reads `implemented` rather than the `safe_stub` an
+    // unreachable surface used to record. Whether a human was there is a fact
+    // about the session, not about the plugin's compatibility.
     expect(
       harness.policyRecorder.entries().find((e) => e.symbol === "FileManager.promptForDeletion")
         ?.policy,
-    ).toBe("safe_stub");
+    ).toBe("implemented");
   });
 
   it("brokers a confirm when a handler is attached, and deletes on yes", async () => {

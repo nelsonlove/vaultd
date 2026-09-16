@@ -19,6 +19,12 @@
 
 import { App } from "../shim/app";
 import { CoexistenceMonitor } from "../pluginset/coexistence";
+import {
+  InteractionBroker,
+  InteractionTimeout,
+  InteractionUnavailable,
+  installInteractionBroker,
+} from "../interaction/broker";
 import { CommandRegistry } from "../shim/commands";
 import { HeadlessConfigDir } from "../pluginset/config-dir";
 import { FileManager } from "../shim/file-manager";
@@ -27,16 +33,17 @@ import { PluginRegistry } from "../shim/plugin-registry";
 import { ShimEventBus } from "../shim/events";
 import { MetadataCache } from "../shim/metadata-cache";
 import { DispatchQueue } from "../runtime/queue";
-import { setPolicyRecorder } from "../shim/policy";
+import { HOST_PLUGIN_ID, HostErrors } from "../shim/errors";
+import { currentPluginId, setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
 import { Harvest } from "../shim/harvest";
 import { NoticeLog } from "../shim/notice";
-import { HostErrors } from "../shim/errors";
 import { Workspace } from "../shim/workspace";
 import { createObsidianApi } from "../shim/api";
 import { installGlobals } from "../shim/globals";
 import { installPluginHost } from "../shim/plugin";
 import { forwardingSink } from "../runtime/forwarding-sink";
+import type { ConfirmBroker } from "../shim/file-manager";
 import type { RequestSink } from "../client/request-sink";
 import type { VaultdClient } from "../client/client";
 import type { Clock, HostConfig } from "../config";
@@ -97,6 +104,17 @@ export interface HostAssembly {
   readonly errors: HostErrors;
   /** The headless config directory this host runs plugins out of. */
   readonly dir: HeadlessConfigDir;
+  /**
+   * How a plugin asks a human a question, when a client is attached to answer.
+   *
+   * Built here and handed to two places: the `App`, so a `SuggestModal` several
+   * layers down can reach it without every call site passing one, and the
+   * `FileManager`, whose `promptForDeletion` is the only shim surface that asks
+   * a question of its own. Task 22's `main.ts` hands the same object to
+   * `HostServer.attachWiring`, which is what puts the three `host.*interaction`
+   * operations on the socket.
+   */
+  readonly broker: InteractionBroker;
   /**
    * The GUI overlap check, wired to the config re-reads and **not started**.
    *
@@ -312,6 +330,11 @@ export function assembleShim(deps: {
   // Third, because it reads both of the others: the vault's index for the files
   // it moves and the metadata cache's resolver for the links it composes.
   const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
+  // How a plugin asks a human. Built before the `App`'s surfaces are installed
+  // because two of them need it, and it reads nothing during construction.
+  const broker = new InteractionBroker({ config, errors });
+  installInteractionBroker(app, broker);
+  fileManager.setConfirmBroker(confirmAdapter(broker, queue));
   // On this host's clock, so a notice's `atUnixMs` is the same time base every
   // other timestamp in this host is measured against.
   const noticeLog = new NoticeLog({ clock });
@@ -383,6 +406,7 @@ export function assembleShim(deps: {
     harvest,
     errors,
     dir,
+    broker,
     coexistence,
     globals,
     noticeLog,
@@ -410,6 +434,64 @@ export function assembleShim(deps: {
     },
   };
 }
+
+/**
+ * `FileManager.promptForDeletion`'s question, as an interaction prompt.
+ *
+ * **The one caller that deliberately swallows the typed failure.** Every other
+ * consumer of the broker lets `InteractionUnavailable` reach the plugin,
+ * because "nobody could be asked" is not an answer to "which of these did you
+ * pick". For a confirmation it is: nobody was asked, so nothing was confirmed,
+ * and `false` is exactly what the caller's own `if (confirmed)` branch should
+ * see. `promptForDeletion` never deletes silently and never throws, which is
+ * what keeps folder-notes' delete path a no-op rather than a crash.
+ *
+ * **The compatibility report now reads `implemented` where it used to read
+ * `safe_stub`**, and that is the truer reading rather than a loss. Before Task
+ * 18 a host with no broker installed took `promptForDeletion`'s unattended
+ * branch, which recorded a stub hit; now the surface is really reached and
+ * really asks, and whether a human was there is a fact about the session rather
+ * than about the plugin's compatibility. (The recorder tallies one policy per
+ * symbol-and-plugin pair, so a second reading for the same call could not have
+ * been recorded alongside the first in any case.)
+ *
+ * Attribution is the queue's, falling back to the ambient plugin id: a
+ * `promptForDeletion` is `async` all the way down, so the synchronous window
+ * `currentPluginId()` reads may have closed by the time the confirm is raised,
+ * while the dispatch queue still names the entry point it is inside.
+ */
+function confirmAdapter(broker: InteractionBroker, queue: DispatchQueue): ConfirmBroker {
+  return {
+    async confirm(request): Promise<boolean> {
+      const pluginId = queue.inFlight()?.pluginId ?? currentPluginId() ?? HOST_PLUGIN_ID;
+      try {
+        const answer = await broker.ask({
+          pluginId,
+          kind: "confirm",
+          prompt: request.message,
+          // Pinned, and in this order: `choice_index` 0 is yes and anything
+          // else — including a cancel — is no, so a client that answers with an
+          // index it did not think about answers "no".
+          items: CONFIRM_ITEMS,
+        });
+        return answer.cancelled !== true && answer.choiceIndex === 0;
+      } catch (error) {
+        // `InteractionUnavailable` — nobody was asked — is the deliberate
+        // swallow. A timeout is swallowed the same way and for the same
+        // reason: somebody was asked and did not answer, which is still not a
+        // confirmation, and this surface's contract is `Promise<boolean>` — a
+        // rejection would crash a delete path that has a perfectly good answer
+        // available. Anything else is a bug in this host and is not hidden.
+        if (error instanceof InteractionUnavailable) return false;
+        if (error instanceof InteractionTimeout) return false;
+        throw error;
+      }
+    },
+  };
+}
+
+/** What a confirm prompt offers, in the order the answer mapping reads them. */
+const CONFIRM_ITEMS: readonly string[] = ["confirm", "cancel"];
 
 /**
  * Obsidian's `app.appId`: sixteen hex characters, stable for a vault root.

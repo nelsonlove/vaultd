@@ -43,6 +43,15 @@
  * trusting — can tell "the host could not read its own config" apart from "this
  * plugin keeps breaking", and never quarantines anything on the strength of the
  * former.
+ *
+ * `interaction` is a brokered prompt that failed with nobody looking: most
+ * plugins call `modal.open()` without awaiting it, so a timeout or a detach has
+ * no caller left to reach and would otherwise be a process-level
+ * `unhandledRejection` naming nothing. It is attributed to the plugin that
+ * asked — so `lastError` can say what went wrong — and, like `config`, it is
+ * **never counted** toward a quarantine: a human who closed their laptop is not
+ * evidence that a plugin is broken, and five abandoned prompts would otherwise
+ * disable one that works. See `runtime/quarantine.ts`.
  */
 export type HostErrorPhase =
   | "onload"
@@ -52,7 +61,8 @@ export type HostErrorPhase =
   | "plugin-data"
   | "command"
   | "event"
-  | "config";
+  | "config"
+  | "interaction";
 
 /**
  * The plugin id the host reports its own failures under.

@@ -37,6 +37,7 @@ import type { MirrorEntry } from "../mirror/types";
 import type { PluginRunState } from "../runtime/lifecycle";
 import type { NoticeEntry } from "../shim/notice";
 import type { OverlapReport } from "../pluginset/coexistence";
+import type { PromptKind, PromptRequest } from "../interaction/broker";
 import type { TreeEntryDto } from "../client/protocol";
 import type { ApiPolicy } from "../shim/policy";
 
@@ -223,6 +224,22 @@ export interface PolicyUseWire {
   hits: number;
 }
 
+/**
+ * The `host.interaction_request` event's value.
+ *
+ * `items` is copied rather than passed through: the broker holds the array for
+ * the life of the prompt and a client-shaped object handed a live reference
+ * would let anything that mutated it change a question already asked.
+ */
+export interface InteractionRequestWire {
+  prompt_id: string;
+  plugin_id: string;
+  kind: PromptKind;
+  prompt: string;
+  items: string[];
+  timeout_ms: number;
+}
+
 export function toWirePluginState(state: PluginState): PluginStateWire {
   return {
     id: state.id,
@@ -305,6 +322,17 @@ export function toWirePolicyUse(use: {
   hits: number;
 }): PolicyUseWire {
   return { symbol: use.symbol, policy: use.policy, plugin_id: use.pluginId, hits: use.hits };
+}
+
+export function toWireInteractionRequest(request: PromptRequest): InteractionRequestWire {
+  return {
+    prompt_id: request.promptId,
+    plugin_id: request.pluginId,
+    kind: request.kind,
+    prompt: request.prompt,
+    items: [...request.items],
+    timeout_ms: request.timeoutMs,
+  };
 }
 
 /**

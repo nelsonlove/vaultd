@@ -79,7 +79,7 @@ import { join } from "node:path";
 import { HOST_PLUGIN_ID } from "../shim/errors";
 import { OverlapRefused, overlapRefusalMessage } from "../pluginset/coexistence";
 import { TFile } from "../shim/files";
-import { failureFromReport } from "./quarantine";
+import { UNCOUNTED_PHASES, failureFromReport } from "./quarantine";
 import { mapConcurrent } from "../mirror/mirror";
 import type { App } from "../shim/app";
 import type { BundleLoader } from "./loader";
@@ -851,7 +851,15 @@ export class LifecycleSequencer {
   /** Count one failure against a plugin — unless it is the host's own. */
   private recordFailure(report: HostErrorEntry, detail?: string): void {
     const failure = failureFromReport(report, this.deps.config.clock.now(), detail);
-    if (failure === null) return;
+    if (failure === null) {
+      // An uncounted phase — a brokered prompt that nobody answered — is still
+      // *this plugin's* last failure, and is still worth being able to name.
+      // Recorded without being counted: see `UNCOUNTED_PHASES`.
+      if (UNCOUNTED_PHASES.has(report.phase) && report.pluginId !== HOST_PLUGIN_ID) {
+        this.deps.quarantine.note(report.pluginId, report.error);
+      }
+      return;
+    }
     void this.deps.quarantine.record(failure).catch((error: unknown) => {
       // Task 14b's carry: a rejecting `onQuarantine` propagates *after* the
       // transition, so the plugin is already quarantined and this cannot loop

@@ -349,18 +349,23 @@ describe("host.* operations", () => {
     try {
       await harness.lifecycle.start();
       const client = await harness.connectClient();
+      // **Three, not six.** The interaction trio left this list in Task 18,
+      // which built the broker and attaches it in every assembly: an operation
+      // whose service exists answers it. These three still wait on Task 20b's
+      // plugin config service and compatibility detector, and each names the
+      // one it is missing rather than the set.
       for (const method of [
-        "host.attach_interaction",
-        "host.detach_interaction",
         "host.get_plugin_config",
         "host.set_plugin_config",
         "host.compat_report",
-        "host.respond_interaction",
       ]) {
         await expect(client.call(method, { id: "demo" })).rejects.toMatchObject({
           code: "host_not_ready",
         });
       }
+      // And the trio answers, on the same host, with the same flag unset.
+      await expect(client.call("host.attach_interaction", {})).resolves.toEqual({ attached: true });
+      await expect(client.call("host.detach_interaction", {})).resolves.toEqual({ attached: false });
     } finally {
       await harness.stop();
     }

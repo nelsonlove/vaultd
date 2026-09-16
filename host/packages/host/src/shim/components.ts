@@ -26,9 +26,12 @@
 import { Component } from "./plugin";
 import { Scope } from "./keymap";
 import { StubEl } from "./dom";
-import { declarePolicy, recordUse, stub, unsupported } from "./policy";
+import { HOST_PLUGIN_ID } from "./errors";
+import { InteractionUnavailable, interactionBrokerFor } from "../interaction/broker";
+import { currentPluginId, declarePolicy, recordUse, stub, unsupported } from "./policy";
 import { prepareFuzzySearch, sortSearchResults } from "./search";
 import type { App } from "./app";
+import type { InteractionBroker, PromptKind } from "../interaction/broker";
 import type { Plugin } from "./plugin";
 import type { SearchResult } from "./search";
 
@@ -780,8 +783,18 @@ export class Modal {
     return this;
   }
 
-  /** There is no window to show it in. Names the subclass that asked. */
-  open(): void {
+  /**
+   * There is no window to show it in. Names the subclass that asked.
+   *
+   * Declared `void | Promise<void>` although this one only ever throws, because
+   * the two suggester subclasses override it with a promise that settles when
+   * the client answers — and a base declared bare `void` would make each of
+   * those overrides a type error. Obsidian's own is `void`, which **accepts** a
+   * promise at every call site a plugin writes: `modal.open()` on its own
+   * behaves exactly as it always did, and an `await` — what a plugin that wants
+   * the answer writes — now means something.
+   */
+  open(): void | Promise<void> {
     unsupported("Modal.open", this.constructor.name);
   }
 
@@ -839,14 +852,32 @@ export class SuggestModal<T> extends Modal {
   }
 
   /**
-   * The showing half, which does not exist, named as itself.
+   * The showing half, brokered rather than refused.
    *
-   * Inherited from {@link Modal.open} the refusal would say `Modal.open`, and a
-   * report reader would be told a plugin opened a modal when what it opened was
-   * a picker — the one Task 18 can broker.
+   * **This is the one modal a headless host can honestly open**, because the
+   * showing is the only part it is missing: the base owns the rendering, the
+   * subclass supplies `getSuggestions` and `onChooseSuggestion`, and everything
+   * between them is a list of strings and an index. So `open()` asks
+   * `getSuggestions("")` — the unfiltered list, which is what a picker shows
+   * before anybody types — hands it to whoever is attached, and runs the
+   * subclass's own choice handler with the item that came back.
+   *
+   * The promise settles when the choice handler has run, so a plugin that
+   * awaits it resumes after its own `onChooseSuggestion`, exactly as it would
+   * after Obsidian's dialog closed. `onClose()` runs either way, because a
+   * plugin's cleanup is on it.
+   *
+   * It returns a promise where Obsidian's returns `void`, which is a **widening
+   * a caller cannot notice**: `void` accepts a promise, an `open()` nobody
+   * awaits behaves as it always did, and an `await` — which is what a plugin
+   * that wants the answer writes — now means something. See
+   * {@link brokerChoice} for the rejection every non-awaiting caller is spared.
    */
-  override open(): void {
-    unsupported("SuggestModal.open", this.constructor.name);
+  override open(): Promise<void> {
+    return brokerChoice(this, "SuggestModal.open", "suggest", {
+      values: this.getSuggestions(""),
+      label: displayText,
+    });
   }
 
   setPlaceholder(placeholder: string): this {
@@ -901,8 +932,25 @@ export class FuzzySuggestModal<T> extends SuggestModal<FuzzyMatch<T>> {
     recordUse("FuzzySuggestModal");
   }
 
-  override open(): void {
-    unsupported("FuzzySuggestModal.open", this.constructor.name);
+  /**
+   * The same brokerage as {@link SuggestModal.open}, over `getItems()`.
+   *
+   * `getItems()` rather than `getSuggestions("")`, which is what the base would
+   * have called: the fuzzy `getSuggestions` runs every item past
+   * `prepareFuzzySearch("")` and keeps only what matched, and an empty query is
+   * not a question a scorer has a useful answer to. The unfiltered list, in the
+   * plugin's own order, is what a picker shows before anybody types.
+   *
+   * Each item is wrapped as the {@link FuzzyMatch} the choice path expects, so
+   * a subclass that overrode `onChooseSuggestion` rather than `onChooseItem` is
+   * still the one that runs.
+   */
+  override open(): Promise<void> {
+    const items = this.getItems();
+    return brokerChoice(this, "FuzzySuggestModal.open", "fuzzy_suggest", {
+      values: items.map((item) => ({ item, match: { score: 0, matches: [] } })),
+      label: (value) => this.getItemText(value.item),
+    });
   }
 
   /** A plugin overrides this. */
@@ -943,6 +991,102 @@ export class FuzzySuggestModal<T> extends SuggestModal<FuzzyMatch<T>> {
   override onChooseSuggestion(item: FuzzyMatch<T>, event: unknown): void {
     this.onChooseItem(item.item, event);
   }
+}
+
+/**
+ * What a brokered picker is asked about: the choices, and what to call each.
+ *
+ * `values` may be a promise, because `SuggestModal.getSuggestions` may be — a
+ * plugin that searches the vault for its suggestions returns one, and a version
+ * of this that only accepted an array would broker a `Promise` object as the
+ * single choice.
+ */
+interface BrokeredChoices<T> {
+  readonly values: T[] | Promise<T[]>;
+  readonly label: (value: T) => string;
+}
+
+/**
+ * Ask whoever is attached to pick one of `choices`, and run the modal's own
+ * choice path with what came back.
+ *
+ * **The rejection is handled here whether or not the plugin handles it**, which
+ * is the one thing this helper exists for. Most plugins call `modal.open()`
+ * without awaiting it — Obsidian's returns `void`, so there was never anything
+ * to await — and a timeout or a detach on an ignored promise is a process-level
+ * `unhandledRejection` naming nothing. Attaching a handler to the promise this
+ * returns marks it handled without consuming it: a plugin that *does* await
+ * still sees the rejection on its own path, and one that does not gets the
+ * failure attributed in the host's error sink under the `interaction` phase,
+ * which is visible and never counts toward a quarantine.
+ *
+ * Attribution is read **before the first await**. `enterPluginSync` closes its
+ * window when the command callback returns, not when its promise settles, so
+ * `currentPluginId()` is the asking plugin here and nobody a turn later.
+ */
+function brokerChoice<T>(
+  modal: SuggestModal<T>,
+  symbol: string,
+  kind: PromptKind,
+  choices: BrokeredChoices<T>,
+): Promise<void> {
+  const pluginId = currentPluginId();
+  recordUse(symbol);
+  const broker = interactionBrokerFor(modal.app);
+  const settled = askAndChoose(modal, kind, pluginId, broker, choices);
+  // Never a floating rejection. See the note above: this does not consume it.
+  void settled.catch((error: unknown) => {
+    broker?.reportUnobserved(pluginId, error);
+  });
+  return settled;
+}
+
+async function askAndChoose<T>(
+  modal: SuggestModal<T>,
+  kind: PromptKind,
+  pluginId: string | null,
+  broker: InteractionBroker | null,
+  choices: BrokeredChoices<T>,
+): Promise<void> {
+  if (broker === null) {
+    throw new InteractionUnavailable(
+      `${modal.constructor.name} was built against an App this host never assembled, so there ` +
+        "is no channel to ask a human through",
+    );
+  }
+  const values = await choices.values;
+  const answer = await broker.ask({
+    pluginId: pluginId ?? HOST_PLUGIN_ID,
+    kind,
+    prompt: promptTextOf(modal),
+    items: values.map((value) => choices.label(value)),
+  });
+  // Cancelled, or answered with no choice at all: the modal closes, `onClose`
+  // runs, and no choice handler is called — which is exactly what pressing
+  // escape does in Obsidian, and what a plugin's own cleanup expects.
+  const index = answer.cancelled === true ? undefined : answer.choiceIndex;
+  const chosen = index === undefined ? undefined : values[index];
+  // Closed **before** the handler, which is Obsidian's own order: its
+  // `selectSuggestion` closes and then chooses, and a plugin whose handler
+  // opens a second modal relies on the first one being gone.
+  modal.close();
+  if (chosen === undefined) return;
+  modal.selectSuggestion(chosen, null);
+}
+
+/**
+ * What to show above the choices.
+ *
+ * The title if the plugin set one, the placeholder if it set that instead, and
+ * the subclass's name when it set neither — because "a picker was opened" is
+ * useless to whoever has to answer it and "QuickAdd's ChoiceSuggester" is not.
+ */
+function promptTextOf(modal: SuggestModal<unknown>): string {
+  const title = modal.titleEl.textContent;
+  if (title !== "") return title;
+  const placeholder = modal.inputEl.getAttr("placeholder");
+  if (placeholder !== null && placeholder !== "") return placeholder;
+  return modal.constructor.name;
 }
 
 /**
@@ -1166,7 +1310,10 @@ function hueToChannel(p: number, q: number, t: number): number {
 // classes themselves are declared by the barrel, from the policy table.
 declarePolicy("Modal.open", "absent");
 declarePolicy("Modal.close", "safe_stub");
-declarePolicy("SuggestModal.open", "absent");
-declarePolicy("FuzzySuggestModal.open", "absent");
+// `implemented`, not `absent`, since Task 18: the showing half is brokered to
+// whoever is attached and the plugin's own choice handler really runs. Only
+// `Modal.open` — a bespoke `onOpen()` UI nothing can intercept — stays absent.
+declarePolicy("SuggestModal.open", "implemented");
+declarePolicy("FuzzySuggestModal.open", "implemented");
 declarePolicy("PopoverSuggest.open", "safe_stub");
 declarePolicy("PopoverSuggest.close", "safe_stub");

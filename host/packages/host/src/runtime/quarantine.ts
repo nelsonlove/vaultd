@@ -32,11 +32,35 @@
  * command invoked with no plugin on the stack). {@link failureFromReport} drops
  * both. A host that quarantined a plugin for its own bug would disable
  * working plugins one at a time until somebody noticed.
+ *
+ * **Uncounted is not the same as unseen.** Task 18 added a third kind: a
+ * brokered prompt that failed with nobody awaiting it (phase `interaction`).
+ * That one really is the plugin's — it asked the question — but it is not
+ * evidence the plugin is broken, because what failed is the human's end of the
+ * channel. So it is dropped from the window like the other two and still
+ * recorded as the plugin's {@link QuarantineTracker.lastError} through
+ * {@link QuarantineTracker.note}: `harness.lastHandlerError` can say what went
+ * wrong, and no number of them ever quarantines anything. See
+ * {@link UNCOUNTED_PHASES}.
  */
 
 import { HOST_PLUGIN_ID } from "../shim/errors";
 import type { HostConfig } from "../config";
-import type { HostErrorEntry } from "../shim/errors";
+import type { HostErrorEntry, HostErrorPhase } from "../shim/errors";
+
+/**
+ * The phases that are a plugin's failure and are still never counted.
+ *
+ * One member today: `interaction`. A brokered prompt fails when the *client*
+ * end goes — a detach, a disconnect, a human who never answered — and counting
+ * that against the plugin that asked would quarantine a working plugin for
+ * something it has no control over. `config` is not here because it is not the
+ * plugin's at all: {@link failureFromReport} drops it on the phase, and nothing
+ * about it is worth recording as any plugin's last error.
+ */
+export const UNCOUNTED_PHASES: ReadonlySet<HostErrorPhase> = new Set<HostErrorPhase>([
+  "interaction",
+]);
 
 /**
  * Re-exported, not re-declared.
@@ -120,6 +144,19 @@ export class QuarantineTracker {
     record.quarantined = true;
     record.reason = [...record.window];
     await this.onQuarantine(failure.pluginId, record.reason);
+  }
+
+  /**
+   * Record a failure as this plugin's last one, and count it against nothing.
+   *
+   * The half of {@link record} that survives for an {@link UNCOUNTED_PHASES}
+   * report: the window is not touched, no threshold can be reached, and a
+   * plugin that is already quarantined is not disturbed — but
+   * {@link lastError} answers, which is what makes an uncounted failure
+   * diagnosable rather than silent.
+   */
+  note(pluginId: string, error: unknown): void {
+    this.recordFor(pluginId).lastError = asError(error);
   }
 
   /** How many failures are inside the window right now. */
@@ -241,7 +278,11 @@ export class QuarantineTracker {
  *
  * Returns `null` for the host's own failures — phase `config`, or the plugin id
  * {@link HOST_PLUGIN_ID} — and a caller that skips the `null` is a caller that
- * never quarantines a plugin for the host's bug.
+ * never quarantines a plugin for the host's bug. It also returns `null` for an
+ * {@link UNCOUNTED_PHASES} report, which **is** a plugin's failure and still
+ * must not be counted; the caller records that one through
+ * {@link QuarantineTracker.note} instead, so it is visible without being
+ * evidence.
  */
 export function failureFromReport(
   report: HostErrorEntry,
@@ -249,6 +290,7 @@ export function failureFromReport(
   detail?: string,
 ): HandlerFailure | null {
   if (report.phase === "config" || report.pluginId === HOST_PLUGIN_ID) return null;
+  if (UNCOUNTED_PHASES.has(report.phase)) return null;
   const label = detail === undefined || detail === "" ? report.phase : `${report.phase}:${detail}`;
   return { pluginId: report.pluginId, label, error: asError(report.error), atUnixMs };
 }

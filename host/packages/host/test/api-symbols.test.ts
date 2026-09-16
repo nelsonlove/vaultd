@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { API_POLICY } from "../src/shim/api";
-import { HeadlessUnsupported } from "../src/shim/policy";
+import { HeadlessUnsupported, policyOf } from "../src/shim/policy";
 import { NetworkRefused, request, requestUrl } from "../src/shim/helpers";
 import { ShimHarness } from "../src/testing/shim-harness";
 import type { SearchResult } from "../src/shim/search";
@@ -336,7 +336,10 @@ describe("implemented barrel symbols", () => {
     // "A modal was opened" is useless in a compatibility report; "quickadd's
     // ChoiceSuggester was opened" is a diagnosis, and Task 18 brokers by name.
     try {
-      modal.open();
+      // `void`: `Modal.open` is declared `void | Promise<void>` since Task 18,
+      // because the suggester subclasses override it with a promise. This one
+      // still only ever throws.
+      void modal.open();
       expect.unreachable("Modal.open did not throw");
     } catch (error) {
       expect(error).toBeInstanceOf(HeadlessUnsupported);
@@ -351,15 +354,21 @@ describe("implemented barrel symbols", () => {
     }).not.toThrow();
   });
 
-  it("names the picker rather than the modal when a suggester is opened", async () => {
+  it("brokers a suggester rather than refusing it, and says so when nobody can answer", async () => {
     const harness = await ShimHarness.withVault({});
     class Picker extends harness.api.FuzzySuggestModal<string> {}
-    try {
-      new Picker(harness.app).open();
-      expect.unreachable("FuzzySuggestModal.open did not throw");
-    } catch (error) {
-      expect((error as HeadlessUnsupported).symbol).toBe("FuzzySuggestModal.open");
-    }
+    // **Not a `HeadlessUnsupported`, since Task 18.** The suggester family is
+    // the one modal shape a headless host can honestly open: the base owns the
+    // rendering and the subclass supplies only a list and a choice handler, so
+    // `open()` brokers to whatever client is attached. This harness has no
+    // socket and therefore nobody attached, which is a different refusal — the
+    // channel is missing, not the surface.
+    await expect(new Picker(harness.app).open()).rejects.toMatchObject({
+      code: "interaction_unavailable",
+    });
+    expect(policyOf("FuzzySuggestModal.open")).toBe("implemented");
+    // A bespoke `Modal.onOpen()` UI stays absent: there is no seam in it.
+    expect(policyOf("Modal.open")).toBe("absent");
   });
 
   it("orders fuzzy matches well enough for a brokered picker", async () => {

@@ -38,8 +38,11 @@ import {
   toWireProtocolHandler,
   toWireTimer,
 } from "./wire";
+import { InteractionUnavailable } from "../interaction/broker";
 import type { App } from "../shim/app";
 import type { ClientSubscriptions } from "./subscriptions";
+import type { HostEvent } from "./subscriptions";
+import type { InteractionBroker, PromptAnswer } from "../interaction/broker";
 import type { CoexistenceMonitor } from "../pluginset/coexistence";
 import type { DispatchQueue } from "../runtime/queue";
 import type { EditorRange } from "../shim/editor";
@@ -100,26 +103,44 @@ export interface HostServerDeps {
 }
 
 /**
- * The three services Task 20b produces, attached as a second object rather than
- * by widening {@link HostServerDeps}.
+ * The late services, attached as a second object rather than by widening
+ * {@link HostServerDeps}.
  *
- * Typed as `unknown` here on purpose: 16a must not declare the shape of an
- * interface task 18 and 20 have not written yet, and a placeholder shape would
- * be a second declaration for 20b to reconcile. What 16a owns is the *state* —
- * attached or not — which is what turns six forward references into a typed
- * `host_not_ready` instead of six missing methods.
+ * **Partial, and merged rather than replaced.** 16a declared all three as one
+ * object because one task was going to produce all three; Task 18 produces the
+ * broker and Task 20b the other two, so an all-or-nothing wiring would force
+ * whichever ran first to invent placeholders for the other's services. Each
+ * field is optional, {@link HostOps.attachWiring} merges what it is given into
+ * what is already attached, and each late operation answers `host_not_ready`
+ * naming **its own** missing service rather than the set.
+ *
+ * `pluginConfig` and `detector` stay `unknown`: this module must not declare
+ * the shape of an interface Task 20b has not written, and a placeholder shape
+ * would be a second declaration for it to reconcile. `broker` is typed, because
+ * it exists.
  */
 export interface HostServerWiring {
-  readonly broker: unknown;
-  readonly pluginConfig: unknown;
-  readonly detector: unknown;
+  readonly broker?: InteractionBroker;
+  readonly pluginConfig?: unknown;
+  readonly detector?: unknown;
 }
 
 /** One connected, authenticated client, as an operation sees it. */
 export interface OpSession {
   /** Identity for the things a client owns: its snapshots and its subscriptions. */
   readonly owner: object;
+  /** What a refusal calls this connection — `host-conn-3`. Never parsed. */
+  readonly label: string;
   readonly subscriptions: ClientSubscriptions;
+  /**
+   * Deliver one event to **this** connection alone.
+   *
+   * Everything else the host emits is a broadcast: an event describes something
+   * that happened to the vault and every subscriber is owed a copy. A prompt is
+   * the other kind — a question addressed to the one client that said it would
+   * answer — so the broker needs a way down one socket rather than all of them.
+   */
+  deliver(event: HostEvent): void;
 }
 
 export type OpHandler = (params: Record<string, unknown>, session: OpSession) => Promise<unknown>;
@@ -136,14 +157,19 @@ const NEEDS_STEADY = new Set([
   "host.disable_plugin",
 ]);
 
-/** The six operations Task 20b wires, with the service each one waits on. */
+/**
+ * The operations still waiting on a service nobody has built, with the service
+ * each one waits on.
+ *
+ * Three rather than six since Task 18: the interaction trio is wired below
+ * against a real broker, and answers `host_not_ready` only when no broker is
+ * attached — which is the same typed state, named for the one service it is
+ * actually missing rather than for the set.
+ */
 const LATE_OPS: ReadonlyArray<readonly [string, string]> = [
   ["host.get_plugin_config", "the plugin config service"],
   ["host.set_plugin_config", "the plugin config service"],
   ["host.compat_report", "the compatibility detector"],
-  ["host.attach_interaction", "the interaction broker"],
-  ["host.detach_interaction", "the interaction broker"],
-  ["host.respond_interaction", "the interaction broker"],
 ];
 
 export class HostOps {
@@ -173,12 +199,44 @@ export class HostOps {
     this.install();
   }
 
+  /**
+   * Attach one or more late services, **merging** into what is already there.
+   *
+   * Merging rather than replacing, because two tasks attach: Task 18 hands over
+   * the interaction broker and Task 20b the plugin config service and the
+   * compatibility detector, in whichever order the caller assembles them. A
+   * replacing version would make the second call silently un-wire the first
+   * one's service, and the symptom would be a `host_not_ready` on an operation
+   * that worked a moment ago.
+   */
   attachWiring(wiring: HostServerWiring): void {
-    this.wiring = wiring;
+    this.wiring = {
+      ...(this.wiring ?? {}),
+      // Spread would let an explicitly-`undefined` field erase an attached
+      // service, which is the one thing merging exists to prevent.
+      ...(wiring.broker === undefined ? {} : { broker: wiring.broker }),
+      ...(wiring.pluginConfig === undefined ? {} : { pluginConfig: wiring.pluginConfig }),
+      ...(wiring.detector === undefined ? {} : { detector: wiring.detector }),
+    };
   }
 
   hasWiring(): boolean {
     return this.wiring !== null;
+  }
+
+  /**
+   * A client's connection closed: release everything it held that outlives the
+   * socket's own teardown.
+   *
+   * The interaction channel is one of those. A client that attached and then
+   * crashed still holds it as far as the broker is concerned, and every prompt
+   * raised afterwards would be delivered into a socket nobody is reading —
+   * so a disconnect is an implicit detach, and detaching fails the prompts it
+   * was holding immediately rather than two minutes later.
+   */
+  connectionGone(session: OpSession): void {
+    this.snapshots.closeAll(session.owner);
+    this.wiring?.broker?.detach(session);
   }
 
   /** Every `host.*` method this build answers, for the protocol document's sake. */
@@ -387,6 +445,70 @@ export class HostOps {
       Promise.resolve(this.snapshots.close(session.owner, stringOf(params, "snapshot_id"))),
     );
 
+    // --- Interaction (Task 18) ------------------------------------------------
+    //
+    // **One holder at a time, and the holder is this connection.** A prompt is
+    // a question addressed to whoever said they would answer it, not a
+    // broadcast, so attaching is exclusive and a second client is refused by
+    // name rather than quietly taking the channel from the first.
+
+    table.set("host.attach_interaction", (_params, session) => {
+      const broker = this.broker("host.attach_interaction");
+      // **A subscription, if this connection holds none.** Events reach a
+      // client through its subscriptions and nowhere else, so a client that
+      // attached without subscribing would have asked for prompts down a
+      // channel it had not opened — and would sit waiting for an event the host
+      // had nowhere to put. Opening one here is what makes "attached" mean
+      // "reachable"; a client that already subscribed keeps the subscriptions
+      // it has and gets no second one.
+      if (session.subscriptions.count() === 0) session.subscriptions.open();
+      try {
+        broker.attach(session);
+      } catch (error) {
+        throw asInteractionRefusal(error);
+      }
+      return Promise.resolve({ attached: true });
+    });
+
+    table.set("host.detach_interaction", (_params, session) => {
+      const broker = this.broker("host.detach_interaction");
+      // A detach from a client that never attached is not an error: it is the
+      // same request ("I am not answering prompts") answered by a host that
+      // already agreed. Every disconnect runs this path too.
+      broker.detach(session);
+      return Promise.resolve({ attached: broker.attached() });
+    });
+
+    table.set("host.respond_interaction", (params, session) => {
+      const broker = this.broker("host.respond_interaction");
+      // **Only the holder answers.** A prompt is delivered to one connection,
+      // so an answer from any other is an answer to a question that client
+      // never saw — and letting it land would let a second client decide what a
+      // plugin does with the first one's human in front of it.
+      if (!broker.isHolder(session)) {
+        throw new HostError(
+          "interaction_unavailable",
+          `${session.label} does not hold the interaction channel, so it has no prompt to ` +
+            "answer; call host.attach_interaction first",
+        );
+      }
+      const promptId = stringOf(params, "prompt_id");
+      const answer = answerOf(params, broker.pendingFor(promptId), promptId);
+      // **Checked here rather than inside the broker**, because refusing a
+      // client's malformed answer and failing a plugin's prompt are two
+      // different events: the first leaves the prompt pending so the client can
+      // answer it properly, the second is the plugin's error path.
+      if (!broker.answer(promptId, answer)) {
+        throw new HostError(
+          "interaction_unavailable",
+          `no prompt "${promptId}" is waiting for an answer: it was answered already, it timed ` +
+            "out, or it belongs to a host that has since restarted",
+          { prompt_id: promptId },
+        );
+      }
+      return Promise.resolve({ prompt_id: promptId });
+    });
+
     for (const [method, service] of LATE_OPS) {
       table.set(method, () => {
         throw new HostError(
@@ -397,6 +519,20 @@ export class HostOps {
         );
       });
     }
+  }
+
+  /** The broker, or the typed state that says which service is missing. */
+  private broker(method: string): InteractionBroker {
+    const broker = this.wiring?.broker;
+    if (broker === undefined) {
+      throw new HostError(
+        "host_not_ready",
+        `"${method}" needs the interaction broker, which has not been attached to this host. ` +
+          "It is a typed, documented state rather than a missing method: the operation exists " +
+          "and will answer once the broker is wired.",
+      );
+    }
+    return broker;
   }
 
   // --- The operations that are more than a lookup -----------------------------
@@ -715,6 +851,57 @@ function stringArrayOf(params: Record<string, unknown>, key: string): string[] |
     throw new HostError("invalid_request", `"${key}" must be an array of strings`);
   }
   return value as string[];
+}
+
+/**
+ * One `host.respond_interaction` body, decoded against the prompt it answers.
+ *
+ * **The range check needs the prompt**, which is why the pending request is
+ * passed in rather than looked up later: `choice_index` means "the nth of the
+ * items this host sent you", so out of range is a malformed parameter in
+ * exactly the way a missing `command_id` is — the client got the request wrong
+ * — and it is refused as `invalid_request` with the prompt left pending, not as
+ * `interaction_unavailable` with the plugin failed. A client that miscounted
+ * can answer again.
+ */
+function answerOf(
+  params: Record<string, unknown>,
+  request: { items: readonly string[] } | null,
+  promptId: string,
+): PromptAnswer {
+  const choiceIndex = numberOf(params, "choice_index");
+  const value = optionalStringOf(params, "value");
+  const cancelled = boolOf(params, "cancelled");
+  if (choiceIndex !== null && request !== null) {
+    if (!Number.isInteger(choiceIndex) || choiceIndex < 0 || choiceIndex >= request.items.length) {
+      throw new HostError(
+        "invalid_request",
+        `"choice_index" must be a whole number from 0 to ${String(request.items.length - 1)}: ` +
+          `prompt "${promptId}" offered ${String(request.items.length)} items and this answer ` +
+          `names ${String(choiceIndex)}`,
+      );
+    }
+  }
+  return {
+    ...(choiceIndex === null ? {} : { choiceIndex }),
+    ...(value === null ? {} : { value }),
+    ...(cancelled === null ? {} : { cancelled }),
+  };
+}
+
+/**
+ * The broker's own refusal, as a wire refusal.
+ *
+ * Anything that is not an {@link InteractionUnavailable} is a bug in this host
+ * rather than something the client did, and is re-thrown so it travels the
+ * ordinary internal-error path instead of being dressed up as a refusal the
+ * client could act on.
+ */
+function asInteractionRefusal(error: unknown): unknown {
+  if (error instanceof InteractionUnavailable) {
+    return new HostError("interaction_unavailable", error.message);
+  }
+  return error;
 }
 
 function stringMapOf(params: Record<string, unknown>, key: string): Record<string, string> {

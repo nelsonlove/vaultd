@@ -50,6 +50,7 @@ import { fs } from "../runtime/fs-access";
 import { noteDto } from "./mirror-harness";
 import { revisionOfSource } from "./daemon-harness";
 import type { HostConfig } from "../config";
+import type { InteractionBroker } from "../interaction/broker";
 import type { App } from "../shim/app";
 import type { CoexistenceMonitor } from "../pluginset/coexistence";
 import type { ObsidianApi } from "../shim/api";
@@ -158,7 +159,12 @@ export class HostHarness extends ShimHarness {
         this.addCommand({
           id: "pick",
           name: "Pick",
-          callback: () => {
+          // **`async`, and it awaits.** `open()` settles when the client
+          // answers, so a callback that did not await it would return before
+          // the prompt was even delivered — and a case asserting on what the
+          // prompt did would be racing the broker rather than testing it. This
+          // is also the shape a real plugin takes when it wants the choice.
+          callback: async () => {
             const modal = new (class extends api.SuggestModal<string> {
               override getSuggestions(): string[] {
                 return ["one", "two"];
@@ -171,7 +177,7 @@ export class HostHarness extends ShimHarness {
                 // Recorded by the broker.
               }
             })(this.app);
-            modal.open();
+            await modal.open();
           },
         });
       }
@@ -314,8 +320,10 @@ export class HostHarness extends ShimHarness {
     // rather than one that started watching when it knocked.
     if (spec.config?.wireLateOps === true) {
       throw new Error(
-        "wireLateOps: true needs Task 20b's broker, plugin config service and detector, none of " +
-          "which exist yet. Leave it false (or unset) and the six late ops answer host_not_ready.",
+        "wireLateOps: true needs Task 20b's plugin config service and detector, neither of which " +
+          "exists yet. Leave it false (or unset) and those three ops answer host_not_ready. The " +
+          "interaction broker is Task 18's and is always attached, so the three interaction ops " +
+          "answer for real whatever this flag says.",
       );
     }
     this.serverValue = new HostServer({
@@ -333,6 +341,12 @@ export class HostHarness extends ShimHarness {
       errors: this.assembly.errors,
       policyRecorder: this.policyRecorder,
     });
+    // **Always**, and not behind `wireLateOps`. The broker is Task 18's and it
+    // is part of every assembly: a host that had one and did not put it on the
+    // socket would refuse `host.attach_interaction` with `host_not_ready` while
+    // holding the very service that refusal names. The other two late services
+    // are Task 20b's and are still absent, which is what the flag is about.
+    this.serverValue.attachWiring({ broker: this.assembly.broker });
   }
 
   /**
@@ -397,8 +411,8 @@ export class HostHarness extends ShimHarness {
   }
 
   /** The modal/suggester broker. **Activated by Task 18.** */
-  get broker(): never {
-    throw notActivated("broker", "18");
+  get broker(): InteractionBroker {
+    return this.assembly.broker;
   }
 
   /** The `--dry-run` gate. **Activated by Task 19.** */
