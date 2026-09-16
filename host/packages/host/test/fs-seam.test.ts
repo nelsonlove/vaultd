@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -13,6 +13,41 @@ import { describe, expect, it } from "vitest";
  */
 const SRC_ROOT = resolve(__dirname, "..", "src");
 const SEAM = join("runtime", "fs-access.ts");
+
+/**
+ * The one file outside `src/` that is allowed to name the fs modules, and why.
+ *
+ * **The watchdog's worker writes the stall report itself, because the main
+ * thread is the thing that is wedged.** It cannot reach the seam: the seam is
+ * TypeScript under `src/`, it lives in another thread, and it is behind the
+ * CommonJS door the write guard patches for the *main* thread. So the worker
+ * names `node:fs` directly.
+ *
+ * The scan above covers `.ts` under `src/`, so this file would have slipped
+ * past it by accident. The case below says so on purpose instead: the worker is
+ * permitted, it is permitted alone, and a second `.js` file that reaches for fs
+ * turns this assertion red rather than going unnoticed.
+ */
+const PACKAGE_ROOT = resolve(__dirname, "..");
+const WORKER = join("worker", "watchdog-worker.js");
+
+/**
+ * Directories the ban does not speak for: build output, dependencies, and the
+ * test tree — whose `.js` files are *fixtures* rather than host code (a spawned
+ * stand-in daemon, plugin bundles compiled as a browser would compile them).
+ */
+const NOT_HOST_CODE = new Set(["node_modules", "dist", "test"]);
+
+function javascriptFilesUnder(dir: string): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (NOT_HOST_CODE.has(entry.name)) continue;
+      found.push(...javascriptFilesUnder(join(dir, entry.name)));
+    } else if (entry.name.endsWith(".js")) found.push(join(dir, entry.name));
+  }
+  return found.sort();
+}
 
 /**
  * Two kinds of ban, because there are two kinds of escape.
@@ -135,6 +170,28 @@ describe("the host has one fs seam", () => {
         );
       }
     }
+  });
+});
+
+describe("the one file outside src that may name the fs modules", () => {
+  it("is the watchdog's worker, and it is the only one", () => {
+    const worker = join(PACKAGE_ROOT, WORKER);
+    expect(existsSync(worker), `${worker} is the watchdog's worker and must exist`).toBe(true);
+    // It names them **on purpose**: the report is written from the healthy
+    // thread, because the thread being reported on cannot write anything.
+    expect(readFileSync(worker, "utf8")).toContain("node:fs");
+    const namers = javascriptFilesUnder(PACKAGE_ROOT)
+      .filter((file) => readFileSync(file, "utf8").includes("node:fs"))
+      .map((file) => relative(PACKAGE_ROOT, file));
+    expect(namers).toEqual([WORKER]);
+  });
+
+  it("sees a tree worth checking", () => {
+    // Guards the instrument, like the `src` walk above: a mis-rooted or
+    // directory-pruned walk would make the assertion pass without checking
+    // anything.
+    const files = javascriptFilesUnder(PACKAGE_ROOT).map((file) => relative(PACKAGE_ROOT, file));
+    expect(files).toContain(WORKER);
   });
 });
 

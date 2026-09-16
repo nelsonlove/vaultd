@@ -27,11 +27,35 @@
 
 import { enterPlugin, enterPluginSync } from "../shim/policy";
 
+export interface DispatchQueueOptions {
+  /**
+   * Called on every task boundary, whichever serialization the task ran under.
+   *
+   * **The seam the wedged-thread watchdog stamps through**, and a hook rather
+   * than an import because the dependency only runs one way: the watchdog knows
+   * what a dispatch queue is, and the queue must not have to know what a
+   * watchdog is. `src/testing/assemble.ts` is what ties the two together, and
+   * nothing here ever calls it.
+   *
+   * The reason a queue stamps at all: a host saturated with plugin work
+   * services no interval, so the heartbeat stops even though the loop is
+   * perfectly healthy — and the busiest host in the fleet would be the one
+   * reporting itself wedged. A task boundary is the other proof of life, and it
+   * is the one a busy host produces most often.
+   *
+   * **It must not throw.** It is called from a `finally`, so a hook that threw
+   * would replace the answer — or the failure — the task was about to give.
+   */
+  readonly afterTask?: () => void;
+}
+
 export class DispatchQueue {
   private tail: Promise<void> = Promise.resolve();
   private depthValue = 0;
   private running: { pluginId: string | null; label: string } | null = null;
   private readonly pathLocks = new Map<string, Promise<void>>();
+
+  constructor(private readonly options: DispatchQueueOptions = {}) {}
 
   /**
    * Queue one plugin entry point behind everything already queued.
@@ -51,6 +75,7 @@ export class DispatchQueue {
         // first, so a later `.finally` would null out the *next* task's entry.
         this.running = null;
         this.depthValue -= 1;
+        this.boundary();
       }
     });
     this.tail = result.then(
@@ -85,6 +110,7 @@ export class DispatchQueue {
     } finally {
       this.running = outer;
       this.depthValue -= 1;
+      this.boundary();
     }
   }
 
@@ -107,6 +133,7 @@ export class DispatchQueue {
         return await task();
       } finally {
         this.depthValue -= 1;
+        this.boundary();
       }
     });
     const settled = result.then(
@@ -120,6 +147,16 @@ export class DispatchQueue {
       if (this.pathLocks.get(path) === settled) this.pathLocks.delete(path);
     });
     return result;
+  }
+
+  /**
+   * One task boundary, announced to whoever asked to hear about them.
+   *
+   * See {@link DispatchQueueOptions.afterTask}: no hook is the ordinary case,
+   * and the queue's own behaviour does not depend on one being there.
+   */
+  private boundary(): void {
+    this.options.afterTask?.();
   }
 
   /** How many tasks are queued or running, across both serializations. */

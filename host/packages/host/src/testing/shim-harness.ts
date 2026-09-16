@@ -770,6 +770,14 @@ function configFor(options: ShimHarnessOptions): Partial<HostConfig> {
     // `config: { allowNetwork: true }` deliberately, and then owns the
     // consequence. The spread below is what lets it.
     allowNetwork: false,
+    // **No harness spawns a watchdog thread.** Production defaults to 30 s and
+    // the assembler builds one whenever this is positive; a suite that spawned
+    // a worker thread per assembled host would pay for a component none of its
+    // cases are about, and would have a thread to account for in every file.
+    // `test/watchdog.test.ts` builds its own directly, and a case that wants the
+    // assembled one passes a threshold deliberately — the spread below is what
+    // lets it.
+    watchdogThresholdMs: 0,
     ...(options.config ?? {}),
   };
 }

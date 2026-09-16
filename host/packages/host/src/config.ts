@@ -89,6 +89,18 @@ export interface HostConfig {
    */
   readonly allowNetwork: boolean;
   readonly promptTimeoutMs: number;
+  /**
+   * How long the main loop may go without stamping before the watchdog's worker
+   * thread writes a stall report. `0` disables the watchdog entirely.
+   *
+   * Thirty seconds because the thing being caught is a *wedge* — a synchronous
+   * loop, a blocking call, a plugin that never returns — and not slowness. A
+   * host under load stamps late; a host that is stuck stamps never, and the gap
+   * between those two is seconds rather than milliseconds. See
+   * `runtime/watchdog.ts`, which also explains why this is the one component
+   * with a real timer in it.
+   */
+  readonly watchdogThresholdMs: number;
   readonly quarantineFailures: number;
   readonly quarantineWindowMs: number;
   readonly overlapPollMs: number;
@@ -295,6 +307,7 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     // so no test run can make a request, whatever bundle it loads.
     allowNetwork: true,
     promptTimeoutMs: 120_000,
+    watchdogThresholdMs: 30_000,
     quarantineFailures: 5,
     quarantineWindowMs: 60_000,
     overlapPollMs: 60_000,

@@ -15,6 +15,58 @@ import { describe, expect, it } from "vitest";
 
 import { HostHarness } from "../src/testing/host-harness";
 
+describe("the idle census after a rollback", () => {
+  it("leaves no timer behind when a plugin's onload throws", async () => {
+    // **Task 13's carry: a rolled-back plugin is a plugin that costs nothing.**
+    // The idle-cost census counts what a loaded plugin leaves armed, and a
+    // plugin whose `onload` threw is not loaded — so a timer of its still
+    // firing would be charged to a plugin the host says it does not have, and
+    // would go on waking the process for the life of it.
+    //
+    // Both kinds are armed here, because the rollback has to reach both through
+    // different machinery: `Component.unload` disarms what the plugin handed to
+    // `registerInterval`, and the loader's own sweep disarms what it never did.
+    // Obsidian cannot reach the second kind at all; this host owns the clock, so
+    // it can.
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: [],
+      plugins: {
+        greedy: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              this.registerInterval(harness.window.setInterval(() => undefined, 200));
+              // Never registered: a bare interval, the shape a bundle writes
+              // when it is not thinking about teardown.
+              harness.window.setInterval(() => undefined, 300);
+              await Promise.resolve();
+              throw new Error("boom during onload");
+            }
+          },
+      },
+    });
+    try {
+      // **Enabled late rather than at startup, so the baseline is the host's.**
+      // `start()` arms the coexistence poll — a timer of the host's own, which
+      // has nothing to do with this plugin — so a baseline taken before it
+      // would be measuring the startup rather than the rollback.
+      await harness.lifecycle.start();
+      const baseline = harness.clock.armed();
+      await expect(harness.lifecycle.enableLate("greedy")).rejects.toThrow(/could not be enabled/);
+      // The load really failed and was really rolled back — without this the
+      // assertions below would hold for a plugin that never ran.
+      expect(harness.lifecycle.loadFailures().get("greedy")).toContain("rolled back");
+      expect(harness.app.plugins.getPlugin("greedy")).toBeNull();
+      // Nothing armed, and nothing left in the census for a plugin the host no
+      // longer has.
+      expect(harness.clock.armed()).toBe(baseline);
+      expect(harness.harvest.timers().filter((timer) => timer.pluginId === "greedy")).toEqual([]);
+    } finally {
+      await harness.stop();
+    }
+  });
+});
+
 describe("lifecycle traps", () => {
   it("survives the folder-notes tabManager trap: rename after layoutReady", async () => {
     const harness = await HostHarness.create({

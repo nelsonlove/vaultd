@@ -33,6 +33,8 @@ import { PluginRegistry } from "../shim/plugin-registry";
 import { ShimEventBus } from "../shim/events";
 import { MetadataCache } from "../shim/metadata-cache";
 import { DispatchQueue } from "../runtime/queue";
+import { watchdogFor } from "../runtime/watchdog";
+import type { Watchdog } from "../runtime/watchdog";
 import { HOST_PLUGIN_ID, HostErrors } from "../shim/errors";
 import { currentPluginId, setPolicyRecorder } from "../shim/policy";
 import { Vault } from "../shim/vault";
@@ -88,6 +90,17 @@ export interface HostAssembly {
   readonly mirror: Mirror;
   readonly events: ShimEventBus;
   readonly queue: DispatchQueue;
+  /**
+   * The wedged-thread watchdog, **built and not started**, or `null` when
+   * `config.watchdogThresholdMs` is `0` — which is every harness.
+   *
+   * Starting it is the host lifecycle's call, not the assembler's, for the same
+   * reason the coexistence monitor is handed over unstarted: an assembler that
+   * spawned a worker thread would spawn one in every harness that merely
+   * assembled a host. {@link HostAssembly.teardown} stops it, so nothing that
+   * tears an assembly down leaves a thread behind.
+   */
+  readonly watchdog: Watchdog | null;
   readonly policyRecorder: PolicyRecorder;
   readonly app: App;
   readonly writes: WriteGate;
@@ -339,7 +352,20 @@ export function assembleShim(deps: {
   // frozen barrel, far below anything holding the host — so the recorder every
   // `stub`/`unsupported` hit lands in is installed rather than passed.
   setPolicyRecorder(policyRecorder);
-  const queue = new DispatchQueue();
+  // **Above the queue, because the queue stamps it.** Built rather than
+  // started, and `null` unless `config.watchdogThresholdMs` is positive — which
+  // every harness sets to zero. The hook is how the two are joined: the
+  // watchdog knows what a dispatch queue is, and the queue is not made to know
+  // what a watchdog is. See `runtime/watchdog.ts`.
+  const watchdog = watchdogFor(config, dataDir);
+  const queue =
+    watchdog === null
+      ? new DispatchQueue()
+      : new DispatchQueue({
+          afterTask: () => {
+            watchdog.stamp();
+          },
+        });
   // **Above the write gate, because the gate reads a window of it**, and it can
   // be: the log needs nothing but the clock. It is the host's one notice log in
   // every mode — see the `noticeLog` field on {@link HostAssembly} — and a
@@ -460,6 +486,7 @@ export function assembleShim(deps: {
     mirror,
     events,
     queue,
+    watchdog,
     policyRecorder,
     app,
     writes,
@@ -488,6 +515,13 @@ export function assembleShim(deps: {
       // restored would read a vault this host no longer owns. Idempotent, and a
       // no-op when nothing ever started it.
       coexistence.stop();
+      // **Not awaited, because teardown is synchronous and the stop is not.**
+      // `stop()` clears the heartbeat synchronously and then waits for the
+      // worker thread to exit; the wait is the part nothing here can hold. A
+      // caller that must *prove* the thread is gone awaits `watchdog.stop()`
+      // itself before tearing down — which is what `test/watchdog.test.ts`
+      // does, and it is the only place the proof is the point.
+      void watchdog?.stop();
       // The refusal sink is module-level, like the policy recorder, so a host
       // that went away while still installed would go on collecting the next
       // host's refusals into a report nobody is reading. Only the gate this
