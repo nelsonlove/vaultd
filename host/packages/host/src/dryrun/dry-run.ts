@@ -214,17 +214,40 @@ function isIndexedPath(path: string): boolean {
  * put "worked" in a report for a call that cannot work — which is the one thing
  * a detector must never read.
  *
- * Only the two deletes are listed because they are the two this host's shim
- * really can address at a dot path (`Vault.trash`, `Vault.delete`,
- * `FileManager.trashFile`, `DataAdapter.remove`/`rmdir`). The others are
- * reachable only through paths the index already refuses to hand out, and a
- * speculative refusal for a call nothing can make would be untested code.
+ * **Five of the seven are listed, and the two that are missing are missing
+ * because nothing in this host can reach them at a dot path.** `write_note` and
+ * `patch_frontmatter` are routed away from one before the gate ever sees them:
+ * `DataAdapter.write`/`writeBinary`/`append` branch on `isIndexedNote` and send
+ * `write_file` for a hidden path, and `FileManager.processFrontMatter` takes a
+ * `TFile` the index owns — and the index holds no row for anything hidden. A
+ * refusal for a call nothing can make would be untested code.
+ *
+ * **The other three are reachable, and the route is the adapter.**
+ * `DataAdapter.rename` and `DataAdapter.copy` take the caller's own two paths
+ * with no indexability check and send `rename_note`, `rename_folder` or
+ * `copy_file` straight through. `app.vault.adapter` is an ordinary documented
+ * surface — it is the one `HeadlessConfigDir` itself uses — so a plugin
+ * shuffling a file inside its own cache directory under `.obsidian-headless/`,
+ * or inside `.trash/` or `.obsidian/`, hits exactly this. Until they were
+ * listed here those calls answered a synthetic success and recorded a row
+ * saying the daemon would have done it, for a call the daemon refuses.
+ *
+ * The daemon checks **both ends, source first** (`crates/vault-index/src/mutate.rs`:
+ * "a path the scan never lists is a path this operation cannot address in
+ * either direction"), and so does {@link offendingZonePath}.
  */
-const ZONE_REFUSING: ReadonlySet<string> = new Set(["delete_note", "delete_folder"]);
+const ZONE_REFUSING: ReadonlySet<string> = new Set([
+  "delete_note",
+  "delete_folder",
+  "rename_note",
+  "rename_folder",
+  "copy_file",
+]);
 
 /** Params carry a `path`, or two ends, or neither. Read defensively. */
 interface MutationParams {
   readonly path?: unknown;
+  readonly from?: unknown;
   readonly to?: unknown;
   readonly expected?: unknown;
 }
@@ -284,14 +307,14 @@ export class DryRunGate implements WriteGate {
 
   send<T>(method: string, params: unknown): Promise<T> {
     if (!INTERCEPTED.has(method)) return this.client.request<T>(method, params);
-    const path = pathOf(params);
     // **Refused before it is recorded**, because it did not happen — not even
     // in the pretend sense the other rows describe. A `writes()` row means "the
     // daemon would have done this"; a `zone_violation` means it would have
     // refused, and putting one in the transcript as a recorded write would tell
     // a detector the opposite of the truth.
-    if (ZONE_REFUSING.has(method) && path !== null && !isIndexedPath(path)) {
-      return Promise.reject(zoneViolation(path));
+    if (ZONE_REFUSING.has(method)) {
+      const offending = offendingZonePath(params);
+      if (offending !== null) return Promise.reject(zoneViolation(offending));
     }
     this.recorded.push({
       kind: this.kindOf(method, params),
@@ -460,6 +483,28 @@ function pathOf(params: unknown): string | null {
   const shaped = params as MutationParams | null;
   if (typeof shaped?.path === "string") return shaped.path;
   if (typeof shaped?.to === "string") return shaped.to;
+  return null;
+}
+
+/**
+ * The end of a mutation that lies outside the indexed universe, or `null` when
+ * neither does.
+ *
+ * **Both ends, source first**, which is the daemon's own order: `copy_file`,
+ * `rename_note` and `rename_folder` each check `from` and then `to` before
+ * touching the filesystem, and the error names whichever end tripped first. A
+ * check that read only the destination would let a plugin move a note *out* of
+ * `.trash/` and be told it worked.
+ *
+ * Distinct from {@link pathOf}, which answers "where do the bytes land" for
+ * classification and for the synthetic revision, and therefore prefers the
+ * destination. Two questions, two readings of the same object.
+ */
+function offendingZonePath(params: unknown): string | null {
+  const shaped = params as MutationParams | null;
+  for (const end of [shaped?.path, shaped?.from, shaped?.to]) {
+    if (typeof end === "string" && !isIndexedPath(end)) return end;
+  }
   return null;
 }
 

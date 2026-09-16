@@ -345,9 +345,15 @@ describe("dry-run", () => {
    *
    * `docs/protocol.md`: `create_folder` and `write_file` serve the zone and
    * hidden folders; every other verb refuses them with `zone_violation`. A
-   * synthetic success for a delete that cannot happen puts "worked" in a
+   * synthetic success for a call that cannot happen puts "worked" in a
    * transcript for an operation that would have failed — the one reading a
    * detector must never get.
+   *
+   * Five verbs, not two. The deletes were the obvious pair; the renames and the
+   * copy reach a dot path through `DataAdapter`, which takes the caller's own
+   * two paths with no indexability check — and `app.vault.adapter` is the
+   * ordinary surface a plugin uses to shuffle files inside its own cache
+   * directory.
    */
   it("refuses a delete in an unindexable zone the way the daemon does", async () => {
     const harness = await HostHarness.create({
@@ -371,12 +377,59 @@ describe("dry-run", () => {
         },
       });
     }
+    // A folder rename on a dot path, and the two ends checked source first —
+    // the daemon's own order, so an attempt to move something *out* of a
+    // hidden zone is refused naming the source rather than the destination.
+    for (const [method, from, to, named] of [
+      ["rename_folder", ".trash", ".trash-old", ".trash"],
+      ["rename_folder", "Plain", ".archive", ".archive"],
+    ] as const) {
+      await expect(
+        gate.send(method, { from, to, rewrite_links: true }),
+      ).rejects.toMatchObject({
+        code: "zone_violation",
+        body: {
+          message: `${named} is outside the vault, or is not a valid target for this operation`,
+        },
+      });
+    }
     // Refused, therefore not recorded: a `writes()` row means "the daemon would
     // have done this", and it would not have.
     expect(gate.writes()).toEqual([]);
     // An ordinary delete is still recorded.
     await gate.send("delete_note", { path: "Plain.md", mode: "permanent" });
     expect(gate.writes()).toHaveLength(1);
+  });
+
+  /**
+   * The route that made the gap reachable: `DataAdapter`, which takes the
+   * caller's own two paths with no indexability check.
+   *
+   * Driven through the shim rather than through the gate, because "a plugin can
+   * reach this" is the whole finding — a unit call on the gate would prove the
+   * refusal without proving it is ever asked for.
+   */
+  it("refuses an adapter rename or copy inside a hidden zone", async () => {
+    const harness = await HostHarness.create({
+      vault: {}, enabled: [], config: { dryRun: true },
+    });
+    const adapter = harness.vault.adapter;
+    const expected = {
+      code: "zone_violation",
+      message:
+        "zone_violation: .hidden/a.md is outside the vault, or is not a valid target for this operation",
+      body: {
+        code: "zone_violation",
+        message: ".hidden/a.md is outside the vault, or is not a valid target for this operation",
+      },
+    };
+    await expect(adapter.rename(".hidden/a.md", ".hidden/b.md")).rejects.toMatchObject(expected);
+    await expect(adapter.copy(".hidden/a.md", ".hidden/b.md")).rejects.toMatchObject(expected);
+    // Nothing recorded and nothing forwarded: the daemon would have refused
+    // both, so a transcript saying otherwise would be worse than no transcript.
+    expect(harness.dryRun.writes()).toEqual([]);
+    expect(harness.daemonMethodsSeen()).not.toContain("rename_note");
+    expect(harness.daemonMethodsSeen()).not.toContain("copy_file");
   });
 
   /**
