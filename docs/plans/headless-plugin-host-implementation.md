@@ -8389,6 +8389,8 @@ git commit -m "feat(host): detect plugin compatibility by bundle scan and runtim
 
 > **Amended 2026-09-16 (RULING, Task 18).** The three interaction ops and the `host.interaction_request` event are wired by Task 18 (see its amendment); this task attaches `{ pluginConfig, detector }` and its interaction cases are pins of Task 18's behaviour, so only the config and detector cases fail with `host_not_ready` on the first run.
 
+> **Amended 2026-09-16 (CARRY from the Task 18 review, interaction delivery under lag).** A prompt's `host.interaction_request` rides the attached client's subscription queue, so a client that has fallen behind can have the request collapsed into `subscriber_lag` / `resync_required`. Task 18 ships the interim: delivery reports whether every subscription took the line, and a prompt whose delivery was collapsed fails at once with `interaction_unavailable` instead of waiting the full `promptTimeoutMs`. The durable fix is protocol surface for this task or Task 22: a client treats `resync_required` as "re-ask what is pending", backed by a `host.list_interactions` op that returns the broker's `pending()` rows. Note also that attaching subscribes the prompt client to the whole event stream, which is what makes it the likeliest client to lag.
+
 This completes Task 16a. The six ops below all need a service that did not exist at 16a: the broker (Task 18), the config service (Task 17), and the detector (Task 20). Rather than let 16a take forward references, the server exposes `attachWiring(...)` and those ops answer `host_not_ready` until it is called; this task calls it and makes them real. Nothing about the wire contract changes — it was pinned in full at 16a and this task implements the rows it marked.
 
 **Files:**
