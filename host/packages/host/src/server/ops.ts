@@ -59,6 +59,7 @@ import type { PluginState, PositionWire, SelectionWire } from "./wire";
 import type { PolicyRecorder } from "../shim/policy";
 import type { QuarantineTracker } from "../runtime/quarantine";
 import type { RequestSink } from "../client/request-sink";
+import type { WriteGate } from "../dryrun/dry-run";
 
 /** The protocol version this host speaks — `vaultd`'s, because it is the same. */
 export const HOST_PROTOCOL_VERSION = 1;
@@ -91,6 +92,17 @@ export interface HostServerDeps {
   readonly harvest: Harvest;
   readonly mirror: Mirror;
   readonly client: RequestSink;
+  /**
+   * The same {@link WriteGate} every shim surface writes through.
+   *
+   * Here because the non-`host.` road below is a **write path too**: a client's
+   * own `write_note` is proxied to the daemon by this host, and a host
+   * answering `dry_run: true` on `host.hello` that then let that write land
+   * would be a dry run that writes — the one failure this mode exists to
+   * prevent. Optional so a caller that predates it keeps working; it defaults
+   * to forwarding, which is what the proxy always did.
+   */
+  readonly writes?: WriteGate;
   readonly quarantine: QuarantineTracker;
   readonly coexistence: CoexistenceMonitor;
   readonly noticeLog: NoticeLog;
@@ -281,9 +293,21 @@ export class HostOps {
    * The three-way split is the multiplexing rule: a `host.` method the table
    * knows is answered here, a `host.` method it does not know is
    * `invalid_request`, and everything else is the daemon's.
+   *
+   * **"The daemon's" goes through the write gate, not around it.** The gate
+   * forwards every verb that is not a mutation, so a client's reads reach the
+   * daemon exactly as they always did; a client's `write_note` under
+   * `--dry-run` is recorded instead, with `pluginId: null` because no plugin
+   * asked for it. Before this it was the one mutation path in the process that
+   * bypassed the gate, and `host.hello` was answering `dry_run: true` while it
+   * did. A client that genuinely wants to write has the daemon's own socket.
    */
   async dispatch(method: string, params: unknown, session: OpSession): Promise<unknown> {
-    if (!method.startsWith("host.")) return await this.deps.client.request(method, params);
+    if (!method.startsWith("host.")) {
+      const writes = this.deps.writes;
+      if (writes === undefined) return await this.deps.client.request(method, params);
+      return await writes.send(method, params);
+    }
     const handler = this.table.get(method);
     if (handler === undefined) {
       throw new HostError("invalid_request", `this host has no operation "${method}"`);

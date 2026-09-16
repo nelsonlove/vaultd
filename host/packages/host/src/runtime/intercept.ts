@@ -115,8 +115,13 @@ const REFUSED_BARE: readonly string[] = [
  * **It refuses every requester while installed, not only plugin bundles.** The
  * host's own file-system access is captured at module scope in
  * `runtime/fs-access.ts` and so is unaffected, but anything that reached for
- * one of these lazily during a dry-run would refuse itself. Task 19 owns
- * dry-run and is where that boundary gets drawn properly.
+ * one of these lazily during a dry-run would refuse itself. Task 19 built the
+ * gate and left this boundary where it found it, because nothing in the host
+ * installs this patch yet: `installModuleInterception` has no non-test caller,
+ * so the only thing arming it today is `test/module-intercept.test.ts`. **Task
+ * 22's `main.ts` is where it gets drawn properly** — that is the entry point
+ * that will pass `allowNodeBuiltins: !config.dryRun`, and the first
+ * configuration in which "who is asking" is a question with consequences.
  */
 const REFUSED_UNDER_DRY_RUN: ReadonlySet<string> = new Set([
   ...REFUSED_BARE,

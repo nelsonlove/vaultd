@@ -111,9 +111,21 @@ export interface DryRunRefusalSink {
 
 let refusalSink: DryRunRefusalSink | null = null;
 
-/** Install the sink every {@link refuseInDryRun} hit is tallied into. */
+/**
+ * Install the sink every {@link refuseInDryRun} hit is tallied into.
+ *
+ * **Last installed wins**, like the recorder. One host per process is the
+ * supported shape, so the displacement only happens in a test that builds two
+ * — and {@link currentDryRunRefusalSink} is what lets a gate check whether it
+ * is still the owner before taking the sink back out.
+ */
 export function setDryRunRefusalSink(next: DryRunRefusalSink | null): void {
   refusalSink = next;
+}
+
+/** Who is installed right now. For an owner check on the way out; nothing else. */
+export function currentDryRunRefusalSink(): DryRunRefusalSink | null {
+  return refusalSink;
 }
 
 /**

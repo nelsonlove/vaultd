@@ -123,6 +123,9 @@ export class SettingsHarness extends DaemonHarness {
     };
     this.serveFiles();
     this.ladder = new SchemaLadder(this.dataDir, this.clock);
+    // On the forwarding default deliberately: this harness has no `--dry-run`
+    // mode and its whole subject is what really lands in `data.json`, so a gate
+    // that recorded instead of writing would make every case here vacuous.
     this.dir = new HeadlessConfigDir(this.client, this.config);
     this.harvest = new Harvest();
     this.app = new App({ appId: "settings-harness", appVersion: this.config.appVersion });

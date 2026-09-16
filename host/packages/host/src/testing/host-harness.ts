@@ -343,6 +343,10 @@ export class HostHarness extends ShimHarness {
       harvest: this.harvest,
       mirror: this.mirror,
       client: this.assembly.client,
+      // The same gate every shim surface holds: the server's non-`host.` proxy
+      // is a write path too, and under `--dry-run` a client's own `write_note`
+      // has to be recorded rather than forwarded.
+      writes: this.assembly.writes,
       quarantine: this.quarantine,
       coexistence: this.assembly.coexistence,
       noticeLog: this.noticeLog,

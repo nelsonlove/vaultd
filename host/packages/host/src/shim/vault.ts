@@ -387,6 +387,14 @@ export class Vault extends Events {
     await this.deps.mirror.applyMutation(result.generation, [path]);
     const folder = this.index.sync(path);
     if (folder instanceof TFolder) return folder;
+    // **Under `--dry-run` this is the expected outcome, not a broken host.**
+    // Nothing was created, so `applyMutation` was a no-op and the mirror has no
+    // row — and a plugin whose `onload` makes a folder is ordinary, so throwing
+    // here would fail working plugins for a property of the mode rather than of
+    // the plugin. A detached folder is the same answer this method already
+    // gives for a folder the mirror will never hold. The throw stays for a real
+    // run, where it is a genuine invariant failure worth hearing about.
+    if (this.deps.config.dryRun) return this.index.detachedFolder(path);
     throw new Error(`the daemon created ${path} but the mirror has no folder row for it`);
   }
 

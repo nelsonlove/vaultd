@@ -7,20 +7,38 @@
  * module names what it intercepts and names what it does not, and the host's
  * `docs/protocol-host.md` carries the same two lists for a client to read.
  *
+ * Both lists are enumerated from the code they describe, and
+ * `docs/protocol-host.md`'s `## Dry-run` section carries the same two for a
+ * client to read. A line that says "and so on" belongs in neither.
+ *
  * **Intercepted**
  *
  * - The nine mutating daemon verbs in {@link INTERCEPTED} — recorded, **not**
  *   forwarded, and answered with a response of the shape the daemon would have
  *   sent. A write into the headless config directory is recorded as
  *   `plugin_config`; everything else is `vault`.
+ * - **A connected client's own daemon request**, proxied through this host by
+ *   `server/ops.ts`'s non-`host.` road: it goes through this same gate, so a
+ *   client's `write_note` is recorded (with `pluginId: null`, because no plugin
+ *   asked for it) and never reaches the daemon. Its *reads* still forward. A
+ *   host that answered `dry_run: true` on `host.hello` and then let a client
+ *   mutate the vault through its own socket would be the worst kind of dry run.
  * - `requestUrl` / `request` — refused in `shim/helpers.ts` unless
  *   `--dry-run-allow-network`, and the refusal lands in {@link DryRunGate.refusals}.
  * - `electron.shell.openPath` / `showItemInFolder` / `openExternal` — refused in
  *   `runtime/electron-stub.ts`.
- * - `require` of the file-system modules (both spellings, named by the seam in
- *   `runtime/fs-access.ts`, which is the one file allowed to write them down),
- *   `node:child_process`, `node:http`, `node:https` and `node:net` from a
- *   plugin bundle — refused in `runtime/intercept.ts`.
+ * - A plugin bundle's `require` of thirteen node builtins, **each in both its
+ *   bare and its `node:`-prefixed spelling**, because the two are one module and
+ *   a list naming one is a list a bundle walks around by accident: the two
+ *   file-system modules and their promise variants (spelled by the seam in
+ *   `runtime/fs-access.ts`, the one file allowed to write them down), then
+ *   `child_process`, `http`, `https`, `http2`, `net`, `tls`, `dns`, `dgram`,
+ *   `worker_threads`, `vm` and `inspector`. Refused in `runtime/intercept.ts`,
+ *   which owns the list — if the two ever disagree, that file is right.
+ *   **Pending its production wiring:** `installModuleInterception` has no
+ *   non-test caller yet, so today only `test/module-intercept.test.ts` arms it.
+ *   Task 22's `main.ts` is what makes this surface real in a shipped run, by
+ *   passing `allowNodeBuiltins: !config.dryRun`.
  * - `new Notice(...)` and every log line — recorded, but **in every mode**: the
  *   log is `shim/notice.ts`'s and this gate reads a *window* of it rather than
  *   keeping a second one. See {@link DryRunGate.notices}.
@@ -28,28 +46,44 @@
  * **Not intercepted, by design**
  *
  * - Reads, timers and CPU. A plugin that reads a note under `--dry-run` really
- *   reads it, an interval really fires, and a loop really spins.
+ *   reads it, an interval really fires, and a loop really spins. A change made
+ *   by somebody else still reaches the mirror, too: dry-run is not read
+ *   isolation.
+ * - `localStorage` — `shim/globals.ts` persists it into the host's own data
+ *   directory, not into the vault, and a dry run writes it for real. Plugins
+ *   commonly keep state there, so a run that looks like it changed nothing may
+ *   still have changed that.
  * - Any route to the file system that is not on the list above. Plugins run
  *   with this host's Node privileges, exactly as they do under Electron, and a
  *   bundle determined to reach the disk another way will succeed. Dry-run is
  *   the detector's runtime-harness backend and an evaluation tool; it is a
  *   guard rail, not a wall.
  *
- * **What a dry run cannot pretend.** Nothing is written, so the mirror gains no
- * row — `Mirror.applyMutation` is a no-op under the flag, because there is no
- * generation to come forward to. A plugin that creates a path and then uses the
- * `TFile` the create answered with is therefore told the mirror has no row for
- * it. That is a real limit of recording rather than performing, and it is named
- * here rather than papered over with an invented file.
+ * **What a dry run cannot pretend, today.** Nothing is written, so the mirror
+ * gains no row — `Mirror.applyMutation` is a no-op under the flag, because
+ * there is no generation to come forward to. Two consequences follow, and both
+ * belong to **Task 19b's dry-run overlay** rather than to this module: a
+ * plugin that creates or copies a path and then uses the `TFile` the call
+ * answered with is told the mirror has no row for it, and a plugin that writes
+ * and then reads gets the bytes that are really on disk rather than its own —
+ * so a transcript of several writes to one path does not compose. Named here
+ * rather than papered over with an invented file.
  */
 
-import { currentPluginId, setDryRunRefusalSink } from "../shim/policy";
+import { VaultdError } from "../client/errors";
+import { currentDryRunRefusalSink, currentPluginId, setDryRunRefusalSink } from "../shim/policy";
 import type { RequestSink } from "../client/request-sink";
 import type { HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
 import type { NoticeEntry, NoticeLog } from "../shim/notice";
 
-export type { DryRunRefused } from "../shim/policy";
+/**
+ * Re-exported as a **value**, not a type, so a consumer that imports it from
+ * this module can write `error instanceof DryRunRefused`. The class itself
+ * lives in `shim/policy.ts`, beside `HeadlessUnsupported`, because the two are
+ * this host's whole refusal vocabulary and a reader should meet them together.
+ */
+export { DryRunRefused } from "../shim/policy";
 
 /**
  * The one seam every host write passes through.
@@ -146,6 +180,48 @@ const CONFIG_CAPABLE: ReadonlySet<string> = new Set([
  */
 const SYNTHETIC_REVISION = "blake3:dry-run";
 
+/**
+ * Is this path inside the indexed universe?
+ *
+ * **The daemon's own predicate, not the config-directory one.** `kind` asks
+ * "which half of this host's storage is this" and answers from
+ * `configDirName` — that is ruling 5 and it is right. `semantic`, and whether a
+ * synthetic answer carries a `generation` at all, ask a different question, and
+ * `docs/protocol.md` answers it: a write "into the configuration zone, **or
+ * into any hidden folder**, answers `semantic: false` with no `generation` —
+ * nothing there is indexed, so no generation will ever contain it". Hidden
+ * means a dot segment, anywhere in the path: `.obsidian/`, `.trash/`,
+ * `.obsidian-headless/` and a plugin's own `.cache/` alike.
+ *
+ * `shim/adapter.ts`'s `isIndexedNote` is the precedent — the same split, spelled
+ * the same way, for the same reason. Conflating the two questions is what made
+ * `Vault.createFolder(".hidden/x")` throw under dry-run while it worked for
+ * real: the gate answered with a generation the daemon would have withheld, and
+ * the shim took the indexed branch on the strength of it.
+ */
+function isIndexedPath(path: string): boolean {
+  return !path.split("/").some((segment) => segment.startsWith("."));
+}
+
+/**
+ * The verbs the daemon refuses outright on an unindexable path.
+ *
+ * `docs/protocol.md`: `read_file`, `read_dir`, `write_file` and `create_folder`
+ * accept paths under `.obsidian/` and in hidden folders; "every other operation
+ * refuses them with `zone_violation` — `write_note`, `patch_frontmatter`, the
+ * renames, the copies, the deletes, and the two destructive folder verbs
+ * alike". A dry run that answered one of those with a synthetic success would
+ * put "worked" in a report for a call that cannot work — which is the one thing
+ * a detector must never read.
+ *
+ * Only the two deletes are listed because they are the two this host's shim
+ * really can address at a dot path (`Vault.trash`, `Vault.delete`,
+ * `FileManager.trashFile`, `DataAdapter.remove`/`rmdir`). The others are
+ * reachable only through paths the index already refuses to hand out, and a
+ * speculative refusal for a call nothing can make would be untested code.
+ */
+const ZONE_REFUSING: ReadonlySet<string> = new Set(["delete_note", "delete_folder"]);
+
 /** Params carry a `path`, or two ends, or neither. Read defensively. */
 interface MutationParams {
   readonly path?: unknown;
@@ -153,6 +229,17 @@ interface MutationParams {
   readonly expected?: unknown;
 }
 
+/**
+ * The gate `--dry-run` installs in place of the forwarding one.
+ *
+ * **One per process is the supported shape.** The refusal sink it installs is
+ * module-level, like the policy recorder and for the same reason, so the
+ * last gate constructed is the one every refusal reaches. Production builds
+ * exactly one (`main.ts` starts one host); two live gates at once is a
+ * test-only situation, and {@link uninstall} is written for it — it clears the
+ * module sink **only if this gate still owns it**, so tearing the first one
+ * down does not take the second one's installation with it.
+ */
 export class DryRunGate implements WriteGate {
   private readonly client: RequestSink;
   private readonly config: HostConfig;
@@ -197,10 +284,24 @@ export class DryRunGate implements WriteGate {
 
   send<T>(method: string, params: unknown): Promise<T> {
     if (!INTERCEPTED.has(method)) return this.client.request<T>(method, params);
+    const path = pathOf(params);
+    // **Refused before it is recorded**, because it did not happen — not even
+    // in the pretend sense the other rows describe. A `writes()` row means "the
+    // daemon would have done this"; a `zone_violation` means it would have
+    // refused, and putting one in the transcript as a recorded write would tell
+    // a detector the opposite of the truth.
+    if (ZONE_REFUSING.has(method) && path !== null && !isIndexedPath(path)) {
+      return Promise.reject(zoneViolation(path));
+    }
     this.recorded.push({
       kind: this.kindOf(method, params),
       method,
-      params,
+      // **Cloned, not aliased.** A recorded write is read after the fact — by a
+      // report, by the detector, by a human reading a transcript — and a row
+      // that held the caller's own object would follow any later mutation of
+      // it. Every shim call site builds a fresh literal today, so this costs a
+      // copy and closes a class of bug rather than a live one.
+      params: clone(params),
       pluginId: currentPluginId(),
       atUnixMs: this.config.clock.now(),
     });
@@ -252,11 +353,17 @@ export class DryRunGate implements WriteGate {
    * Stop receiving refusals. Called by the assembly's teardown, so a process
    * that tears one host down and builds another does not leave the first one's
    * gate collecting the second one's refusals.
+   *
+   * **Only if this gate still owns the sink.** Last-installed wins, so a second
+   * gate built while this one is alive has already displaced it; clearing the
+   * module sink unconditionally here would then uninstall *that* gate, and the
+   * next refusal would reach nobody. Measured before the guard existed: gate A
+   * torn down silently deafened gate B.
    */
   uninstall(): void {
     if (!this.installed) return;
     this.installed = false;
-    setDryRunRefusalSink(null);
+    if (currentDryRunRefusalSink() === this) setDryRunRefusalSink(null);
   }
 
   /**
@@ -285,11 +392,16 @@ export class DryRunGate implements WriteGate {
    * there would send the caller down the indexed path), reads `revision` back
    * as the precondition for its next write, and reads `links_rewritten` off a
    * rename.
+   *
+   * **`semantic` is {@link isIndexedPath}, not {@link kindOf}.** The two look
+   * alike and answer different questions — see `isIndexedPath` for the
+   * divergence this cost, measured against the release daemon.
    */
   private syntheticAnswer(method: string, params: unknown): unknown {
     const generation = this.mirror?.generation() ?? 0;
     const revision = this.revisionFor(params);
-    const semantic = this.kindOf(method, params) === "vault";
+    const path = pathOf(params);
+    const semantic = path === null || isIndexedPath(path);
     switch (method) {
       case "write_note":
       case "patch_frontmatter":
@@ -349,4 +461,38 @@ function pathOf(params: unknown): string | null {
   if (typeof shaped?.path === "string") return shaped.path;
   if (typeof shaped?.to === "string") return shaped.to;
   return null;
+}
+
+/**
+ * The refusal the daemon would have sent, as the daemon sends it.
+ *
+ * A {@link VaultdError} rather than an error of this module's own, with the
+ * daemon's code and the daemon's message verbatim from
+ * `crates/vault-index/src/mutate.rs` (`docs/protocol.md` lists the code). A
+ * caller that catches `zone_violation` from a real run must catch the same
+ * thing here — anything else would make the refusal a fact about the flag
+ * rather than about the operation.
+ */
+function zoneViolation(path: string): VaultdError {
+  return new VaultdError({
+    code: "zone_violation",
+    message: `${path} is outside the vault, or is not a valid target for this operation`,
+  });
+}
+
+/**
+ * A deep copy of a recorded mutation's params. See {@link DryRunGate.send}.
+ *
+ * `structuredClone` rather than a JSON round trip: the params are plain wire
+ * objects today, but a JSON copy would silently drop an `undefined` and rewrite
+ * a `Date`, and a transcript that quietly differs from what was sent is worse
+ * than one that throws. A value it cannot clone is kept by reference rather
+ * than losing the row — the report's honesty matters more than its immutability.
+ */
+function clone(params: unknown): unknown {
+  try {
+    return structuredClone(params);
+  } catch {
+    return params;
+  }
 }
