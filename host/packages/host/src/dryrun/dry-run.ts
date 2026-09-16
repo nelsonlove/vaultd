@@ -59,19 +59,48 @@
  *   the detector's runtime-harness backend and an evaluation tool; it is a
  *   guard rail, not a wall.
  *
- * **What a dry run cannot pretend, today.** Nothing is written, so the mirror
- * gains no row — `Mirror.applyMutation` is a no-op under the flag, because
- * there is no generation to come forward to. Two consequences follow, and both
- * belong to **Task 19b's dry-run overlay** rather than to this module: a
- * plugin that creates or copies a path and then uses the `TFile` the call
- * answered with is told the mirror has no row for it, and a plugin that writes
- * and then reads gets the bytes that are really on disk rather than its own —
- * so a transcript of several writes to one path does not compose. Named here
- * rather than papered over with an invented file.
+ * **What a dry run pretends instead, and where.** Nothing is written, so the
+ * mirror gains no row — `Mirror.applyMutation` is a no-op under the flag,
+ * because there is no generation to come forward to. What closes the gap is
+ * {@link DryRunOverlay}, which this gate owns: every mutation it records also
+ * lands there, and the file index and the read paths consult it. A plugin that
+ * creates, copies or renames a path and then uses the `TFile` the call answered
+ * with gets one; a plugin that writes and then reads gets its own bytes, so a
+ * transcript of several writes to one path composes.
+ *
+ * Four rules bound it, and each is a promise this module keeps rather than a
+ * detail of the implementation:
+ *
+ * - **Nothing is written into the `Mirror`.** The mirror mirrors the daemon, and
+ *   a row the daemon never produced would pollute the metadata cache, link
+ *   resolution and the server's snapshots, and would fight the next resync. The
+ *   overlay is a second, smaller structure, consulted after the mirror for a
+ *   node and before it for bytes.
+ * - **Precedence is removed, then overlay bytes, then the mirror.** A path this
+ *   run deleted, trashed, or renamed away reads as gone — including everything
+ *   under it — whatever is really on disk.
+ * - **Metadata stays the mirror's.** `getFileCache` of an overlay-only file
+ *   answers `null`, and of a modified one answers the daemon's cached metadata,
+ *   stale by design: a dry run does not re-parse its own bytes. A synthetic
+ *   node's `stat` carries the recorded byte length and zero times, because a dry
+ *   run invents no clock readings either.
+ * - **No vault events are fired for synthetic writes.** `create`, `modify`,
+ *   `rename` and `delete` events come from a mirror batch, the mirror does not
+ *   move, and nothing here manufactures one. A plugin listening to its own
+ *   writes hears nothing under `--dry-run`.
+ *
+ * Two things the overlay deliberately does not do: `patch_frontmatter` records
+ * no bytes, because `FileManager.processFrontMatter` sends key-path patches and
+ * never serializes a note, so a frontmatter read after a dry-run patch is the
+ * pre-patch text; and `DataAdapter.list` and `HeadlessConfigDir`'s own reads are
+ * answered from the mirror and the daemon alone, so a synthetic path is not in
+ * a directory listing and `host.get_plugin_config` does not see a plugin's
+ * dry-run `saveData` (`Plugin.loadData` does).
  */
 
 import { VaultdError } from "../client/errors";
 import { currentDryRunRefusalSink, currentPluginId, setDryRunRefusalSink } from "../shim/policy";
+import type { ReadFileResponse } from "../client/protocol";
 import type { RequestSink } from "../client/request-sink";
 import type { HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
@@ -96,6 +125,162 @@ export { DryRunRefused } from "../shim/policy";
  */
 export interface WriteGate {
   send<T>(method: string, params: unknown): Promise<T>;
+  /**
+   * What this gate is pretending exists, when it is pretending at all.
+   *
+   * Optional, and absent on {@link forwardingWriteGate}: a gate that really
+   * writes has nothing to overlay, and the consultation points all spell the
+   * question `gate.overlay` rather than testing for a class. That is what keeps
+   * `shim/vault.ts`, `shim/adapter.ts` and `shim/plugin.ts` free of a value
+   * import of {@link DryRunGate} — and what makes a harness that injects its
+   * own gate work unchanged.
+   */
+  readonly overlay?: DryRunOverlay;
+}
+
+/**
+ * What a dry run pretends exists: paths it synthesised, and the last bytes it
+ * recorded for any path.
+ *
+ * Read-only to every consumer. {@link DryRunGate} owns the one implementation
+ * and is the only thing that writes it, from the mutations it is already
+ * recording.
+ */
+export interface DryRunOverlay {
+  /** A folder or file the run created, renamed into, or copied to; absent from the mirror. */
+  has(path: string): boolean;
+  /** The last content recorded for `path` by this run, or null when the run never wrote it. */
+  contentOf(path: string): string | Uint8Array | null;
+  /** Paths the run deleted or renamed away, so a later read reports them gone. */
+  removed(path: string): boolean;
+  /** Synthetic rows for `getAbstractFileByPath` / listing: kind, and the synthetic revision the gate answered. */
+  entry(path: string): { kind: "file" | "folder"; revision: string | null } | null;
+  /**
+   * Where `path`'s bytes really are, for a path the run renamed or copied into
+   * whose source it never wrote.
+   *
+   * **Beyond the brief's four, and the alternative was worse.** Ruling 5 says a
+   * rename's destination takes "the source's bytes (overlay's if present, else
+   * the mirror's content read through the daemon)". Reading them *into* the
+   * overlay would make {@link DryRunGate.send} issue a `read_file` — per
+   * descendant, for a folder move — from inside a synchronous recording step.
+   * Naming the source instead costs nothing, and the read happens where every
+   * other read happens: at the read path, on demand, once.
+   */
+  sourceOf(path: string): string | null;
+  /**
+   * Every path this run holds a row for and has not since removed.
+   *
+   * **Beyond the brief's four**, because `FileIndex` has to *enumerate* the
+   * synthetic nodes to put them in the tree — `has(path)` answers about a path
+   * the caller already knows, and `getFiles()` knows none.
+   */
+  paths(): readonly string[];
+  /**
+   * A counter bumped by every record and by every {@link DryRunGate.clear}.
+   *
+   * **Beyond the brief's four**, so that a consumer caching a reconciliation
+   * against this overlay can tell in one integer comparison that nothing has
+   * changed. `FileIndex.get` is on the link-resolution path and is called once
+   * per link in every note; walking {@link paths} there would be a real cost for
+   * a question that is almost always "nothing moved".
+   */
+  version(): number;
+}
+
+/** What a read of one path should do under a dry run. See {@link overlayRead}. */
+export type OverlayRead =
+  /** The run removed it: answer the way a missing path answers. */
+  | { readonly kind: "gone" }
+  /** The run wrote it: these bytes, not the daemon's. */
+  | { readonly kind: "bytes"; readonly content: string | Uint8Array }
+  /** The run moved or copied it here; the bytes are still at this other path. */
+  | { readonly kind: "elsewhere"; readonly path: string };
+
+/**
+ * The one precedence rule, written once: removed, then overlay bytes, then the
+ * source a rename or a copy named, then `null` for "ask the daemon".
+ *
+ * Every read path in the shim calls this rather than spelling the three
+ * branches itself, because three spellings of one precedence is three chances
+ * to disagree about it.
+ *
+ * **The `elsewhere` path is read unconditionally**, and that is deliberate: a
+ * rename marks its source removed, and the destination's bytes are exactly the
+ * bytes at that removed path. Checking `removed` again on the way through would
+ * make every renamed file unreadable.
+ */
+export function overlayRead(
+  overlay: DryRunOverlay | undefined,
+  path: string,
+): OverlayRead | null {
+  if (overlay === undefined) return null;
+  if (overlay.removed(path)) return { kind: "gone" };
+  const content = overlay.contentOf(path);
+  if (content !== null) return { kind: "bytes", content };
+  const source = overlay.sourceOf(path);
+  if (source !== null && source !== path) return { kind: "elsewhere", path: source };
+  return null;
+}
+
+/** Recorded content as text. A dry run's own bytes are UTF-8 if they are text at all. */
+export function overlayText(content: string | Uint8Array): string {
+  return typeof content === "string" ? content : Buffer.from(content).toString("utf8");
+}
+
+/** Recorded content as bytes. */
+export function overlayBytes(content: string | Uint8Array): Buffer {
+  return typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+}
+
+/**
+ * One path's current bytes and the revision to write against — **the one read
+ * that knows about the overlay**, and the only implementation of its
+ * precedence.
+ *
+ * `Vault.read`, `Vault.readBinary`, `Vault.process`, `DataAdapter.read`,
+ * `DataAdapter.readBinary` and `DataAdapter.append` all go through it. Three
+ * classes spelling the same three branches would be three chances to disagree
+ * about what "current" means, and the one that disagreed would be the one a
+ * plugin's compare-and-swap loop ran on.
+ *
+ * The revision is the **addressed path's**, never the source's: for a path a
+ * rename or a copy put here, the bytes come from wherever they really are and
+ * the precondition is the one the gate answered for the destination. Writing
+ * the source's revision back at the destination would be a precondition
+ * describing a different file.
+ */
+export async function readThroughOverlay(
+  client: RequestSink,
+  overlay: DryRunOverlay | undefined,
+  path: string,
+): Promise<{ content: Buffer; revision: string | undefined }> {
+  const overlaid = overlayRead(overlay, path);
+  if (overlaid?.kind === "gone") throw missingPath(path);
+  const held = overlay?.entry(path)?.revision ?? undefined;
+  if (overlaid?.kind === "bytes") {
+    return { content: overlayBytes(overlaid.content), revision: held };
+  }
+  const response = await client.request<ReadFileResponse>("read_file", {
+    path: overlaid?.kind === "elsewhere" ? overlaid.path : path,
+  });
+  return {
+    content: Buffer.from(response.content_base64, "base64"),
+    revision: overlaid?.kind === "elsewhere" ? held : response.revision,
+  };
+}
+
+/**
+ * The refusal a read of a path this run removed answers with.
+ *
+ * The daemon's own code and the daemon's own message — `MutationError::NotFound`
+ * is `#[error("{} does not exist", path.as_str())]` — so a plugin that catches
+ * `not_found` from a real run catches the same thing here. A refusal that were a
+ * fact about the flag rather than about the path would be a worse lie than the
+ * stale read it replaces.
+ */
+export function missingPath(path: string): VaultdError {
+  return new VaultdError({ code: "not_found", message: `${path} does not exist` });
 }
 
 /**
@@ -244,12 +429,129 @@ const ZONE_REFUSING: ReadonlySet<string> = new Set([
   "copy_file",
 ]);
 
+/** One path's row in the overlay. Sequenced, so a create after a delete wins. */
+interface OverlayRow {
+  readonly seq: number;
+  readonly kind: "file" | "folder";
+  readonly revision: string | null;
+  readonly content: string | Uint8Array | null;
+  readonly source: string | null;
+}
+
+/** What {@link RecordedOverlay.put} is told; an omitted field keeps what was there. */
+interface OverlayPatch {
+  readonly kind: "file" | "folder";
+  readonly revision: string | null;
+  readonly content?: string | Uint8Array | null;
+  readonly source?: string | null;
+}
+
+/**
+ * The gate's overlay, as a pair of maps and a sequence number.
+ *
+ * **The sequence is what makes order legible.** A path can be created, deleted
+ * and created again inside one run, and a removal covers a whole subtree by
+ * prefix — so "is this removed" is not a set membership question but a
+ * comparison: the newest removal covering the path against the row's own stamp.
+ * Without it, a plugin that cleans a folder out and rebuilds it would find its
+ * rebuild invisible.
+ */
+class RecordedOverlay implements DryRunOverlay {
+  private readonly rows = new Map<string, OverlayRow>();
+  private readonly removals = new Map<string, number>();
+  private seq = 0;
+  private stamp = 0;
+
+  has(path: string): boolean {
+    return this.rowFor(path) !== null;
+  }
+
+  contentOf(path: string): string | Uint8Array | null {
+    return this.rowFor(path)?.content ?? null;
+  }
+
+  sourceOf(path: string): string | null {
+    return this.rowFor(path)?.source ?? null;
+  }
+
+  entry(path: string): { kind: "file" | "folder"; revision: string | null } | null {
+    const row = this.rowFor(path);
+    return row === null ? null : { kind: row.kind, revision: row.revision };
+  }
+
+  removed(path: string): boolean {
+    const at = this.removalSeq(path);
+    if (at === null) return false;
+    const row = this.rows.get(path);
+    return row === undefined || row.seq < at;
+  }
+
+  paths(): readonly string[] {
+    const live: string[] = [];
+    for (const path of this.rows.keys()) if (!this.removed(path)) live.push(path);
+    return live;
+  }
+
+  version(): number {
+    return this.stamp;
+  }
+
+  // --- Written by the gate, and by nothing else -------------------------------
+
+  /** Record what one path now is. An omitted `content` or `source` is kept. */
+  put(path: string, patch: OverlayPatch): void {
+    const carried = this.rowFor(path);
+    this.seq += 1;
+    this.stamp += 1;
+    this.rows.set(path, {
+      seq: this.seq,
+      kind: patch.kind,
+      revision: patch.revision,
+      content: patch.content === undefined ? (carried?.content ?? null) : patch.content,
+      source: patch.source === undefined ? (carried?.source ?? null) : patch.source,
+    });
+  }
+
+  /** Record that `path`, and everything under it, is gone. */
+  remove(path: string): void {
+    this.seq += 1;
+    this.stamp += 1;
+    this.removals.set(path, this.seq);
+  }
+
+  /** Forget everything. {@link DryRunGate.clear}'s half of the asymmetry. */
+  reset(): void {
+    this.rows.clear();
+    this.removals.clear();
+    this.stamp += 1;
+  }
+
+  /** The row for a path that is not removed, or `null`. */
+  private rowFor(path: string): OverlayRow | null {
+    const row = this.rows.get(path);
+    if (row === undefined || this.removed(path)) return null;
+    return row;
+  }
+
+  /** The newest removal covering `path` — its own, or an ancestor's. */
+  private removalSeq(path: string): number | null {
+    let newest = this.removals.get(path) ?? null;
+    for (const [prefix, at] of this.removals) {
+      if (!path.startsWith(`${prefix}/`)) continue;
+      if (newest === null || at > newest) newest = at;
+    }
+    return newest;
+  }
+}
+
 /** Params carry a `path`, or two ends, or neither. Read defensively. */
 interface MutationParams {
   readonly path?: unknown;
   readonly from?: unknown;
   readonly to?: unknown;
   readonly expected?: unknown;
+  readonly content?: unknown;
+  readonly content_base64?: unknown;
 }
 
 /**
@@ -270,6 +572,14 @@ export class DryRunGate implements WriteGate {
   private readonly mirror: Mirror | null;
   private readonly recorded: RecordedWrite[] = [];
   private readonly refused: RecordedRefusal[] = [];
+  /**
+   * What this run pretends exists. Owned here, read everywhere.
+   *
+   * The concrete type is private and the public one is the read-only
+   * {@link DryRunOverlay}: the gate is the only writer, and a consumer that
+   * could `put` into it would be inventing a file the report never mentions.
+   */
+  private readonly overlayState = new RecordedOverlay();
   /**
    * Where {@link notices} starts reading the shared log from.
    *
@@ -328,7 +638,19 @@ export class DryRunGate implements WriteGate {
       pluginId: currentPluginId(),
       atUnixMs: this.config.clock.now(),
     });
-    return Promise.resolve(this.syntheticAnswer(method, params) as T);
+    const answer = this.syntheticAnswer(method, params);
+    // **After the answer, because the answer is where the revision comes
+    // from.** Ruling 4: the synthetic revision this call hands back is the one
+    // `overlay.entry(path).revision` reports and the one the caller's *next*
+    // write must carry as its precondition, so recording it from anywhere else
+    // would be recording a second opinion.
+    this.recordOverlay(method, params, answer);
+    return Promise.resolve(answer as T);
+  }
+
+  /** What this run pretends exists. See {@link DryRunOverlay}. */
+  get overlay(): DryRunOverlay {
+    return this.overlayState;
   }
 
   /** Every mutation this run recorded instead of performing, in order. */
@@ -364,6 +686,7 @@ export class DryRunGate implements WriteGate {
   clear(): void {
     this.recorded.length = 0;
     this.refused.length = 0;
+    this.overlayState.reset();
     this.startMark = this.noticeLog.mark();
   }
 
@@ -451,6 +774,135 @@ export class DryRunGate implements WriteGate {
   }
 
   /**
+   * Put one recorded mutation into the overlay, per verb.
+   *
+   * The same nine verbs {@link INTERCEPTED} names, and the mapping is the whole
+   * of what "the plugin sees success" means after the call returns: bytes for
+   * the three that carry bytes, a node for the two that make one, a removal for
+   * the two that take one away, and both for the two that move one.
+   *
+   * **`patch_frontmatter` records a row and no bytes.**
+   * `FileManager.processFrontMatter` sends key-path patches and deliberately
+   * never serializes a note — that is the whole reason it does not rewrite the
+   * user's YAML — so there is no patched text here to record. The row still
+   * carries the revision the call answered, so the *next* write to that note
+   * states the right precondition; the bytes a later read sees are the ones
+   * before the patch. Named in the module header and in `docs/protocol-host.md`.
+   */
+  private recordOverlay(method: string, params: unknown, answer: unknown): void {
+    const path = (params as MutationParams | null)?.path;
+    const revision = revisionOf(answer);
+    switch (method) {
+      case "write_note":
+        if (typeof path !== "string") return;
+        this.overlayState.put(path, {
+          kind: "file",
+          revision,
+          content: typeof (params as MutationParams).content === "string"
+            ? ((params as MutationParams).content as string)
+            : null,
+          source: null,
+        });
+        return;
+      case "write_file": {
+        if (typeof path !== "string") return;
+        const encoded = (params as MutationParams).content_base64;
+        this.overlayState.put(path, {
+          kind: "file",
+          revision,
+          content:
+            typeof encoded === "string" ? new Uint8Array(Buffer.from(encoded, "base64")) : null,
+          source: null,
+        });
+        return;
+      }
+      case "patch_frontmatter":
+        if (typeof path !== "string") return;
+        this.overlayState.put(path, { kind: "file", revision });
+        return;
+      case "create_folder":
+        if (typeof path !== "string") return;
+        this.overlayState.put(path, {
+          kind: "folder",
+          revision: null,
+          content: null,
+          source: null,
+        });
+        return;
+      case "delete_note":
+      case "delete_folder":
+        if (typeof path !== "string") return;
+        this.overlayState.remove(path);
+        return;
+      case "rename_note":
+      case "rename_folder":
+      case "copy_file": {
+        const shaped = params as MutationParams | null;
+        const from = shaped?.from;
+        const to = shaped?.to;
+        if (typeof from !== "string" || typeof to !== "string") return;
+        this.graft(from, to, method === "rename_folder" ? "folder" : "file", revision);
+        if (method !== "copy_file") this.overlayState.remove(from);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  /**
+   * Put `from`'s whole subtree down at `to`, for a rename or a copy.
+   *
+   * **The subtree, not the named pair**, for the same reason `Vault.rename`
+   * refetches one: the wire's answer names two paths and a folder move carries
+   * every row under them. A dry run that moved only the named pair would leave
+   * a plugin that renames a folder and then walks it seeing nothing at the new
+   * path — the failure this task exists to stop, one level down.
+   *
+   * Bytes come across when the run itself wrote them; otherwise the destination
+   * **names its source** and the read path fetches from there, so no read
+   * happens inside this synchronous recording step. A chain of moves follows the
+   * chain back to the path that really holds the bytes.
+   */
+  private graft(from: string, to: string, kindOfFrom: "file" | "folder", revision: string | null): void {
+    for (const source of this.subtreeOf(from)) {
+      const destination = `${to}${source.slice(from.length)}`;
+      const content = this.overlayState.contentOf(source);
+      this.overlayState.put(destination, {
+        kind: source === from ? kindOfFrom : this.kindAt(source),
+        revision: source === from ? revision : this.revisionAt(source),
+        content,
+        source: content === null ? (this.overlayState.sourceOf(source) ?? source) : null,
+      });
+    }
+  }
+
+  /** `from` and every live path under it, the overlay's and the mirror's, parents first. */
+  private subtreeOf(from: string): string[] {
+    const prefix = `${from}/`;
+    const under = new Set<string>([from]);
+    for (const path of this.overlayState.paths()) if (path.startsWith(prefix)) under.add(path);
+    for (const entry of this.mirror?.entries() ?? []) {
+      if (entry.path.startsWith(prefix) && !this.overlayState.removed(entry.path)) {
+        under.add(entry.path);
+      }
+    }
+    return [...under].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
+  private kindAt(path: string): "file" | "folder" {
+    const held = this.overlayState.entry(path);
+    if (held !== null) return held.kind;
+    return this.mirror?.entry(path)?.kind === "folder" ? "folder" : "file";
+  }
+
+  private revisionAt(path: string): string | null {
+    const held = this.overlayState.entry(path);
+    if (held !== null) return held.revision;
+    return this.mirror?.entry(path)?.revision ?? null;
+  }
+
+  /**
    * The revision to echo: the caller's own precondition, then the mirror's row,
    * then {@link SYNTHETIC_REVISION}.
    *
@@ -479,6 +931,12 @@ export class DryRunGate implements WriteGate {
  * The **destination**, because that is where the bytes land and therefore which
  * half of the host's storage this write belongs to.
  */
+/** The revision a synthetic answer carried, when it carried one. */
+function revisionOf(answer: unknown): string | null {
+  const named = (answer as { revision?: unknown } | null)?.revision;
+  return typeof named === "string" ? named : null;
+}
+
 function pathOf(params: unknown): string | null {
   const shaped = params as MutationParams | null;
   if (typeof shaped?.path === "string") return shaped.path;

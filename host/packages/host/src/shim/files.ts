@@ -56,6 +56,7 @@
  * uncaptured, so this host does not guess at it.
  */
 
+import type { DryRunOverlay } from "../dryrun/dry-run";
 import type { MirrorChangeBatch, MirrorEntry, MirrorQuery } from "../mirror/types";
 import type { Vault } from "./vault";
 
@@ -169,10 +170,31 @@ const ROOT_PATH = "/";
 export class FileIndex {
   private readonly nodes = new Map<string, TAbstractFile>();
   private rootFolder: TFolder;
+  /**
+   * Paths in {@link nodes} that no mirror row backs — Task 19b's dry-run
+   * overlay, materialized.
+   *
+   * Tracked separately from the nodes themselves so that {@link dropSynthetic}
+   * can take exactly them out again when the overlay is cleared, leaving the
+   * mirror's own tree untouched. A node is in here or it is the daemon's; there
+   * is no third kind.
+   */
+  private readonly synthetic = new Set<string>();
+  /** The overlay {@link version} this index last reconciled against. */
+  private reconciled = -1;
 
   constructor(
     private readonly mirror: MirrorQuery,
     private readonly vault: Vault,
+    /**
+     * What a dry run pretends exists, or `null` in every real run.
+     *
+     * The index consults it **after** the mirror for a node, so a path the
+     * daemon really holds is never shadowed by a synthetic one, and treats an
+     * overlaid removal as authoritative — the precedence
+     * `dryrun/dry-run.ts` states. Nothing here is ever written into the mirror.
+     */
+    private readonly overlay: DryRunOverlay | null = null,
   ) {
     this.rootFolder = new TFolder(vault, ROOT_PATH, "", null);
   }
@@ -187,6 +209,8 @@ export class FileIndex {
    */
   rebuild(): void {
     this.nodes.clear();
+    this.synthetic.clear();
+    this.reconciled = -1;
     this.rootFolder = new TFolder(this.vault, ROOT_PATH, "", null);
     const entries = [...this.mirror.entries()].sort((a, b) =>
       a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
@@ -309,15 +333,27 @@ export class FileIndex {
    * rather than waiting for Task 15's sequencer to deliver the batch.
    */
   sync(path: string): TAbstractFile | null {
+    this.reconcileOverlay();
     const entry = this.mirror.entry(path);
     if (entry === undefined) {
+      // **The overlay's answer, after the mirror's and only after it.** Under
+      // `--dry-run` the mirror never moves, so every path the run created,
+      // copied or renamed into lands here — and `Vault.create` is about to
+      // demand the `TFile` it promised its caller. `reconcileOverlay` has
+      // already put the node in the tree, so this is a lookup rather than a
+      // second materialization.
+      if (this.overlay?.removed(path) !== true && this.synthetic.has(path)) {
+        return this.nodes.get(path) ?? null;
+      }
       const gone = this.nodes.get(path);
       if (gone !== undefined) {
         this.detach(gone);
         this.nodes.delete(path);
+        this.synthetic.delete(path);
       }
       return null;
     }
+    if (this.overlay?.removed(path) === true) return null;
     const existing = this.nodes.get(path);
     if (existing instanceof TFile) {
       existing.stat = statOfEntry(entry);
@@ -342,30 +378,146 @@ export class FileIndex {
 
   get(path: string): TAbstractFile | undefined {
     if (path === ROOT_PATH || path === "") return this.rootFolder;
+    this.reconcileOverlay();
+    if (this.overlay?.removed(path) === true) return undefined;
     return this.nodes.get(path);
   }
 
   root(): TFolder {
+    this.reconcileOverlay();
     return this.rootFolder;
   }
 
   allFiles(): TFile[] {
     const files: TFile[] = [];
-    for (const node of this.nodes.values()) if (node instanceof TFile) files.push(node);
+    for (const node of this.live()) if (node instanceof TFile) files.push(node);
     return files;
   }
 
   allFolders(): TFolder[] {
     const folders: TFolder[] = [];
-    for (const node of this.nodes.values()) if (node instanceof TFolder) folders.push(node);
+    for (const node of this.live()) if (node instanceof TFolder) folders.push(node);
     return folders;
   }
 
   allLoaded(): TAbstractFile[] {
-    return [...this.nodes.values()];
+    return [...this.live()];
   }
 
   // --- Internals ------------------------------------------------------------
+
+  /**
+   * The nodes a caller may see: every node, less the ones a dry run removed.
+   *
+   * **A removed node is filtered rather than spliced out**, which is the one
+   * asymmetry in how the overlay meets the tree. A synthetic *create* really is
+   * attached, because a plugin is meant to hold the `TFolder` and read its
+   * `children`; a removal is masked, because taking a mirror-backed node out of
+   * `nodes` would leave a later batch — an external delete of the same path, a
+   * resync — with nothing to fire a `delete` event about. The visible cost is
+   * that a deleted file is still in its parent's `children` array for the rest
+   * of the run; the alternative loses a real event, and the mirror is the thing
+   * this index may never be wrong about.
+   */
+  private live(): TAbstractFile[] {
+    this.reconcileOverlay();
+    const overlay = this.overlay;
+    const nodes = [...this.nodes.values()];
+    return overlay === null ? nodes : nodes.filter((node) => !overlay.removed(node.path));
+  }
+
+  /**
+   * Bring the synthetic nodes into line with the overlay: attach what it now
+   * holds, detach what it no longer does.
+   *
+   * Idempotent, and cheap when nothing has changed — the overlay's `version()`
+   * is a single integer that every record and every `clear()` bumps, and this
+   * is called from every accessor, including the ones link resolution walks per
+   * link.
+   *
+   * A path the **mirror** holds a row for is never synthesized: the daemon's
+   * row wins for the node, exactly as the overlay's bytes win for a read.
+   */
+  private reconcileOverlay(): void {
+    const overlay = this.overlay;
+    if (overlay === null) return;
+    const version = overlay.version();
+    if (version === this.reconciled) return;
+    this.reconciled = version;
+    const wanted = this.overlayWanted(overlay);
+
+    // Deepest first, so a folder leaves the tree after its children do.
+    for (const path of [...this.synthetic].sort((a, b) => depthOf(b) - depthOf(a))) {
+      if (wanted.has(path)) continue;
+      const node = this.nodes.get(path);
+      if (node !== undefined) {
+        this.detach(node);
+        this.nodes.delete(path);
+      }
+      this.synthetic.delete(path);
+    }
+
+    // Shallowest first, so a parent exists before anything hangs off it.
+    const order = [...wanted.keys()].sort(
+      (a, b) => depthOf(a) - depthOf(b) || (a < b ? -1 : a > b ? 1 : 0),
+    );
+    for (const path of order) {
+      if (this.nodes.has(path)) continue;
+      this.installSynthetic(path, wanted.get(path) ?? "file", overlay.contentOf(path));
+    }
+  }
+
+  /**
+   * Every path the overlay wants in the tree, **with its missing ancestors**.
+   *
+   * The ancestors matter because the daemon makes a write's parent folders
+   * implicitly: a dry-run `create("New/Deep/A.md")` records one path, and a tree
+   * that materialized only that one would hang it off a `TFolder` nobody tracks
+   * and nobody takes away again on `clear()`.
+   */
+  private overlayWanted(overlay: DryRunOverlay): Map<string, "file" | "folder"> {
+    const wanted = new Map<string, "file" | "folder">();
+    for (const path of overlay.paths()) {
+      if (this.mirror.entry(path) !== undefined) continue;
+      const row = overlay.entry(path);
+      if (row === null) continue;
+      wanted.set(path, row.kind);
+      for (let at = parentOf(path); at !== "" && at !== ROOT_PATH; at = parentOf(at)) {
+        if (this.mirror.entry(at) !== undefined || wanted.has(at)) break;
+        wanted.set(at, "folder");
+      }
+    }
+    return wanted;
+  }
+
+  /**
+   * One synthetic node, in the tree.
+   *
+   * The `stat` of a synthetic file is the recorded byte length and **zero
+   * times**: a dry run writes nothing, so there is no ctime and no mtime to
+   * report, and inventing `Date.now()` would make two runs of one fixture
+   * differ. The same reasoning as {@link synthesizeStat}'s, which uses the
+   * generation for the same reason.
+   */
+  private installSynthetic(
+    path: string,
+    kind: "file" | "folder",
+    content: string | Uint8Array | null,
+  ): void {
+    const parent = this.ensureFolder(parentOf(path));
+    const name = basenameOf(path);
+    const node: TAbstractFile =
+      kind === "folder"
+        ? new TFolder(this.vault, path, name, parent)
+        : new TFile(this.vault, path, name, parent, {
+            ctime: 0,
+            mtime: 0,
+            size: byteLengthOf(content),
+          });
+    parent.children.push(node);
+    this.nodes.set(path, node);
+    this.synthetic.add(path);
+  }
 
   /**
    * Every pair this batch is to replay as a move: the caller's own first, then
@@ -510,6 +662,12 @@ export class FileIndex {
 
 function statOfEntry(entry: MirrorEntry): { ctime: number; mtime: number; size: number } {
   return { ctime: entry.ctimeMs, mtime: entry.mtimeMs, size: entry.size ?? 0 };
+}
+
+/** How big a synthetic file says it is: the bytes the dry run recorded, or none. */
+function byteLengthOf(content: string | Uint8Array | null): number {
+  if (content === null) return 0;
+  return typeof content === "string" ? Buffer.byteLength(content, "utf8") : content.byteLength;
 }
 
 /**

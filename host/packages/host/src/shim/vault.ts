@@ -58,6 +58,7 @@ import type {
 import type { HostConfig } from "../config";
 // The seam itself is declared with its implementations; this file re-exports
 // the type a few lines below, and needs it in scope for `VaultDeps`.
+import { readThroughOverlay } from "../dryrun/dry-run";
 import type { WriteGate } from "../dryrun/dry-run";
 import type { Mirror } from "../mirror/mirror";
 import type { MirrorChangeBatch } from "../mirror/types";
@@ -153,7 +154,9 @@ export class Vault extends Events {
   constructor(private readonly deps: VaultDeps) {
     super(deps.events);
     this.configDir = deps.config.configDirName;
-    this.index = new FileIndex(deps.mirror, this);
+    // The gate's overlay, not a class test: a forwarding gate declares none,
+    // and `--dry-run`'s declares the one Task 19b's consultation points read.
+    this.index = new FileIndex(deps.mirror, this, deps.writes.overlay ?? null);
     this.index.rebuild();
     this.adapter = new DataAdapter(deps, () => this);
     // Wired, not assumed: a GUI or a plugin writing into the config zone drops
@@ -320,11 +323,16 @@ export class Vault extends Events {
 
   // --- Reads ----------------------------------------------------------------
 
+  /**
+   * A note's current bytes, as text.
+   *
+   * Under `--dry-run` "current" means the run's own: {@link currentSource}
+   * consults the gate's overlay before the wire, so a plugin that wrote and
+   * then read sees what it wrote. In every other run it is one `read_file`, as
+   * it always was.
+   */
   async read(file: TFile): Promise<string> {
-    const response = await this.deps.client.request<ReadFileResponse>("read_file", {
-      path: file.path,
-    });
-    return Buffer.from(response.content_base64, "base64").toString("utf8");
+    return (await this.currentSource(file.path)).content.toString("utf8");
   }
 
   /**
@@ -342,10 +350,7 @@ export class Vault extends Events {
   }
 
   async readBinary(file: TFile): Promise<ArrayBuffer> {
-    const response = await this.deps.client.request<ReadFileResponse>("read_file", {
-      path: file.path,
-    });
-    const bytes = Buffer.from(response.content_base64, "base64");
+    const bytes = (await this.currentSource(file.path)).content;
     const copy = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(copy).set(bytes);
     return copy;
@@ -439,16 +444,17 @@ export class Vault extends Events {
   process(file: TFile, fn: (data: string) => string): Promise<string> {
     return this.deps.queue.runExclusivePath(file.path, async () => {
       for (let attempt = 1; attempt <= PROCESS_ATTEMPTS; attempt += 1) {
-        const read = await this.deps.client.request<ReadFileResponse>("read_file", {
-          path: file.path,
-        });
-        const content = Buffer.from(read.content_base64, "base64").toString("utf8");
-        const next = fn(content);
+        // The overlay first, so that two `append`s to one note under
+        // `--dry-run` compose instead of the second one silently discarding the
+        // first — the read half of the same promise `read` keeps.
+        const read = await this.currentSource(file.path);
+        const next = fn(read.content.toString("utf8"));
         try {
           const result = await this.deps.writes.send<MutationResponse>("write_note", {
             path: file.path,
             content: next,
-            expected: { revision: read.revision },
+            expected:
+              read.revision === undefined ? { any: true as const } : { revision: read.revision },
           });
           await this.deps.mirror.applyMutation(result.generation, [file.path]);
           this.index.sync(file.path);
@@ -677,8 +683,28 @@ export class Vault extends Events {
    * "what does this host consider unconditional".
    */
   expectedFor(path: string): { revision: string } | { any: true } {
+    // **The overlay's revision first, under `--dry-run` only** — it holds one
+    // exactly for a path this run has already written. Ruling 4: the synthetic
+    // revision the gate answered is the one the *next* write must carry, so a
+    // plugin that creates a note and then modifies it states a precondition
+    // rather than declaring itself unconditional, which is what it would do for
+    // real against a note that now exists.
+    const overlaid = this.deps.writes.overlay?.entry(path)?.revision;
+    if (typeof overlaid === "string") return { revision: overlaid };
     const revision = this.deps.mirror.entry(path)?.revision;
     return revision === null || revision === undefined ? { any: true } : { revision };
+  }
+
+  /**
+   * One path's current bytes and the revision to write against.
+   *
+   * The one place `Vault` reads a note, so that `read`, `cachedRead`,
+   * `readBinary` and `process` cannot disagree about what "current" means. The
+   * overlay branch lives in `dryrun/dry-run.ts` beside the precedence it
+   * implements.
+   */
+  private currentSource(path: string): Promise<{ content: Buffer; revision: string | undefined }> {
+    return readThroughOverlay(this.deps.client, this.deps.writes.overlay, path);
   }
 
   private createdFile(path: string): TFile {

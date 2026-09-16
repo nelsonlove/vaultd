@@ -24,6 +24,7 @@
 import { basename, posix } from "node:path";
 
 import { stub } from "./policy";
+import { overlayBytes, readThroughOverlay } from "../dryrun/dry-run";
 import type { Vault, VaultDeps } from "./vault";
 import type {
   GenerationResponse,
@@ -104,6 +105,13 @@ export class DataAdapter {
    * disk.
    */
   async exists(normalizedPath: string, sensitive?: boolean): Promise<boolean> {
+    // **Before the mirror, because a dry run's answer overrides both ways**: a
+    // path this run removed does not exist however solidly it sits on disk, and
+    // one it created does however little the daemon knows about it. The
+    // case-folding walk below is the mirror's own question and is left alone.
+    const overlay = this.deps.writes.overlay;
+    if (overlay?.removed(normalizedPath) === true) return false;
+    if (overlay?.has(normalizedPath) === true) return true;
     if (this.deps.mirror.entry(normalizedPath) !== undefined) return true;
     const wanted = normalizedPath.toLowerCase();
     let folded = false;
@@ -124,12 +132,34 @@ export class DataAdapter {
     }
   }
 
-  /** The mirror's row, in Obsidian's `Stat` shape. `null` for a path it has no row for. */
+  /**
+   * The mirror's row, in Obsidian's `Stat` shape. `null` for a path it has no
+   * row for.
+   *
+   * **Metadata stays the mirror's**, so a path a dry run merely *modified*
+   * still reports the daemon's times and the daemon's size — stale by design,
+   * because a dry run does not re-stat what it did not write. Only a path the
+   * mirror has no row for at all is answered from the overlay, and then with
+   * the recorded byte length and zero times: a dry run invents no clock
+   * readings, exactly as `FileIndex` does not.
+   */
   stat(
     normalizedPath: string,
   ): Promise<{ type: "file" | "folder"; ctime: number; mtime: number; size: number } | null> {
+    const overlay = this.deps.writes.overlay;
+    if (overlay?.removed(normalizedPath) === true) return Promise.resolve(null);
     const entry = this.deps.mirror.entry(normalizedPath);
-    if (entry === undefined) return Promise.resolve(null);
+    if (entry === undefined) {
+      const row = overlay?.entry(normalizedPath) ?? null;
+      if (row === null) return Promise.resolve(null);
+      const content = overlay?.contentOf(normalizedPath) ?? null;
+      return Promise.resolve({
+        type: row.kind,
+        ctime: 0,
+        mtime: 0,
+        size: content === null ? 0 : overlayBytes(content).byteLength,
+      });
+    }
     return Promise.resolve({
       type: entry.kind === "folder" ? "folder" : "file",
       ctime: entry.ctimeMs,
@@ -149,17 +179,11 @@ export class DataAdapter {
   }
 
   async read(normalizedPath: string): Promise<string> {
-    const response = await this.deps.client.request<ReadFileResponse>("read_file", {
-      path: normalizedPath,
-    });
-    return Buffer.from(response.content_base64, "base64").toString("utf8");
+    return (await this.currentSource(normalizedPath)).content.toString("utf8");
   }
 
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
-    const response = await this.deps.client.request<ReadFileResponse>("read_file", {
-      path: normalizedPath,
-    });
-    return toArrayBuffer(Buffer.from(response.content_base64, "base64"));
+    return toArrayBuffer((await this.currentSource(normalizedPath)).content);
   }
 
   /**
@@ -205,12 +229,15 @@ export class DataAdapter {
    * them from being silently overwritten: the append fails loudly instead.
    */
   async append(normalizedPath: string, data: string): Promise<void> {
-    const response = await this.deps.client.request<ReadFileResponse>("read_file", {
-      path: normalizedPath,
-    });
-    const existing = Buffer.from(response.content_base64, "base64").toString("utf8");
-    const content = `${existing}${data}`;
-    const expected = { revision: response.revision };
+    // **One read, for the bytes and the precondition together** — a second
+    // round trip for the revision could see a different writer's bytes, which
+    // is the lost update the precondition is here to prevent. Under
+    // `--dry-run` it is the overlay's, so two appends to one path compose
+    // rather than the second quietly dropping the first.
+    const read = await this.currentSource(normalizedPath);
+    const content = `${read.content.toString("utf8")}${data}`;
+    const expected =
+      read.revision === undefined ? { any: true as const } : { revision: read.revision };
     if (isIndexedNote(normalizedPath)) {
       const note = await this.deps.writes.send<MutationResponse>("write_note", {
         path: normalizedPath,
@@ -306,6 +333,16 @@ export class DataAdapter {
   }
 
   // --- Internals ------------------------------------------------------------
+
+  /**
+   * One path's current bytes and the revision to write against.
+   *
+   * The same function `Vault` reads through, so the adapter and the vault
+   * cannot disagree about what a dry run has made of a path.
+   */
+  private currentSource(path: string): Promise<{ content: Buffer; revision: string | undefined }> {
+    return readThroughOverlay(this.deps.client, this.deps.writes.overlay, path);
+  }
 
   private async trashWith(
     normalizedPath: string,

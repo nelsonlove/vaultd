@@ -39,11 +39,12 @@ import { declarePolicy, recordUse, stub } from "./policy";
 import { clearTimerById, intervalMsOf } from "./timers";
 import { pluginDataPath } from "../pluginset/config-dir";
 import { VaultdError } from "../client/errors";
+import { readThroughOverlay } from "../dryrun/dry-run";
 import type { App } from "./app";
 import type { EventRef, ShimEventBus } from "./events";
 import type { Harvest } from "./harvest";
 import type { HostErrorPhase, HostErrors } from "./errors";
-import type { ReadFileResponse, WriteFileResponse } from "../client/protocol";
+import type { WriteFileResponse } from "../client/protocol";
 import type { RequestSink } from "../client/request-sink";
 import type { Clock, HostConfig } from "../config";
 import type { DispatchQueue } from "../runtime/queue";
@@ -638,10 +639,19 @@ export abstract class Plugin extends Component {
     recordUse("Plugin.loadData");
     let source: string;
     try {
-      const response = await this.host.client.request<ReadFileResponse>("read_file", {
-        path: this.dataPath(),
-      });
-      source = Buffer.from(response.content_base64, "base64").toString("utf8");
+      // **Through the dry-run overlay**, which is what makes `saveData` then
+      // `loadData` round-trip under `--dry-run`. It is the same file either
+      // way; the overlay simply holds the bytes the gate recorded instead of
+      // the daemon holding the bytes it wrote. A plugin whose `onload` saves
+      // defaults and reads them back is ordinary, and a run that answered the
+      // *previous* settings there would make the detector's transcript describe
+      // a plugin that is not the one that ran.
+      const read = await readThroughOverlay(
+        this.host.client,
+        this.host.writes.overlay,
+        this.dataPath(),
+      );
+      source = read.content.toString("utf8");
     } catch (error) {
       if (isMissing(error)) return null;
       throw error;
