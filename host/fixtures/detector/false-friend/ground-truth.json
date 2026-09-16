@@ -1,0 +1,20 @@
+{
+  "minified": false,
+  "apiSymbols": {
+    "addCommand": 1,
+    "getActiveFile": 1,
+    "getFileCache": 1
+  },
+  "lifecycleGates": {
+    "onLayoutReady": 0,
+    "layoutReadyRead": 0,
+    "metadataResolved": 0,
+    "metadataResolve": 0
+  },
+  "commandIds": ["review-note"],
+  "eventNames": [],
+  "frameworks": [],
+  "crossPlugin": [],
+  "internalPlugins": [],
+  "tierEstimate": 1
+}

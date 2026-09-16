@@ -1,0 +1,22 @@
+{
+  "minified": false,
+  "apiSymbols": {
+    "on": 2,
+    "addCommand": 2,
+    "getActiveFile": 2,
+    "getFileCache": 2,
+    "process": 1
+  },
+  "lifecycleGates": {
+    "onLayoutReady": 0,
+    "layoutReadyRead": 0,
+    "metadataResolved": 0,
+    "metadataResolve": 0
+  },
+  "commandIds": ["count-tags", "stamp-counts"],
+  "eventNames": ["changed", "rename"],
+  "frameworks": [],
+  "crossPlugin": [],
+  "internalPlugins": [],
+  "tierEstimate": 1
+}

@@ -45,7 +45,7 @@ import { DataAdapter } from "./adapter";
 import { Events } from "./events";
 import { FileIndex, TFile, TFolder } from "./files";
 import { affectedPathsForRename } from "./rename-paths";
-import { stub } from "./policy";
+import { declarePolicy, recordUse, stub } from "./policy";
 import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
 import type { RequestSink } from "../client/request-sink";
 import type {
@@ -359,6 +359,7 @@ export class Vault extends Events {
   // --- Writes ---------------------------------------------------------------
 
   async create(path: string, data: string): Promise<TFile> {
+    recordUse("Vault.create");
     const result = await this.deps.writes.send<MutationResponse>("write_note", {
       path,
       content: data,
@@ -369,6 +370,7 @@ export class Vault extends Events {
   }
 
   async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
+    recordUse("Vault.createBinary");
     const result = await this.deps.writes.send<WriteFileResponse>("write_file", {
       path,
       content_base64: Buffer.from(data).toString("base64"),
@@ -381,6 +383,7 @@ export class Vault extends Events {
   }
 
   async createFolder(path: string): Promise<TFolder> {
+    recordUse("Vault.createFolder");
     const result = await this.deps.writes.send<GenerationResponse>("create_folder", { path });
     // **`generation` absent is a success, not a failure.** It is absent — not
     // zero — for a folder that landed somewhere nothing scans: the config zone,
@@ -404,6 +407,7 @@ export class Vault extends Events {
   }
 
   async modify(file: TFile, data: string): Promise<void> {
+    recordUse("Vault.modify");
     const expected = this.expectedFor(file.path);
     const result = await this.deps.writes.send<MutationResponse>("write_note", {
       path: file.path,
@@ -415,6 +419,7 @@ export class Vault extends Events {
   }
 
   async modifyBinary(file: TFile, data: ArrayBuffer): Promise<void> {
+    recordUse("Vault.modifyBinary");
     const result = await this.deps.writes.send<WriteFileResponse>("write_file", {
       path: file.path,
       content_base64: Buffer.from(data).toString("base64"),
@@ -442,6 +447,7 @@ export class Vault extends Events {
    * (mutation-spec Ruling 2 assigns that serialization here explicitly).
    */
   process(file: TFile, fn: (data: string) => string): Promise<string> {
+    recordUse("Vault.process");
     return this.deps.queue.runExclusivePath(file.path, async () => {
       for (let attempt = 1; attempt <= PROCESS_ATTEMPTS; attempt += 1) {
         // The overlay first, so that two `append`s to one note under
@@ -477,10 +483,12 @@ export class Vault extends Events {
    * plugin appending to a daily note cannot detect.
    */
   async append(file: TFile, data: string): Promise<void> {
+    recordUse("Vault.append");
     await this.process(file, (existing) => `${existing}${data}`);
   }
 
   async copy<T extends TAbstractFile>(file: T, newPath: string): Promise<T> {
+    recordUse("Vault.copy");
     const result = await this.deps.writes.send<MutationResponse>("copy_file", {
       from: file.path,
       to: newPath,
@@ -534,6 +542,7 @@ export class Vault extends Events {
    * content revision for the pairing to work from. See {@link folderMoves}.
    */
   async rename(file: TAbstractFile, newPath: string): Promise<void> {
+    recordUse("Vault.rename");
     const folder = file instanceof TFolder;
     // Read before the send: afterwards `from` is gone and so is its backlink
     // entry, so the same call would answer with a smaller set and say nothing.
@@ -573,6 +582,7 @@ export class Vault extends Events {
    * it still has to ask the mirror.
    */
   async delete(file: TAbstractFile, force?: boolean): Promise<void> {
+    recordUse("Vault.delete");
     const recursive = force ?? false;
     if (file instanceof TFolder && !recursive && this.descendantsOf(file.path).length > 0) {
       throw new FolderNotEmpty(file.path);
@@ -588,6 +598,7 @@ export class Vault extends Events {
    * `trashOption`, which is the *user's* default for deletions the user makes.
    */
   async trash(file: TAbstractFile, system: boolean): Promise<void> {
+    recordUse("Vault.trash");
     await this.remove(file, system ? "trash_system" : "trash_local", true);
   }
 
@@ -787,3 +798,36 @@ export class Vault extends Events {
     }
   }
 }
+
+/**
+ * The vault's **mutations**, declared and recorded — and only the mutations.
+ *
+ * Added by Task 20, which needed `Vault.modify` to appear in the detector's
+ * ordered call log. The line is drawn at mutations rather than at every method
+ * on purpose. The write surface is what a compatibility report is *about*: the
+ * 2026-08-28 census found 31 of 56 plugins mutate the vault and that every one
+ * of those mutations goes through these primitives, so "which of them does this
+ * plugin reach for" is a question with a reader. A read answered out of the
+ * mirror — `getFileByPath`, `getMarkdownFiles`, `getAbstractFileByPath` — is
+ * the host handing back something it already holds; recording those would
+ * bury the writes under them and make the report a log of ordinary work rather
+ * than a description of a surface.
+ *
+ * `implemented` because they are: every one of them really performs the
+ * mutation, and `--dry-run` recording it instead is a property of the run
+ * rather than of the surface (see `refuseInDryRun` in `shim/policy.ts`).
+ *
+ * `append` records **and** so does the `process` it delegates to, which is the
+ * honest reading: a plugin that appends has reached for both.
+ */
+declarePolicy("Vault.create", "implemented");
+declarePolicy("Vault.createBinary", "implemented");
+declarePolicy("Vault.createFolder", "implemented");
+declarePolicy("Vault.modify", "implemented");
+declarePolicy("Vault.modifyBinary", "implemented");
+declarePolicy("Vault.process", "implemented");
+declarePolicy("Vault.append", "implemented");
+declarePolicy("Vault.copy", "implemented");
+declarePolicy("Vault.rename", "implemented");
+declarePolicy("Vault.delete", "implemented");
+declarePolicy("Vault.trash", "implemented");
