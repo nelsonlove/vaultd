@@ -5,13 +5,16 @@
     "getActiveFile": 1,
     "getFileCache": 1
   },
+  "genericSymbols": {},
   "lifecycleGates": {
     "onLayoutReady": 0,
     "layoutReadyRead": 0,
     "metadataResolved": 0,
     "metadataResolve": 0
   },
-  "commandIds": ["review-note"],
+  "commandIds": [
+    "review-note"
+  ],
   "eventNames": [],
   "frameworks": [],
   "crossPlugin": [],

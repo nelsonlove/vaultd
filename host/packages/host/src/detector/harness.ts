@@ -35,7 +35,7 @@ import type { LifecycleSequencer } from "../runtime/lifecycle";
 import type { PluginConfigService } from "../settings/plugin-config";
 import type { PolicyRecorder, RecordedApiCall } from "../shim/policy";
 import type { QuarantineTracker } from "../runtime/quarantine";
-import type { RecordedWrite, WriteGate } from "../dryrun/dry-run";
+import type { RecordedRefusal, RecordedWrite, WriteGate } from "../dryrun/dry-run";
 import type { CompatReport, CompatReportRow } from "./report";
 import type { ScanResult } from "./scanner";
 
@@ -53,6 +53,21 @@ export interface HarnessResult {
   readonly calls: readonly RecordedApiCall[];
   readonly throws: readonly RecordedApiCall[];
   readonly writes: readonly RecordedWrite[];
+  /**
+   * Every refusal the dry-run gate answered during the load — the network
+   * calls, the OS bridges and the node builtins this run would not perform.
+   *
+   * **Beside `writes`, and not among `throws`.** A `DryRunRefused` says
+   * something about the *run*, not about this host's surface: the same call on
+   * the same host succeeds with the flag off, so it is recorded at the
+   * symbol's declared policy with `threw: null` and it never moves a verdict.
+   * But it is still a fact the reader of a report needs — a plugin whose one
+   * job is to fetch has not been exercised by a run that refused the fetch —
+   * and before this field existed it lived in `DryRunGate.refusals()` and
+   * nowhere a client could reach. Task 20b carries it as `harness.refusals`
+   * on the wire.
+   */
+  readonly refusals: readonly RecordedRefusal[];
   readonly harvest: {
     commands: number;
     menuHooks: number;
@@ -123,8 +138,11 @@ export class Detector {
       const scanned = scanBundle(pluginId, "");
       return {
         ...scanned,
+        // **The only reason, not an extra one.** The empty scan's own reason
+        // ("nothing is registered as an entry point") asserts something about
+        // a file that does not exist, and a reader weighing two sentences
+        // would weigh one of them wrongly.
         tierReasons: [
-          ...scanned.tierReasons,
           `no bundle source to scan (${messageOf(error)}): the tier is a default, not a finding`,
         ],
       };
@@ -167,7 +185,24 @@ export class Detector {
     const plugins: CompatReportRow[] = [];
     for (const id of ids) {
       const scan = await this.scan(id);
-      const harness = this.inDryRun() ? await this.runHarness(id) : null;
+      // **One plugin's refusal is one row's, never the report's.** A host
+      // holding a quarantined plugin is exactly the host an operator wants a
+      // compatibility report from, and a `report()` that rejected on the first
+      // one it could not probe would answer nothing about the other forty.
+      // The refusal becomes a note on the row it belongs to and the walk goes
+      // on — the same shape `HeadlessConfigDir.listInstalled` takes for a
+      // broken manifest.
+      let harness: HarnessResult | null = null;
+      const notes: string[] = [];
+      if (this.inDryRun()) {
+        try {
+          harness = await this.runHarness(id);
+        } catch (error) {
+          notes.push(`harness not run: ${messageOf(error)}`);
+        }
+      } else {
+        notes.push("harness not run: this host is not in dry-run");
+      }
       plugins.push({
         id,
         version: await this.versionOf(id),
@@ -175,6 +210,7 @@ export class Detector {
         harness,
         schemaSource: this.deps.pluginConfig?.schemaSourceFor(id) ?? "none",
         verdict: verdictFor(scan, harness),
+        notes,
       });
     }
     return { generatedAtUnixMs: this.deps.clock.now(), plugins };
@@ -192,8 +228,16 @@ export class Detector {
         { plugin_id: pluginId },
       );
     }
+    // **The enabled SET, read before the load — not the loaded list.** The two
+    // are different sets and the difference is a plugin the user switched on
+    // whose `onload` threw: enabled, not loaded. Deciding the restore from
+    // `loadedPlugins()` made the detector disable exactly that plugin, so
+    // asking for a compatibility report silently un-enabled the plugin the
+    // report was most likely being asked about. What has to be put back is
+    // what the host was asked to run, which is this set.
+    const wasEnabled = (await this.deps.dir.readEnabledSet()).includes(pluginId);
     const wasLoaded = this.deps.lifecycle.loadedPlugins().includes(pluginId);
-    const writeMark = gate.writes().length;
+    const mark = gate.mark();
     const callMark = this.deps.recorder.callMark?.() ?? null;
     const harnessLimits: string[] = [];
     if (callMark === null) {
@@ -213,7 +257,10 @@ export class Detector {
         // not happen.
         loaded = true;
         harnessLimits.push(
-          `${pluginId} was already loaded, so this run records nothing it did at load time`,
+          `${pluginId} was already loaded, so this run records nothing it did at load time — ` +
+            "`calls`, `throws` and `writes` are empty for that reason and not because the plugin " +
+            "touched nothing, while the `harvest` counts below are its real registrations, so the " +
+            "verdict for this row rides on those alone",
         );
       } else {
         await this.deps.lifecycle.enableLate(pluginId);
@@ -232,9 +279,9 @@ export class Detector {
       loadError = withLastError(messageOf(error), this.deps.quarantine.lastError(pluginId));
     }
 
-    // **Read before the restore.** `disable` forgets the plugin's harvest, so
-    // a count taken afterwards would report zero registrations for every
-    // plugin the detector itself switched off.
+    // **Read before the restore.** The restore's unload forgets the plugin's
+    // harvest, so a count taken afterwards would report zero registrations for
+    // every plugin the detector itself switched off.
     const calls =
       callMark === null
         ? []
@@ -249,11 +296,16 @@ export class Detector {
       throws: calls.filter((call) => call.threw !== null),
       writes: gate
         .writes()
-        .slice(writeMark)
+        .slice(mark.writes)
         // The enabled-set write the lifecycle makes on the way in carries
         // `pluginId: null` — it is this host's bookkeeping, not the plugin's —
         // and so does the one the restore makes on the way out.
         .filter((write) => write.pluginId === pluginId),
+      // **Windowed, not attributed**, because a `RecordedRefusal` carries no
+      // plugin id: the refusal is raised below every surface that knows one.
+      // The window is the whole attribution available, and the detector
+      // serializes its runs, so what it holds is what this load provoked.
+      refusals: gate.refusals().slice(mark.refusals),
       harvest: {
         commands: this.deps.harvest.commands().filter((row) => row.pluginId === pluginId).length,
         menuHooks: this.deps.harvest.menuHooks().filter((row) => row.pluginId === pluginId).length,
@@ -266,17 +318,39 @@ export class Detector {
       harnessLimits,
     };
 
-    if (!wasLoaded) {
+    if (!wasEnabled) {
       // Put the enabled set back, whether or not the load worked: a failed
       // `enableLate` has already written the plugin into it (that order is the
       // lifecycle's, and it is the one that fails safely for a real enable).
       // A failure here is the host's, not the plugin's, and must not turn a
       // finished probe into a refusal.
+      //
+      // **`preserveDiagnostics`, because this is a restore and not a
+      // decision.** A user's `disable` forgets the plugin's failure window and
+      // its load failure on purpose — the next enable should start from
+      // nothing — but a detector that forgot them would clear the host's
+      // answer to "why isn't this running" for every plugin it probed, and
+      // would hand a plugin sitting at four of five failures a clean slate.
       try {
-        await this.deps.lifecycle.disable(pluginId);
+        await this.deps.lifecycle.disable(pluginId, { preserveDiagnostics: true });
       } catch (error) {
         harnessLimits.push(`could not disable ${pluginId} after the run: ${messageOf(error)}`);
       }
+    }
+    // **Last, and only this run's rows.** The gate is the host's, and its log
+    // is what an operator reads to decide whether a dry run is safe to perform
+    // for real. Everything between the two marks was caused by the detector
+    // loading a plugin nobody asked to run — two enabled-set rewrites that
+    // cancel out, and whatever the probed plugin's `onload` did — so leaving
+    // them would tell that operator the host intends writes it does not. The
+    // rows are already copied into `result`, which is where they belong.
+    gate.dropSince(mark);
+    if (result.writes.length > 0) {
+      harnessLimits.push(
+        "this run's recorded writes were taken back out of the host's dry-run log, but the " +
+          "dry-run overlay still reflects them: a note this probe modified reads back modified " +
+          "for the rest of the session",
+      );
     }
     return result;
   }

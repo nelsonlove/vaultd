@@ -73,8 +73,28 @@ export interface ScanResult {
   readonly pluginId: string;
   readonly minified: boolean;
   readonly bytes: number;
-  /** Property-position hits, keyed by member name. See {@link scannedMembers}. */
+  /**
+   * Property-position hits on the **specific** surface, keyed by member name.
+   *
+   * Specific means: a declared dotted row whose member is not also an everyday
+   * JavaScript name. `.getFileCache` in a bundle is Obsidian's; `.delete` is
+   * usually a `Map`'s. Both are declared rows and both are counted, but they
+   * are not the same kind of evidence, and one field holding both is a field a
+   * client renders as `delete: 100` beside `getFileCache: 26` with nothing to
+   * tell them apart. Measured on the goldens before the split: 32–57% of the
+   * hits in this field were generic members. See {@link genericSymbols} and
+   * {@link GENERIC_MEMBERS}.
+   */
   readonly apiSymbols: Readonly<Record<string, number>>;
+  /**
+   * The same counting, for the members that are common JavaScript names.
+   *
+   * Reported rather than dropped: `.on(` really is how a plugin subscribes and
+   * `.delete(` really is how one deletes a file, so the rows carry signal —
+   * they simply carry noise as well, and an upper bound in its own field is
+   * honest where an upper bound mixed into {@link apiSymbols} is not.
+   */
+  readonly genericSymbols: Readonly<Record<string, number>>;
   readonly lifecycleGates: {
     onLayoutReady: number;
     layoutReadyRead: number;
@@ -113,6 +133,50 @@ const FRAMEWORK_CONSTANTS: ReadonlyArray<readonly [FrameworkName, readonly strin
   ["preact", ["__PREACT_DEVTOOLS__"]],
   ["vue", ["__VUE_DEVTOOLS_GLOBAL_HOOK__", "__vue_app__", "__v_isRef"]],
 ];
+
+/**
+ * Declared members that are also everyday JavaScript names.
+ *
+ * Property-position matching cannot tell `map.delete(k)` from
+ * `vault.delete(file)`: both are `.delete` and both are what the bundle shows.
+ * The study accepts that — it is the price of a count that survives
+ * minification — but a report that presented the two together would be handing
+ * a reader an upper bound labelled as a measurement. So these rows go to
+ * {@link ScanResult.genericSymbols} and the rest to
+ * {@link ScanResult.apiSymbols}.
+ *
+ * The list is by hand rather than by a rule, because "is this a common name"
+ * is a judgement about JavaScript and not a property of the policy table. A
+ * new declared row that is a common name has to be added here, and the fixture
+ * ground truths re-derived — the same deliberate cost the declaring-module
+ * import list carries above.
+ */
+const GENERIC_MEMBERS: ReadonlySet<string> = new Set([
+  "blur",
+  "close",
+  "contains",
+  "create",
+  "delete",
+  "first",
+  "focus",
+  "getValue",
+  "hide",
+  "invoke",
+  "last",
+  "load",
+  "off",
+  "on",
+  "open",
+  "refresh",
+  "remove",
+  "render",
+  "require",
+  "save",
+  "send",
+  "setValue",
+  "transaction",
+  "unique",
+]);
 
 /** The registrations a report counts, whatever the policy table calls them. */
 const REGISTRATION_MEMBERS: readonly string[] = [
@@ -260,9 +324,15 @@ const MINIFIED_MEAN_LINE_WITH_RATIO = 80;
 const MINIFIED_SHORT_RATIO_WITH_LINE = 0.15;
 
 export function scanBundle(pluginId: string, source: string): ScanResult {
-  const apiSymbols = countMembers(source, scannedMembers());
+  const members = countMembers(source, scannedMembers());
+  const apiSymbols: Record<string, number> = {};
+  const genericSymbols: Record<string, number> = {};
+  for (const [member, hits] of Object.entries(members)) {
+    if (GENERIC_MEMBERS.has(member)) genericSymbols[member] = hits;
+    else apiSymbols[member] = hits;
+  }
   const registrations = countMembers(source, REGISTRATION_MEMBERS);
-  const commandSlices = argumentSlices(source, "addCommand");
+  const commandSlices = commandRegistrations(source);
   const lifecycleGates = {
     onLayoutReady: countMember(source, "onLayoutReady"),
     layoutReadyRead: countMember(source, "layoutReady"),
@@ -283,6 +353,7 @@ export function scanBundle(pluginId: string, source: string): ScanResult {
     minified: looksMinified(source),
     bytes: Buffer.byteLength(source, "utf8"),
     apiSymbols,
+    genericSymbols,
     lifecycleGates,
     registrations,
     commandIds: commandIdsIn(commandSlices),
@@ -374,7 +445,10 @@ function literalsAfter(source: string, patterns: readonly RegExp[]): readonly st
 
 function requiredBuiltins(source: string): readonly string[] {
   const found = new Set<string>();
-  for (const match of source.matchAll(/require\(\s*(["'`])(?:node:)?([a-z_/]+)\1\s*\)/g)) {
+  // `[a-z0-9_/]`, with the digit: `http2` is a builtin, and a character class
+  // without one reported it absent while its name sat in the list below — the
+  // failure shape a list and a matcher that disagree always take.
+  for (const match of source.matchAll(/require\(\s*(["'`])(?:node:)?([a-z0-9_/]+)\1\s*\)/g)) {
     const name = match[2];
     if (name !== undefined && NODE_BUILTINS.includes(name)) found.add(name);
   }
@@ -387,6 +461,29 @@ function detectFrameworks(source: string): readonly FrameworkName[] {
     if (constants.some((constant) => source.includes(constant))) found.push(name);
   }
   return found;
+}
+
+/**
+ * The `addCommand(...)` calls that register a command, and not the others.
+ *
+ * **A plugin's own method may be called `addCommand`.** obsidian-linter has a
+ * settings-tab helper `addCommand(e, i, r)` invoked as `this.addCommand(e, i)`
+ * — the same receiver and the same name as the real registration — so neither
+ * the name nor the receiver separates them. What separates them is the shape
+ * of the argument: Obsidian's takes a `Command` object, and a `Command`
+ * without an `id` is not one. The `id:` literal is also exactly what
+ * {@link commandIdsIn} reads, so a call this keeps is a call that contributes
+ * an id and a call it drops contributed nothing.
+ *
+ * The cost is a real registration built elsewhere — `this.addCommand(cmd)`
+ * with the object in a variable — which this does not see. It was already
+ * invisible to `commandIds` for the same reason: an id assembled at runtime is
+ * not in the bundle to read. Counting it as a command while being unable to
+ * name it would make the tier estimate depend on something no reader could
+ * check.
+ */
+function commandRegistrations(source: string): readonly string[] {
+  return argumentSlices(source, "addCommand").filter((slice) => idLiteralIn(slice) !== null);
 }
 
 /**
@@ -476,11 +573,17 @@ function endOfString(source: string, open: number): number {
 function commandIdsIn(slices: readonly string[]): readonly string[] {
   const ids: string[] = [];
   for (const slice of slices) {
-    const match = /(?:^|[{,\s])id\s*:\s*(["'`])([^"'`]*)\1/.exec(slice);
-    const id = match?.[2];
-    if (id !== undefined && id.length > 0 && !ids.includes(id)) ids.push(id);
+    const id = idLiteralIn(slice);
+    if (id !== null && !ids.includes(id)) ids.push(id);
   }
   return ids;
+}
+
+/** The first `id: "…"` in an argument list, or `null`. See {@link commandIdsIn}. */
+function idLiteralIn(slice: string): string | null {
+  const match = /(?:^|[{,\s])id\s*:\s*(["'`])([^"'`]*)\1/.exec(slice);
+  const id = match?.[2];
+  return id !== undefined && id.length > 0 ? id : null;
 }
 
 function looksMinified(source: string): boolean {

@@ -340,6 +340,12 @@ export interface RecordedWrite {
   readonly atUnixMs: number;
 }
 
+/** A position in a {@link DryRunGate}'s two logs. See {@link DryRunGate.mark}. */
+export interface DryRunMark {
+  readonly writes: number;
+  readonly refusals: number;
+}
+
 /** One refusal a dry run answered, as a report tallies them. */
 export interface RecordedRefusal {
   readonly surface: string;
@@ -745,6 +751,37 @@ export class DryRunGate implements WriteGate {
   /** Every mutation this run recorded instead of performing, in order. */
   writes(): readonly RecordedWrite[] {
     return [...this.recorded];
+  }
+
+  /**
+   * Where the two logs stand right now, for a caller about to do something and
+   * read back only what it caused. **The compatibility detector is the only
+   * caller**, and {@link dropSince} is the other half of the pair.
+   */
+  mark(): DryRunMark {
+    return { writes: this.recorded.length, refusals: this.refused.length };
+  }
+
+  /**
+   * Forget everything recorded since `mark`. **Harness-only.**
+   *
+   * Not a general undo, and it must not become one: a dry run's write log is
+   * what an operator reads to decide whether the run is safe to perform for
+   * real, and a caller that could delete rows from it could hide a write the
+   * host would make. The one caller that may is the detector, because the rows
+   * it deletes are rows *it* caused by loading a plugin nobody asked to run —
+   * an enabled-set rewrite the restore undoes, and whatever the probed
+   * plugin's `onload` did. Leaving them in would tell the operator this host
+   * intends to rewrite `community-plugins.json` twice, which it does not.
+   *
+   * **What it cannot take back is the overlay.** A recorded write also put
+   * bytes in {@link DryRunGate.overlay}, and those have no per-row removal:
+   * for the rest of the session a note the probe modified reads back modified.
+   * The detector says so in its own result rather than pretending otherwise.
+   */
+  dropSince(mark: DryRunMark): void {
+    this.recorded.length = Math.min(this.recorded.length, mark.writes);
+    this.refused.length = Math.min(this.refused.length, mark.refusals);
   }
 
   /**

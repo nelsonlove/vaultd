@@ -1,10 +1,12 @@
 {
   "minified": false,
   "apiSymbols": {
-    "setValue": 1,
     "loadData": 1,
     "addSettingTab": 1,
     "registerMarkdownCodeBlockProcessor": 1
+  },
+  "genericSymbols": {
+    "setValue": 1
   },
   "lifecycleGates": {
     "onLayoutReady": 0,
@@ -14,7 +16,9 @@
   },
   "commandIds": [],
   "eventNames": [],
-  "frameworks": ["svelte"],
+  "frameworks": [
+    "svelte"
+  ],
   "crossPlugin": [],
   "internalPlugins": [],
   "tierEstimate": 3

@@ -237,9 +237,13 @@ export function memoryPolicyRecorder(options: MemoryRecorderOptions = {}): Polic
 /**
  * How many ordered calls a recorder keeps. See {@link memoryPolicyRecorder}.
  *
- * Large enough that no plugin's `onload` comes near it — the widest surface in
- * the corpus reaches for fifteen distinct symbols — and small enough that the
- * log is a few megabytes at worst rather than a leak.
+ * The log grows per **call**, not per symbol, so the number that matters is
+ * traffic and not surface: a plugin's `onload` makes tens of calls, a busy
+ * session's event fan-out makes thousands an hour, and the only reader — one
+ * harness run's window — wants the last few hundred. 20,000 rows is a few
+ * megabytes at worst, leaves a window three orders of magnitude wider than any
+ * load needs, and turns an unbounded leak into a bounded ring. A mark survives
+ * the trim: see `firstSeq` above.
  */
 const CALL_LOG_LIMIT = 20_000;
 

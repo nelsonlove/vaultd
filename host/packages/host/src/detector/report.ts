@@ -19,6 +19,18 @@ export interface CompatReportRow {
   readonly harness: HarnessResult | null;
   readonly schemaSource: SchemaSource;
   readonly verdict: Verdict;
+  /**
+   * Why this row's `harness` is null or partial, in the host's words.
+   *
+   * A report over every installed plugin must finish: a plugin that is
+   * quarantined, or whose probe refused for any other reason, is one row with
+   * a sentence in it and not a report that answers nothing about the other
+   * forty. Empty when the harness ran normally. The run's *own* limits — an
+   * already-loaded plugin, an overlay that still holds the probe's bytes —
+   * are `harness.harnessLimits`, one level down, because they describe a run
+   * that happened.
+   */
+  readonly notes: readonly string[];
 }
 
 export interface CompatReport {
@@ -79,11 +91,16 @@ export function summaryLine(row: CompatReportRow): string {
   const settings = describeSchemaSource(row.schemaSource);
   const detail =
     row.harness === null
-      ? "not run (this host is not in dry-run)"
+      ? (row.notes[0] ?? "harness not run")
       : row.harness.loaded
         ? `${String(row.harness.calls.length)} calls, ` +
           `${String(row.harness.throws.length)} refused, ` +
           `${String(row.harness.harvest.unreachable)} unreachable registrations`
         : `did not load: ${row.harness.loadError ?? "no reason recorded"}`;
-  return `${row.id} ${version}: ${row.verdict} — ${tier}, settings ${settings}; ${detail}`;
+  const refused =
+    row.harness === null || row.harness.refusals.length === 0
+      ? ""
+      : `; ${String(row.harness.refusals.length)} refused by dry-run ` +
+        `(${[...new Set(row.harness.refusals.map((refusal) => refusal.surface))].join(", ")})`;
+  return `${row.id} ${version}: ${row.verdict} — ${tier}, settings ${settings}; ${detail}${refused}`;
 }

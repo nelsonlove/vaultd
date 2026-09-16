@@ -25,7 +25,7 @@
  *    instead, and every registration made inside it is owned by that plugin.
  */
 
-import { declarePolicy, stub } from "./policy";
+import { declarePolicy, enterPluginSync, stub } from "./policy";
 
 /** Anything a shim event hands its listeners. Obsidian's own signature is untyped. */
 export type EventCallback = (...data: never[]) => unknown;
@@ -225,9 +225,34 @@ export class ShimEventBus {
     };
   }
 
+  /**
+   * Call one listener inside **its own** plugin's attribution window.
+   *
+   * The window is the correction Task 20 forced. Without it the ambient
+   * `currentPluginId()` during a handler is whoever *raised* the event, not
+   * whoever registered the handler — so a bystander's listener firing inside
+   * another plugin's `onload` recorded its API hits against that other plugin,
+   * and the compatibility detector then reported surface the probed plugin had
+   * never touched. Measured before the fix: a bystander's
+   * `DataAdapter.getResourcePath` landed in the probed plugin's call log, and a
+   * per-plugin filter could not help because the id it filtered on was already
+   * wrong.
+   *
+   * `enterPluginSync` rather than `enterPlugin`, and the difference is the
+   * honest boundary: a fan-out is synchronous, so the window covers the
+   * handler's own turn and no further. A handler that continues after an
+   * `await` is no longer inside anything this can attribute — the dispatch
+   * queue is what covers the paths that can wait.
+   *
+   * The failure report was already the listener's owner, so error attribution
+   * (and with it the quarantine's count) is unchanged; this makes the *hits*
+   * agree with the failures.
+   */
   private tryTrigger(registration: Registration, data: never[]): void {
     try {
-      registration.callback.apply(registration.context, data);
+      enterPluginSync(registration.owner, () =>
+        registration.callback.apply(registration.context, data),
+      );
     } catch (error) {
       this.report({ event: registration.name, owner: registration.owner, error });
     }

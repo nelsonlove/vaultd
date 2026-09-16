@@ -549,13 +549,16 @@ export class LifecycleSequencer {
    * on its first failure after being re-enabled, which is not a rolling window
    * but a grudge.
    *
+   * `preserveDiagnostics` keeps the quarantine record and the load failure —
+   * see the comment at the call site below for who asks for that and why.
+   *
    * **No phase guard, unlike {@link enableLate}**, and that is deliberate: a
    * disable is a removal, and every phase a host can be in is one in which
    * removing a plugin is a legal thing to want. `enableLate` needs the guard
    * because it fires `layoutReady` and `resolved` at the plugin it loads, and
    * neither is true before the host has started.
    */
-  async disable(id: string): Promise<void> {
+  async disable(id: string, options: { preserveDiagnostics?: boolean } = {}): Promise<void> {
     this.deps.onOperation?.("disable");
     const enabled = await this.deps.dir.readEnabledSet();
     // **Read before anything is removed**, because every one of these is about
@@ -571,8 +574,19 @@ export class LifecycleSequencer {
     }
     await this.deps.plugins.unload(id);
     this.forget(id);
-    this.deps.quarantine.forgetPlugin(id);
-    this.failures.delete(id);
+    // **`preserveDiagnostics` is the compatibility detector's disable, and
+    // nobody else's.** The forgetting above this line is right for a *user*
+    // switching a plugin off: the next enable starts from nothing rather than
+    // from a grudge. It is wrong for a caller whose whole purpose was to put
+    // the host back the way it found it — a detector that probed a plugin and
+    // cleared its failure window would restart a plugin sitting at four of
+    // five failures at zero, and would erase the sequencer's answer to "why
+    // isn't this one running". So this arm unloads and rewrites the enabled
+    // set and leaves the diagnosis alone.
+    if (options.preserveDiagnostics !== true) {
+      this.deps.quarantine.forgetPlugin(id);
+      this.failures.delete(id);
+    }
     if (known) this.announce(id, "disabled", null);
   }
 
