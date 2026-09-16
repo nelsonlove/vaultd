@@ -54,6 +54,15 @@ function deepPatch(depth: number): Record<string, unknown> {
   return { nest: node };
 }
 
+/** A promise somebody else settles — a parked `onload`, an occupied queue slot. */
+function deferred(): { promise: Promise<void>; settle: () => void } {
+  let settle = (): void => undefined;
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+}
+
 /** Turn the event loop until `check` holds, or let the assertion say what was true. */
 async function settleUntil(check: () => boolean): Promise<void> {
   for (let turn = 0; turn < 200; turn += 1) {
@@ -166,7 +175,17 @@ describe("wired host ops", () => {
     const harness = await HostHarness.create({
       vault: {},
       enabled: ["demo"],
-      pluginData: { demo: { taskTag: "task", myApiKey: "s3cret" } },
+      pluginData: {
+        demo: {
+          taskTag: "task",
+          myApiKey: "s3cret",
+          // A secret one hop down **and inside an array**, so the wire case
+          // catches a dotted flattening of the path grammar. With only the
+          // top-level key, `[...path]` and `[path.join(".")]` are the same
+          // value and the segment array is pinned at the service alone.
+          accounts: [{ refreshToken: "arr3y" }],
+        },
+      },
       plugins: { demo: HostHarness.settingsPlugin },
     });
     try {
@@ -185,7 +204,13 @@ describe("wired host ops", () => {
       // **Segment arrays, not names.** Task 17 round 2 froze `redacted_keys` as
       // the daemon's `key_path` grammar, so a top-level key is a one-segment
       // path; the brief's `["myApiKey"]` predates that freeze.
-      expect(guarded.redacted_keys).toEqual([["myApiKey"]]);
+      expect(guarded.redacted_keys).toEqual([["myApiKey"], ["accounts", 0, "refreshToken"]]);
+      // The array index is a **number** on the wire, not the string "0": a
+      // client acting on the path indexes an array with it.
+      expect(guarded.redacted_keys[1]?.[1]).toBe(0);
+      // The enum, never a rendering of it. `none` means "not yet described",
+      // and that sentence is the document's to write, not the socket's.
+      expect(guarded.schema.source).toBe("none");
       expect(Object.keys(guarded).sort()).toEqual([
         "id",
         "redacted_keys",
@@ -202,7 +227,7 @@ describe("wired host ops", () => {
       expect(revealed.values["myApiKey"]).toBe("s3cret");
       // Still named, because a caller holding plaintext most needs to know
       // which of the values it is holding are credentials.
-      expect(revealed.redacted_keys).toEqual([["myApiKey"]]);
+      expect(revealed.redacted_keys).toEqual(guarded.redacted_keys);
 
       const set = await client.call<{ applied: string[]; refused: unknown[] }>(
         "host.set_plugin_config",
@@ -228,6 +253,25 @@ describe("wired host ops", () => {
       expect(guardedWrite.refused).toEqual([
         { key: "myApiKey", reason: "redacted_value", path: ["myApiKey"] },
       ]);
+
+      // **An array is not an object.** `Object.entries(["a","b"])` yields
+      // index-keyed pairs, so an array accepted as a patch would write two
+      // settings called `0` and `1` into the plugin's file. Refused by name,
+      // with nothing written — and a missing patch is refused too, because an
+      // empty patch is `{}` and an omitted one is a different question asked
+      // by accident.
+      await expect(
+        client.call("host.set_plugin_config", { id: "demo", patch: ["taskTag", "todo"] }),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(
+        client.call("host.set_plugin_config", { id: "demo" }),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      const untouched = await client.call<{ values: Record<string, unknown> }>(
+        "host.get_plugin_config",
+        { id: "demo" },
+      );
+      expect(untouched.values["taskTag"]).toBe("done");
+      expect(untouched.values["0"]).toBeUndefined();
     } finally {
       await harness.stop();
     }
@@ -301,6 +345,267 @@ describe("wired host ops", () => {
       expect(row?.notes[0]).toContain("not in dry-run");
       expect(row?.schema_source).toBe("none");
     } finally {
+      await harness.stop();
+    }
+  });
+
+  it("needs a steady host for the report and the write, but never for the read", async () => {
+    const parked = deferred();
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["slow"],
+      pluginData: { slow: { taskTag: "task" } },
+      plugins: {
+        slow: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              await parked.promise;
+            }
+          },
+      },
+    });
+    try {
+      // Started, and deliberately not awaited: the host is in `loading` until
+      // the plugin's `onload` returns.
+      const starting = harness.lifecycle.start();
+      const client = await harness.connectClient();
+
+      // A report about a host that has not finished loading describes nothing.
+      await expect(client.call("host.compat_report", {})).rejects.toMatchObject({
+        code: "host_not_ready",
+      });
+      // And a write that lands before the loader's `loadData` silently changes
+      // what the plugin loads with.
+      await expect(
+        client.call("host.set_plugin_config", { id: "slow", patch: { taskTag: "during" } }),
+      ).rejects.toMatchObject({ code: "host_not_ready" });
+      // Reading a settings document is well defined at every phase.
+      const during = await client.call<{ values: Record<string, unknown> }>(
+        "host.get_plugin_config",
+        { id: "slow" },
+      );
+      expect(during.values["taskTag"]).toBe("task");
+
+      parked.settle();
+      await starting;
+
+      const report = await client.call<{ report: { plugins: unknown[] } }>("host.compat_report", {
+        plugin_id: "slow",
+      });
+      expect(report.report.plugins).toHaveLength(1);
+      await expect(
+        client.call("host.set_plugin_config", { id: "slow", patch: { taskTag: "after" } }),
+      ).resolves.toMatchObject({ applied: ["taskTag"] });
+    } finally {
+      parked.settle();
+      await harness.stop();
+    }
+  });
+
+  it("reads unknown, never fails, when the host is what stopped the probe", async () => {
+    const parked = deferred();
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["slow"],
+      plugins: {
+        slow: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              await parked.promise;
+            }
+          },
+      },
+      config: { dryRun: true },
+    });
+    try {
+      const starting = harness.lifecycle.start();
+      // In-process, because the socket operation is gated by the case above —
+      // and this is the fact the gate protects, not the gate itself. Before the
+      // fix the row read `verdict: "fails"`, `loaded: false` and an **empty**
+      // `notes`: the worst word available, about a healthy plugin, with
+      // nothing for the reader to argue with. The load error was the host's.
+      const report = await harness.detector.report("slow");
+      const row = report.plugins[0];
+      expect(row?.verdict).toBe("unknown");
+      expect(row?.harness).toBeNull();
+      expect(row?.harnessAttempted).toBe(true);
+      expect(row?.notes[0]).toContain("harness not run");
+      expect(row?.notes[0]).toContain("not steady");
+      parked.settle();
+      await starting;
+    } finally {
+      parked.settle();
+      await harness.stop();
+    }
+  });
+
+  it("carries a dry run's writes, refusals and limits, with no bytes and no credentials", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      // Installed and **not** enabled, so the probe is what loads it: a plugin
+      // already running records nothing it did at load time, which is a
+      // different row with a different limit.
+      enabled: [],
+      plugins: {
+        dryrunner: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              try {
+                await api.requestUrl({
+                  url: "https://api.example.test/v1/sync?key=URLSECRET#frag",
+                });
+              } catch {
+                // The dry run refused it. That refusal is the point of the case.
+              }
+              await this.saveData({ taskTag: "x", myApiKey: "SAVEDSECRET" });
+            }
+          },
+      },
+      config: { dryRun: true },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const reported = await client.call<{
+        report: {
+          plugins: Array<{
+            harness_attempted: boolean;
+            harness: {
+              loaded: boolean;
+              writes: Array<Record<string, unknown>>;
+              refusals: Array<{ surface: string; detail: string }>;
+              harness_limits: string[];
+              harvest: Record<string, number>;
+            } | null;
+          }>;
+        };
+      }>("host.compat_report", { plugin_id: "dryrunner" });
+      const row = reported.report.plugins[0];
+      expect(row?.harness_attempted).toBe(true);
+      const harnessRow = row?.harness;
+      expect(harnessRow).not.toBeNull();
+      expect(harnessRow?.loaded).toBe(true);
+
+      // **The write rows carry no bytes.** `RecordedWrite.params` is the body
+      // of the write — here, the whole of the plugin's saved settings — and a
+      // report carrying it would be the copy of the configuration this report
+      // exists not to make.
+      expect(harnessRow?.writes.length).toBeGreaterThan(0);
+      for (const write of harnessRow?.writes ?? []) {
+        expect(Object.keys(write).sort()).toEqual([
+          "at_unix_ms",
+          "kind",
+          "method",
+          "plugin_id",
+        ]);
+      }
+
+      // **A network refusal crosses as origin plus path.** The plugin put an
+      // API key in the query string, which is what a plugin handing a stored
+      // token to `requestUrl` does.
+      const network = harnessRow?.refusals.find((refusal) => refusal.surface === "network");
+      expect(network?.detail).toBe("https://api.example.test/v1/sync");
+
+      // A run that recorded writes says so: the overlay still reflects them.
+      expect(harnessRow?.harness_limits.length).toBeGreaterThan(0);
+      expect(harnessRow?.harvest).toBeTypeOf("object");
+
+      const serialized = JSON.stringify(reported);
+      expect(serialized).not.toContain("SAVEDSECRET");
+      expect(serialized).not.toContain("URLSECRET");
+      expect(serialized).not.toContain("#frag");
+      expect(camelCaseKeys(reported)).toEqual([]);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("refuses an id nobody installed, and creates no file for it", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: [],
+      pluginData: { demo: { taskTag: "task" } },
+      plugins: { demo: HostHarness.settingsPlugin },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      for (const call of [
+        client.call("host.get_plugin_config", { id: "nobody" }),
+        client.call("host.set_plugin_config", { id: "nobody", patch: { a: 1 } }),
+        client.call("host.compat_report", { plugin_id: "nobody" }),
+      ]) {
+        await expect(call).rejects.toMatchObject({ code: "plugin_not_installed" });
+      }
+      // Byte-check through the daemon: a typo must not leave a stray file in
+      // the config zone that nothing will ever read.
+      expect(
+        harness.writtenFile(`${harness.config.configDirName}/plugins/nobody/data.json`),
+      ).toBeUndefined();
+
+      // Installed but **not enabled** keeps its documented answer: installed is
+      // the test, loaded is not.
+      const disabled = await client.call<{ schema: { source: string } }>(
+        "host.get_plugin_config",
+        { id: "demo" },
+      );
+      expect(disabled.schema.source).toBe("none");
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("answers a set while the plugin is busy, and tells the plugin afterwards", async () => {
+    const notified: string[] = [];
+    const occupied = deferred();
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["demo"],
+      pluginData: { demo: { taskTag: "task" } },
+      plugins: {
+        demo: (api) =>
+          class extends api.Plugin {
+            override onload(): void {
+              // `onExternalSettingsChange` is Obsidian's own "your data.json
+              // changed underneath you" signal, and it runs through the
+              // dispatch queue like every other plugin entry point.
+              this.onExternalSettingsChange = (): void => {
+                notified.push("told");
+              };
+            }
+          },
+      },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      // Stand in for a plugin that is already busy — a parked `onload`, a long
+      // command. The queue is strict FIFO, so the notify this set provokes
+      // queues behind it.
+      const parking = harness.queue.run("demo", "park", () => occupied.promise);
+
+      const set = await client.call<{ applied: string[] }>("host.set_plugin_config", {
+        id: "demo",
+        patch: { taskTag: "todo" },
+      });
+      // **The write is the contract.** Before the fix this call waited out the
+      // whole of the plugin's queued work — measured at 1504 ms for a parked
+      // load — with no timeout and nothing to say what it was waiting on.
+      expect(set.applied).toEqual(["taskTag"]);
+      expect(notified).toEqual([]);
+      const after = await client.call<{ values: Record<string, unknown> }>(
+        "host.get_plugin_config",
+        { id: "demo" },
+      );
+      expect(after.values["taskTag"]).toBe("todo");
+
+      // And the plugin is still told, once it is free.
+      occupied.settle();
+      await parking;
+      await settleUntil(() => notified.length > 0);
+      expect(notified).toEqual(["told"]);
+    } finally {
+      occupied.settle();
       await harness.stop();
     }
   });

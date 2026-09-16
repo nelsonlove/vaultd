@@ -82,6 +82,7 @@ import seed from "./key-registry.json";
 import type { CachedSchema, SchemaControl, SchemaLadder, SchemaSource } from "./ladder";
 import type { DispatchQueue } from "../runtime/queue";
 import type { HeadlessConfigDir } from "../pluginset/config-dir";
+import type { HostErrors } from "../shim/errors";
 import type { HostConfig } from "../config";
 import type { PluginRegistry } from "../shim/plugin-registry";
 
@@ -215,11 +216,33 @@ export interface PluginConfigWrite {
 export interface PluginConfigDeps {
   readonly plugins?: PluginRegistry;
   readonly queue?: DispatchQueue;
+  /**
+   * Where a plugin's `onExternalSettingsChange` failure goes.
+   *
+   * The notify is no longer awaited (see {@link PluginConfigService.set}), so
+   * its rejection has nowhere to travel: without a sink it would be an
+   * unhandled rejection with the *host's* name on it rather than a handler
+   * failure with the plugin's. Optional like the other two — a service built
+   * without one falls back to the process guard, which is worse but not
+   * silent.
+   */
+  readonly errors?: HostErrors;
 }
 
 /** A `data.json` this host will not write because the daemon would refuse it. */
 export class PluginDataTooLarge extends Error {
-  readonly code = "payload_too_large";
+  /**
+   * The **host's** code, not the daemon's.
+   *
+   * It read `payload_too_large` until Task 20b's fix round, and that is a real
+   * `vaultd` code (`client/protocol.ts`, `docs/protocol.md`): a future relay
+   * that answered `error.code` generically would have reported this host's own
+   * write cap as the daemon's refusal, and a client would have retried against
+   * the wrong authority. The two are different facts — the daemon's 16 MiB
+   * payload limit, and this host's `write_file_cap_bytes` — so they get
+   * different names.
+   */
+  readonly code = "plugin_data_too_large";
   readonly pluginId: string;
 
   constructor(pluginId: string, bytes: number, cap: number) {
@@ -382,11 +405,22 @@ export class PluginConfigService {
       }
       await this.dir.writePluginData(id, merged);
     });
-    // **Outside the lock.** `onExternalSettingsChange` is a plugin entry point,
-    // and a plugin's natural response to "your file changed" is to re-read and
-    // sometimes to save — which takes this same path lock. See `locked` for
-    // what exactly deadlocks and what merely resolves late.
-    await this.notify(id);
+    // **Outside the lock, and no longer awaited.** `onExternalSettingsChange`
+    // is a plugin entry point, and a plugin's natural response to "your file
+    // changed" is to re-read and sometimes to save — which takes this same path
+    // lock. See `locked` for what exactly deadlocks and what merely resolves
+    // late.
+    //
+    // Not awaited, because **the write is the contract**. The notify goes
+    // through `queue.run`, which is strict FIFO: a plugin with work already in
+    // the queue — an `onload` still running, a long command — put the whole
+    // of `set` behind it, measured at 1504 ms for a parked load, with no
+    // timeout and no way for the caller to know what it was waiting on. The
+    // file is written and durable before this line; telling the plugin is the
+    // host's errand, not the caller's, and a plugin that never gets around to
+    // being told has still had its file changed. Its failure travels the
+    // handler path, attributed to the plugin.
+    void this.notifyLater(id);
     return { applied, refused };
   }
 
@@ -483,6 +517,28 @@ export class PluginConfigService {
    * while another plugin's work was in flight, and `currentPluginId()` would
    * name the wrong plugin for anything it touched.
    */
+  /**
+   * {@link notify}, with its failure sent somewhere a person will see it.
+   *
+   * The caller has gone by the time this settles, so there is no promise left
+   * to reject into: a throw here would be an unhandled rejection blamed on the
+   * host. `"config"` is the phase, and the plugin is the one attributed —
+   * which is true, because the code that failed is the plugin's.
+   */
+  private async notifyLater(id: string): Promise<void> {
+    const errors = this.deps.errors;
+    // With no sink the rejection is left to travel: `HostServer` installs a
+    // process-level unhandled-rejection guard that reports it under the host's
+    // own name. Worse attribution, but not silence — and swallowing it here
+    // would be silence.
+    if (errors === undefined) return await this.notify(id);
+    try {
+      await this.notify(id);
+    } catch (error) {
+      errors.report(error, id, "config");
+    }
+  }
+
   private async notify(id: string): Promise<void> {
     const plugin = this.deps.plugins?.plugins[id];
     if (plugin === undefined || typeof plugin.onExternalSettingsChange !== "function") return;

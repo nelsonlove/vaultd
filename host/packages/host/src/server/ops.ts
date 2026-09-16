@@ -180,6 +180,28 @@ const NEEDS_STEADY = new Set([
   "host.invoke_protocol",
   "host.enable_plugin",
   "host.disable_plugin",
+  // **Both joined in Task 20b's first fix round, for two different reasons.**
+  //
+  // `host.compat_report` because a report about a host that has not finished
+  // loading describes nothing: before `steady` the detector cannot probe at
+  // all, so under `--dry-run` every row read `fails` with an empty `notes` —
+  // the worst word available, about a plugin that is perfectly healthy, with
+  // nothing for the reader to argue with.
+  //
+  // `host.set_plugin_config` because it is the one config call that races the
+  // startup it runs beside. A write that lands before the loader's `loadData`
+  // silently changes what the plugin loads with, and the `onExternalSettingsChange`
+  // notify queues behind the plugin's own in-flight `onload` — measured at
+  // 1504 ms, the parked load's exact duration, with no timeout and no typed
+  // refusal. `host_not_ready` was available the whole time, and an answer beats
+  // an unbounded wait.
+  //
+  // `host.get_plugin_config` is deliberately **not** here: reading a settings
+  // document is well defined at every phase, and it belongs with `hello`,
+  // `info` and `list_plugins` in the set a client needs *because* something is
+  // wrong.
+  "host.compat_report",
+  "host.set_plugin_config",
 ]);
 
 export class HostOps {
@@ -590,6 +612,15 @@ export class HostOps {
     table.set("host.get_plugin_config", async (params) => {
       const service = this.pluginConfig("host.get_plugin_config");
       const id = stringOf(params, "id");
+      // **An id nobody installed is a typo, and a typo is not a plugin with an
+      // empty configuration.** Without this the three config operations
+      // answered a plausible-looking `{}` for any string at all, and `set` went
+      // further and *created* `plugins/<id>/data.json` for it — a stray file in
+      // the config zone that nothing would ever read. `plugin_not_installed`
+      // already exists for exactly this, and it is what tells a client a typo
+      // apart from a plugin that is installed and switched off. The disabled
+      // plugin keeps its documented answer: installed is the test, not loaded.
+      await this.assertInstalled(id);
       // **A statement of fact rather than a second check.** The brief requires
       // `reveal_secrets` to come from an authenticated session, and every
       // session on this socket is one: the nonce gate authenticates before the
@@ -603,6 +634,8 @@ export class HostOps {
       const service = this.pluginConfig("host.set_plugin_config");
       const id = stringOf(params, "id");
       const patch = objectOf(params, "patch");
+      // Before the write, so a typo creates nothing. See `get_plugin_config`.
+      await this.assertInstalled(id);
       return toWirePluginConfigWrite(id, await configFailure(id, () => service.set(id, patch)));
     });
 
@@ -611,6 +644,11 @@ export class HostOps {
     table.set("host.compat_report", async (params) => {
       const detector = this.detector("host.compat_report");
       const pluginId = optionalStringOf(params, "plugin_id");
+      // A named plugin has to be one this host has: a report about an id
+      // nobody installed is a full row of defaults — `version: ""`,
+      // `verdict: "runs"` — about nothing at all. Omitting `plugin_id` reports
+      // the installed set, which cannot contain one.
+      if (pluginId !== null) await this.assertInstalled(pluginId);
       // Thin over `Detector.report`, and scrubbed on the way out. The detector
       // answers for every installed plugin when no id is named; a plugin it
       // could not probe is one row with a sentence in its `notes`, never a

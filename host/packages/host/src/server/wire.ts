@@ -599,9 +599,60 @@ function toWireRecordedWrite(write: RecordedWrite): RecordedWriteWire {
   };
 }
 
+/**
+ * A dry run's refusal, with a network address cut back to origin and path.
+ *
+ * **The one plugin-controlled string in this report that routinely holds a
+ * credential.** A `network` refusal's detail is the address the plugin asked
+ * for, verbatim — and a plugin that hands a stored token to `requestUrl` puts
+ * that token in the query string: `https://api.example/v1/sync?key=SECRET`
+ * crossed this socket in full, on a report the protocol document describes as
+ * carrying no configuration values. Nothing was read out of `data.json` to put
+ * it there, which is why every leak probe passed; it arrived through the
+ * plugin's own argument.
+ *
+ * So a detail that parses as a URL crosses as **origin plus path**: userinfo
+ * is not in `origin`, and the query and the fragment are dropped. That is
+ * enough for the reading a report is for — *which host did this plugin want,
+ * and for what* — and it is the half that carries secrets that goes.
+ *
+ * Every other surface crosses unchanged: a node builtin's name and an OS
+ * bridge's channel are short, host-authored strings with nowhere to hide a
+ * credential, and truncating them would cost a reader the whole fact. A detail
+ * that is not a URL crosses unchanged too, because guessing at the shape of a
+ * string this host did not write is how a report starts lying.
+ *
+ * **The in-process {@link RecordedRefusal} keeps the raw detail**: the dry-run
+ * log is an operator's own record on their own machine, and it is not this
+ * door. Only the socket copy is cut.
+ */
 function toWireRefusal(refusal: RecordedRefusal): RecordedRefusalWire {
-  return { surface: refusal.surface, detail: refusal.detail };
+  return { surface: refusal.surface, detail: scrubRefusalDetail(refusal) };
 }
+
+function scrubRefusalDetail(refusal: RecordedRefusal): string {
+  if (refusal.surface !== NETWORK_SURFACE) return refusal.detail;
+  let url: URL;
+  try {
+    url = new URL(refusal.detail);
+  } catch {
+    // Not an address this host can parse — a relative URL, a template a plugin
+    // never filled in. Unchanged, because the alternative is inventing a
+    // structure for it.
+    return refusal.detail;
+  }
+  return `${url.origin}${url.pathname}`;
+}
+
+/**
+ * The dry-run gate's grouping for the two HTTP helpers.
+ *
+ * Spelled here rather than imported from `shim/helpers.ts`, which does not
+ * export it, and duplicated deliberately: a rename there that missed this
+ * would stop the scrub silently, so `server-wiring.test.ts` asserts the
+ * scrubbing happens through a real refusal rather than against this constant.
+ */
+const NETWORK_SURFACE = "network";
 
 export function toWireScanResult(scan: ScanResult): ScanResultWire {
   return {

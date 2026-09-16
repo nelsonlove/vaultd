@@ -58,6 +58,7 @@ import type { HostConfig } from "../config";
 import type { InteractionBroker } from "../interaction/broker";
 import type { App } from "../shim/app";
 import type { CoexistenceMonitor } from "../pluginset/coexistence";
+import type { DispatchQueue } from "../runtime/queue";
 import type { ObsidianApi } from "../shim/api";
 import type { Plugin, PluginManifest } from "../shim/plugin";
 import type { PluginLoadSeam } from "../runtime/lifecycle";
@@ -359,7 +360,10 @@ export class HostHarness extends ShimHarness {
       new SchemaLadder(this.config.dataDir, this.config.clock),
       DEFAULT_KEY_REGISTRY,
       this.config,
-      { plugins: this.app.plugins, queue: this.assembly.queue },
+      // `errors` because `set` no longer awaits the plugin's
+      // `onExternalSettingsChange`: its failure has no caller left to reject
+      // into, and the handler-failure sink is where a plugin's throw belongs.
+      { plugins: this.app.plugins, queue: this.assembly.queue, errors: this.assembly.errors },
     );
     this.pluginConfigValue = pluginConfig;
     this.detectorValue = new Detector({
@@ -523,6 +527,17 @@ export class HostHarness extends ShimHarness {
       throw new Error("this harness has not been assembled yet");
     }
     return this.detectorValue;
+  }
+
+  /**
+   * The host's dispatch queue.
+   *
+   * Exposed because a case about what happens *while a plugin is busy* has to
+   * be able to make one busy: the queue is strict FIFO, so occupying a slot is
+   * how a test stands in for a parked `onload` without needing a real one.
+   */
+  get queue(): DispatchQueue {
+    return this.assembly.queue;
   }
 
   /** The one config service, shared by the detector and by the socket's two ops. */

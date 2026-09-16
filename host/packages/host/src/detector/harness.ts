@@ -26,6 +26,7 @@
 
 import { DryRunGate } from "../dryrun/dry-run";
 import { HostError } from "../server/wire";
+import { OverlapRefused } from "../pluginset/coexistence";
 import { scanBundle } from "./scanner";
 import { verdictFor } from "./report";
 import type { Clock, HostConfig } from "../config";
@@ -52,7 +53,14 @@ export const DETECTOR_REQUIRES_DRY_RUN = "detector_requires_dry_run";
  * Anything else a probe throws means it started, which is a different sentence
  * in the report row and a different thing for a reader to do about it.
  */
-const REFUSALS: ReadonlySet<string> = new Set([DETECTOR_REQUIRES_DRY_RUN, "plugin_quarantined"]);
+const REFUSALS: ReadonlySet<string> = new Set([
+  DETECTOR_REQUIRES_DRY_RUN,
+  "plugin_quarantined",
+  // A host that is not steady cannot load anything, so a probe asked for
+  // during startup was declined by this host before it reached the plugin.
+  // See {@link Detector.probe} on why that must not read as a load failure.
+  "host_not_ready",
+]);
 
 export interface HarnessResult {
   readonly pluginId: string;
@@ -212,7 +220,7 @@ export class Detector {
           // plugin: a refusal means the host declined before touching it, and
           // anything else means the probe started and broke, having already
           // loaded it. The restore runs either way (see {@link restore}).
-          const refused = error instanceof HostError && REFUSALS.has(error.code);
+          const refused = isRefusal(error) || error instanceof OverlapRefused;
           notes.push(
             `${refused ? "harness not run" : "harness failed mid-run"}: ${messageOf(error)}`,
           );
@@ -236,6 +244,24 @@ export class Detector {
 
   private async probe(pluginId: string): Promise<HarnessResult> {
     const gate = this.gateOrRefuse();
+    // **A host that is not steady declines before it touches the plugin**, and
+    // the refusal has to happen *here* rather than inside the load. `enableLate`
+    // throws its own phase guard ("needs a started host"), which arrives at the
+    // catch below as an ordinary load failure — so a report asked for during a
+    // parked startup read `loaded: false`, `verdict: "fails"` and an **empty**
+    // `notes` for a plugin that is in perfect health. The one word a client is
+    // told to render was the worst one available, about the host's timing.
+    // Refusing by name instead makes the row `unknown` with a sentence in it,
+    // which is what `harnessAttempted` and `notes` exist for.
+    const phase = this.deps.lifecycle.phase();
+    if (phase !== "steady" && !this.deps.lifecycle.loadedPlugins().includes(pluginId)) {
+      throw new HostError(
+        "host_not_ready",
+        `this host cannot load ${pluginId} to probe it: the lifecycle is ${phase}, not steady. ` +
+          "Nothing about the plugin is known from this run — ask again once the host has started.",
+        { plugin_id: pluginId },
+      );
+    }
     if (this.deps.quarantine.isQuarantined(pluginId)) {
       const reason = this.deps.quarantine.reason(pluginId);
       throw new HostError(
@@ -301,6 +327,14 @@ export class Detector {
           loaded = true;
         }
       } catch (error) {
+        // **A refusal by this host is not a load failure**, and the difference
+        // is the whole distance between `unknown` and `fails`. The GUI already
+        // running the plugin (`OverlapRefused`), or any other refusal this host
+        // makes before the plugin's code runs, says nothing about the plugin —
+        // so it leaves this probe by the refusal road, where `report()` turns
+        // it into a note on the row, rather than being recorded as a load that
+        // did not work.
+        if (error instanceof OverlapRefused || isRefusal(error)) throw error;
         // **The plugin's own message, added back.** The sequencer turns a load
         // failure into a sentence before it throws — `loadOne` keeps the message
         // and builds a fresh `Error` from it — so the cause chain ends at "threw
@@ -460,6 +494,11 @@ export class Detector {
 function withLastError(message: string, last: Error | null): string {
   if (last === null || message.includes(last.message)) return message;
   return `${message}: ${last.message}`;
+}
+
+/** Did this host decline before the plugin's own code ran? See {@link REFUSALS}. */
+function isRefusal(error: unknown): boolean {
+  return error instanceof HostError && REFUSALS.has(error.code);
 }
 
 function messageOf(error: unknown): string {
