@@ -304,6 +304,99 @@ describe("host subscriptions", () => {
     }
   });
 
+  it("drops a held commit that a later resync has made void", async () => {
+    const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+      const seen: string[] = [];
+      client.onEvent((envelope) => seen.push(envelope.event.type));
+
+      const generation = harness.mirror.generation() + 1;
+      harness.server.relayDaemonEvent({
+        type: "generation_committed",
+        value: {
+          previous_generation: harness.mirror.generation(),
+          generation,
+          cause: "watcher",
+          changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+          affected_note_count: 1,
+          affected_reference_count: 0,
+        },
+      });
+      expect(harness.server.heldCommitCount()).toBe(1);
+
+      // The daemon lost per-path detail five generations on. The resync is not
+      // held — it is a statement about the engine, not about this host's view —
+      // and it **voids** the commit still waiting behind it.
+      harness.server.relayDaemonEvent({
+        type: "resync_required",
+        value: { current_generation: generation + 4, reason: "oversized_change_set" },
+      });
+      await harness.serverQuiesce();
+      expect(seen).toEqual(["resync_required"]);
+      expect(harness.server.heldCommitCount()).toBe(0);
+
+      // And it stays void when the mirror finally reaches it: a client told
+      // "re-read at generation N + 5" that then applied a change set for N would
+      // move its own state backwards.
+      await harness.commitGeneration({ generation, modified: ["A.md"], announce: false });
+      await harness.serverQuiesce();
+      expect(seen).toEqual(["resync_required"]);
+      await client.disconnect();
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("bounds the held commits and collapses the hold rather than growing", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      config: { subscriberQueueLimit: 32 },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+      const collapse = client.nextEvent("resync_required");
+
+      // A mirror that falls a long way behind a committing daemon — a slow
+      // re-hydration, a stalled engine connection, a vault import. The held list
+      // was the one buffer on this door that grew without bound: measured at
+      // 7.4 MiB for twenty thousand commits, with nothing refusing any of them.
+      const ahead = harness.mirror.generation() + 1;
+      let peak = 0;
+      for (let i = 0; i < 20_000; i += 1) {
+        harness.server.relayDaemonEvent({
+          type: "generation_committed",
+          value: {
+            previous_generation: ahead + i,
+            generation: ahead + i + 1,
+            cause: "watcher",
+            changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+            affected_note_count: 1,
+            affected_reference_count: 0,
+          },
+        });
+        peak = Math.max(peak, harness.server.heldCommitCount());
+      }
+      // Flat, at the same bound the subscriber queue uses.
+      expect(peak).toBeLessThanOrEqual(32);
+      await expect(collapse).resolves.toMatchObject({
+        reason: "subscriber_lag",
+        current_generation: harness.mirror.generation(),
+      });
+      // The client is still served: a collapse is a message, not a broken
+      // connection.
+      await expect(client.call("host.list_plugins", {})).resolves.toMatchObject({ plugins: [] });
+      await client.disconnect();
+    } finally {
+      await harness.stop();
+    }
+  }, 30_000);
+
   it("does not lag a reading client with a burst larger than the queue", async () => {
     const harness = await HostHarness.create({
       vault: {},

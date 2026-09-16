@@ -57,6 +57,18 @@ interface Subscription {
   readonly queue: HostEvent[];
   /** Set when the cap was reached. Cleared when the resync is actually emitted. */
   dropped: boolean;
+  /**
+   * The highest generation this subscription has been told to re-read at.
+   *
+   * **A `generation_committed` at or below it is void and is never delivered.**
+   * A subscriber told "your view is void, re-read at generation N" that then
+   * received a change set for generation 2 would move its own state *backwards*
+   * — which is the one thing the resync told it not to do. The server prunes the
+   * commits it is *holding* when a resync is relayed; this is the same rule one
+   * layer down, and it is what covers the collapse this class synthesizes for a
+   * subscriber that fell behind, which no server-side prune can see.
+   */
+  resyncedThrough: number;
 }
 
 export interface SubscriptionsDeps {
@@ -84,7 +96,7 @@ export class ClientSubscriptions {
    */
   open(): { id: string; generation: number } {
     const id = this.deps.mintId();
-    this.subscriptions.set(id, { id, queue: [], dropped: false });
+    this.subscriptions.set(id, { id, queue: [], dropped: false, resyncedThrough: -1 });
     return { id, generation: this.deps.currentGeneration() };
   }
 
@@ -112,7 +124,15 @@ export class ClientSubscriptions {
 
   /** Queue one event for every subscription this client holds, then flush. */
   deliver(event: HostEvent): void {
+    const resyncAt = resyncGenerationOf(event);
+    const committedAt = event.type === "generation_committed" ? generationOf(event) : null;
     for (const subscription of this.subscriptions.values()) {
+      // Void: this subscription has already been told to re-read at a generation
+      // at or past this one. See {@link Subscription.resyncedThrough}.
+      if (committedAt !== null && committedAt <= subscription.resyncedThrough) continue;
+      if (resyncAt !== null) {
+        subscription.resyncedThrough = Math.max(subscription.resyncedThrough, resyncAt);
+      }
       // Already behind: everything from here is part of the same gap, and one
       // gap is one `resync_required`. Queueing more would only postpone the
       // moment the client is told, and would deliver events *older* than the
@@ -183,7 +203,15 @@ export class ClientSubscriptions {
       if (subscription.dropped) {
         subscription.dropped = false;
         this.rotation = at + 1;
-        return frame(subscription.id, this.lagEvent());
+        const collapse = this.lagEvent();
+        // The collapse is a resync like any other: everything at or below the
+        // generation it names is void for this subscription from here on, which
+        // covers a commit the server releases from its held set afterwards.
+        subscription.resyncedThrough = Math.max(
+          subscription.resyncedThrough,
+          resyncGenerationOf(collapse) ?? -1,
+        );
+        return frame(subscription.id, collapse);
       }
     }
     return null;
@@ -208,4 +236,25 @@ export class ClientSubscriptions {
 /** One event envelope, as a line. The host's envelope is the daemon's. */
 function frame(subscriptionId: string, event: HostEvent): string {
   return `${JSON.stringify({ version: 1, subscription_id: subscriptionId, event })}\n`;
+}
+
+/** The generation a `generation_committed` names, or `-1` if it names none. */
+function generationOf(event: HostEvent): number {
+  const value = event.value as { generation?: unknown } | null;
+  return typeof value?.generation === "number" ? value.generation : -1;
+}
+
+/**
+ * The generation a `resync_required` tells a subscriber to re-read at, or `null`
+ * for any other event.
+ *
+ * A daemon that could not name one sends `null`, which is the strongest form of
+ * "start over": everything is void, so it reads as infinity here.
+ */
+function resyncGenerationOf(event: HostEvent): number | null {
+  if (event.type !== "resync_required") return null;
+  const value = event.value as { current_generation?: unknown } | null;
+  return typeof value?.current_generation === "number"
+    ? value.current_generation
+    : Number.POSITIVE_INFINITY;
 }

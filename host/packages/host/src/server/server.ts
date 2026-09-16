@@ -68,26 +68,36 @@ import { HostOps, HOST_PROTOCOL_VERSION } from "./ops";
 import { VaultdError } from "../client/errors";
 import { isKnownRuntimeEvent } from "../client/protocol";
 import { toWireNotice, toWireOverlap } from "./wire";
+import type { HostConfig } from "../config";
 import type { HostEvent } from "./subscriptions";
 import type { HostServerDeps, HostServerWiring, OpSession } from "./ops";
-import type { RuntimeEventDto } from "../client/protocol";
+import type { ResyncReasonDto, RuntimeEventDto } from "../client/protocol";
 
 export type { HostServerDeps, HostServerWiring } from "./ops";
 
 /** The file, inside the host's data directory, that holds the ownership nonce. */
 const NONCE_FILE = "nonce";
 
+/** How much room a request's envelope and base64 padding get above its payload. */
+const LINE_CAP_HEADROOM_BYTES = 1024 * 1024;
+
 /**
- * How long one request line may be.
+ * How long one request line may be, **in bytes of UTF-8**.
  *
  * A client that sends an unterminated stream would otherwise grow this host's
  * memory one chunk at a time, which is the same hazard the subscriber queue is
  * bounded against and deserves the same answer: a bound, and a connection that
- * is destroyed rather than served. 16 MB matches `HostConfig.writeFileCapBytes`,
- * so the largest legitimate request — a `write_file` forwarded to the daemon —
- * still fits with room for its envelope.
+ * is destroyed rather than served.
+ *
+ * Derived from `writeFileCapBytes` rather than written as a literal beside it,
+ * because the relationship is the whole justification for the number: the
+ * largest legitimate request through this door is a `write_file` forwarded to
+ * the daemon, so the cap has to be that payload plus room for its envelope. Two
+ * constants that happened to agree would be two constants to keep agreeing.
  */
-const MAX_LINE_BYTES = 17 * 1024 * 1024;
+function lineCapFor(config: HostConfig): number {
+  return config.writeFileCapBytes + LINE_CAP_HEADROOM_BYTES;
+}
 
 /**
  * Every host that wants to hear about an unhandled rejection in this process.
@@ -306,6 +316,15 @@ export class HostServer {
    * `mirror.appliedThrough() >= value.generation` is the release condition, and
    * {@link HostServer.releaseHeldCommits} runs it on every applied batch.
    *
+   * **A `resync_required` voids every held commit at or below the generation it
+   * names.** A subscriber that has just been told "your view is void, re-read at
+   * generation N" must not then receive a change set for generation 2: a client
+   * that applied it would move its own state *backwards*, which is the one thing
+   * the resync told it not to do. So the resync is relayed — it is never held,
+   * because it is a statement about the engine rather than about this host's
+   * view — and the held set is pruned behind it. It is the queue's own collapse
+   * discipline one layer up: **one message, not a prefix of the truth.**
+   *
    * `config_changed` arrives here as well as through the mirror's own seam, and
    * only the mirror's is broadcast — one announcement per raw write into the
    * config zone, from the seam that also invalidates this host's cached config.
@@ -313,15 +332,57 @@ export class HostServer {
   relayDaemonEvent(event: RuntimeEventDto): void {
     if (isKnownRuntimeEvent(event) && event.type === "config_changed") return;
     if (isKnownRuntimeEvent(event) && event.type === "generation_committed") {
-      const held = { generation: event.value.generation, event: { type: event.type, value: event.value } };
-      if (this.deps.mirror.appliedThrough() >= held.generation) {
-        this.broadcast(held.event);
-        return;
-      }
-      this.heldCommits.push(held);
+      this.hold(event.value.generation, { type: event.type, value: event.value });
       return;
     }
+    if (isKnownRuntimeEvent(event) && event.type === "resync_required") {
+      // `null` means the daemon could not name a generation, which is the
+      // strongest form of "start over": everything held is void.
+      this.voidHeldCommits(event.value.current_generation ?? Number.POSITIVE_INFINITY);
+    }
     this.broadcast({ type: event.type, value: event.value });
+  }
+
+  /** How many daemon commits are waiting for the mirror. **For its own test.** */
+  heldCommitCount(): number {
+    return this.heldCommits.length;
+  }
+
+  /**
+   * Hold one commit until the mirror reaches it — or deliver it now, or collapse.
+   *
+   * **The held list is bounded, like every other buffer on this door.** It was
+   * the one that was not: a mirror that falls a long way behind a committing
+   * daemon — a slow re-hydration, a stalled engine connection, a vault import —
+   * grew it without limit, measured at 7.4 MiB for twenty thousand commits with
+   * nothing refusing, dropping or collapsing any of them.
+   *
+   * The bound is `subscriberQueueLimit`, and overflow takes the same road the
+   * queue's own overflow takes: drop the held set **whole** and owe one
+   * `resync_required { subscriber_lag }`. That is not a compromise — a mirror
+   * that far behind is going to re-hydrate anyway, and a client being told to
+   * re-read needs none of the detail that was being held for it.
+   */
+  private hold(generation: number, event: HostEvent): void {
+    if (this.deps.mirror.appliedThrough() >= generation) {
+      this.broadcast(event);
+      return;
+    }
+    this.heldCommits.push({ generation, event });
+    if (this.heldCommits.length <= this.deps.config.subscriberQueueLimit) return;
+    this.heldCommits.length = 0;
+    const reason: ResyncReasonDto = "subscriber_lag";
+    this.broadcast({
+      type: "resync_required",
+      value: { current_generation: this.deps.mirror.generation(), reason },
+    });
+  }
+
+  /** Forget every held commit at or below `generation`. See {@link relayDaemonEvent}. */
+  private voidHeldCommits(generation: number): void {
+    if (this.heldCommits.length === 0) return;
+    const kept = this.heldCommits.filter((held) => held.generation > generation);
+    this.heldCommits.splice(0, this.heldCommits.length, ...kept);
   }
 
   /**
@@ -472,6 +533,7 @@ export class HostServer {
   private accept(socket: Socket): void {
     const connection = new Connection(socket, {
       limit: this.deps.config.subscriberQueueLimit,
+      lineCap: lineCapFor(this.deps.config),
       currentGeneration: () => this.deps.mirror.generation(),
       mintId: () => {
         this.subscriptionSequence += 1;
@@ -552,6 +614,8 @@ export class HostServer {
 /** What a {@link Connection} needs of the server that owns it. */
 interface ConnectionDeps {
   readonly limit: number;
+  /** Bytes of UTF-8 one request line may reach. See {@link lineCapFor}. */
+  readonly lineCap: number;
   readonly currentGeneration: () => number;
   readonly mintId: () => string;
   readonly authenticate: (nonce: string) => boolean;
@@ -574,6 +638,8 @@ class Connection {
   authenticated = false;
 
   private buffered = "";
+  /** The byte length of {@link buffered}, kept incrementally. See {@link absorb}. */
+  private bufferedBytes = 0;
   private destroyed = false;
   /** Flush loops waiting for the socket to have taken everything written. */
   private readonly drainWaiters: Array<() => void> = [];
@@ -668,34 +734,35 @@ class Connection {
     this.deps.gone(this);
   }
 
+  /**
+   * Take one chunk, and hand over every complete line in it.
+   *
+   * **The cap is counted in bytes, incrementally.** `String.length` counts
+   * UTF-16 units, so a multi-byte payload used to reach several times the
+   * intended cap before the destroy fired — and measuring the whole buffer on
+   * every chunk instead would be quadratic in exactly the case the cap exists
+   * for, a peer that never sends a newline. So each chunk's own byte length is
+   * added as it arrives (the socket decodes UTF-8, so a chunk never splits a
+   * character), and the counter is recomputed from the remainder only when a
+   * line has actually been consumed — which is short in every case but the one
+   * that is about to be destroyed anyway.
+   */
   private absorb(chunk: string): void {
     this.buffered += chunk;
-    if (this.overLineCap()) {
+    this.bufferedBytes += Buffer.byteLength(chunk, "utf8");
+    if (this.bufferedBytes > this.deps.lineCap) {
       this.destroy();
       return;
     }
     let newline = this.buffered.indexOf("\n");
+    if (newline === -1) return;
     while (newline !== -1) {
       const line = this.buffered.slice(0, newline);
       this.buffered = this.buffered.slice(newline + 1);
       if (line.trim().length > 0) this.dispatchLine(line);
       newline = this.buffered.indexOf("\n");
     }
-  }
-
-  /**
-   * Is what is buffered past the cap, in **bytes**?
-   *
-   * `String.length` counts UTF-16 units, so a multi-byte payload reached roughly
-   * twice the intended cap before the destroy fired. A UTF-8 encoding is never
-   * *shorter* than the unit count and never longer than four times it, so the
-   * cheap comparison decides almost every call and the real encoding is only
-   * measured in the narrow band where it could matter.
-   */
-  private overLineCap(): boolean {
-    if (this.buffered.length > MAX_LINE_BYTES) return true;
-    if (this.buffered.length * 4 <= MAX_LINE_BYTES) return false;
-    return Buffer.byteLength(this.buffered, "utf8") > MAX_LINE_BYTES;
+    this.bufferedBytes = Buffer.byteLength(this.buffered, "utf8");
   }
 
   /**

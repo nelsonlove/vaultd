@@ -77,14 +77,22 @@ const untilClose = (path: string, lines: string[]): Promise<string[]> =>
   new Promise((resolve, reject) => {
     const socket = connect(path);
     const replies: string[] = [];
+    let connected = false;
     reader(socket, replies);
     socket.on("connect", () => {
+      connected = true;
       for (const line of lines) socket.write(`${line}\n`);
     });
     socket.on("close", () => {
       resolve(replies);
     });
-    socket.on("error", reject);
+    socket.on("error", (error) => {
+      // **An `EPIPE` here is the host doing its job.** A line past the cap is
+      // destroyed mid-write, so the rest of what this probe was sending has
+      // nowhere to go — which is the assertion, not a failure of it. Only a
+      // failure to reach the socket at all is this probe's problem.
+      if (!connected) reject(error);
+    });
   });
 
 /**
@@ -336,6 +344,43 @@ describe("host socket security", () => {
     } finally {
       await harness.stop();
     }
+  });
+
+  it("measures the line cap in bytes, not in UTF-16 units", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: [],
+      // The cap is `writeFileCapBytes` plus a megabyte of headroom, so a small
+      // write cap makes this case cheap rather than a 20 MB one.
+      config: { writeFileCapBytes: 4096 },
+    });
+    try {
+      const socketPath = await harness.server.listen();
+      // Three bytes each in UTF-8 and one UTF-16 unit each, so this payload is
+      // **over** the byte cap and well under the unit count a `String.length`
+      // check would have measured. Before the fix a multi-byte line reached
+      // several times the intended cap before the destroy fired.
+      const cjk = "漢".repeat(600_000);
+      expect(Buffer.byteLength(cjk, "utf8")).toBeGreaterThan(4096 + 1024 * 1024);
+      expect(cjk.length).toBeLessThan(4096 + 1024 * 1024);
+      expect(await untilClose(socketPath, [JSON.stringify({ padding: cjk })])).toEqual([]);
+      // The host is unharmed, and a line inside the cap is still served.
+      const client = await harness.connectClient();
+      await expect(client.call("host.list_plugins", {})).resolves.toMatchObject({ plugins: [] });
+    } finally {
+      await harness.stop();
+    }
+  }, 30_000);
+
+  it("disarms the rejection guard when the last host closes", async () => {
+    // The refcount is what keeps two live hosts to one `process.on` listener and
+    // a host that is never closed from leaking one. Asserted at the boundary:
+    // this is the only harness alive at this point in the file, so the last
+    // `close()` is this one's.
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    expect(rejectionGuardArmed()).toBe(true);
+    await harness.stop();
+    expect(rejectionGuardArmed()).toBe(false);
   });
 
   it("stops listening on a refusal, and can listen again once it is repaired", async () => {

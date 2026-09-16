@@ -445,6 +445,29 @@ describe("host.* operations", () => {
     }
   });
 
+  it("says nothing about disabling an id nothing has ever heard of", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+      const seen: string[] = [];
+      client.onEvent((envelope) => seen.push(envelope.event.type));
+      // Disabling something still loaded but no longer on disk is a real need,
+      // so `disable` does not require the plugin to be installed — but a typo'd
+      // id is a no-op, and a no-op must not broadcast a state change for a
+      // plugin that never existed.
+      await expect(client.call("host.disable_plugin", { id: "never-existed" })).resolves.toEqual({
+        id: "never-existed",
+        state: "disabled",
+      });
+      await harness.serverQuiesce();
+      expect(seen).toEqual([]);
+    } finally {
+      await harness.stop();
+    }
+  });
+
   it("refuses a plugin the GUI is already running, and honours force_shared", async () => {
     const harness = await HostHarness.create({
       vault: {},
