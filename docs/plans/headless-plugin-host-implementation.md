@@ -7897,6 +7897,8 @@ git commit -m "feat(host): broker suggest modals and refuse bespoke modals typed
 
 ### Task 19: Dry-run mode
 
+> **Amended 2026-09-16 (RULING, Task 19 review — Task 19b added).** The review measured that under `--dry-run` a plugin which creates a note, binary, folder or copy and then uses it throws "the mirror has no row for it", and that `modify` then `read` returns the old bytes: the mirror never moves because nothing was written. That breaks "the plugin sees success" and would make the Task 20 detector verdict a daily-notes-shaped plugin `fails` for a harness defect. Ruling: a new **Task 19b, the dry-run overlay** — the gate holds the paths it synthesised and the last bytes it recorded; the vault index and the read paths consult it only after the mirror answers `null` (bytes before the mirror for read-your-writes); **no synthetic rows in the `Mirror`** (it mirrors the daemon; a resync would fight them); precedence removed > overlay bytes > mirror metadata; dry-run stays non-isolating for reads (a daemon delta still reaches the mirror). Also ruled at the review: the host's non-`host.` client proxy routes through the `WriteGate` (a dry run that forwards a client's `write_note` is a dry run that writes), and synthetic answers follow the daemon's dot-segment rule for `semantic`/`generation` presence while `kind` keeps the config-dir rule. Task 19b's brief lives in the SDD workspace and lands before Task 20.
+
 **Files:**
 
 - Create: `host/packages/host/src/dryrun/dry-run.ts`
