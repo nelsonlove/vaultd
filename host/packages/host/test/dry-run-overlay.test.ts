@@ -7,7 +7,9 @@ import { assembleShim } from "../src/testing/assemble";
 import { defaultHostConfig, systemClock } from "../src/config";
 import { DryRunGate } from "../src/dryrun/dry-run";
 import { VaultdError } from "../src/client/errors";
+import { DEFAULT_KEY_REGISTRY, PluginConfigService } from "../src/settings/plugin-config";
 import { HostHarness } from "../src/testing/host-harness";
+import { SchemaLadder } from "../src/settings/ladder";
 import { TFile, TFolder } from "../src/shim/files";
 import type { HostConfig } from "../src/config";
 import type { MirrorChangeBatch } from "../src/mirror/types";
@@ -355,4 +357,277 @@ describe("the dry-run overlay", () => {
     expect(await adapter.exists("New.md")).toBe(false);
     expect(await adapter.stat("New.md")).toBeNull();
   });
+
+  // --- Fix round 1 -----------------------------------------------------------
+
+  /**
+   * I5/M2. Removed beats bytes, for a path the run itself wrote.
+   *
+   * The brief's headline precedence had no case holding it: every fixture the
+   * nine cases delete or rename away was one the run had never written, so
+   * `contentOf` was `null` there and the ordering never decided anything.
+   * Reordering `overlayRead` survived the whole mutation battery.
+   */
+  it("lets a removal beat bytes the same run recorded", async () => {
+    const harness = await dryRunHarness({});
+    const made = await harness.vault.create("Ghost.md", "# Ghost\n");
+    expect(await harness.vault.read(made)).toBe("# Ghost\n");
+
+    await harness.vault.delete(made);
+
+    expect(harness.dryRun.overlay.contentOf("Ghost.md")).toBeNull();
+    expect(harness.dryRun.overlay.has("Ghost.md")).toBe(false);
+    expect(harness.vault.getFileByPath("Ghost.md")).toBeNull();
+    expect(await harness.vault.adapter.exists("Ghost.md")).toBe(false);
+    await expect(harness.vault.read(made)).rejects.toMatchObject({ code: "not_found" });
+    // And the sequence keeps going: a second create at the same path wins again.
+    const again = await harness.vault.create("Ghost.md", "# Back\n");
+    expect(await harness.vault.read(again)).toBe("# Back\n");
+  });
+
+  /**
+   * I5/M9. `graft` walks the subtree, which is its stated reason for existing.
+   *
+   * Case 5 renames one file, so nothing held the folder shape — the failure
+   * this task exists to stop, one level down.
+   */
+  it("moves a renamed folder's whole subtree, and walks at the new path", async () => {
+    const harness = await dryRunHarness({
+      "Src/A.md": "# A\n",
+      "Src/Sub/B.md": "# B\n",
+    });
+    const folder = harness.vault.getFolderByPath("Src")!;
+    await harness.vault.rename(folder, "Dst");
+
+    expect(harness.vault.getAbstractFileByPath("Src")).toBeNull();
+    expect(harness.vault.getAbstractFileByPath("Src/Sub/B.md")).toBeNull();
+
+    const moved = harness.vault.getFolderByPath("Dst");
+    expect(moved).toBeInstanceOf(TFolder);
+    expect(moved!.children.map((child) => child.path).sort()).toEqual(["Dst/A.md", "Dst/Sub"]);
+    expect(harness.vault.getMarkdownFiles().map((file) => file.path).sort()).toEqual([
+      "Dst/A.md",
+      "Dst/Sub/B.md",
+    ]);
+    // The bytes are still the source's, fetched from where they really are.
+    expect(await harness.vault.read(harness.vault.getFileByPath("Dst/Sub/B.md")!)).toBe("# B\n");
+    expect(await harness.vault.adapter.exists("Dst/Sub/B.md")).toBe(true);
+    expect(await harness.vault.adapter.exists("Src/Sub/B.md")).toBe(false);
+  });
+
+  /**
+   * I5/M10. A write invents the folders above it, and `clear()` takes them away.
+   *
+   * The daemon makes a write's parents implicitly, so a plugin that creates
+   * `Deep/Down/A.md` without a `createFolder` first is ordinary. Case 2 makes
+   * its folder explicitly, so the ancestor rule was unguarded.
+   */
+  it("materializes the ancestors a write invents, and drops them on clear", async () => {
+    const harness = await dryRunHarness({});
+    const made = await harness.vault.create("Deep/Down/A.md", "# A\n");
+
+    const deep = harness.vault.getAbstractFileByPath("Deep");
+    const down = harness.vault.getAbstractFileByPath("Deep/Down");
+    expect(deep).toBeInstanceOf(TFolder);
+    expect(down).toBeInstanceOf(TFolder);
+    expect((deep as TFolder).children.map((child) => child.path)).toEqual(["Deep/Down"]);
+    expect((down as TFolder).children).toEqual([made]);
+    expect(harness.vault.getRoot().children.map((child) => child.path)).toContain("Deep");
+
+    harness.dryRun.clear();
+
+    expect(harness.vault.getAbstractFileByPath("Deep")).toBeNull();
+    expect(harness.vault.getAbstractFileByPath("Deep/Down")).toBeNull();
+    expect(harness.vault.getRoot().children).toEqual([]);
+  });
+
+  /**
+   * I3. A deleted file leaves its parent's `children` too.
+   *
+   * `TFolder.children` is a public field and walking it is the ordinary way to
+   * enumerate a folder, so a node the rest of the index denies must not still
+   * sit in it. The node stays in the index's own map — a later real batch looks
+   * it up there to fire `delete` — which is why this is a detach and not a
+   * splice out of everything.
+   */
+  it("takes a deleted node out of its parent's children", async () => {
+    const harness = await dryRunHarness({
+      "Folder/A.md": "# A\n",
+      "Folder/B.md": "# B\n",
+    });
+    const doomed = harness.vault.getFileByPath("Folder/A.md")!;
+    const folder = harness.vault.getFolderByPath("Folder")!;
+
+    await harness.vault.delete(doomed);
+
+    expect(folder.children.map((child) => child.path)).toEqual(["Folder/B.md"]);
+    expect(harness.vault.getFileByPath("Folder/A.md")).toBeNull();
+    expect(harness.vault.getMarkdownFiles().map((file) => file.path)).toEqual(["Folder/B.md"]);
+    expect(await harness.vault.adapter.exists("Folder/A.md")).toBe(false);
+    expect(await harness.vault.adapter.list("Folder")).toEqual({
+      files: ["Folder/B.md"],
+      folders: [],
+    });
+
+    // A whole folder leaves the root's children the same way, and `clear()`
+    // puts back the very node a plugin was holding.
+    await harness.vault.delete(folder, true);
+    expect(harness.vault.getRoot().children).toEqual([]);
+
+    harness.dryRun.clear();
+    expect(harness.vault.getRoot().children).toEqual([folder]);
+    expect(folder.children.map((child) => child.path).sort()).toEqual([
+      "Folder/A.md",
+      "Folder/B.md",
+    ]);
+  });
+
+  /**
+   * I2. `adapter.list` agrees with `TFolder.children` — the daily-notes shape.
+   *
+   * Write into a folder, then list the folder. Periodic notes, templater and
+   * every scanner that walks a directory it has just populated do this, and a
+   * listing that came back empty is exactly how Task 20's detector would
+   * verdict a working plugin `fails` for a defect of the harness.
+   */
+  it("lists a folder the run has just created and written into", async () => {
+    const harness = await dryRunHarness({ "Kept.md": "# Kept\n" });
+    const adapter = harness.vault.adapter;
+
+    await harness.vault.createFolder("Daily/2026-10");
+    await harness.vault.create("Daily/2026-10/2026-10-01.md", "# Today\n");
+    expect(await adapter.list("Daily/2026-10")).toEqual({
+      files: ["Daily/2026-10/2026-10-01.md"],
+      folders: [],
+    });
+    expect(await adapter.list("Daily")).toEqual({ files: [], folders: ["Daily/2026-10"] });
+
+    // The adapter's own two verbs answer the same way.
+    await adapter.mkdir("Made");
+    await adapter.write("Made/A.md", "# A\n");
+    expect(await adapter.list("Made")).toEqual({ files: ["Made/A.md"], folders: [] });
+
+    // The mirror's rows are still listed, and a removal takes one out.
+    expect(await adapter.list("/")).toEqual({
+      files: ["Kept.md"],
+      folders: ["Daily", "Made"],
+    });
+    await harness.vault.delete(harness.vault.getFileByPath("Kept.md")!);
+    expect(await adapter.list("/")).toEqual({ files: [], folders: ["Daily", "Made"] });
+  });
+
+  /**
+   * I4. The config directory's read half sees the plugin's own save.
+   *
+   * `readPluginData` is the read half of `PluginConfigService.set`'s
+   * read-modify-write, so a read blind to a dry-run `saveData` merged over the
+   * pre-run document and recorded a write that erased the save — a lost update
+   * inside the very lock that exists to prevent one.
+   */
+  it("makes readPluginData and loadData agree, so a config set merges over the save", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["saver"],
+      config: { dryRun: true },
+      plugins: {
+        saver: (api) =>
+          class extends api.Plugin {
+            override onload(): void {
+              /* the case drives the methods itself. */
+            }
+          },
+      },
+    });
+    await harness.lifecycle.start();
+    const plugin = harness.app.plugins.getPlugin("saver") as Plugin;
+    await plugin.saveData({ greeting: "hello" });
+
+    expect(await harness.dir.readPluginData("saver")).toEqual({ greeting: "hello" });
+    expect(await plugin.loadData()).toEqual({ greeting: "hello" });
+
+    const service = new PluginConfigService(
+      harness.dir,
+      new SchemaLadder(harness.config.dataDir, harness.config.clock),
+      DEFAULT_KEY_REGISTRY,
+      harness.config,
+    );
+    await service.set("saver", { other: 1 });
+
+    // The merged document the set recorded carries both keys: the plugin's save
+    // survived rather than being written over.
+    const recorded = harness.dryRun.writes().at(-1);
+    const encoded = (recorded?.params as { content_base64: string }).content_base64;
+    expect(JSON.parse(Buffer.from(encoded, "base64").toString("utf8"))).toMatchObject({
+      greeting: "hello",
+      other: 1,
+    });
+    expect(await plugin.loadData()).toMatchObject({ greeting: "hello", other: 1 });
+  });
+
+  /**
+   * B1. A real row at a synthesised path wins, everywhere at once.
+   *
+   * The collision the whole task exists for: the detector runs a periodic-notes
+   * plugin under `--dry-run` while the user's own Obsidian creates today's note.
+   * Before the fix the index evicted the daemon's row on the next overlay change
+   * and left it evicted, so `getFiles` denied a file `adapter.exists` affirmed.
+   *
+   * Real daemon, because "the daemon produced a row" is the daemon's own fact.
+   */
+  it.skipIf(!BINARY_EXISTS)(
+    "yields a synthesised path to the daemon's real row when one arrives",
+    async () => {
+      const config = realVaultFor({ "A.md": "# A\n" });
+      const supervisor = await startedOn(config);
+      const mirror = await Mirror.open(() => supervisor.client(), config);
+      const assembly = assembleShim({
+        config,
+        client: () => supervisor.client(),
+        mirror,
+        clock: systemClock(),
+      });
+      const vault = assembly.app.vault;
+      mirror.onBatch((batch: MirrorChangeBatch) => {
+        vault.applyBatch(batch);
+      });
+      const failures: Error[] = [];
+      await supervisor.subscribe((event: RuntimeEventDto) => {
+        void mirror.applyEvent(event).catch((error: unknown) => {
+          failures.push(error instanceof Error ? error : new Error(String(error)));
+        });
+      });
+
+      await vault.create("Collide.md", "# mine\n");
+      expect(vault.getFileByPath("Collide.md")).not.toBeNull();
+
+      // The user's own Obsidian makes exactly the path the run is pretending to.
+      writeFileSync(join(config.vaultRoot, "Collide.md"), "# theirs\n", "utf8");
+      await waitFor(
+        "the mirror to learn of the real Collide.md",
+        () => mirror.entry("Collide.md") !== undefined,
+        () =>
+          `The mirror is at generation ${String(mirror.generation())}; it holds ` +
+          `${mirror.entries().map((entry) => entry.path).join(", ")}. Failures: ` +
+          `${failures.map((error) => error.message).join(" | ")}.`,
+      );
+      // One unrelated overlay write, which is what used to trigger the eviction.
+      await vault.create("Unrelated.md", "# other\n");
+
+      const real = vault.getFileByPath("Collide.md");
+      expect(real).toBeInstanceOf(TFile);
+      expect(vault.getAbstractFileByPath("Collide.md")).toBe(real);
+      expect(vault.getFiles().map((file) => file.path)).toContain("Collide.md");
+      expect(vault.getRoot().children.map((child) => child.path)).toContain("Collide.md");
+      expect(await vault.adapter.exists("Collide.md")).toBe(true);
+      // Every surface agrees it is the daemon's file, not the run's pretend one.
+      expect(await vault.read(real!)).toBe("# theirs\n");
+      expect(real!.stat.mtime).toBeGreaterThan(0);
+      expect(await vault.adapter.stat("Collide.md")).toMatchObject({ type: "file", size: 9 });
+      expect(await vault.adapter.read("Collide.md")).toBe("# theirs\n");
+      // The run's other pretend path is untouched by any of it.
+      expect(await vault.read(vault.getFileByPath("Unrelated.md")!)).toBe("# other\n");
+      expect(failures).toEqual([]);
+    },
+    60_000,
+  );
 });

@@ -46,7 +46,7 @@ import type {
   WriteFileResponse,
 } from "../client/protocol";
 import type { RequestSink } from "../client/request-sink";
-import { forwardingWriteGate } from "../dryrun/dry-run";
+import { forwardingWriteGate, readThroughOverlay } from "../dryrun/dry-run";
 import type { WriteGate } from "../dryrun/dry-run";
 
 export type { PluginManifest };
@@ -146,10 +146,12 @@ export class HeadlessConfigDir {
    * the host holds, so `--dry-run` intercepts a plugin-config write exactly as
    * it intercepts a vault write.
    *
-   * Reads stay on the {@link RequestSink}. A dry run reads the real files: the
-   * point is to find out what a plugin would do to the settings it actually
-   * has, and a run that read an invented `data.json` would answer about a
-   * vault nobody owns.
+   * Reads go to the {@link RequestSink} too, but **through the gate's dry-run
+   * overlay** ({@link readFileOrNull}), so a dry run reads the real files
+   * except where it has itself pretended to write one. The point is still to
+   * find out what a plugin would do to the settings it actually has; the
+   * exception is that a run must not read back a document it has just, in the
+   * same run, told the plugin it replaced. See review finding I4.
    */
   private readonly writes: WriteGate;
   /**
@@ -593,7 +595,17 @@ export class HeadlessConfigDir {
    */
   private async readFileOrNull(path: string): Promise<string | null> {
     try {
-      return await this.readFile(path);
+      // **Through the dry-run overlay, using the gate this class already
+      // holds.** `readPluginData` is the read half of a read-modify-write:
+      // `PluginConfigService.set` reads it, merges the caller's keys over it
+      // and writes the result back. Under `--dry-run` a read that could not see
+      // the plugin's own `saveData` therefore merged over the *pre-run*
+      // document and recorded a write that erased the save — the lost update
+      // the path lock around it exists to prevent, happening while the lock was
+      // held. Review finding I4. `Plugin.loadData` reads the same file the same
+      // way, so the two readers agree.
+      const read = await readThroughOverlay(this.client, this.writes.overlay, path);
+      return read.content.toString("utf8");
     } catch (error) {
       if (isAbsent(error)) return null;
       throw error;

@@ -78,7 +78,14 @@
  *   node and before it for bytes.
  * - **Precedence is removed, then overlay bytes, then the mirror.** A path this
  *   run deleted, trashed, or renamed away reads as gone — including everything
- *   under it — whatever is really on disk.
+ *   under it — whatever is really on disk, and its node leaves its parent's
+ *   `children` as well as every listing. The **one exception** is a path this
+ *   run *invented* that the daemon has since really made: the pretend file gives
+ *   way to the real one, everywhere at once, because a plugin holding a `TFile`
+ *   with zero times for a file that exists is the contradiction all of this is
+ *   here to prevent. A path the run merely *modified* keeps answering the run's
+ *   own bytes; that is read-your-writes, and the mirror holding a row for it is
+ *   not news.
  * - **Metadata stays the mirror's.** `getFileCache` of an overlay-only file
  *   answers `null`, and of a modified one answers the daemon's cached metadata,
  *   stale by design: a dry run does not re-parse its own bytes. A synthetic
@@ -89,13 +96,19 @@
  *   move, and nothing here manufactures one. A plugin listening to its own
  *   writes hears nothing under `--dry-run`.
  *
- * Two things the overlay deliberately does not do: `patch_frontmatter` records
- * no bytes, because `FileManager.processFrontMatter` sends key-path patches and
+ * **What consults it.** `Vault`'s reads and its file index, `DataAdapter`'s
+ * `read`/`readBinary`/`append`/`exists`/`stat`/`list`, `Plugin.loadData`, and
+ * `HeadlessConfigDir`'s read half — so the two readers of a plugin's
+ * `data.json` agree, and `host.set_plugin_config`'s read-modify-write merges
+ * over a save the plugin made in the same run rather than erasing it.
+ *
+ * **Two things it deliberately does not do.** `patch_frontmatter` records no
+ * bytes, because `FileManager.processFrontMatter` sends key-path patches and
  * never serializes a note, so a frontmatter read after a dry-run patch is the
- * pre-patch text; and `DataAdapter.list` and `HeadlessConfigDir`'s own reads are
- * answered from the mirror and the daemon alone, so a synthetic path is not in
- * a directory listing and `host.get_plugin_config` does not see a plugin's
- * dry-run `saveData` (`Plugin.loadData` does).
+ * pre-patch text. And `HeadlessConfigDir.listInstalled` walks the config
+ * directory with `read_dir`, which is the daemon's own listing and knows
+ * nothing of this — so a plugin folder a dry run "created" is not an installed
+ * plugin. Both are deliberate and both are in `docs/protocol-host.md`.
  */
 
 import { VaultdError } from "../client/errors";
@@ -104,6 +117,7 @@ import type { ReadFileResponse } from "../client/protocol";
 import type { RequestSink } from "../client/request-sink";
 import type { HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
+import type { MirrorQuery } from "../mirror/types";
 import type { NoticeEntry, NoticeLog } from "../shim/notice";
 
 /**
@@ -176,6 +190,18 @@ export interface DryRunOverlay {
    * the caller already knows, and `getFiles()` knows none.
    */
   paths(): readonly string[];
+  /**
+   * The roots this run removed: the paths a delete, a trash or a rename's
+   * source named, whether or not anything still stands at them.
+   *
+   * **Beyond the brief's four**, and the counterpart to {@link paths} for the
+   * other half of the tree's job: `FileIndex` has to take a removed node out of
+   * its parent's `children` and put it back if the overlay is cleared, and
+   * asking `removed()` about every node in the vault to find out which ones is
+   * the cost this avoids. A removal covers its whole subtree, so the roots are
+   * all the index needs — everything under one leaves the tree with it.
+   */
+  removedPaths(): readonly string[];
   /**
    * A counter bumped by every record and by every {@link DryRunGate.clear}.
    *
@@ -266,7 +292,13 @@ export async function readThroughOverlay(
   });
   return {
     content: Buffer.from(response.content_base64, "base64"),
-    revision: overlaid?.kind === "elsewhere" ? held : response.revision,
+    // **The overlay's revision whenever it holds one**, so that `process`,
+    // `append` and `modify` state the same precondition for one path. The
+    // fall-through case that made them disagree is `patch_frontmatter`, which
+    // records a revision and no bytes: the bytes then come off the wire and the
+    // wire's revision is the *pre-patch* one, while `Vault.expectedFor` was
+    // already answering the patch's (review finding N6).
+    revision: held ?? response.revision,
   };
 }
 
@@ -436,6 +468,17 @@ interface OverlayRow {
   readonly revision: string | null;
   readonly content: string | Uint8Array | null;
   readonly source: string | null;
+  /**
+   * Did this row invent a path the mirror had no row for, or restate one it
+   * already held?
+   *
+   * The two behave differently the moment the daemon produces a row at the same
+   * path — see {@link RecordedOverlay.superseded}. A `modify` of a note that
+   * exists keeps answering the run's own bytes for ever, because that is
+   * read-your-writes; a `create` of a note the daemon then really creates gives
+   * way, because pretending past a fact is how a plugin comes to see two worlds.
+   */
+  readonly synthesised: boolean;
 }
 
 /** What {@link RecordedOverlay.put} is told; an omitted field keeps what was there. */
@@ -461,6 +504,14 @@ class RecordedOverlay implements DryRunOverlay {
   private readonly removals = new Map<string, number>();
   private seq = 0;
   private stamp = 0;
+
+  /**
+   * The mirror, read-only, so a row can tell when the daemon has overtaken it.
+   *
+   * `null` only for a gate built without one — the three-argument constructor,
+   * which is a test shape. A run with no mirror can never be overtaken.
+   */
+  constructor(private readonly mirror: MirrorQuery | null) {}
 
   has(path: string): boolean {
     return this.rowFor(path) !== null;
@@ -488,8 +539,12 @@ class RecordedOverlay implements DryRunOverlay {
 
   paths(): readonly string[] {
     const live: string[] = [];
-    for (const path of this.rows.keys()) if (!this.removed(path)) live.push(path);
+    for (const path of this.rows.keys()) if (this.rowFor(path) !== null) live.push(path);
     return live;
+  }
+
+  removedPaths(): readonly string[] {
+    return [...this.removals.keys()];
   }
 
   version(): number {
@@ -509,6 +564,10 @@ class RecordedOverlay implements DryRunOverlay {
       revision: patch.revision,
       content: patch.content === undefined ? (carried?.content ?? null) : patch.content,
       source: patch.source === undefined ? (carried?.source ?? null) : patch.source,
+      // Decided once, when the row is first laid down, and carried by every
+      // later write to the same path: what matters is whether this run *invented*
+      // the path, not whether the daemon has since caught up with it.
+      synthesised: carried?.synthesised ?? this.mirror?.entry(path) === undefined,
     });
   }
 
@@ -526,19 +585,48 @@ class RecordedOverlay implements DryRunOverlay {
     this.stamp += 1;
   }
 
-  /** The row for a path that is not removed, or `null`. */
+  /** The row for a path that is neither removed nor overtaken, or `null`. */
   private rowFor(path: string): OverlayRow | null {
     const row = this.rows.get(path);
-    if (row === undefined || this.removed(path)) return null;
+    if (row === undefined || this.removed(path) || this.superseded(path, row)) return null;
     return row;
   }
 
-  /** The newest removal covering `path` — its own, or an ancestor's. */
+  /**
+   * Has the daemon produced a real row at a path this run invented?
+   *
+   * Then the run's pretend file gives way to the real one, everywhere at once:
+   * the index installs the mirror's node, `read` answers the daemon's bytes,
+   * `stat` answers the daemon's times, and `exists` is true because the mirror
+   * says so rather than because this overlay does. The alternative is the
+   * measured contradiction of review finding B1 — a plugin holding a `TFile`
+   * with `{ctime: 0}` for a file that really exists, reading seven pretend bytes
+   * out of a nine-byte file.
+   *
+   * **Only for a path this run invented.** A `modify` of a note that already
+   * existed keeps answering the run's own bytes for the life of the run; that is
+   * read-your-writes, and the mirror holding a row for it is not news.
+   */
+  private superseded(path: string, row: OverlayRow): boolean {
+    return row.synthesised && this.mirror?.entry(path) !== undefined;
+  }
+
+  /**
+   * The newest removal covering `path` — its own, or an ancestor's.
+   *
+   * **Walks the path's own ancestors rather than the removal set**, so the cost
+   * is the path's depth and not the number of paths this run has deleted.
+   * `removed()` is asked once per row by `paths()` and once per node in the
+   * vault by `FileIndex.live()`, so scanning the removals here made a plugin
+   * that deletes a few hundred paths quadratic on `getFiles()` (review finding
+   * N7).
+   */
   private removalSeq(path: string): number | null {
+    if (this.removals.size === 0) return null;
     let newest = this.removals.get(path) ?? null;
-    for (const [prefix, at] of this.removals) {
-      if (!path.startsWith(`${prefix}/`)) continue;
-      if (newest === null || at > newest) newest = at;
+    for (let at = parentOf(path); at !== ""; at = parentOf(at)) {
+      const seq = this.removals.get(at);
+      if (seq !== undefined && (newest === null || seq > newest)) newest = seq;
     }
     return newest;
   }
@@ -579,7 +667,7 @@ export class DryRunGate implements WriteGate {
    * {@link DryRunOverlay}: the gate is the only writer, and a consumer that
    * could `put` into it would be inventing a file the report never mentions.
    */
-  private readonly overlayState = new RecordedOverlay();
+  private readonly overlayState: RecordedOverlay;
   /**
    * Where {@link notices} starts reading the shared log from.
    *
@@ -606,6 +694,7 @@ export class DryRunGate implements WriteGate {
     this.config = config;
     this.noticeLog = noticeLog;
     this.mirror = mirror ?? null;
+    this.overlayState = new RecordedOverlay(this.mirror);
     this.startMark = noticeLog.mark();
     // Module-level, exactly as the policy recorder is installed, and for the
     // same reason: the three surfaces that refuse — the HTTP helpers, the
@@ -931,6 +1020,12 @@ export class DryRunGate implements WriteGate {
  * The **destination**, because that is where the bytes land and therefore which
  * half of the host's storage this write belongs to.
  */
+/** A path's parent, or `""` at the vault root. */
+function parentOf(path: string): string {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? "" : path.slice(0, cut);
+}
+
 /** The revision a synthetic answer carried, when it carried one. */
 function revisionOf(answer: unknown): string | null {
   const named = (answer as { revision?: unknown } | null)?.revision;

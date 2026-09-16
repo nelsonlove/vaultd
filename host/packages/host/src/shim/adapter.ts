@@ -168,12 +168,41 @@ export class DataAdapter {
     });
   }
 
-  /** One folder's direct children, split the way Obsidian splits them. */
+  /**
+   * One folder's direct children, split the way Obsidian splits them.
+   *
+   * **The mirror's rows plus the dry run's, minus what the run removed.**
+   * Listing a folder a plugin has just written into is ordinary — periodic
+   * notes, templater, any scanner that walks a directory it populated — and a
+   * listing that disagreed with the same folder's `TFolder.children` would be
+   * the self-contradiction the overlay exists to prevent, on the surface a
+   * plugin is most likely to use for exactly this. Review finding I2.
+   */
   list(normalizedPath: string): Promise<ListedFiles> {
+    const folder = normalizedPath === "/" ? "" : normalizedPath;
+    const overlay = this.deps.writes.overlay;
     const listed: ListedFiles = { files: [], folders: [] };
-    for (const entry of this.deps.mirror.children(normalizedPath === "/" ? "" : normalizedPath)) {
+    const seen = new Set<string>();
+    for (const entry of this.deps.mirror.children(folder)) {
+      if (overlay?.removed(entry.path) === true) continue;
+      seen.add(entry.path);
       if (entry.kind === "folder") listed.folders.push(entry.path);
       else listed.files.push(entry.path);
+    }
+    for (const path of overlay?.paths() ?? []) {
+      // **The path, or whichever folder above it is a child of this one.** A
+      // write creates its parents implicitly, exactly as the daemon would have,
+      // so `create("Daily/2026-10/today.md")` has to put `Daily` in the root's
+      // listing even though the overlay holds a row for neither `Daily` nor
+      // anything but the note. `FileIndex.overlayWanted` closes over the same
+      // ancestors for the same reason.
+      const child = childOf(folder, path);
+      // The mirror's own row already spoke for a path it holds; the overlay
+      // adds the ones it does not.
+      if (child === null || seen.has(child)) continue;
+      seen.add(child);
+      if (child === path && overlay?.entry(path)?.kind === "file") listed.files.push(child);
+      else listed.folders.push(child);
     }
     return Promise.resolve(listed);
   }
@@ -407,6 +436,10 @@ export class DataAdapter {
     // its own bytes, and `getConfig` is synchronous, so the reload has to be
     // inside the promise this write hands back.
     if (sync !== null) await this.vault().configWritten(sync);
+    // The adapter's removes and renames name no `sync` path, so nothing below
+    // touches the tree; under `--dry-run` no batch follows either. See
+    // {@link FileIndex.refresh} — a no-op in a real run.
+    this.vault().index.refresh();
     if (generation === undefined) return;
     const affected = paths ?? (sync === null ? [] : [sync]);
     if (affected.length > 0) await this.deps.mirror.applyMutation(generation, affected);
@@ -425,6 +458,19 @@ export class DataAdapter {
 function isIndexedNote(path: string): boolean {
   if (!path.toLowerCase().endsWith(".md")) return false;
   return !path.split("/").some((segment) => segment.startsWith("."));
+}
+
+/**
+ * `path`, or the folder above it that sits directly inside `folder` — `null`
+ * when `path` is not under `folder` at all.
+ *
+ * What a listing of `folder` should show for a path somewhere beneath it. See
+ * the ancestor rule in {@link DataAdapter.list}.
+ */
+function childOf(folder: string, path: string): string | null {
+  if (folder !== "" && !path.startsWith(`${folder}/`)) return null;
+  const cut = path.indexOf("/", folder === "" ? 0 : folder.length + 1);
+  return cut === -1 ? path : path.slice(0, cut);
 }
 
 /** Both ends of a folder move, and every row under both ends. */

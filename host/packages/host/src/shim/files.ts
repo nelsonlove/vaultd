@@ -180,6 +180,20 @@ export class FileIndex {
    * is no third kind.
    */
   private readonly synthetic = new Set<string>();
+  /**
+   * Removal roots whose node this index has taken out of its parent's
+   * `children` — Task 19b fix round 1, review finding I3.
+   *
+   * A dry-run delete may not splice the node out of {@link nodes}: a later real
+   * batch looks it up there to fire the `delete` event, and a node that had
+   * quietly vanished would fire none. But leaving it in its parent's `children`
+   * hands a plugin walking that folder a `TFile` whose `read` throws
+   * `not_found` and whose path `getFileByPath` denies — the self-contradiction
+   * the overlay exists to prevent, on a public field. So the node stays in
+   * `nodes` and leaves `children`, and this set is what puts it back if the
+   * overlay is cleared.
+   */
+  private readonly masked = new Set<string>();
   /** The overlay {@link version} this index last reconciled against. */
   private reconciled = -1;
 
@@ -210,6 +224,7 @@ export class FileIndex {
   rebuild(): void {
     this.nodes.clear();
     this.synthetic.clear();
+    this.masked.clear();
     this.reconciled = -1;
     this.rootFolder = new TFolder(this.vault, ROOT_PATH, "", null);
     const entries = [...this.mirror.entries()].sort((a, b) =>
@@ -376,6 +391,24 @@ export class FileIndex {
     return new TFolder(this.vault, path, basenameOf(path), null);
   }
 
+  /**
+   * Bring the tree in line with the overlay now, rather than at the next
+   * accessor.
+   *
+   * @internal Host seam. Every *read* of this index reconciles on its way in,
+   * which is enough for everything the index answers itself — but `children` is
+   * a plain public field on a `TFolder` a plugin is already holding, and a
+   * plugin that deletes a note and then walks the folder reads that array
+   * without asking this class anything. So the two mutation paths that do not
+   * already `sync` a path — `Vault.rename` and `Vault.remove`, which leave the
+   * tree to the batch, and under `--dry-run` no batch comes — call this
+   * instead. A no-op in every real run: there is no overlay to reconcile
+   * against.
+   */
+  refresh(): void {
+    this.reconcileOverlay();
+  }
+
   get(path: string): TAbstractFile | undefined {
     if (path === ROOT_PATH || path === "") return this.rootFolder;
     this.reconcileOverlay();
@@ -455,6 +488,16 @@ export class FileIndex {
         this.nodes.delete(path);
       }
       this.synthetic.delete(path);
+      this.masked.delete(path);
+      // **The daemon may have overtaken this path, and then the row is its.**
+      // `overlayWanted` stops wanting a path the moment the mirror holds a row
+      // for it, so without this the one thing that really exists — the node the
+      // daemon produced — would be evicted from the index and stay evicted for
+      // the rest of the run, invisible to `getFiles` while `adapter.exists`
+      // still answered `true` off the mirror. Measured in review finding B1
+      // against the real daemon, on the daily-notes shape this task exists for.
+      const real = this.mirror.entry(path);
+      if (real !== undefined) this.install(real);
     }
 
     // Shallowest first, so a parent exists before anything hangs off it.
@@ -464,6 +507,43 @@ export class FileIndex {
     for (const path of order) {
       if (this.nodes.has(path)) continue;
       this.installSynthetic(path, wanted.get(path) ?? "file", overlay.contentOf(path));
+    }
+
+    this.reconcileMasked(overlay);
+  }
+
+  /**
+   * Take a removed path's node out of its parent's `children`, and put it back
+   * if the overlay stops saying it is gone.
+   *
+   * **The removal roots only**, which is all the tree needs: everything under a
+   * removed folder leaves with it, because the subtree hangs off the node that
+   * has just been detached, and `get`/`live` mask descendants by prefix anyway.
+   * It is also what keeps the cost proportional to how many paths this run
+   * deleted rather than to how many the vault holds.
+   *
+   * The node itself stays in {@link nodes} — see {@link masked} — and
+   * `applyBatch`'s own `detach` is idempotent (`indexOf` answers `-1` and
+   * nothing is spliced), so a later real delete of the same path still fires
+   * its event.
+   */
+  private reconcileMasked(overlay: DryRunOverlay): void {
+    for (const root of overlay.removedPaths()) {
+      if (this.masked.has(root) || !overlay.removed(root)) continue;
+      const node = this.nodes.get(root);
+      if (node === undefined) continue;
+      this.detach(node);
+      this.masked.add(root);
+    }
+    for (const root of [...this.masked]) {
+      if (overlay.removed(root)) continue;
+      const node = this.nodes.get(root);
+      // Re-attached rather than re-created, so a plugin still holding the
+      // `TFile` from before the delete is holding the node that comes back.
+      if (node?.parent != null && !node.parent.children.includes(node)) {
+        node.parent.children.push(node);
+      }
+      this.masked.delete(root);
     }
   }
 
@@ -606,7 +686,24 @@ export class FileIndex {
     options: ApplyBatchOptions,
   ): TAbstractFile | null {
     const existing = this.nodes.get(path);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      // **A real row beats a synthetic node at the same path.** Otherwise the
+      // `create` event this batch is about to fire hands the plugin the dry
+      // run's pretend `TFile` — `{ctime: 0, mtime: 0}` and the run's own byte
+      // count — for a file the daemon really made, while `adapter.stat` already
+      // answers the real one. Review finding B1's first contradiction. The
+      // instance is replaced because the pretend file and the real file are not
+      // the same file; identity is a promise about one file, and this path now
+      // has a different one.
+      if (!this.synthetic.has(path)) return existing;
+      const real = this.mirror.entry(path);
+      if (real === undefined) return existing;
+      this.detach(existing);
+      this.nodes.delete(path);
+      this.synthetic.delete(path);
+      this.masked.delete(path);
+      return this.install(real);
+    }
     const entry = this.mirror.entry(path);
     if (entry !== undefined) return this.install(entry);
     return this.install(synthesizeEntry(path, batch, options));

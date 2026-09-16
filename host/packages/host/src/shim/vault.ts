@@ -551,6 +551,10 @@ export class Vault extends Events {
     // {@link folderMoves}.
     if (folder) this.recordFolderMove(from, newPath);
     await this.deps.mirror.applyMutation(result.generation, affected);
+    // Under `--dry-run` no batch follows, so nothing else would move the tree
+    // — and a plugin holding the old parent's `TFolder` reads `children`
+    // without asking the index anything. A no-op in a real run.
+    this.index.refresh();
   }
 
   /**
@@ -619,6 +623,9 @@ export class Vault extends Events {
             path: file.path,
             mode,
           });
+    // Before the early return, because a delete in an unindexed zone answers no
+    // generation and still has to leave the tree. See {@link FileIndex.refresh}.
+    this.index.refresh();
     if (result.generation === undefined) return;
     // The same subtree rule as `rename`: a deleted folder's descendants are
     // rows that moved and the wire names none of them.
