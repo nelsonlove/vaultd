@@ -18,9 +18,11 @@
  * `host.list_plugins` and `host.subscribe` answer from the moment the socket is
  * up — a client that has just connected needs to be able to ask what is going on
  * *because* something is wrong. Everything that needs a loaded plugin set
- * answers `host_not_ready` until the sequencer reports `steady`. The six
- * operations Task 20b owns are in the table from the start and answer
- * `host_not_ready` with a message naming that task, so a client meets a
+ * answers `host_not_ready` until the sequencer reports `steady`. The
+ * operations that need a **late service** — the interaction broker, the plugin
+ * config service, the compatibility detector — are in the table from the start
+ * and answer `host_not_ready` naming the one service they are missing until
+ * {@link HostOps.attachWiring} has been given it, so a client meets a
  * documented state rather than a missing method.
  */
 
@@ -31,19 +33,25 @@ import { failureFromReport } from "../runtime/quarantine";
 import {
   HostError,
   toWireCommand,
+  toWireCompatReport,
+  toWireInteractionRequest,
   toWireMenuItem,
   toWireOverlap,
+  toWirePluginConfig,
+  toWirePluginConfigWrite,
   toWirePluginState,
   toWirePolicyUse,
   toWireProtocolHandler,
   toWireTimer,
 } from "./wire";
 import { InteractionUnavailable } from "../interaction/broker";
+import { PluginDataTooDeep, PluginDataTooLarge } from "../settings/plugin-config";
 import type { App } from "../shim/app";
 import type { ClientSubscriptions } from "./subscriptions";
 import type { HostEvent } from "./subscriptions";
 import type { InteractionBroker, PromptAnswer } from "../interaction/broker";
 import type { CoexistenceMonitor } from "../pluginset/coexistence";
+import type { Detector } from "../detector/harness";
 import type { DispatchQueue } from "../runtime/queue";
 import type { EditorRange } from "../shim/editor";
 import type { Harvest, MenuContext } from "../shim/harvest";
@@ -55,6 +63,7 @@ import type { LiveStateDto } from "../client/protocol";
 import type { Mirror } from "../mirror/mirror";
 import type { NoticeLog } from "../shim/notice";
 import type { InstalledPlugin } from "../pluginset/config-dir";
+import type { PluginConfigService } from "../settings/plugin-config";
 import type { PluginState, PositionWire, SelectionWire } from "./wire";
 import type { PolicyRecorder } from "../shim/policy";
 import type { QuarantineTracker } from "../runtime/quarantine";
@@ -126,15 +135,18 @@ export interface HostServerDeps {
  * what is already attached, and each late operation answers `host_not_ready`
  * naming **its own** missing service rather than the set.
  *
- * `pluginConfig` and `detector` stay `unknown`: this module must not declare
- * the shape of an interface Task 20b has not written, and a placeholder shape
- * would be a second declaration for it to reconcile. `broker` is typed, because
- * it exists.
+ * All three are typed now: Task 18 built the broker and Task 20b the plugin
+ * config service and the compatibility detector, so the two that stood as
+ * `unknown` — "this module must not declare the shape of an interface Task 20b
+ * has not written" — name the services they carry. The imports are type-only,
+ * which is what keeps the dependency one-way at runtime: `detector/harness.ts`
+ * imports {@link HostError} from `server/wire.ts`, and a value import back
+ * would close that circle.
  */
 export interface HostServerWiring {
   readonly broker?: InteractionBroker;
-  readonly pluginConfig?: unknown;
-  readonly detector?: unknown;
+  readonly pluginConfig?: PluginConfigService;
+  readonly detector?: Detector;
 }
 
 /** One connected, authenticated client, as an operation sees it. */
@@ -169,21 +181,6 @@ const NEEDS_STEADY = new Set([
   "host.enable_plugin",
   "host.disable_plugin",
 ]);
-
-/**
- * The operations still waiting on a service nobody has built, with the service
- * each one waits on.
- *
- * Three rather than six since Task 18: the interaction trio is wired below
- * against a real broker, and answers `host_not_ready` only when no broker is
- * attached — which is the same typed state, named for the one service it is
- * actually missing rather than for the set.
- */
-const LATE_OPS: ReadonlyArray<readonly [string, string]> = [
-  ["host.get_plugin_config", "the plugin config service"],
-  ["host.set_plugin_config", "the plugin config service"],
-  ["host.compat_report", "the compatibility detector"],
-];
 
 export class HostOps {
   readonly snapshots: SnapshotStore;
@@ -573,30 +570,88 @@ export class HostOps {
       return Promise.resolve({ prompt_id: promptId });
     });
 
-    for (const [method, service] of LATE_OPS) {
-      table.set(method, () => {
-        throw new HostError(
-          "host_not_ready",
-          `"${method}" is wired by Task 20b, which attaches ${service}. It is a typed, ` +
-            "documented state rather than a missing method: the operation exists and will " +
-            "answer once that task has run.",
-        );
-      });
-    }
+    // **What is pending, for a client that missed the event.** A prompt is
+    // delivered once, to the holder, and a subscriber that fell behind is told
+    // `resync_required` rather than handed the backlog — which recovers an
+    // ordinary event by re-reading, and recovers a prompt by asking what is
+    // still waiting. That is this operation. It reads rather than answers, so
+    // it is not restricted to the holder: every session on this socket is
+    // authenticated by the nonce gate, and only the holder can actually answer
+    // a prompt (`host.respond_interaction` checks). A client that has just
+    // taken the channel from one that disconnected is the other reader this
+    // exists for.
+    table.set("host.list_interactions", () => {
+      const broker = this.broker("host.list_interactions");
+      return Promise.resolve({ pending: broker.pending().map(toWireInteractionRequest) });
+    });
+
+    // --- Plugin configuration (Task 17) ---------------------------------------
+
+    table.set("host.get_plugin_config", async (params) => {
+      const service = this.pluginConfig("host.get_plugin_config");
+      const id = stringOf(params, "id");
+      // **A statement of fact rather than a second check.** The brief requires
+      // `reveal_secrets` to come from an authenticated session, and every
+      // session on this socket is one: the nonce gate authenticates before the
+      // first operation is dispatched, over a socket in a `0700` directory
+      // owned by this user. There is no unauthenticated caller to refuse.
+      const reveal = boolOf(params, "reveal_secrets") === true;
+      return toWirePluginConfig(id, await configFailure(id, () => service.get(id, reveal)));
+    });
+
+    table.set("host.set_plugin_config", async (params) => {
+      const service = this.pluginConfig("host.set_plugin_config");
+      const id = stringOf(params, "id");
+      const patch = objectOf(params, "patch");
+      return toWirePluginConfigWrite(id, await configFailure(id, () => service.set(id, patch)));
+    });
+
+    // --- Compatibility (Task 20) ----------------------------------------------
+
+    table.set("host.compat_report", async (params) => {
+      const detector = this.detector("host.compat_report");
+      const pluginId = optionalStringOf(params, "plugin_id");
+      // Thin over `Detector.report`, and scrubbed on the way out. The detector
+      // answers for every installed plugin when no id is named; a plugin it
+      // could not probe is one row with a sentence in its `notes`, never a
+      // refusal for the whole report.
+      const report = await (pluginId === null ? detector.report() : detector.report(pluginId));
+      return { report: toWireCompatReport(report) };
+    });
   }
 
   /** The broker, or the typed state that says which service is missing. */
   private broker(method: string): InteractionBroker {
-    const broker = this.wiring?.broker;
-    if (broker === undefined) {
+    return this.service(method, this.wiring?.broker, "the interaction broker");
+  }
+
+  private pluginConfig(method: string): PluginConfigService {
+    return this.service(method, this.wiring?.pluginConfig, "the plugin config service");
+  }
+
+  private detector(method: string): Detector {
+    return this.service(method, this.wiring?.detector, "the compatibility detector");
+  }
+
+  /**
+   * One late service, or the typed state that names the one that is missing.
+   *
+   * **Named for the service, not for the set.** Three of these are attached by
+   * two different callers, so "the wiring is incomplete" would tell a client
+   * nothing it could act on; `host_not_ready` naming the service is a
+   * documented state a client can read, and the operation it names exists and
+   * will answer once that service is wired.
+   */
+  private service<T>(method: string, service: T | undefined, name: string): T {
+    if (service === undefined) {
       throw new HostError(
         "host_not_ready",
-        `"${method}" needs the interaction broker, which has not been attached to this host. ` +
-          "It is a typed, documented state rather than a missing method: the operation exists " +
-          "and will answer once the broker is wired.",
+        `"${method}" needs ${name}, which has not been attached to this host. It is a typed, ` +
+          "documented state rather than a missing method: the operation exists and will answer " +
+          "once that service is wired.",
       );
     }
-    return broker;
+    return service;
   }
 
   // --- The operations that are more than a lookup -----------------------------
@@ -906,6 +961,51 @@ function boolOf(params: Record<string, unknown>, key: string): boolean | null {
     throw new HostError("invalid_request", `"${key}" must be a boolean when it is present`);
   }
   return value;
+}
+
+/**
+ * A required object parameter — `host.set_plugin_config`'s `patch`.
+ *
+ * An array is refused by name rather than accepted as an object: `Object.entries`
+ * of one yields index-keyed pairs, so a patch sent as `["a","b"]` would be read
+ * as `{ "0": "a", "1": "b" }` and two settings called `0` and `1` would be
+ * applied to the plugin's file. A missing `patch` is refused too: an empty
+ * patch is `{}`, which is a request to change nothing, and a client that
+ * omitted the field asked a different question by accident.
+ */
+function objectOf(params: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = params[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new HostError("invalid_request", `"${key}" is required and must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+/**
+ * Run one plugin-config call, turning its two throws into wire refusals.
+ *
+ * **Errors rather than refusal rows, and that is the point of the pair.** A
+ * refusal row is per key — "this key was not applied, and here is why" — and
+ * neither of these can be attributed to one key: a merged document over the
+ * write cap is a fact about the whole file, and a document nested past the
+ * depth this host inspects is a walk that did not finish. Neither writes
+ * anything, so the file on disk is still the one the plugin last saved.
+ */
+async function configFailure<T>(id: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (error instanceof PluginDataTooLarge) {
+      throw new HostError("plugin_data_too_large", error.message, { plugin_id: id });
+    }
+    if (error instanceof PluginDataTooDeep) {
+      throw new HostError("plugin_data_too_deep", error.message, {
+        plugin_id: id,
+        path: [...error.path],
+      });
+    }
+    throw error;
+  }
 }
 
 function stringArrayOf(params: Record<string, unknown>, key: string): string[] | null {

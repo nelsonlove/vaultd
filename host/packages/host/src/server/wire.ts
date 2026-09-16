@@ -39,7 +39,13 @@ import type { NoticeEntry } from "../shim/notice";
 import type { OverlapReport } from "../pluginset/coexistence";
 import type { PromptKind, PromptRequest } from "../interaction/broker";
 import type { TreeEntryDto } from "../client/protocol";
-import type { ApiPolicy } from "../shim/policy";
+import type { ApiPolicy, RecordedApiCall } from "../shim/policy";
+import type { CachedSchema, SchemaControl, SchemaItem, SchemaSource } from "../settings/ladder";
+import type { CompatReport, CompatReportRow, Verdict } from "../detector/report";
+import type { ConfigPath, PluginConfigView, PluginConfigWrite } from "../settings/plugin-config";
+import type { FrameworkName, ScanResult, Tier } from "../detector/scanner";
+import type { HarnessResult } from "../detector/harness";
+import type { RecordedRefusal, RecordedWrite } from "../dryrun/dry-run";
 
 /**
  * The host's own error codes, **additive to `vaultd`'s**.
@@ -60,6 +66,14 @@ export type HostErrorCode =
   | "headless_unsupported"
   | "overlap_refused"
   | "config_key_refused"
+  // The two failures of the plugin-config pair that are **not** per-key
+  // refusal rows: the service throws for both, because neither can be answered
+  // about one key. A document merged past the host's write cap is
+  // `plugin_data_too_large`, and one nested past the depth this host inspects
+  // is `plugin_data_too_deep` — which fails closed, because a redactor that
+  // cannot read a document to the bottom must not serve the half it inspected.
+  | "plugin_data_too_large"
+  | "plugin_data_too_deep"
   | "interaction_unavailable"
   | "interaction_timeout"
   | "dry_run_refused"
@@ -349,6 +363,324 @@ export function toWireInteractionRequest(request: PromptRequest): InteractionReq
  * the wire says it by omission, which is what the daemon does and what a client
  * decoding into a strict Rust struct expects.
  */
+// --- Plugin configuration (Task 17, wired here) -------------------------------
+
+/**
+ * One schema row. **Absent is spelled by omission**, as `toWireTreeEntry` does
+ * it and as the daemon does it: a key that is not there says "this rung of the
+ * ladder described no name for this setting", where `null` would be a name the
+ * plugin had declared as nothing.
+ */
+export interface SchemaItemWire {
+  key: string;
+  control: SchemaControl;
+  name?: string;
+  description?: string;
+  default_value?: unknown;
+  options?: Array<{ value: string; label: string }>;
+}
+
+/**
+ * `host.get_plugin_config`'s answer.
+ *
+ * `schema` carries the **source enum and the items, and nothing else**: the
+ * cache's `pluginId`, `pluginVersion` and `capturedAtUnixMs` are bookkeeping
+ * about the host's own cache rather than a description of the plugin, and the
+ * row the protocol document pins is `{ source, items }`. The enum crosses
+ * as itself — `"none"` stays `"none"` — because prose is a rendering and a
+ * client that branched on a sentence would break the first time one was
+ * reworded. What `"none"` means (**not yet described**, never "no settings") is
+ * the protocol document's to say.
+ */
+export interface PluginConfigWire {
+  id: string;
+  values: Record<string, unknown>;
+  schema: { source: SchemaSource; items: SchemaItemWire[] };
+  redacted_keys: ConfigPath[];
+  state_keys: string[];
+}
+
+export interface ConfigRefusalWire {
+  key: string;
+  reason: string;
+  path?: ConfigPath;
+}
+
+export interface PluginConfigWriteWire {
+  id: string;
+  applied: string[];
+  refused: ConfigRefusalWire[];
+}
+
+function toWireSchemaItem(item: SchemaItem): SchemaItemWire {
+  return {
+    key: item.key,
+    control: item.control,
+    ...(item.name === undefined ? {} : { name: item.name }),
+    ...(item.description === undefined ? {} : { description: item.description }),
+    ...(item.defaultValue === undefined ? {} : { default_value: item.defaultValue }),
+    ...(item.options === undefined
+      ? {}
+      : { options: item.options.map((option) => ({ value: option.value, label: option.label })) }),
+  };
+}
+
+function toWireSchema(schema: CachedSchema): { source: SchemaSource; items: SchemaItemWire[] } {
+  return { source: schema.source, items: schema.items.map(toWireSchemaItem) };
+}
+
+/**
+ * **`values` crosses as it stands.** It is the plugin's own document, whose
+ * keys are the plugin author's spelling — `taskTag`, `myApiKey` — and
+ * converting them would rename a client's settings. The `snake_case` rule is
+ * about the fields *this host* names; a plugin's key is data, and the
+ * redaction has already happened one layer down.
+ */
+export function toWirePluginConfig(id: string, view: PluginConfigView): PluginConfigWire {
+  return {
+    id,
+    values: view.values,
+    schema: toWireSchema(view.schema),
+    redacted_keys: view.redacted_keys.map((path) => [...path]),
+    state_keys: [...view.state_keys],
+  };
+}
+
+export function toWirePluginConfigWrite(
+  id: string,
+  write: PluginConfigWrite,
+): PluginConfigWriteWire {
+  return {
+    id,
+    applied: [...write.applied],
+    refused: write.refused.map((refusal) => ({
+      key: refusal.key,
+      reason: refusal.reason,
+      ...(refusal.path === undefined ? {} : { path: [...refusal.path] }),
+    })),
+  };
+}
+
+// --- The compatibility report (Task 20, wired here) ---------------------------
+
+/**
+ * One tallied symbol, as a **row** rather than as a key.
+ *
+ * The scan's tallies are `Record<symbolName, hits>` inside the host, and the
+ * symbol names are Obsidian's own: `getFileCache`, `onLayoutReady`,
+ * `registerEvent`. Serialized as an object they would put `camelCase` *keys* on
+ * a socket whose one rule is that it has none — and the rule is worth more than
+ * the shape, because it is what lets a client (and `server-wire.test.ts`) check
+ * a whole response mechanically instead of maintaining a list of fields that are
+ * allowed to be exempt. As rows, the symbol is a value, where it belongs: it is
+ * the plugin's evidence, not this host's field name. Insertion order is
+ * preserved, so the rows read in the order the scanner found them.
+ */
+export interface SymbolTallyWire {
+  symbol: string;
+  hits: number;
+}
+
+export interface ScanResultWire {
+  plugin_id: string;
+  minified: boolean;
+  bytes: number;
+  api_symbols: SymbolTallyWire[];
+  generic_symbols: SymbolTallyWire[];
+  lifecycle_gates: {
+    on_layout_ready: number;
+    layout_ready_read: number;
+    metadata_resolved: number;
+    metadata_resolve: number;
+  };
+  registrations: SymbolTallyWire[];
+  command_ids: string[];
+  event_names: string[];
+  frameworks: FrameworkName[];
+  cross_plugin: string[];
+  internal_plugins: string[];
+  requires_electron: boolean;
+  requires_node: string[];
+  tier_estimate: Tier;
+  tier_reasons: string[];
+}
+
+export interface RecordedApiCallWire {
+  symbol: string;
+  plugin_id: string | null;
+  policy: ApiPolicy;
+  threw: string | null;
+  at_unix_ms: number;
+}
+
+/**
+ * One recorded write, **without its params**.
+ *
+ * `RecordedWrite.params` is the body of the write — a note's text, or the whole
+ * of a plugin's `data.json` on its way to disk — and a compatibility report
+ * that carried it would be a copy of the settings this report exists not to
+ * copy. What a reader needs from a dry run is *that* the plugin wrote, what
+ * verb it used and whether it landed in the vault or in the config zone; the
+ * bytes are the dry-run log's, and the dry-run log is not this door.
+ */
+export interface RecordedWriteWire {
+  kind: "vault" | "plugin_config";
+  method: string;
+  plugin_id: string | null;
+  at_unix_ms: number;
+}
+
+export interface RecordedRefusalWire {
+  surface: string;
+  detail: string;
+}
+
+export interface HarnessResultWire {
+  plugin_id: string;
+  loaded: boolean;
+  load_error: string | null;
+  calls: RecordedApiCallWire[];
+  throws: RecordedApiCallWire[];
+  writes: RecordedWriteWire[];
+  refusals: RecordedRefusalWire[];
+  harvest: {
+    commands: number;
+    menu_hooks: number;
+    protocol_handlers: number;
+    unreachable: number;
+  };
+  harness_limits: string[];
+}
+
+export interface CompatReportRowWire {
+  id: string;
+  version: string;
+  scan: ScanResultWire;
+  harness: HarnessResultWire | null;
+  schema_source: SchemaSource;
+  verdict: Verdict;
+  /**
+   * Whether this host tried to run the plugin, whatever came of it.
+   *
+   * The discriminator between the two ways `harness` is `null`. Without it a
+   * client cannot tell "this host is not in dry-run, so nothing was attempted"
+   * from "the attempt was refused" — and only the second one means the verdict
+   * is `unknown` rather than the tier's estimate.
+   */
+  harness_attempted: boolean;
+  notes: string[];
+}
+
+export interface CompatReportWire {
+  generated_at_unix_ms: number;
+  plugins: CompatReportRowWire[];
+}
+
+function toWireTally(tally: Readonly<Record<string, number>>): SymbolTallyWire[] {
+  return Object.entries(tally).map(([symbol, hits]) => ({ symbol, hits }));
+}
+
+function toWireApiCall(call: RecordedApiCall): RecordedApiCallWire {
+  return {
+    symbol: call.symbol,
+    plugin_id: call.pluginId,
+    policy: call.policy,
+    threw: call.threw,
+    at_unix_ms: call.atUnixMs,
+  };
+}
+
+function toWireRecordedWrite(write: RecordedWrite): RecordedWriteWire {
+  return {
+    kind: write.kind,
+    method: write.method,
+    plugin_id: write.pluginId,
+    at_unix_ms: write.atUnixMs,
+  };
+}
+
+function toWireRefusal(refusal: RecordedRefusal): RecordedRefusalWire {
+  return { surface: refusal.surface, detail: refusal.detail };
+}
+
+export function toWireScanResult(scan: ScanResult): ScanResultWire {
+  return {
+    plugin_id: scan.pluginId,
+    minified: scan.minified,
+    bytes: scan.bytes,
+    api_symbols: toWireTally(scan.apiSymbols),
+    generic_symbols: toWireTally(scan.genericSymbols),
+    lifecycle_gates: {
+      on_layout_ready: scan.lifecycleGates.onLayoutReady,
+      layout_ready_read: scan.lifecycleGates.layoutReadyRead,
+      metadata_resolved: scan.lifecycleGates.metadataResolved,
+      metadata_resolve: scan.lifecycleGates.metadataResolve,
+    },
+    registrations: toWireTally(scan.registrations),
+    command_ids: [...scan.commandIds],
+    event_names: [...scan.eventNames],
+    frameworks: [...scan.frameworks],
+    cross_plugin: [...scan.crossPlugin],
+    internal_plugins: [...scan.internalPlugins],
+    requires_electron: scan.requiresElectron,
+    requires_node: [...scan.requiresNode],
+    tier_estimate: scan.tierEstimate,
+    tier_reasons: [...scan.tierReasons],
+  };
+}
+
+export function toWireHarnessResult(harness: HarnessResult): HarnessResultWire {
+  return {
+    plugin_id: harness.pluginId,
+    loaded: harness.loaded,
+    load_error: harness.loadError,
+    calls: harness.calls.map(toWireApiCall),
+    throws: harness.throws.map(toWireApiCall),
+    writes: harness.writes.map(toWireRecordedWrite),
+    refusals: harness.refusals.map(toWireRefusal),
+    harvest: {
+      commands: harness.harvest.commands,
+      menu_hooks: harness.harvest.menuHooks,
+      protocol_handlers: harness.harvest.protocolHandlers,
+      unreachable: harness.harvest.unreachable,
+    },
+    harness_limits: [...harness.harnessLimits],
+  };
+}
+
+export function toWireCompatReportRow(row: CompatReportRow): CompatReportRowWire {
+  return {
+    id: row.id,
+    version: row.version,
+    scan: toWireScanResult(row.scan),
+    harness: row.harness === null ? null : toWireHarnessResult(row.harness),
+    schema_source: row.schemaSource,
+    verdict: row.verdict,
+    harness_attempted: row.harnessAttempted,
+    notes: [...row.notes],
+  };
+}
+
+/**
+ * The whole report, scrubbed.
+ *
+ * **What does not cross, and why.** No `tab`: a `HarvestedSettingTab` carries
+ * the plugin's live `PluginSettingTab`, and nothing in this report reaches one.
+ * No plugin instance and no live object of any kind — every field below is a
+ * string, a number, a boolean or an array of those. And **no configuration
+ * values**: the report says which rung of the ladder described a plugin's
+ * settings ({@link CompatReportRowWire.schema_source}) and never what those
+ * settings are. A compatibility report is a description of a plugin, never a
+ * copy of its settings — that is what `host.get_plugin_config` is for, where a
+ * caller has to ask for the plaintext by name.
+ */
+export function toWireCompatReport(report: CompatReport): CompatReportWire {
+  return {
+    generated_at_unix_ms: report.generatedAtUnixMs,
+    plugins: report.plugins.map(toWireCompatReportRow),
+  };
+}
+
 export function toWireTreeEntry(entry: MirrorEntry): TreeEntryDto {
   return {
     path: entry.path,

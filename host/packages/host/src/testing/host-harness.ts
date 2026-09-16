@@ -73,7 +73,15 @@ export interface HostHarnessSpec {
   /** Seeds `<configDir>/plugins/<id>/data.json` before the host starts. */
   pluginData?: Record<string, Record<string, unknown>>;
   config?: Partial<HostConfig> & {
-    /** 16a only: leave the six 20b ops answering `host_not_ready`. */
+    /**
+     * Attach the plugin config service and the detector? Default **true**.
+     *
+     * Set `false` to leave `host.get_plugin_config`, `host.set_plugin_config`
+     * and `host.compat_report` answering `host_not_ready`, which is the state
+     * a host is in before its late services are wired and the one thing
+     * `server-ops.test.ts` pins about it. The interaction broker is attached
+     * whatever this says — it is part of every assembly.
+     */
     wireLateOps?: boolean;
     subscriberQueueLimit?: number;
   };
@@ -136,6 +144,8 @@ export class HostHarness extends ShimHarness {
   private serverValue: HostServer | null = null;
   /** Built by {@link bindHost}, over the sequencer it loads plugins through. */
   private detectorValue: Detector | null = null;
+  /** Built by {@link bindHost} and shared with the detector. */
+  private pluginConfigValue: PluginConfigService | null = null;
 
   /**
    * Reusable plugin factories the tests share instead of restating them.
@@ -334,6 +344,24 @@ export class HostHarness extends ShimHarness {
     // `assembleShim` — the assembly is built before the sequencer exists.
     // Task 22 builds it in the same place for the real host, and hands it to
     // `HostServer.attachWiring` there.
+    //
+    // **One config service, shared by the detector and the socket.** The
+    // ladder is over this harness's own data directory, so a schema cached by
+    // one case cannot be read by another, and the plugin registry is passed so
+    // a loaded plugin's version is the one the cache is keyed by. Shared rather
+    // than one each, because the cache and the key registry are what the two
+    // callers must agree about: a detector reporting `schema_source` from one
+    // service while `host.get_plugin_config` answered from another could
+    // disagree about the same plugin in the same second. Task 22 builds the
+    // same pair the same way for the real host.
+    const pluginConfig = new PluginConfigService(
+      this.assembly.dir,
+      new SchemaLadder(this.config.dataDir, this.config.clock),
+      DEFAULT_KEY_REGISTRY,
+      this.config,
+      { plugins: this.app.plugins, queue: this.assembly.queue },
+    );
+    this.pluginConfigValue = pluginConfig;
     this.detectorValue = new Detector({
       config: this.config,
       clock: this.config.clock,
@@ -343,17 +371,7 @@ export class HostHarness extends ShimHarness {
       recorder: this.policyRecorder,
       writes: this.assembly.writes,
       quarantine: this.quarantine,
-      // The same shape Task 20b will wire: the ladder over this harness's own
-      // data directory, so a schema cached by one case cannot be read by
-      // another, and the plugin registry so a loaded plugin's version is the
-      // one the cache is keyed by.
-      pluginConfig: new PluginConfigService(
-        this.assembly.dir,
-        new SchemaLadder(this.config.dataDir, this.config.clock),
-        DEFAULT_KEY_REGISTRY,
-        this.config,
-        { plugins: this.app.plugins, queue: this.assembly.queue },
-      ),
+      pluginConfig,
     });
     // **Built here, not on the first `connectClient`.** The server subscribes to
     // the mirror, the notice log, the sequencer and the coexistence monitor the
@@ -361,14 +379,6 @@ export class HostHarness extends ShimHarness {
     // connects still has a host whose event sources are wired — and a client
     // that connects afterwards sees a host that has been watching all along
     // rather than one that started watching when it knocked.
-    if (spec.config?.wireLateOps === true) {
-      throw new Error(
-        "wireLateOps: true needs Task 20b's plugin config service and detector, neither of which " +
-          "exists yet. Leave it false (or unset) and those three ops answer host_not_ready. The " +
-          "interaction broker is Task 18's and is always attached, so the three interaction ops " +
-          "answer for real whatever this flag says.",
-      );
-    }
     this.serverValue = new HostServer({
       config: this.config,
       lifecycle: this.lifecycle,
@@ -388,12 +398,18 @@ export class HostHarness extends ShimHarness {
       errors: this.assembly.errors,
       policyRecorder: this.policyRecorder,
     });
-    // **Always**, and not behind `wireLateOps`. The broker is Task 18's and it
-    // is part of every assembly: a host that had one and did not put it on the
-    // socket would refuse `host.attach_interaction` with `host_not_ready` while
-    // holding the very service that refusal names. The other two late services
-    // are Task 20b's and are still absent, which is what the flag is about.
-    this.serverValue.attachWiring({ broker: this.assembly.broker });
+    // **Every service this assembly holds, unless a case asks otherwise.** A
+    // host that had a service and did not put it on the socket would refuse the
+    // operation with `host_not_ready` while holding the very service that
+    // refusal names. `wireLateOps: false` is the one way to ask for that state
+    // on purpose — it is what pins the typed refusal in `server-ops.test.ts`,
+    // and it withholds only the two services this harness attaches late. The
+    // broker is Task 18's and is attached whatever the flag says, because it is
+    // part of every assembly.
+    this.serverValue.attachWiring({
+      broker: this.assembly.broker,
+      ...(spec.config?.wireLateOps === false ? {} : { pluginConfig, detector: this.detectorValue }),
+    });
   }
 
   /**
@@ -498,15 +514,23 @@ export class HostHarness extends ShimHarness {
   /**
    * The compatibility detector. **Activated by Task 20.**
    *
-   * The same object the server's `host.compat_report` will be wired to, over
-   * this harness's own lifecycle and dry-run gate: a case reading a harness
-   * result is reading what the running host recorded, not a second reckoning.
+   * The same object the server's `host.compat_report` is wired to, over this
+   * harness's own lifecycle and dry-run gate: a case reading a harness result
+   * is reading what the running host recorded, not a second reckoning.
    */
   get detector(): Detector {
     if (this.detectorValue === null) {
       throw new Error("this harness has not been assembled yet");
     }
     return this.detectorValue;
+  }
+
+  /** The one config service, shared by the detector and by the socket's two ops. */
+  get pluginConfig(): PluginConfigService {
+    if (this.pluginConfigValue === null) {
+      throw new Error("this harness has not been assembled yet");
+    }
+    return this.pluginConfigValue;
   }
 
   setGuiEnabled(ids: string[] | null): void {

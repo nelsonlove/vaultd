@@ -64,7 +64,7 @@ The child only tries to connect. The expected result is `EACCES` (or `ENOENT`) f
 
 ## Operations
 
-Every field below is `snake_case`. The **Task** column says which task implements the row; the six marked **20b** are present in the dispatch table today and answer `host_not_ready` with a message naming that task until it lands.
+Every field below is `snake_case`. The **Task** column says which task implements the row.
 
 | Method | Params | Result | Task |
 |---|---|---|---:|
@@ -85,12 +85,15 @@ Every field below is `snake_case`. The **Task** column says which task implement
 | `host.snapshot_tree` | `{ snapshot_id, cursor, limit? }` | `{ snapshot_id, generation, entries, next_cursor }` | 16a |
 | `host.snapshot_notes` | `{ snapshot_id, cursor, limit?, include? }` | `{ snapshot_id, generation, notes, next_cursor }` | 16a |
 | `host.close_snapshot` | `{ snapshot_id }` | `{ snapshot_id }` | 16a |
-| `host.get_plugin_config` | `{ id, reveal_secrets?: bool }` | `{ id, values, schema: { source, items }, redacted_keys: Path[], state_keys }` | **wired in 20b** |
-| `host.set_plugin_config` | `{ id, patch: Record<string, unknown> }` | `{ id, applied: string[], refused: { key, reason, path?: Path }[] }` | **wired in 20b** |
-| `host.compat_report` | `{ plugin_id?: string }` | `{ report: CompatReport }` | **wired in 20b** |
+| `host.get_plugin_config` | `{ id, reveal_secrets?: bool }` | `{ id, values, schema: { source, items }, redacted_keys: Path[], state_keys }` | 20b |
+| `host.set_plugin_config` | `{ id, patch: Record<string, unknown> }` | `{ id, applied: string[], refused: { key, reason, path?: Path }[] }` | 20b |
+| `host.compat_report` | `{ plugin_id?: string }` | `{ report: CompatReport }` | 20b |
 | `host.attach_interaction` | `{}` | `{ attached: bool }` | 18 |
 | `host.detach_interaction` | `{}` | `{ attached: bool }` | 18 |
 | `host.respond_interaction` | `{ prompt_id, choice_index?: number, value?: string, cancelled?: bool }` | `{ prompt_id }` | 18 |
+| `host.list_interactions` | `{}` | `{ pending: InteractionRequest[] }` | 20b |
+
+The last seven rows need a service the server is handed rather than one it builds: the interaction broker, the plugin config service and the compatibility detector. Until the host has been given the one an operation needs, that operation answers `host_not_ready` **naming that service** — a typed, documented state rather than a missing method. The services themselves are Tasks 18, 17 and 20; 20b is where they reach the socket.
 
 `host.invoke_command`'s `selection` is a range — `{ from: { line, ch }, to: { line, ch } }`, both fields zero-based — rather than a string. **This is a ratified deviation from the phase brief's pinned table**, which spells the row `selection?: string`: an `editorCallback` is handed an `Editor`, whose `setSelection` takes two positions, so a string would have to be *searched* for in the note — a different operation, with a different failure mode (no match, several matches) and a different answer for each. The controller ratified the range in Task 16a's fix round and the brief's table is amended to match. A client that sends a string is told so by name rather than having it silently ignored. The shape is pinned as `SelectionWire` in `host/packages/host/src/server/wire.ts`.
 
@@ -102,19 +105,43 @@ Every field below is `snake_case`. The **Task** column says which task implement
 
 **A prompt that could not be delivered fails immediately.** An ordinary event a lagging subscriber missed is recovered by re-reading, which is what the `resync_required` it was given instead is for; a prompt is not recoverable that way, because it is a question with a plugin waiting on the answer. So a `host.interaction_request` whose delivery was collapsed fails that prompt with `interaction_unavailable` at once, rather than leaving the plugin to run down the full `prompt_timeout_ms`.
 
+**A client treats `resync_required` as "re-ask what is pending".** The collapse drops the queue whole, so a prompt event may be among what went with it — and the prompt it announced is not necessarily gone: the one that was in flight when the queue collapsed was failed, but a prompt raised after the collapse and before the client caught up is still waiting for an answer. `host.list_interactions` answers what the broker is still holding, in the same shape the event carries, and it is what an attached client should call after any `resync_required` rather than waiting for an event that has already been sent. It reads rather than answers, so any authenticated session may call it; only the holder can answer a prompt.
+
 **Every way a prompt can fail is typed, and none of them waits forever.** No client attached: the plugin's call rejects `interaction_unavailable` immediately, rather than hanging on a human who is not there. The holder detaches or disconnects: every prompt it had not answered fails `interaction_unavailable` at once, rather than running down its timeout against a socket that is gone. Nobody answers within `prompt_timeout_ms` (120 000): `interaction_timeout`. The plugin sees each as a rejected promise on its own error path; a prompt that fails with nobody awaiting it is attributed to the plugin in the host's error log and **never counts toward a quarantine**, because a human who closed their laptop is not evidence that a plugin is broken.
 
 **Answering.** `choice_index` is an index into the `items` the request carried, and `cancelled: true` closes the prompt with no choice at all — the plugin's `onClose` runs and no choice handler is called. A `choice_index` outside the range of that prompt's `items` is `invalid_request`, and the prompt **stays pending** so the client can answer it properly; a `prompt_id` that names nothing still waiting — already answered, or timed out — is `interaction_unavailable`. For a `confirm` prompt the items are `["confirm", "cancel"]`: index 0 is yes and anything else, cancellation included, is no.
 
 **`Modal.open()` on a bespoke modal is `headless_unsupported`, and is not brokered.** The suggester family is interceptable because the base class owns the rendering and the subclass supplies only `getItems`/`getItemText`/`getSuggestions`/`onChoose…` — a list of strings and an index, which is exactly what fits down a socket. A modal that builds its own UI in `onOpen()` has no such seam: it can be *constructed* (building the `contentEl` is ordinary work that must not throw) and opening it refuses, naming the actual subclass so the report says which plugin's which modal.
 
-The plugin-config rows carry **two ratified amendments** from Task 17's fix rounds, both settled before 20b wires the handlers so the shape is frozen rather than discovered.
+### Plugin configuration
+
+**`reveal_secrets: true` needs an authenticated session, which every session on this socket is.** The nonce gate authenticates a connection before its first operation is dispatched, over a socket in a `0700` directory this user owns, so the requirement is a statement of fact about this door rather than a second check the host performs. What the flag changes is only the rendering: the credential comes back in plaintext and `redacted_keys` still names it, because a caller holding plaintext is exactly the one that needs to know which of the values it is holding are credentials.
+
+**`schema.source` is the enum, never a sentence.** `none` crosses as `none`, and it means **not yet described** — the ladder was never climbed for this plugin, or the plugin is installed and not loaded — and never "this plugin has no settings", which is a different fact this host cannot see. A source of `none` also refuses nothing: with no schema to contradict, `unknown_key` is not raised, because a host that knows nothing must not pretend a key is invented merely because it could not read the schema.
+
+**A plugin that is installed but not loaded cannot be configured beyond that.** The schema is keyed by the plugin's version, and the only version this host can read today comes from `app.plugins` — which knows the plugins it is running. So a disabled plugin serves `source: "none"` with no items, every write to it is type-checked against nothing, and the state keys the registry names are still refused. Closing that gap is a `manifest.json` read through the daemon, and it belongs to the task that assembles the real host rather than to the socket wiring.
+
+The plugin-config rows carry **two ratified amendments** from Task 17's fix rounds, both settled before 20b wired the handlers so the shape is frozen rather than discovered.
 
 **A fourth refusal reason, `redacted_value`.** The brief pins three — `state_key`, `unknown_key`, `type_mismatch`. The fourth refuses the literal string `[redacted]` written back into a key the host would redact, at any depth, and it exists because the most ordinary client there is reads a config, changes one field and writes the whole thing back: without it, that saves the placeholder over the user's real token, on a file with no history. The refusal is per key like the other three, the rest of the patch still lands, and a client that really means to store `[redacted]` in an ordinary key still can.
 
 **`redacted_keys` and a refusal's `path` are `Path = (string | number)[]`** — one segment per hop, a number for an array index (`["accounts", 0, "refreshToken"]`, `["apiAuthToken"]` for a top-level key) — rather than dotted strings. This is the daemon's own `patch_frontmatter` `key_path` grammar, chosen for the reason that grammar exists: a key name may contain a dot, so `{"a.b": {...}}` and `{"a": {"b": {...}}}` are two different documents that dot-joining spells the same way, and a client acting on a path cannot recover from the ambiguity. `refused[].key` stays the **top-level** patch key — what the caller sent, and what it would re-send — with `path` beside it naming where the reason actually is; only `redacted_value` carries one. The shapes are pinned as `ConfigPath` and `ConfigRefusal` in `host/packages/host/src/settings/plugin-config.ts`.
 
-**Two failures in this pair are errors rather than refusal rows**, and 20b maps both to error responses: `payload_too_large` when the merged document exceeds the host's write cap, and `plugin_data_too_deep` when a document or a patch is nested deeper than 64 levels — the depth this host inspects. Neither writes anything. The second fails closed on purpose: a redactor that cannot read a document to the bottom must not serve the half it inspected.
+**Two failures in this pair are errors rather than refusal rows**: `plugin_data_too_large` when the merged document exceeds the host's write cap, and `plugin_data_too_deep` when a document or a patch is nested deeper than 64 levels — the depth this host inspects. Neither is attributable to one key, which is what a refusal row is for: the first is a fact about the whole file and the second is a walk that did not finish. Neither writes anything, so the file on disk is still the one the plugin last saved. The second fails closed on purpose: a redactor that cannot read a document to the bottom must not serve the half it inspected, so `host.get_plugin_config` raises it too. Both carry `plugin_id`, and `plugin_data_too_deep` carries the `path` the walk gave up at.
+
+### The compatibility report
+
+`host.compat_report` is thin over the detector and scrubbed on the way out. **No `tab`** — a harvested setting tab carries the plugin's live `PluginSettingTab`, and nothing in this report reaches one — **no live object of any kind**, and **no configuration values**: the report says which rung of the ladder described a plugin's settings and never what those settings are. A compatibility report is a description of a plugin, never a copy of its settings; `host.get_plugin_config` is where a caller asks for those, by name.
+
+**`verdict` is one of `runs`, `degrades`, `fails`, `unknown`, and it is never asserted** — `scan.tier_reasons` and the harness's own rows are what a reader argues with. `fails` is "it did not load"; `degrades` is "it loaded, and something it reached for is not here or cannot be reached headlessly"; `runs` is the rest. `unknown` is the narrowest: a harness was **attempted and refused** — the plugin is quarantined, or the probe itself failed — and the row says why in `notes`.
+
+**`harness_attempted` sits beside it because `harness: null` means two different things.** `false` is "this host is not in dry-run, so nothing was tried", and the verdict is then the tier estimate mapped rather than invented: tiers 1 and 2 read `runs`, 3 and 4 read `degrades`, and never `fails`, because nothing was run. `true` with a null harness is "the attempt was refused", which is `unknown`. Without the discriminator a client cannot tell the two apart, and a quarantined plugin would read green.
+
+**`harness.harness_limits` is what the run could not see, and `harness.refusals` is what the dry run declined.** They are separate facts and both are needed: a run against an already-loaded plugin records nothing it did at load time and says so in the limits — its `calls`, `throws` and `writes` are empty for that reason and not because the plugin touched nothing — while a refusal is a network call or an OS bridge this run would not perform, which means a plugin whose one job is to fetch has not really been exercised. A refusal never moves a verdict: the same call succeeds on the same host with the flag off.
+
+**A recorded write carries no bytes.** `harness.writes` says *that* the plugin wrote, with the verb and whether it landed in the vault or in the config zone; the body is the dry-run log's and does not cross this door, because a report carrying it would be the copy of the settings this report exists not to make.
+
+A `plugin_id` reports one plugin; omitting it reports every installed one. **One plugin's refusal is one row's, never the report's** — a host holding a quarantined plugin is exactly the host an operator wants a report from, so the refusal becomes a sentence in that row's `notes` and the walk goes on.
 
 ### Readiness
 
@@ -129,7 +156,30 @@ PluginState { id, name, version, state: "loaded"|"disabled"|"failed"|"quarantine
 Command     { plugin_id, id, local_id, name, icon: string|null, kind, hotkeys: { modifiers: string[], key: string }[] }
 MenuItem    { hook_id, plugin_id, id, title, icon: string|null, section: string|null, checked: boolean|null }
 Overlap     { host_enabled: string[], gui_enabled: string[], overlap: string[], forced: string[], gui_readable: bool, checked_at_ms, overlap_poll_ms }
+
+Path        (string | number)[]
+SchemaItem  { key, control, name?, description?, default_value?, options?: { value, label }[] }
+InteractionRequest { prompt_id, plugin_id, kind, prompt, items: string[], timeout_ms }
+
+CompatReport { generated_at_unix_ms, plugins: CompatRow[] }
+CompatRow    { id, version, scan: Scan, harness: Harness|null, schema_source, verdict: "runs"|"degrades"|"fails"|"unknown", harness_attempted: bool, notes: string[] }
+Scan         { plugin_id, minified, bytes, api_symbols: Tally[], generic_symbols: Tally[],
+               lifecycle_gates: { on_layout_ready, layout_ready_read, metadata_resolved, metadata_resolve },
+               registrations: Tally[], command_ids: string[], event_names: string[], frameworks: string[],
+               cross_plugin: string[], internal_plugins: string[], requires_electron: bool,
+               requires_node: string[], tier_estimate: 1|2|3|4, tier_reasons: string[] }
+Tally        { symbol, hits }
+Harness      { plugin_id, loaded, load_error: string|null, calls: Call[], throws: Call[],
+               writes: { kind: "vault"|"plugin_config", method, plugin_id, at_unix_ms }[],
+               refusals: { surface, detail }[],
+               harvest: { commands, menu_hooks, protocol_handlers, unreachable },
+               harness_limits: string[] }
+Call         { symbol, plugin_id, policy: "implemented"|"harvested"|"safe_stub"|"absent", threw: string|null, at_unix_ms }
 ```
+
+**The scan's tallies are rows, not objects keyed by symbol name.** `api_symbols`, `generic_symbols` and `registrations` count Obsidian's own members — `getFileCache`, `onLayoutReady` — and an object keyed by those names would put `camelCase` *keys* on a socket whose one rule is that it has none. As `{ symbol, hits }` rows the symbol is a value, which is what it is: the plugin's evidence, not this host's field name. The rows keep the order the scanner found them in.
+
+`values` in `host.get_plugin_config` is the **plugin's own document**, so its keys are the plugin author's spelling (`taskTag`, `myApiKey`) and are never converted — renaming them would rename a user's settings. The `snake_case` rule governs the fields this host names.
 
 `version` is the empty string for a plugin whose manifest this host cannot read — unknown rather than invented, because a version nobody verified should not be printed as though it were `0.0.0`.
 
@@ -200,6 +250,52 @@ The installed set is read from the config directory and cached between requests,
 ```json
 {"version":1,"id":"8","request":{"method":"host.subscribe","params":{}}}
 {"version":1,"id":"8","outcome":{"status":"ok","value":{"type":"host.subscribe","value":{"subscription_id":"host-sub-1","generation":1}}}}
+```
+
+`host.get_plugin_config` (`test/server-wiring.test.ts`), against a plugin whose `data.json` holds `{"taskTag":"task","myApiKey":"s3cret"}`:
+
+```json
+{"version":1,"id":"9","request":{"method":"host.get_plugin_config","params":{"id":"demo"}}}
+{"version":1,"id":"9","outcome":{"status":"ok","value":{"type":"host.get_plugin_config","value":{"id":"demo","values":{"taskTag":"task","myApiKey":"[redacted]"},"schema":{"source":"none","items":[]},"redacted_keys":[["myApiKey"]],"state_keys":[]}}}}
+```
+
+`myApiKey` is withheld by the **name-shaped fallback** rather than by the key registry — the registry is the first authority and the name test is the second, and the second only ever *adds* redaction, because the failure of a hand-maintained list is always the key nobody added to it. With `"reveal_secrets": true` the same request answers `"myApiKey":"s3cret"` and `redacted_keys` is unchanged.
+
+`host.set_plugin_config` (`test/server-wiring.test.ts`) — the placeholder written back is refused with the path it was found at, and the rest of the patch still lands:
+
+```json
+{"version":1,"id":"10","request":{"method":"host.set_plugin_config","params":{"id":"demo","patch":{"taskTag":"todo","myApiKey":"[redacted]"}}}}
+{"version":1,"id":"10","outcome":{"status":"ok","value":{"type":"host.set_plugin_config","value":{"id":"demo","applied":["taskTag"],"refused":[{"key":"myApiKey","reason":"redacted_value","path":["myApiKey"]}]}}}}
+```
+
+A patch nested past 64 levels, or one whose merged document is over the write cap, is an error rather than a row — and writes nothing:
+
+```json
+{"version":1,"id":"11","outcome":{"status":"err","value":{"plugin_id":"demo","path":["nest","down","down"],"code":"plugin_data_too_deep","message":"this settings document is nested deeper than 64 levels, …"}}}
+```
+
+`host.compat_report` (`test/server-wiring.test.ts`), on a host that is **not** in dry-run — so nothing was attempted, `harness` is `null`, and the verdict is the tier estimate mapped:
+
+```json
+{"version":1,"id":"12","request":{"method":"host.compat_report","params":{"plugin_id":"demo"}}}
+{"version":1,"id":"12","outcome":{"status":"ok","value":{"type":"host.compat_report","value":{"report":{"generated_at_unix_ms":1700000000000,"plugins":[{"id":"demo","version":"0.0.0","scan":{"plugin_id":"demo","minified":false,"bytes":0,"api_symbols":[],"generic_symbols":[],"lifecycle_gates":{"on_layout_ready":0,"layout_ready_read":0,"metadata_resolved":0,"metadata_resolve":0},"registrations":[],"command_ids":[],"event_names":[],"frameworks":[],"cross_plugin":[],"internal_plugins":[],"requires_electron":false,"requires_node":[],"tier_estimate":1,"tier_reasons":["no bundle source to scan (not_found: .obsidian-headless/plugins/demo/main.js does not exist): the tier is a default, not a finding"]},"harness":null,"schema_source":"none","verdict":"runs","harness_attempted":false,"notes":["harness not run: this host is not in dry-run"]}]}}}}}
+```
+
+`host.list_interactions` (`test/server-wiring.test.ts`), while one prompt is waiting — the rows are the `host.interaction_request` shape exactly, so a client that lost the event needs no second decoder:
+
+```json
+{"version":1,"id":"13","request":{"method":"host.list_interactions","params":{}}}
+{"version":1,"id":"13","outcome":{"status":"ok","value":{"type":"host.list_interactions","value":{"pending":[{"prompt_id":"prompt-1","plugin_id":"picker","kind":"fuzzy_suggest","prompt":"Picker","items":["Alpha","Beta"],"timeout_ms":120000}]}}}}
+```
+
+Once the prompt is answered it is gone: `{"pending":[]}`.
+
+`host.attach_interaction` and `host.detach_interaction` (`test/server-wiring.test.ts`) — the second client is refused by name while the first holds the channel:
+
+```json
+{"version":1,"id":"14","request":{"method":"host.attach_interaction","params":{}}}
+{"version":1,"id":"14","outcome":{"status":"ok","value":{"type":"host.attach_interaction","value":{"attached":true}}}}
+{"version":1,"id":"15","outcome":{"status":"err","value":{"code":"interaction_unavailable","message":"host-conn-1 already holds the interaction channel; it has to detach (or disconnect) before another client can answer prompts"}}}
 ```
 
 ## Snapshots, served from the mirror
@@ -315,7 +411,9 @@ Notices are recorded, but in **every** mode — `host.invoke_command` reports th
 
 The host's codes, **additive to `vaultd`'s** — a forwarded operation's refusal is the daemon's, unchanged:
 
-`host_not_ready`, `plugin_not_found`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `config_key_refused`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `detector_requires_dry_run`, `not_owner`, `snapshot_not_found`.
+`host_not_ready`, `plugin_not_found`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `config_key_refused`, `plugin_data_too_large`, `plugin_data_too_deep`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `detector_requires_dry_run`, `not_owner`, `snapshot_not_found`.
+
+`plugin_data_too_large` and `plugin_data_too_deep` are the plugin-config pair's two non-refusals, described under **Plugin configuration** above: neither can be attributed to one key, and neither writes anything.
 
 `detector_requires_dry_run` is the compatibility detector's own refusal (Task 20). Its scan half reads the shipped bundle and is always available; its harness half **loads the plugin for real**, so the host performs it only under `--dry-run`, where every write the plugin makes is recorded instead of performed. A `host.compat_report` against a host that is not in dry-run therefore answers with `harness: null` per plugin rather than refusing — the refusal is for a harness run asked for by name.
 
