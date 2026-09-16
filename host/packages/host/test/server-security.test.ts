@@ -127,6 +127,46 @@ const untilReplies = (path: string, lines: string[], count: number): Promise<str
     socket.on("error", reject);
   });
 
+/**
+ * A connected socket that says nothing at all, and a promise for the host
+ * closing it.
+ *
+ * The peer the nonce gate could not reach: every other refusal in this file is
+ * an answer to a line, and this one connects and then holds the socket open in
+ * silence. The `close` promise is the assertion — there is no reply to wait for,
+ * because a host that answered a silent peer would be telling it the socket is
+ * there.
+ */
+const silentPeer = async (path: string): Promise<{ closed: Promise<void> }> => {
+  const socket = connect(path);
+  const closed = new Promise<void>((resolve) => {
+    socket.on("close", () => {
+      resolve();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  // Attached only after the connect: the host destroying this socket raises
+  // `ECONNRESET` here, which is the assertion rather than a failure of it.
+  socket.on("error", () => undefined);
+  return { closed };
+};
+
+/**
+ * Yield turns of the loop until `holds()` is true.
+ *
+ * A rendezvous on observable state, never a sleep — and with no deadline of its
+ * own, so a host that never gets there fails by the runner's timeout rather than
+ * by a number somebody guessed. A macrotask rather than an immediate, because
+ * what is being waited for is a socket reaching the host's `accept` from the
+ * poll phase.
+ */
+const until = async (holds: () => boolean): Promise<void> => {
+  while (!holds()) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+};
+
 const outcomeOf = (line: string): { status: string; value: { code?: string } } =>
   (JSON.parse(line) as { outcome: { status: string; value: { code?: string } } }).outcome;
 
@@ -393,6 +433,71 @@ describe("host socket security", () => {
       // ran the very `chmod` the refusal asked for.
       harness.chmodSocketDir(0o700);
       await expect(harness.server.listen()).resolves.toContain("/");
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("closes a peer that never says hello, and leaves an authenticated client alone", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      const socketPath = await harness.server.listen();
+      // Authenticated first, so the baseline below includes whatever a live
+      // client has armed and the assertion is about the silent peer's timer and
+      // nothing else.
+      const client = await harness.connectClient();
+      const baseline = harness.clock.armed();
+      const peer = await silentPeer(socketPath);
+      // The deadline is armed on `config.clock` like every other duration in
+      // this host, which is what lets this case advance to it rather than wait
+      // for it.
+      await until(() => harness.clock.armed() === baseline + 1);
+      expect(harness.server.preAuthClosed()).toBe(0);
+      await harness.advanceClock(5_000);
+      // No reply, just gone: the peer sent nothing, so there is nothing to
+      // answer.
+      await peer.closed;
+      expect(harness.server.preAuthClosed()).toBe(1);
+      // And the client that did say hello is untouched by any of it.
+      await expect(client.call("host.list_plugins", {})).resolves.toMatchObject({ plugins: [] });
+      expect(harness.server.clientCount()).toBe(1);
+      // Nothing left armed: an admitted client is not on a deadline, and a
+      // closed connection's timer goes with it.
+      expect(harness.clock.armed()).toBe(baseline);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("closes the seventeenth silent peer at once, and the sixteen before it on the deadline", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      const socketPath = await harness.server.listen();
+      const baseline = harness.clock.armed();
+      const peers: Array<{ closed: Promise<void> }> = [];
+      for (let i = 0; i < 16; i += 1) {
+        peers.push(await silentPeer(socketPath));
+        await until(() => harness.clock.armed() === baseline + i + 1);
+      }
+      // The cap is what holds under a flood: the deadline bounds how long one
+      // silent peer lasts, this bounds how many can exist inside that window.
+      // **The newest goes** — an older pre-auth connection may be a real client
+      // mid-handshake, and this one is the marginal socket of whoever is opening
+      // them in a loop.
+      const seventeenth = await silentPeer(socketPath);
+      await seventeenth.closed;
+      expect(harness.server.preAuthClosed()).toBe(1);
+      // Closed before a connection was built for it, so it armed nothing.
+      expect(harness.clock.armed()).toBe(baseline + 16);
+      await harness.advanceClock(5_000);
+      for (const peer of peers) await peer.closed;
+      // One count for both rules: from the operator's side they are one fact —
+      // a peer that held a socket and never presented the nonce.
+      expect(harness.server.preAuthClosed()).toBe(17);
+      expect(harness.clock.armed()).toBe(baseline);
+      // The host is unharmed and still admits a client that speaks.
+      const client = await harness.connectClient();
+      await expect(client.call("host.list_plugins", {})).resolves.toMatchObject({ plugins: [] });
     } finally {
       await harness.stop();
     }

@@ -90,6 +90,33 @@ export interface HostConfig {
   readonly allowNetwork: boolean;
   readonly promptTimeoutMs: number;
   /**
+   * How long a peer may hold an accepted connection without saying a
+   * well-formed `host.hello`, before the host closes it.
+   *
+   * **The refusal has nothing to answer, so it answers nothing.** Every other
+   * pre-auth refusal is a reply to a line the peer sent; this one fires because
+   * no line came, and a host that wrote something back would be telling a
+   * silent peer that the socket is there. The close is the whole event, and it
+   * is counted in {@link HostServer.preAuthClosed}.
+   *
+   * The nonce gate already destroys a connection that gets its first line
+   * wrong. What it could not reach was a peer that sends **nothing**: an
+   * accepted socket that never speaks costs a connection slot, a buffer and a
+   * `Connection` for as long as it cares to hold them.
+   */
+  readonly handshakeTimeoutMs: number;
+  /**
+   * How many connections may sit unauthenticated at once.
+   *
+   * The companion bound to {@link handshakeTimeoutMs}, and it is the one that
+   * holds under load: the deadline bounds how long one silent peer lasts, this
+   * bounds how many of them can exist inside that window. Past the cap the
+   * **newest** connection is closed at once — the older ones may be a client
+   * mid-handshake, while the one that has just arrived is the marginal cost of
+   * a peer opening sockets in a loop.
+   */
+  readonly maxPreAuthConnections: number;
+  /**
    * How long the main loop may go without stamping before the watchdog's worker
    * thread writes a stall report. `0` disables the watchdog entirely.
    *
@@ -307,6 +334,8 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     // so no test run can make a request, whatever bundle it loads.
     allowNetwork: true,
     promptTimeoutMs: 120_000,
+    handshakeTimeoutMs: 5_000,
+    maxPreAuthConnections: 16,
     watchdogThresholdMs: 30_000,
     quarantineFailures: 5,
     quarantineWindowMs: 60_000,

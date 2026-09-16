@@ -43,9 +43,11 @@ A `host.`-prefixed method the host does not know is `invalid_request`. The host 
 
 The honest summary: **directory `0700` enforces, socket `0600` is defense in depth and may be advisory on Darwin, the nonce is the portable stand-in for the peer-UID check Node cannot make.**
 
-Two further rules follow from it.
+Three further rules follow from it.
 
 **Before authentication, anything that is not a well-formed `host.hello` carrying the nonce is `not_owner`, and the connection is destroyed.** Not only a wrong nonce: a missing `request`, a method that is not a string, params that are not an object, a different method entirely. There is nothing to guess — the nonce is 32 random bytes — so a peer that got it wrong is either a bug or a probe, and neither is owed a retry on that connection. One refusal is the most an unauthenticated peer is ever told, and a line with no usable envelope (above) is told nothing at all.
+
+**A peer that says nothing is closed too: a handshake deadline and an accept cap.** The rule above answers a peer that speaks. A peer that connects and then holds the socket open in silence was reached by none of it, and it costs a connection slot, a read buffer and a connection object for as long as it cares to — one of each per socket, for a peer opening them in a loop. So a connection that has not presented a well-formed `host.hello` within `handshakeTimeoutMs` (5 s) is closed, **with no reply**: the peer sent no request, and a host that wrote something back would be telling a silent peer the socket is there. And no more than `maxPreAuthConnections` (16) connections may sit unauthenticated at once — past the cap the **newest** is closed the moment it is accepted, because an older pre-auth connection may be a real client mid-handshake while the newest is the marginal socket of whoever is flooding. Both closes are counted in one server diagnostic: which bound caught the peer changes nothing about what it was. Both timers are on the host's injected clock, like every other duration here (`test/server-security.test.ts`).
 
 **A second `host.hello` on a connection that has already said it is `invalid_request`** — the gate is a state, not a re-authentication, and that connection is kept.
 

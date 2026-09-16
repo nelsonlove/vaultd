@@ -175,6 +175,26 @@ export class HostServer {
    */
   private readonly socketDir: DataDir;
   private readonly connections = new Set<Connection>();
+  /**
+   * Every connection that has not said `host.hello` yet, and the deadline armed
+   * on it.
+   *
+   * **The nonce gate could not reach the peer that says nothing.** It destroys a
+   * connection whose first line is wrong, which is the whole answer for a peer
+   * that speaks — and no answer at all for one that connects and then holds the
+   * socket open in silence. That peer costs a connection slot, a read buffer and
+   * a `Connection` object for as long as it cares to, and a peer opening sockets
+   * in a loop costs one of each per socket.
+   *
+   * So: a deadline per connection, and a cap on how many may be in this map at
+   * once. The deadline bounds how long one silent peer lasts; the cap bounds how
+   * many can exist inside that window. A connection leaves this map the moment
+   * it authenticates or the moment it closes, whichever comes first, and its
+   * timer goes with it — so an idle host has nothing armed.
+   */
+  private readonly preAuth = new Map<Connection, NodeJS.Timeout | null>();
+  /** See {@link HostServer.preAuthClosed}. */
+  private preAuthClosedCount = 0;
   private readonly detachers: Array<() => void> = [];
   private server: Server | null = null;
   private listening: Promise<string> | null = null;
@@ -471,6 +491,10 @@ export class HostServer {
     this.holdCollapsed = false;
     for (const connection of [...this.connections]) connection.destroy();
     this.connections.clear();
+    // Each `destroy` above reached `gone` and disarmed its own deadline; this is
+    // the sweep for anything that did not, so a closed host leaves no timer on
+    // the clock whatever order the closes arrived in.
+    for (const connection of [...this.preAuth.keys()]) this.clearPreAuth(connection);
     const server = this.server;
     this.server = null;
     this.listening = null;
@@ -561,6 +585,18 @@ export class HostServer {
   // --- Connections -----------------------------------------------------------
 
   private accept(socket: Socket): void {
+    // **The newest goes, not the oldest.** An older pre-auth connection may be
+    // a real client mid-handshake — it read the nonce file and is writing its
+    // hello — while the one that has just arrived is the marginal socket of
+    // whoever is opening them in a loop. Closed before a `Connection` is built
+    // at all, so a flood costs a socket and nothing else. No reply: there is no
+    // request to answer, and a host that wrote something back would be telling a
+    // silent peer the socket is there.
+    if (this.preAuth.size >= this.deps.config.maxPreAuthConnections) {
+      this.preAuthClosedCount += 1;
+      socket.destroy();
+      return;
+    }
     this.connectionSequence += 1;
     const connection = new Connection(socket, {
       label: `host-conn-${String(this.connectionSequence)}`,
@@ -572,10 +608,17 @@ export class HostServer {
         return `host-sub-${String(this.subscriptionSequence)}`;
       },
       authenticate: (nonce) => this.matchesNonce(nonce),
+      admitted: (connection) => {
+        this.clearPreAuth(connection);
+      },
       hello: () => this.ops.hello(),
       dispatch: (method, params, session) => this.ops.dispatch(method, params, session),
       gone: (closed) => {
         this.connections.delete(closed);
+        // Before anything else: a connection that went away owes no handshake,
+        // and a deadline left armed for it would fire into a closed socket and
+        // keep a timer on the clock that nothing can account for.
+        this.clearPreAuth(closed);
         // A disconnect releases everything the client held: its subscriptions,
         // its snapshot sessions, and the interaction channel if it was holding
         // that. A crashed client must not leave a frozen view of the vault in
@@ -585,6 +628,57 @@ export class HostServer {
       },
     });
     this.connections.add(connection);
+    this.armHandshakeDeadline(connection);
+  }
+
+  /**
+   * Give this connection until `handshakeTimeoutMs` to say a well-formed hello.
+   *
+   * On `config.clock` like every other duration in this host, which is what lets
+   * a test advance to the deadline rather than wait for it — and what makes
+   * "nothing is left armed" an assertion a test can make against
+   * `clock.armed()`.
+   *
+   * A non-positive timeout arms nothing. The connection is still tracked, so the
+   * accept cap still bounds how many silent peers may pile up: the two rules are
+   * independent, and a host that turned the deadline off should not lose the cap
+   * with it.
+   */
+  private armHandshakeDeadline(connection: Connection): void {
+    const timeoutMs = this.deps.config.handshakeTimeoutMs;
+    if (timeoutMs <= 0) {
+      this.preAuth.set(connection, null);
+      return;
+    }
+    const handle = this.deps.config.clock.setTimeout(() => {
+      // Counted first: `destroy` reaches `gone`, which takes this connection out
+      // of the map, and a count taken afterwards would be a count of a
+      // connection nothing remembers.
+      this.preAuthClosedCount += 1;
+      connection.destroy();
+    }, timeoutMs);
+    this.preAuth.set(connection, handle);
+  }
+
+  /** This connection is authenticated or gone: disarm its deadline and forget it. */
+  private clearPreAuth(connection: Connection): void {
+    const handle = this.preAuth.get(connection);
+    if (handle === undefined) return;
+    this.preAuth.delete(connection);
+    if (handle !== null) this.deps.config.clock.clearTimeout(handle);
+  }
+
+  /**
+   * How many connections this host has closed for never authenticating.
+   *
+   * **One count for both rules**, because they are one fact from the operator's
+   * side: a peer that held a socket without ever presenting the nonce. Which
+   * bound caught it — the deadline or the accept cap — changes nothing about
+   * what to do next, and a host with a number here worth looking at has
+   * something on the machine opening sockets it never speaks on.
+   */
+  preAuthClosed(): number {
+    return this.preAuthClosedCount;
   }
 
   /**
@@ -655,6 +749,15 @@ interface ConnectionDeps {
   readonly currentGeneration: () => number;
   readonly mintId: () => string;
   readonly authenticate: (nonce: string) => boolean;
+  /**
+   * This connection has just passed the nonce gate.
+   *
+   * The event the handshake deadline waits for: an admitted connection is a
+   * client, and a client is not on a deadline. Raised before the `host.hello`
+   * answer is composed, because the gate is what the deadline is about and the
+   * answer can take as long as the daemon does.
+   */
+  readonly admitted: (connection: Connection) => void;
   readonly hello: () => Promise<unknown>;
   readonly dispatch: (method: string, params: unknown, session: OpSession) => Promise<unknown>;
   readonly gone: (connection: Connection) => void;
@@ -924,6 +1027,7 @@ class Connection {
       return;
     }
     this.authenticated = true;
+    this.deps.admitted(this);
     try {
       this.answer(id, "host.hello", await this.deps.hello());
     } catch (error) {
