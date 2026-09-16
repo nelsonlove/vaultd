@@ -18,6 +18,7 @@
  */
 
 import { dump, load } from "js-yaml";
+import { refuseInDryRun } from "./policy";
 import type { CachedMetadata, Reference, ReferenceCache } from "../mirror/metadata";
 import type { Clock } from "../config";
 import type { Pos } from "../mirror/positions";
@@ -631,12 +632,50 @@ export interface HttpBindings {
  * below refuse by default (see {@link requestUrl}), so reaching the network is
  * something a caller holding a {@link HostConfig} does deliberately, once, here
  * — and every other caller in the process gets the safe answer for free.
+ *
+ * **Dry-run refuses first, and with the other error.** Under `--dry-run`
+ * without `--dry-run-allow-network` the answer is a `DryRunRefused` naming the
+ * `network` surface, not a {@link NetworkRefused}: "this run was told to change
+ * nothing" and "this host may not reach the network" are two different claims,
+ * and a dry-run report that read the second as the first would say the host has
+ * no network stack. The refusal comes **first** — ahead of the `allowNetwork`
+ * check and ahead of anything that touches a socket — so a dry run makes no DNS
+ * query and opens no connection, and the address reaches the report.
+ *
+ * It is a **rejection, not a synchronous throw**, because Obsidian's
+ * `requestUrl` answers a promise and a plugin writing `requestUrl(…).catch(…)`
+ * has every right to expect its `catch` to run. That does mean a plugin which
+ * calls this and never awaits the result drops the refusal on the floor — which
+ * is the plugin's own bug, and is what `CommandRegistry.settleSync` exists to
+ * catch for the callbacks the host can see.
  */
-export function createHttp(config: { allowNetwork: boolean }): HttpBindings {
+export function createHttp(config: {
+  allowNetwork: boolean;
+  dryRun?: boolean;
+  dryRunAllowNetwork?: boolean;
+}): HttpBindings {
+  const pretending = config.dryRun === true && config.dryRunAllowNetwork !== true;
   return {
-    requestUrl: (param) => requestUrl(param, config.allowNetwork),
-    request: (param) => request(param, config.allowNetwork),
+    requestUrl: async (param) => {
+      if (pretending) refuseInDryRun("requestUrl", NETWORK, urlOf(param));
+      return requestUrl(param, config.allowNetwork);
+    },
+    request: async (param) => {
+      // Under its **own** name. A plugin that dies on `request` must not be
+      // handed a message naming a function it never called, and the
+      // compatibility report counts the two apart for the same reason.
+      if (pretending) refuseInDryRun("request", NETWORK, urlOf(param));
+      return request(param, config.allowNetwork);
+    },
   };
+}
+
+/** The dry-run report's grouping for the two HTTP helpers. */
+const NETWORK = "network";
+
+/** The address a caller named, however it spelled the call. */
+function urlOf(param: string | RequestUrlParam): string {
+  return typeof param === "string" ? param : param.url;
 }
 
 /**

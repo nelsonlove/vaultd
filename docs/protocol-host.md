@@ -291,6 +291,16 @@ At most one line is ever in flight on a connection: the write's own callback is 
 
 **A burst yields between events once a subscriber is behind.** A client reading as fast as it can still cannot drain a socket inside the turn that filled it, so a thousand events emitted in one synchronous loop would collapse a perfectly healthy reader if the host delivered them without pause. It does not: a broadcast that finds a subscriber behind hands the event loop a turn before the next event, which is what lets the socket flush and makes "behind" go away. A subscriber that is genuinely stalled stays behind however many turns it is given, so the collapse still happens for the client the bound exists for. Events are delivered in order either way.
 
+## Dry-run
+
+`host.hello` answers `dry_run: true` when the host was started with `--dry-run`. What that changes is an explicit list, because a mitigation nobody can enumerate is not a mitigation. It is the detector's runtime-harness backend and an evaluation tool. **It is not a sandbox**, it does not claim to be one, and a plugin determined to reach the file system through a route not on the list below will succeed — plugins run with the host's Node privileges, exactly as they do under Electron.
+
+**Intercepted.** Nine mutating operations — `write_note`, `write_file`, `patch_frontmatter`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note` and `delete_folder` — are recorded and **not** forwarded to the daemon, and the caller receives a synthetic success of the shape the daemon would have sent, carrying the mirror's current generation and the path's current revision. A write into the host's config directory is recorded as `plugin_config` and everything else as `vault`, which covers both writers of a plugin's `data.json`: the plugin's own `saveData` and `host.set_plugin_config`. `requestUrl` and `request` are refused with `dry_run_refused` (`surface: "network"`) unless the host was also started with `--dry-run-allow-network`, in which case the ordinary `--allow-network` policy governs. `electron.shell.openPath`, `showItemInFolder` and `openExternal` are refused with `surface: "os_bridge"`. A plugin bundle's `require` of the file-system modules, `node:child_process`, `node:http`, `node:https` or `node:net` is refused with `surface: "node_builtin"`. Notices are recorded, but in **every** mode — `host.invoke_command` reports them whether or not the host is pretending.
+
+**Not intercepted, by design.** Every read path, every timer, and CPU. A dry run reads the real vault and the real settings, because the question it answers is what a plugin would do to the files that are actually there.
+
+**What a dry run cannot pretend.** Nothing is written, so the mirror does not move: a plugin that creates a path and then uses the file the create answered with is told the mirror holds no row for it. That is a limit of recording rather than performing, and the host says so instead of inventing a file.
+
 ## Errors
 
 The host's codes, **additive to `vaultd`'s** — a forwarded operation's refusal is the daemon's, unchanged:

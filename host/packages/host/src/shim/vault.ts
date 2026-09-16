@@ -56,6 +56,9 @@ import type {
   WriteFileResponse,
 } from "../client/protocol";
 import type { HostConfig } from "../config";
+// The seam itself is declared with its implementations; this file re-exports
+// the type a few lines below, and needs it in scope for `VaultDeps`.
+import type { WriteGate } from "../dryrun/dry-run";
 import type { Mirror } from "../mirror/mirror";
 import type { MirrorChangeBatch } from "../mirror/types";
 import type { DispatchQueue } from "../runtime/queue";
@@ -63,17 +66,16 @@ import type { AppliedBatch, ApplyBatchOptions, TAbstractFile } from "./files";
 import type { EventCallback, EventRef, ShimEventBus } from "./events";
 
 /**
- * The one seam every host write passes through.
+ * The one seam every host write passes through — **re-homed by Task 19**, which
+ * owns `src/dryrun/dry-run.ts` and the `DryRunGate` that implements it.
  *
- * An interface with a single method, declared here because `Vault` is its first
- * consumer and Task 19 — which owns `src/dryrun/dry-run.ts` and the
- * `DryRunGate` that implements it — comes twelve tasks later. That task may
- * re-home the declaration; nothing else changes if it does, because every
- * consumer names the type and none of them names an implementation.
+ * The declaration lived here while `Vault` was its only consumer; it now lives
+ * beside its implementations, and this line is what keeps the eight modules
+ * that import `WriteGate` from this file naming it where they always did.
+ * Nothing else moved, because every consumer names the type and none of them
+ * names an implementation.
  */
-export interface WriteGate {
-  send<T>(method: string, params: unknown): Promise<T>;
-}
+export type { WriteGate } from "../dryrun/dry-run";
 
 export interface VaultDeps {
   mirror: Mirror;

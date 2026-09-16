@@ -44,7 +44,8 @@ import { LifecycleSequencer } from "../runtime/lifecycle";
 import { QuarantineTracker } from "../runtime/quarantine";
 import { ShimHarness, configFilePathsFor, sweepStaleDataDirs } from "./shim-harness";
 import { DataDir } from "../datadir";
-import { OBSIDIAN_CONFIG_DIR, pluginDataPath, pluginDirPath } from "../pluginset/config-dir";
+import { DryRunGate } from "../dryrun/dry-run";
+import { HeadlessConfigDir, OBSIDIAN_CONFIG_DIR, pluginDataPath, pluginDirPath } from "../pluginset/config-dir";
 import { TFolder } from "../shim/files";
 import { fs } from "../runtime/fs-access";
 import { noteDto } from "./mirror-harness";
@@ -183,15 +184,25 @@ export class HostHarness extends ShimHarness {
       }
     };
 
+  /**
+   * A plugin whose one command reaches for the network.
+   *
+   * **The callback returns the promise rather than voiding it**, which is the
+   * correction Task 19 carries. `requestUrl` answers a promise and refuses by
+   * rejecting it — a dry run's network refusal and an ordinary `NetworkRefused`
+   * both — and a callback that dropped that promise would turn a refusal the
+   * host can attribute to this plugin into an unhandled rejection with nobody's
+   * name on it. `CommandRegistry.settleSync` adopts what a callback returns and
+   * reports the failure, which is what makes `lastHandlerError("fetcher")` the
+   * question a case can ask.
+   */
   static readonly requestUrlPlugin: PluginFactory = (api) =>
     class RequestUrlPlugin extends api.Plugin {
       override onload(): void {
         this.addCommand({
           id: "fetch",
           name: "Fetch",
-          callback: () => {
-            void api.requestUrl({ url: "https://example.test/" });
-          },
+          callback: () => api.requestUrl({ url: "https://example.test/" }),
         });
       }
     };
@@ -415,9 +426,37 @@ export class HostHarness extends ShimHarness {
     return this.assembly.broker;
   }
 
-  /** The `--dry-run` gate. **Activated by Task 19.** */
-  get dryRun(): never {
-    throw notActivated("dryRun", "19");
+  /**
+   * The `--dry-run` gate. **Activated by Task 19.**
+   *
+   * It is the assembly's `writes`, not a second object: the gate a case reads
+   * its recorded writes off is the same one every shim surface sends through,
+   * which is what makes "nothing was forwarded" a fact rather than a claim. A
+   * harness built without `config: { dryRun: true }` has a forwarding gate and
+   * is told so by name, rather than being handed an empty recording that would
+   * make every assertion pass for the wrong reason.
+   */
+  get dryRun(): DryRunGate {
+    const gate = this.assembly.writes;
+    if (!(gate instanceof DryRunGate)) {
+      throw new Error(
+        "this harness has no DryRunGate: build it with `config: { dryRun: true }` (and without " +
+          "an injected `writes`) if the case is about dry-run.",
+      );
+    }
+    return gate;
+  }
+
+  /**
+   * The headless config directory this host's plugin-config writes go through.
+   *
+   * Exposed because the assembly is `protected` and a case about plugin-config
+   * writes under `--dry-run` needs the directory the assembly wired to the
+   * gate — not one of its own, which would be wired to the client and would
+   * forward.
+   */
+  get dir(): HeadlessConfigDir {
+    return this.assembly.dir;
   }
 
   /** The compatibility detector. **Activated by Task 20.** */

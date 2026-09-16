@@ -1187,6 +1187,17 @@ export class Mirror implements MirrorQuery {
    * what is under it.
    */
   applyMutation(generation: number, paths: readonly string[]): Promise<void> {
+    // **Nothing to come forward to under `--dry-run`.** The mutation this is
+    // about was recorded by the write gate and never reached the daemon, so
+    // there is no new generation and these paths hold exactly the bytes this
+    // mirror already has. Refetching them would send `get_tree_entries` and a
+    // `get_note` per path to answer a question nobody asked — traffic on a run
+    // whose whole promise is that it touches nothing, and a read-your-writes
+    // that would install the *old* content over the write the plugin thinks it
+    // just made. The honest answer is that a dry run's mirror does not move;
+    // `dryrun/dry-run.ts` says so in its header, because it is the one thing a
+    // dry run cannot pretend.
+    if (this.config.dryRun) return Promise.resolve();
     return this.enqueue(async () => {
       // `event: null` — a mutation is this host's own write, not a generation
       // somebody told it about, so a warm failure here is attributable to no

@@ -92,12 +92,49 @@ export class DryRunRefused extends Error {
   }
 }
 
-/** Records the hit against the current plugin, then throws {@link DryRunRefused}. */
+/**
+ * Where a dry run's refusals are tallied: `DryRunGate` installs itself here for
+ * its lifetime, and nothing else implements this.
+ *
+ * **Beside the policy recorder, and installed the same way, because it has the
+ * same problem.** The three surfaces that refuse under `--dry-run` — the HTTP
+ * helpers, the electron stub and the module patch — sit several layers below
+ * anything holding the host, and two of them are reached through a frozen
+ * barrel or a `Module._load` patch no host can thread an argument through. So
+ * the sink is module-level and installed from outside, exactly as
+ * {@link setPolicyRecorder} is, and is taken back out by the assembly's
+ * teardown.
+ */
+export interface DryRunRefusalSink {
+  record(surface: string, detail: string): void;
+}
+
+let refusalSink: DryRunRefusalSink | null = null;
+
+/** Install the sink every {@link refuseInDryRun} hit is tallied into. */
+export function setDryRunRefusalSink(next: DryRunRefusalSink | null): void {
+  refusalSink = next;
+}
+
+/**
+ * Records the hit against the current plugin **and** against the dry-run sink,
+ * then throws {@link DryRunRefused}.
+ *
+ * Two records of two different facts, rather than one fact written twice. The
+ * policy recorder answers "which surfaces did this plugin reach for", which is
+ * true of this host whatever mode it is in; the sink answers "what did this run
+ * refuse", which is a property of the run. A report that read the first as the
+ * second would call every refusal a missing surface.
+ */
 export function refuseInDryRun(symbol: string, surface: string, detail?: string): never {
   // Recorded at the symbol's own declared policy: a surface this host really
   // implements is still implemented, and a report that relabelled it `absent`
   // because one run was pretending would be describing the flag, not the host.
   recorder?.record(symbol, policyOf(symbol), pluginId);
+  // `detail ?? symbol` rather than an empty string: a refusal row with nothing
+  // in its detail column is a row a reader cannot act on, and the symbol is the
+  // least this host always knows.
+  refusalSink?.record(surface, detail ?? symbol);
   throw new DryRunRefused(symbol, pluginId, surface, detail);
 }
 

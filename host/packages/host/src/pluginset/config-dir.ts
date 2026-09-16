@@ -46,6 +46,8 @@ import type {
   WriteFileResponse,
 } from "../client/protocol";
 import type { RequestSink } from "../client/request-sink";
+import { forwardingWriteGate } from "../dryrun/dry-run";
+import type { WriteGate } from "../dryrun/dry-run";
 
 export type { PluginManifest };
 
@@ -140,6 +142,17 @@ export class HeadlessConfigDir {
   private readonly config: HostConfig;
   private readonly errors: HostErrors;
   /**
+   * Where this directory's **writes** go — the same seam every other writer in
+   * the host holds, so `--dry-run` intercepts a plugin-config write exactly as
+   * it intercepts a vault write.
+   *
+   * Reads stay on the {@link RequestSink}. A dry run reads the real files: the
+   * point is to find out what a plugin would do to the settings it actually
+   * has, and a run that read an invented `data.json` would answer about a
+   * vault nobody owns.
+   */
+  private readonly writes: WriteGate;
+  /**
    * Paths already reported as a problem, so the report happens once.
    *
    * The enabled set is re-read on every coexistence poll — once a minute, for
@@ -157,11 +170,24 @@ export class HeadlessConfigDir {
    * {@link HostErrors} rather than to nothing means an unwired directory still
    * prints a damaged config file to stderr instead of losing it — the same
    * floor `HostErrors.report` describes.
+   *
+   * `writes` is optional on the same terms, and its default is the forwarding
+   * gate over the client this directory was already given — which is byte for
+   * byte what it did before the parameter existed, so no existing caller
+   * changes behaviour. `assembleShim` passes the host's real gate, and that is
+   * the one that matters: it is what makes a plugin-config write recordable
+   * under `--dry-run` instead of landing on disk.
    */
-  constructor(client: RequestSink, config: HostConfig, errors: HostErrors = new HostErrors()) {
+  constructor(
+    client: RequestSink,
+    config: HostConfig,
+    errors: HostErrors = new HostErrors(),
+    writes: WriteGate = forwardingWriteGate(client),
+  ) {
     this.client = client;
     this.config = config;
     this.errors = errors;
+    this.writes = writes;
     this.configDir = config.configDirName;
   }
 
@@ -207,8 +233,8 @@ export class HeadlessConfigDir {
    * **before** opening the mirror and nobody pays anything.
    */
   async ensure(): Promise<void> {
-    await this.client.request<unknown>("create_folder", { path: this.configDir });
-    await this.client.request<unknown>("create_folder", { path: this.pluginsDir() });
+    await this.writes.send<unknown>("create_folder", { path: this.configDir });
+    await this.writes.send<unknown>("create_folder", { path: this.pluginsDir() });
   }
 
   /**
@@ -276,7 +302,7 @@ export class HeadlessConfigDir {
     const enabledSetPath = `${this.configDir}/${COMMUNITY_PLUGINS}`;
     if (this.reportedCorrupt.has(enabledSetPath)) throw new EnabledSetDamaged(enabledSetPath);
     const body = `${JSON.stringify([...ids], null, 2)}\n`;
-    await this.client.request<WriteFileResponse>("write_file", {
+    await this.writes.send<WriteFileResponse>("write_file", {
       path: `${this.configDir}/${COMMUNITY_PLUGINS}`,
       content_base64: Buffer.from(body, "utf8").toString("base64"),
     });
@@ -506,14 +532,14 @@ export class HeadlessConfigDir {
       content_base64: Buffer.from(`${JSON.stringify(data, null, 2)}\n`, "utf8").toString("base64"),
     };
     try {
-      await this.client.request<WriteFileResponse>("write_file", params);
+      await this.writes.send<WriteFileResponse>("write_file", params);
       return;
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code;
       if (code !== "parent_not_found") throw error;
     }
-    await this.client.request<unknown>("create_folder", { path: this.pluginDir(id) });
-    await this.client.request<WriteFileResponse>("write_file", params);
+    await this.writes.send<unknown>("create_folder", { path: this.pluginDir(id) });
+    await this.writes.send<WriteFileResponse>("write_file", params);
   }
 
   /** `<configDir>/plugins`. */

@@ -51,7 +51,8 @@ import type { Mirror } from "../mirror/mirror";
 import type { ObsidianApi } from "../shim/api";
 import type { ApiPolicy, PolicyRecorder } from "../shim/policy";
 import type { GlobalInstallation } from "../shim/globals";
-import type { WriteGate } from "../shim/vault";
+import { DryRunGate, forwardingWriteGate } from "../dryrun/dry-run";
+import type { WriteGate } from "../dryrun/dry-run";
 import { createElectronStub, osSpawn } from "../runtime/electron-stub";
 import {
   clearElectronStub,
@@ -60,11 +61,6 @@ import {
   registerObsidianApi,
 } from "../runtime/electron-registry";
 import type { OsSpawn } from "../runtime/electron-stub";
-//
-// `WriteGate` is declared in `../shim/vault` until Task 19 creates
-// `../dryrun/dry-run`, which owns the interface and the one implementation
-// (`DryRunGate`) that is not the forwarding default below. Nothing but this
-// import line moves when it does.
 
 /**
  * Everything one assembled shim consists of.
@@ -169,20 +165,11 @@ export interface HostAssembly {
  * A `WriteGate` that forwards, which is what the host does when it is not
  * pretending.
  *
- * `WriteGate` is an **interface**, not a class — one method, `send` — and the
- * only concrete implementation the plan names is Task 19's `DryRunGate`, which
- * exists to *intercept*. So the ordinary case needs an implementation of its
- * own, and this is the whole of it: hand the request to the daemon. Task 22's
- * `main.ts` passes `DryRunGate` here instead when `--dry-run` is on, and
- * nothing between the two knows which it got.
+ * **Moved to `dryrun/dry-run.ts` by Task 19** and re-exported here, so the two
+ * implementations of the one interface are read side by side and every caller
+ * that already imports it from this module keeps working.
  */
-export function forwardingWriteGate(client: RequestSink): WriteGate {
-  return {
-    send<T>(method: string, params: unknown): Promise<T> {
-      return client.request<T>(method, params);
-    },
-  };
-}
+export { forwardingWriteGate } from "../dryrun/dry-run";
 
 /**
  * The `PolicyRecorder` the host uses when nobody supplies one.
@@ -296,7 +283,20 @@ export function assembleShim(deps: {
   // `stub`/`unsupported` hit lands in is installed rather than passed.
   setPolicyRecorder(policyRecorder);
   const queue = new DispatchQueue();
-  const writes = deps.writes ?? forwardingWriteGate(client);
+  // **Above the write gate, because the gate reads a window of it**, and it can
+  // be: the log needs nothing but the clock. It is the host's one notice log in
+  // every mode — see the `noticeLog` field on {@link HostAssembly} — and a
+  // dry run windows it rather than keeping a second one.
+  const noticeLog = new NoticeLog({ clock });
+  // **The gate the whole of `--dry-run` hangs off.** An injected gate always
+  // wins (a test hands its own); otherwise the flag picks between recording and
+  // forwarding, and nothing downstream knows which it got, because every writer
+  // in this host names the interface and none of them names an implementation.
+  const writes =
+    deps.writes ??
+    (config.dryRun
+      ? new DryRunGate(client, config, noticeLog, mirror)
+      : forwardingWriteGate(client));
   // The error sink and the harvest are built here, above every surface that
   // writes into them, because the globals need both: a torn `localStorage`
   // document is reported to the first, and a `window` listener nothing can
@@ -335,9 +335,9 @@ export function assembleShim(deps: {
   const broker = new InteractionBroker({ config, errors });
   installInteractionBroker(app, broker);
   fileManager.setConfirmBroker(confirmAdapter(broker, queue));
-  // On this host's clock, so a notice's `atUnixMs` is the same time base every
-  // other timestamp in this host is measured against.
-  const noticeLog = new NoticeLog({ clock });
+  // (The notice log is built further up, above the write gate that windows it.
+  // It is on this host's clock, so a notice's `atUnixMs` is the same time base
+  // every other timestamp in this host is measured against.)
   // The workspace needs the harvest at construction — its `on` records menu
   // hooks — and the harvest is built above, with the error sink.
   const workspace = new Workspace({ events, harvest });
@@ -386,7 +386,10 @@ export function assembleShim(deps: {
   // ever. `InternalPluginRegistry.refresh()` with no argument re-reads all
   // three of its files, which is right here — the poll is told nothing about
   // what changed, because nothing told it anything changed.
-  const dir = new HeadlessConfigDir(client, config, errors);
+  // The same gate every other writer holds: a plugin-config write is a write,
+  // and `--dry-run` has to intercept it for the same reason it intercepts a
+  // vault write. Reads stay on the client.
+  const dir = new HeadlessConfigDir(client, config, errors, writes);
   const coexistence = new CoexistenceMonitor(dir, client, config, errors);
   coexistence.onPoll(async () => {
     await internalPlugins.refresh();
@@ -428,6 +431,12 @@ export function assembleShim(deps: {
       // restored would read a vault this host no longer owns. Idempotent, and a
       // no-op when nothing ever started it.
       coexistence.stop();
+      // The refusal sink is module-level, like the policy recorder, so a host
+      // that went away while still installed would go on collecting the next
+      // host's refusals into a report nobody is reading. Only the gate this
+      // assembly built takes itself out; an injected one belongs to whoever
+      // injected it.
+      if (writes instanceof DryRunGate && deps.writes === undefined) writes.uninstall();
       clearObsidianApi();
       clearElectronStub();
       globals.restore();

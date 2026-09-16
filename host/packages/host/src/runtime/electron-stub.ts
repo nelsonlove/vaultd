@@ -69,8 +69,24 @@ export function osSpawn(command: string, args: readonly string[]): Promise<void>
 }
 
 export function createElectronStub(deps: ElectronStubDeps): ElectronStub {
-  const bridge = async (symbol: string, command: string, args: readonly string[]): Promise<void> => {
-    if (deps.dryRun) refuseInDryRun(symbol, OS_BRIDGE, args.join(" "));
+  /**
+   * `member` and `target` are the **call as the plugin wrote it**, not the
+   * command line this host would have run.
+   *
+   * A dry-run report's refusal rows read `openPath /tmp/x`, which is what the
+   * plugin asked for; `open -R /tmp/x` is how one platform happens to spell
+   * `showItemInFolder`, and a row spelled that way would make the reader
+   * reconstruct the call from an implementation detail — and would differ per
+   * platform the day a second opener is added.
+   */
+  const bridge = async (
+    member: string,
+    target: string,
+    command: string,
+    args: readonly string[],
+  ): Promise<void> => {
+    const symbol = `electron.shell.${member}`;
+    if (deps.dryRun) refuseInDryRun(symbol, OS_BRIDGE, `${member} ${target}`);
     // Recorded before the spawn, at the symbol's own declared policy, so the
     // report says a plugin reached for the opener whether or not it succeeded.
     recordUse(symbol);
@@ -84,14 +100,14 @@ export function createElectronStub(deps: ElectronStubDeps): ElectronStub {
      * `if (result)` would branch into its failure path on any other answer.
      */
     async openPath(path: string): Promise<string> {
-      await bridge("electron.shell.openPath", "open", [path]);
+      await bridge("openPath", path, "open", [path]);
       return "";
     },
     async showItemInFolder(path: string): Promise<void> {
-      await bridge("electron.shell.showItemInFolder", "open", ["-R", path]);
+      await bridge("showItemInFolder", path, "open", ["-R", path]);
     },
     async openExternal(url: string): Promise<void> {
-      await bridge("electron.shell.openExternal", "open", [url]);
+      await bridge("openExternal", url, "open", [url]);
     },
   };
 
