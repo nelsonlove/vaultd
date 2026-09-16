@@ -15,11 +15,13 @@
  */
 
 import { connect } from "node:net";
+import type { Socket } from "node:net";
 import { statSync } from "node:fs";
 import { dirname } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { HostHarness } from "../src/testing/host-harness";
+import { rejectionGuardArmed, reportUnhandledRejection } from "../src/server/server";
 
 /**
  * Write one line to the socket and resolve with the first line that comes back.
@@ -49,6 +51,76 @@ const speak = (path: string, line: string): Promise<string> =>
 
 const request = (method: string, params: unknown): string =>
   JSON.stringify({ version: 1, id: "x", request: { method, params } });
+
+/** Every line the peer has been sent so far, split on the framing newline. */
+function reader(socket: Socket, replies: string[]): void {
+  let buffer = "";
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      replies.push(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+    }
+  });
+}
+
+/**
+ * Send some lines and resolve when the **host** closes the connection.
+ *
+ * No deadline and no sleep: the close is the event being asserted, so a host
+ * that wrongly keeps the connection fails by the runner's own timeout rather
+ * than by a number somebody guessed.
+ */
+const untilClose = (path: string, lines: string[]): Promise<string[]> =>
+  new Promise((resolve, reject) => {
+    const socket = connect(path);
+    const replies: string[] = [];
+    reader(socket, replies);
+    socket.on("connect", () => {
+      for (const line of lines) socket.write(`${line}\n`);
+    });
+    socket.on("close", () => {
+      resolve(replies);
+    });
+    socket.on("error", reject);
+  });
+
+/**
+ * Send some lines and resolve once `count` replies have come back.
+ *
+ * This is how "the connection was **kept**" is asserted without a deadline: ask
+ * for a second answer on the same connection and wait for it. A host that closed
+ * after the first would never send it.
+ */
+const untilReplies = (path: string, lines: string[], count: number): Promise<string[]> =>
+  new Promise((resolve, reject) => {
+    const socket = connect(path);
+    const replies: string[] = [];
+    let buffer = "";
+    socket.on("connect", () => {
+      for (const line of lines) socket.write(`${line}\n`);
+    });
+    socket.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      let newline = buffer.indexOf("\n");
+      while (newline !== -1) {
+        replies.push(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf("\n");
+        if (replies.length >= count) {
+          socket.destroy();
+          resolve(replies);
+          return;
+        }
+      }
+    });
+    socket.on("error", reject);
+  });
+
+const outcomeOf = (line: string): { status: string; value: { code?: string } } =>
+  (JSON.parse(line) as { outcome: { status: string; value: { code?: string } } }).outcome;
 
 describe("host socket security", () => {
   it("asserts 0700 on the directory and 0600 on the socket", async () => {
@@ -112,6 +184,170 @@ describe("host socket security", () => {
       expect(JSON.parse(reply)).toMatchObject({
         outcome: { status: "ok", value: { type: "host.hello" } },
       });
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("destroys the connection on a line that is not a request at all", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    const rejections: unknown[] = [];
+    const collect = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", collect);
+    try {
+      const socketPath = await harness.server.listen();
+      // **`null` is the one that used to take the host down.** `JSON.parse`
+      // answers `null`, reading `.id` off it throws a `TypeError`, and the
+      // handler was invoked as a floating promise — so five bytes from a peer
+      // that had presented no nonce became an unhandled rejection, which Node
+      // terminates the process for. Every one of these is now the same fatal
+      // input error a line of garbage already was: no reply, connection gone.
+      for (const line of ["null", "5", '"x"', "[]", "{not json"]) {
+        expect(await untilClose(socketPath, [line]), `for ${line}`).toEqual([]);
+      }
+      expect(rejections).toEqual([]);
+      expect(harness.server.clientCount()).toBe(0);
+    } finally {
+      process.off("unhandledRejection", collect);
+      await harness.stop();
+    }
+  });
+
+  it("destroys an unauthenticated connection after one not_owner, whatever it sent", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      const socketPath = await harness.server.listen();
+      // A malformed-but-parseable envelope used to answer `invalid_request` and
+      // **keep** the connection — a free retry channel for a peer that has
+      // presented no nonce, and the same path a rejection escaped through.
+      // Measured before the fix: a hundred refusals on one connection, then a
+      // successful hello on that same connection.
+      const malformed = [
+        JSON.stringify({ version: 1, id: "a" }),
+        JSON.stringify({ version: 1, id: "b", request: {} }),
+        JSON.stringify({ version: 1, id: "c", request: { method: 7 } }),
+        JSON.stringify({ version: 1, id: "d", request: { method: "host.hello" } }),
+        JSON.stringify({ version: 1, id: "e", request: { method: "host.hello", params: "nope" } }),
+        JSON.stringify({ version: 1, id: "f", request: { method: "host.list_plugins", params: {} } }),
+      ];
+      for (const line of malformed) {
+        const replies = await untilClose(socketPath, [line]);
+        expect(replies, `for ${line}`).toHaveLength(1);
+        expect(outcomeOf(replies[0] as string), `for ${line}`).toMatchObject({
+          status: "err",
+          value: { code: "not_owner" },
+        });
+      }
+      // And a flood on one connection cannot outlive the first line either.
+      const flood = await untilClose(socketPath, [...malformed, ...malformed]);
+      expect(flood).toHaveLength(1);
+      expect(harness.server.clientCount()).toBe(0);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("refuses a version it does not speak, before it dispatches anything", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      const socketPath = await harness.server.listen();
+      const nonce = harness.readNonce();
+      // Version validation precedes method dispatch, which is `docs/protocol.md`'s
+      // rule and the reason version numbers exist: the day this envelope changes,
+      // an old client must be told rather than silently mis-served. A version-99
+      // client used to be answered as though it spoke version 1.
+      for (const envelope of [
+        { version: 99, id: "v99", request: { method: "host.hello", params: { nonce } } },
+        { id: "none", request: { method: "host.hello", params: { nonce } } },
+        { version: "1", id: "str", request: { method: "nonesuch", params: {} } },
+      ]) {
+        const replies = await untilClose(socketPath, [JSON.stringify(envelope)]);
+        expect(replies).toHaveLength(1);
+        const outcome = outcomeOf(replies[0] as string);
+        expect(outcome).toMatchObject({
+          status: "err",
+          value: { code: "incompatible_version", supported_version: 1 },
+        });
+        // Pre-authentication it is still not a well-formed hello, so the socket
+        // goes with the refusal.
+        expect(JSON.parse(replies[0] as string)).toMatchObject({ id: envelope.id });
+      }
+
+      // An **admitted** client is told and kept, the way the daemon keeps a
+      // connection that sent one bad version.
+      const admitted = await untilReplies(
+        socketPath,
+        [
+          request("host.hello", { nonce }),
+          JSON.stringify({ version: 42, id: "bad", request: { method: "host.list_plugins" } }),
+          JSON.stringify({ version: 1, id: "good", request: { method: "host.list_plugins" } }),
+        ],
+        3,
+      );
+      // **Paired by id, not by arrival order.** `host.hello` reads the plugin
+      // set through the daemon and the version refusal is answered inline, so a
+      // client that pipelines gets its answers as they are ready — which is what
+      // the `id` is for, and is why nothing here indexes by position.
+      const byId = new Map(
+        admitted.map((line) => [(JSON.parse(line) as { id: string }).id, outcomeOf(line)]),
+      );
+      expect(byId.get("x")?.status).toBe("ok");
+      expect(byId.get("bad")).toMatchObject({ status: "err", value: { code: "incompatible_version" } });
+      expect(byId.get("good")?.status).toBe("ok");
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("echoes the id a client sent, string or number", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      const socketPath = await harness.server.listen();
+      const replies = await untilClose(socketPath, [
+        JSON.stringify({ version: 1, id: 7, request: { method: "host.list_plugins", params: {} } }),
+      ]);
+      // A client that spelled its id as a number gets that number back, rather
+      // than an empty string it cannot pair with anything it sent.
+      expect(JSON.parse(replies[0] as string)).toMatchObject({ id: 7 });
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("keeps the host alive when a rejection escapes anyway", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      await harness.server.listen();
+      const client = await harness.connectClient();
+      // The guard is defence in depth: every per-line handler carries its own
+      // catch, and this is what happens when a promise escapes somewhere nobody
+      // has thought of yet. Node's default is to terminate the process.
+      expect(rejectionGuardArmed()).toBe(true);
+      const planted = new Error("a promise nobody awaited");
+      reportUnhandledRejection(planted);
+      // Reported through the host's own error seam — visible, attributed to the
+      // host rather than to any plugin, and counted against nobody.
+      expect(harness.hostErrors.map((entry) => entry.error)).toContain(planted);
+      expect(harness.hostErrors.at(-1)?.pluginId).toBe("host");
+      // And the host is still serving.
+      await expect(client.call("host.list_plugins", {})).resolves.toMatchObject({ plugins: [] });
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("stops listening on a refusal, and can listen again once it is repaired", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      harness.chmodSocketDir(0o770);
+      await expect(harness.server.listen()).rejects.toThrow(/socket directory mode/);
+      // A rejected promise is not nullish, so a cached one would leave this host
+      // unable to listen for the rest of the process — even after the operator
+      // ran the very `chmod` the refusal asked for.
+      harness.chmodSocketDir(0o700);
+      await expect(harness.server.listen()).resolves.toContain("/");
     } finally {
       await harness.stop();
     }

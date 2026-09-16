@@ -236,6 +236,110 @@ describe("host.* operations", () => {
     }
   });
 
+  it("refuses a cursor from another session, and one that points backwards", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n", "Folder/B.md": "# B\n" },
+      enabled: [],
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const first = await client.call<{ snapshot_id: string }>("host.open_snapshot", {});
+      const second = await client.call<{ snapshot_id: string }>("host.open_snapshot", {});
+      const page = await client.call<{ next_cursor: string }>("host.snapshot_tree", {
+        snapshot_id: first.snapshot_id,
+        cursor: null,
+        limit: 1,
+      });
+      // The cursor carries its own session id, so one handed to another session
+      // is refused rather than serving a page of somebody else's walk.
+      await expect(
+        client.call("host.snapshot_tree", {
+          snapshot_id: second.snapshot_id,
+          cursor: page.next_cursor,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_cursor" });
+      // A cursor is opaque but the client holds the bytes: a forged negative
+      // index used to slice from the *end* of the frozen array and answer a page
+      // of the wrong rows as though they were the right ones.
+      const forged = Buffer.from(
+        JSON.stringify({ s: first.snapshot_id, i: -5 }),
+        "utf8",
+      ).toString("base64url");
+      await expect(
+        client.call("host.snapshot_tree", { snapshot_id: first.snapshot_id, cursor: forged }),
+      ).rejects.toMatchObject({ code: "invalid_cursor" });
+      await expect(
+        client.call("host.snapshot_tree", { snapshot_id: first.snapshot_id, cursor: "not-a-cursor" }),
+      ).rejects.toMatchObject({ code: "invalid_cursor" });
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("caps snapshot sessions per client, not host-wide", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      config: { snapshotSessionCap: 2 },
+    });
+    try {
+      await harness.lifecycle.start();
+      const greedy = await harness.connectClient();
+      await greedy.call("host.open_snapshot", {});
+      await greedy.call("host.open_snapshot", {});
+      await expect(greedy.call("host.open_snapshot", {})).rejects.toMatchObject({
+        code: "too_many_snapshots",
+      });
+      // A host-wide cap would let one leaking client lock every peer out of
+      // hydration until it disconnected — a denial of service by accident.
+      const other = await harness.connectClient();
+      await expect(other.call("host.open_snapshot", {})).resolves.toMatchObject({
+        note_count: 1,
+      });
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("filters the command list by plugin", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: ["one", "two"],
+      plugins: {
+        one: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              this.addCommand({ id: "a", name: "A", callback: () => undefined });
+              await Promise.resolve();
+            }
+          },
+        two: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              this.addCommand({ id: "b", name: "B", callback: () => undefined });
+              await Promise.resolve();
+            }
+          },
+      },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const all = await client.call<{ commands: Array<{ id: string }> }>("host.list_commands", {});
+      expect(all.commands.map((command) => command.id).sort()).toEqual(["one:a", "two:b"]);
+      const one = await client.call<{ commands: Array<{ id: string }> }>("host.list_commands", {
+        plugin_id: "one",
+      });
+      expect(one.commands.map((command) => command.id)).toEqual(["one:a"]);
+      await expect(
+        client.call("host.list_commands", { plugin_id: "nobody" }),
+      ).resolves.toEqual({ commands: [] });
+    } finally {
+      await harness.stop();
+    }
+  });
+
   it("answers host_not_ready for the ops Task 20b wires, until it does", async () => {
     const harness = await HostHarness.create({
       vault: {},

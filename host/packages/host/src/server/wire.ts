@@ -90,8 +90,15 @@ export class HostError extends Error {
     this.detail = detail;
   }
 
+  /**
+   * The wire body. **`detail` is spread first**, so a detail key called `code`
+   * or `message` cannot overwrite the two fields a client branches on. Every
+   * detail in this build is host-supplied, but "the code is the code" is the
+   * kind of invariant that should not depend on nobody ever passing the wrong
+   * key.
+   */
   body(): ProtocolErrorBody {
-    return { code: this.code, message: this.message, ...this.detail };
+    return { ...this.detail, code: this.code, message: this.message };
   }
 }
 
@@ -153,6 +160,32 @@ export interface OverlapWire {
   forced: string[];
   gui_readable: boolean;
   checked_at_ms: number;
+}
+
+/** One caret position, as `host.invoke_command` takes it. Zero-based, both. */
+export interface PositionWire {
+  line: number;
+  ch: number;
+}
+
+/**
+ * `host.invoke_command`'s `selection`, pinned. **Ratified deviation.**
+ *
+ * The phase brief's table spells this `selection?: string`, and that row cannot
+ * be implemented as written: an `editorCallback` is handed an `Editor`, whose
+ * `setSelection` takes two positions, so a string would have to be *searched*
+ * for in the note — a different operation, with a different failure mode (no
+ * match, several matches) and a different answer for each. The controller
+ * ratified the range in Task 16a's fix round; the brief's table is amended to
+ * match, and a client that sends a string is told so by name rather than having
+ * it silently ignored.
+ *
+ * Both fields are zero-based, which is Obsidian's own convention for
+ * `EditorPosition` and therefore what a plugin's own code already expects.
+ */
+export interface SelectionWire {
+  from: PositionWire;
+  to: PositionWire;
 }
 
 export interface ProtocolHandlerWire {

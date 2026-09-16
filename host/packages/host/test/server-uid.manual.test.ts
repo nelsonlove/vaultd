@@ -20,16 +20,23 @@
  * ## Running it
  *
  * ```bash
+ * sudo -v                                                      # authenticate first
  * VAULTD_HOST_UID_TEST=1 npm --prefix host test -- server-uid.manual
  * ```
  *
- * `sudo` will prompt. The child runs as `nobody`, which exists on every macOS
- * and Linux box and owns nothing; it needs no write access anywhere, because all
- * it does is try to connect and report what it was told.
+ * **The case runs `sudo -n`, which never prompts**, and the two lines above are
+ * why there are two of them: a test runner's child process has no terminal to
+ * prompt on, so a prompting `sudo` would hang until the runner's timeout rather
+ * than ask anybody anything. `sudo -v` first, in your own shell, is what makes
+ * the `-n` run succeed — it caches the credential for a few minutes. (A
+ * passwordless `sudo` rule for this user works too, and on a machine with
+ * neither the case fails with sudo's own refusal rather than passing quietly: a
+ * security assertion that skips itself on the way to green is worse than no
+ * assertion at all, and this file is already opt-in.)
  *
- * If `sudo` is not available or the prompt is declined, the case fails rather
- * than passing quietly — a security assertion that skips itself on the way to
- * green is worse than no assertion at all, and this file is already opt-in.
+ * The child runs as `nobody`, which exists on every macOS and Linux box and owns
+ * nothing; it needs no write access anywhere, because all it does is try to
+ * connect and report what it was told.
  */
 
 import { execFileSync } from "node:child_process";

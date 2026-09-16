@@ -558,6 +558,14 @@ export class LifecycleSequencer {
   async disable(id: string): Promise<void> {
     this.deps.onOperation?.("disable");
     const enabled = await this.deps.dir.readEnabledSet();
+    // **Read before anything is removed**, because every one of these is about
+    // to be untrue: an id nothing has ever heard of is a no-op, and a no-op must
+    // not broadcast a state change for a plugin that never existed.
+    const known =
+      enabled.includes(id) ||
+      this.loadedIds.includes(id) ||
+      this.failures.has(id) ||
+      this.deps.quarantine.isQuarantined(id);
     if (enabled.includes(id)) {
       await this.deps.dir.writeEnabledSet(enabled.filter((other) => other !== id));
     }
@@ -565,7 +573,7 @@ export class LifecycleSequencer {
     this.forget(id);
     this.deps.quarantine.forgetPlugin(id);
     this.failures.delete(id);
-    this.announce(id, "disabled", null);
+    if (known) this.announce(id, "disabled", null);
   }
 
   /**

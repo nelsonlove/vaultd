@@ -18,6 +18,24 @@ import { describe, expect, it } from "vitest";
 import { ClientSubscriptions } from "../src/server/subscriptions";
 import { HostHarness } from "../src/testing/host-harness";
 
+/**
+ * Read until `count` events have arrived, or the client goes quiet for good.
+ *
+ * Not a sleep: each turn drains what the socket has and asks again, so a host
+ * that delivers everything finishes in as many turns as it needs and one that
+ * stops delivering fails by the runner's own timeout.
+ */
+async function drainUntil(
+  client: { drainEvents(): Promise<ReadonlyArray<{ type: string; value: unknown }>> },
+  count: number,
+): Promise<ReadonlyArray<{ type: string; value: unknown }>> {
+  let events = await client.drainEvents();
+  for (let turn = 0; turn < 5_000 && events.length < count; turn += 1) {
+    events = await client.drainEvents();
+  }
+  return events;
+}
+
 describe("host subscriptions", () => {
   it("delivers one generation_committed to each of two connected clients", async () => {
     const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
@@ -243,6 +261,81 @@ describe("host subscriptions", () => {
     });
     expect(subscriptions.pending()).toBe(0);
   });
+
+  it("holds a daemon generation_committed until the mirror has caught up, then relays it unchanged", async () => {
+    const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+      const seen: unknown[] = [];
+      client.onEvent((envelope) => {
+        if (envelope.event.type === "generation_committed") seen.push(envelope.event.value);
+      });
+
+      const generation = harness.mirror.generation() + 1;
+      // The daemon's own payload, with the two fields a host cannot honestly
+      // produce: `affected_reference_count`, which the mirror's batch does not
+      // carry, and a `cause` that is the daemon's account of its own commit.
+      const committed = {
+        previous_generation: harness.mirror.generation(),
+        generation,
+        cause: "watcher" as const,
+        changes: { kind: "detailed" as const, created: [], modified: ["A.md"], deleted: [] },
+        affected_note_count: 1,
+        affected_reference_count: 9,
+      };
+      harness.server.relayDaemonEvent({ type: "generation_committed", value: committed });
+      await harness.serverQuiesce();
+      // Held: this host's mirror is still a generation behind, and a client that
+      // heard about generation N would page `host.open_snapshot` for a view that
+      // does not hold it.
+      expect(seen).toEqual([]);
+
+      await harness.commitGeneration({ generation, modified: ["A.md"], announce: false });
+      await harness.serverQuiesce();
+      // Released the moment the mirror caught up, and byte for byte what the
+      // daemon sent — nothing recomputed, nothing dropped, nothing invented.
+      expect(seen).toEqual([committed]);
+      expect(harness.mirror.appliedThrough()).toBeGreaterThanOrEqual(generation);
+      await client.disconnect();
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("does not lag a reading client with a burst larger than the queue", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      enabled: [],
+      config: { subscriberQueueLimit: 64 },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+      // A thousand events in one synchronous loop, at a queue limit of 64. A
+      // client reading as fast as it can still cannot drain a socket inside the
+      // turn that filled it, so a host that delivered the whole burst without
+      // yielding collapsed a perfectly healthy reader into a `subscriber_lag`.
+      // Measured before the fix: 74 delivered and one collapse.
+      for (let i = 0; i < 1_000; i += 1) {
+        harness.server.broadcast({
+          type: "host.notice",
+          value: { plugin_id: null, message: `notice ${String(i)}`, at_unix_ms: i },
+        });
+      }
+      const events = await drainUntil(client, 1_000);
+      expect(events.filter((event) => event.type === "host.notice")).toHaveLength(1_000);
+      expect(events.filter((event) => event.type === "resync_required")).toHaveLength(0);
+      // In order, which is what the outbox is for.
+      expect((events[0]?.value as { message: string }).message).toBe("notice 0");
+      expect((events[999]?.value as { message: string }).message).toBe("notice 999");
+      await client.disconnect();
+    } finally {
+      await harness.stop();
+    }
+  }, 30_000);
 
   it("stops delivering after unsubscribe", async () => {
     const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });

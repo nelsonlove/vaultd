@@ -51,7 +51,8 @@ import type { LifecycleSequencer } from "../runtime/lifecycle";
 import type { LiveStateDto } from "../client/protocol";
 import type { Mirror } from "../mirror/mirror";
 import type { NoticeLog } from "../shim/notice";
-import type { PluginState } from "./wire";
+import type { InstalledPlugin } from "../pluginset/config-dir";
+import type { PluginState, PositionWire, SelectionWire } from "./wire";
 import type { PolicyRecorder } from "../shim/policy";
 import type { QuarantineTracker } from "../runtime/quarantine";
 import type { RequestSink } from "../client/request-sink";
@@ -149,6 +150,23 @@ export class HostOps {
   readonly snapshots: SnapshotStore;
   private readonly table = new Map<string, OpHandler>();
   private wiring: HostServerWiring | null = null;
+  /**
+   * The installed plugin set, as last read off the config directory.
+   *
+   * **Cached because reading it is not free.** `listInstalled` is one `read_dir`
+   * plus one `read_file` per installed plugin, through the daemon, and five
+   * operations ask for it — `host.hello`, `host.info`, `host.list_plugins` and
+   * both plugin ops. On a hundred-plugin vault a `host.info` was a hundred and
+   * one round trips for a listing that changes when somebody installs a plugin,
+   * which is not something that happens between two requests.
+   *
+   * Invalidated explicitly rather than by a timer: an enable or a disable is the
+   * host's own doing, and `host.info { refresh: true }` is a client saying it
+   * wants the world re-read. Nothing else moves it, so a plugin installed on
+   * disk under a running host is seen at the next refresh — which is the same
+   * window the coexistence poll already documents for the enabled set.
+   */
+  private installedCache: readonly InstalledPlugin[] | null = null;
 
   constructor(private readonly deps: HostServerDeps) {
     this.snapshots = new SnapshotStore(deps.mirror, deps.config);
@@ -213,10 +231,15 @@ export class HostOps {
     table.set("host.hello", () => this.hello());
 
     table.set("host.info", async (params) => {
-      const report =
-        boolOf(params, "refresh") === true
-          ? await this.deps.coexistence.check()
-          : this.deps.coexistence.latest();
+      const refresh = boolOf(params, "refresh") === true;
+      // A client asking to refresh is asking for the world to be re-read, not
+      // only for a fresh coexistence poll: the installed set is part of the
+      // world, and a cache that survived an explicit refresh would be the one
+      // thing this operation could not tell the truth about.
+      if (refresh) this.forgetInstalled();
+      const report = refresh
+        ? await this.deps.coexistence.check()
+        : this.deps.coexistence.latest();
       return {
         plugins: await this.pluginStates(),
         timers: this.deps.harvest.timers().map(toWireTimer),
@@ -245,6 +268,7 @@ export class HostOps {
     table.set("host.enable_plugin", async (params) => {
       const id = stringOf(params, "id");
       await this.assertInstalled(id);
+      this.forgetInstalled();
       try {
         await this.deps.lifecycle.enableLate(id, { forceShared: boolOf(params, "force_shared") === true });
       } catch (error) {
@@ -259,6 +283,7 @@ export class HostOps {
     table.set("host.disable_plugin", async (params) => {
       const id = stringOf(params, "id");
       await this.deps.lifecycle.disable(id);
+      this.forgetInstalled();
       return { id, state: await this.stateOf(id) };
     });
 
@@ -511,8 +536,19 @@ export class HostOps {
     );
   }
 
+  /** The installed set, from the cache if it is warm. See {@link installedCache}. */
+  private async installed(): Promise<readonly InstalledPlugin[]> {
+    this.installedCache ??= await this.deps.dir.listInstalled();
+    return this.installedCache;
+  }
+
+  /** Forget the installed set: an enable, a disable, or a client asking to refresh. */
+  private forgetInstalled(): void {
+    this.installedCache = null;
+  }
+
   private async assertInstalled(id: string): Promise<void> {
-    const installed = await this.deps.dir.listInstalled();
+    const installed = await this.installed();
     if (installed.some((plugin) => plugin.id === id)) return;
     throw new HostError(
       "plugin_not_installed",
@@ -573,7 +609,7 @@ export class HostOps {
    * only what is on disk would not say so.
    */
   private async pluginStates(): Promise<PluginStateWireRow[]> {
-    const installed = await this.deps.dir.listInstalled();
+    const installed = await this.installed();
     const loaded = new Set(this.deps.lifecycle.loadedPlugins());
     const failures = this.deps.lifecycle.loadFailures();
     const timings = this.deps.lifecycle.loadTimings();
@@ -700,16 +736,15 @@ function stringMapOf(params: Record<string, unknown>, key: string): Record<strin
 /**
  * Where an editor command's selection starts and ends.
  *
- * The phase brief's table spelled this `selection?: string`, which no editor
- * command can use: `Editor.setSelection` takes two positions, and a string
- * would have to be searched for in the note — a different operation with a
- * different failure mode. It is the range, and a client that sends a string is
- * told so rather than having it silently ignored.
+ * The shape is pinned as {@link SelectionWire} — a **ratified** deviation from
+ * the brief's `selection?: string`, which no editor command can use. See that
+ * declaration for the reasoning; a client that sends a string is told so rather
+ * than having it silently ignored.
  */
 function selectionOf(params: Record<string, unknown>): EditorRange | null {
   const value = params["selection"];
   if (value === undefined || value === null) return null;
-  const range = value as { from?: unknown; to?: unknown };
+  const range = value as Partial<SelectionWire>;
   const from = positionOf(range.from);
   const to = positionOf(range.to);
   if (from === null || to === null) {
@@ -721,8 +756,8 @@ function selectionOf(params: Record<string, unknown>): EditorRange | null {
   return { from, to };
 }
 
-function positionOf(value: unknown): { line: number; ch: number } | null {
-  const position = value as { line?: unknown; ch?: unknown } | null;
+function positionOf(value: unknown): PositionWire | null {
+  const position = value as Partial<PositionWire> | null;
   if (typeof position?.line !== "number" || typeof position.ch !== "number") return null;
   return { line: position.line, ch: position.ch };
 }

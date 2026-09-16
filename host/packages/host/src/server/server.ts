@@ -43,17 +43,17 @@
  * ## Events
  *
  * Host events (`host.plugin_state_changed`, `host.notice`,
- * `host.overlap_changed`) come from the components that produce them. The
- * daemon-shaped events are relayed with their `vaultd` payloads, with one
- * deliberate difference: **`generation_committed` is emitted from the mirror's
- * applied batch rather than relayed from the daemon's subscription.** A client
- * of this host reads this host's mirror — `host.open_snapshot` serves from it —
- * so an event announcing a generation the mirror has not applied yet would
- * invite a client to page a view that does not hold it. Emitting at apply time
- * makes the event mean "the host's view is now at N", which is the only claim
- * this door can honestly make. `runtime_state_changed` and `resync_required`
- * pass through {@link HostServer.relayDaemonEvent} untouched, because both are
- * statements about the engine rather than about this host's view.
+ * `host.overlap_changed`) come from the components that produce them. Every
+ * daemon-shaped event is relayed with its `vaultd` payload **unchanged**, so a
+ * client correlating this door with a direct daemon subscription sees the same
+ * numbers — which a host that recomputed them could not promise, and the first
+ * cut of this file recomputed all of them.
+ *
+ * `generation_committed` carries one extra rule: it is **held until this host's
+ * mirror has caught up to it**. A client of this host pages this host's mirror
+ * (`host.open_snapshot`), so announcing generation N before the mirror holds N
+ * would invite a client to page a view that does not have it. The payload is the
+ * daemon's; the moment is the mirror's. See {@link HostServer.relayDaemonEvent}.
  */
 
 import { createServer, type Server, type Socket } from "node:net";
@@ -62,6 +62,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 
 import { ClientSubscriptions } from "./subscriptions";
 import { DataDir } from "../datadir";
+import { HOST_PLUGIN_ID } from "../shim/errors";
 import { HostError } from "./wire";
 import { HostOps, HOST_PROTOCOL_VERSION } from "./ops";
 import { VaultdError } from "../client/errors";
@@ -69,7 +70,6 @@ import { isKnownRuntimeEvent } from "../client/protocol";
 import { toWireNotice, toWireOverlap } from "./wire";
 import type { HostEvent } from "./subscriptions";
 import type { HostServerDeps, HostServerWiring, OpSession } from "./ops";
-import type { MirrorChangeBatch } from "../mirror/types";
 import type { RuntimeEventDto } from "../client/protocol";
 
 export type { HostServerDeps, HostServerWiring } from "./ops";
@@ -88,6 +88,62 @@ const NONCE_FILE = "nonce";
  * still fits with room for its envelope.
  */
 const MAX_LINE_BYTES = 17 * 1024 * 1024;
+
+/**
+ * Every host that wants to hear about an unhandled rejection in this process.
+ *
+ * **Defence in depth, and the depth is the point.** Every per-line handler now
+ * carries its own catch, so nothing on the request path can leak a rejection —
+ * but "nothing can" is a claim about code that is still being written, and the
+ * consequence of being wrong is that Node terminates the process (the default
+ * since v15, and this host declares `node >= 24`): every loaded plugin, every
+ * subscription, every client, for one stray promise. A host that logs the bug
+ * and keeps serving is strictly better than one that dies of it.
+ *
+ * Refcounted rather than installed per server, because a process may hold two —
+ * a live host beside a harness, and a test file builds dozens in sequence — and
+ * one `process.on` per host would trip Node's max-listeners warning and leak a
+ * listener per host that is never closed.
+ */
+const rejectionReporters = new Set<(reason: unknown) => void>();
+let installedRejectionHandler: ((reason: unknown) => void) | null = null;
+
+/**
+ * Report one unhandled rejection to every host that asked to hear about it.
+ *
+ * Exported so a test can assert what the guard *does* without planting a real
+ * unhandled rejection — which the test runner would fail the file for, before
+ * this handler ever saw it.
+ */
+export function reportUnhandledRejection(reason: unknown): void {
+  for (const report of [...rejectionReporters]) {
+    try {
+      report(reason);
+    } catch {
+      // The guard is the last place left to report to. A reporter that throws
+      // here must not become the unhandled rejection this exists to absorb.
+    }
+  }
+}
+
+function guardUnhandledRejections(report: (reason: unknown) => void): () => void {
+  rejectionReporters.add(report);
+  if (installedRejectionHandler === null) {
+    installedRejectionHandler = reportUnhandledRejection;
+    process.on("unhandledRejection", installedRejectionHandler);
+  }
+  return (): void => {
+    rejectionReporters.delete(report);
+    if (rejectionReporters.size > 0 || installedRejectionHandler === null) return;
+    process.off("unhandledRejection", installedRejectionHandler);
+    installedRejectionHandler = null;
+  };
+}
+
+/** Is this process's unhandled-rejection guard armed? **For its own test.** */
+export function rejectionGuardArmed(): boolean {
+  return installedRejectionHandler !== null;
+}
 
 export class HostServer {
   private readonly ops: HostOps;
@@ -114,21 +170,26 @@ export class HostServer {
   private listening: Promise<string> | null = null;
   private nonce: Buffer | null = null;
   private subscriptionSequence = 0;
+  /** Events waiting for a turn of the loop. See {@link HostServer.broadcast}. */
+  private readonly outbox: HostEvent[] = [];
+  private pumping = false;
   /**
-   * The generation this host last announced.
+   * Daemon `generation_committed` events the mirror has not caught up to yet.
    *
-   * `generation_committed` carries `previous_generation`, and the honest value
-   * for it on this door is where *this host's view* was before the batch —
-   * which is not necessarily the daemon's `previous_generation`, because a
-   * re-hydration can move the mirror across several generations at once.
+   * Oldest first. See {@link HostServer.relayDaemonEvent} for why they are held
+   * rather than delivered on arrival.
    */
-  private lastAnnounced: number;
+  private readonly heldCommits: Array<{ generation: number; event: HostEvent }> = [];
+  /** Uninstalls the process-level unhandled-rejection guard. */
+  private readonly unguard: () => void;
 
   constructor(private readonly deps: HostServerDeps) {
     this.ops = new HostOps(deps);
     this.dataDir = new DataDir(deps.config.dataDir);
     this.socketDir = new DataDir(dirname(deps.config.socketPath));
-    this.lastAnnounced = deps.mirror.generation();
+    this.unguard = guardUnhandledRejections((reason) => {
+      deps.errors.report(reason, HOST_PLUGIN_ID, "event");
+    });
     this.subscribeToSources();
   }
 
@@ -142,7 +203,15 @@ export class HostServer {
    * alone. Resolves with the socket path. Idempotent.
    */
   listen(): Promise<string> {
-    this.listening ??= this.bind();
+    // **The rejection is not cached.** `??=` keeps a rejected promise, because a
+    // rejected promise is not nullish — so a host that refused to listen on a
+    // widened directory could never listen again in that process, not even after
+    // the operator ran the `chmod` the refusal asked for. A failure clears the
+    // slot; a success is idempotent.
+    this.listening ??= this.bind().catch((error: unknown) => {
+      this.listening = null;
+      throw error instanceof Error ? error : new Error(String(error));
+    });
     return this.listening;
   }
 
@@ -169,28 +238,111 @@ export class HostServer {
     return total;
   }
 
-  /** Send one event to every subscription on every connected client. */
+  /**
+   * Send one event to every subscription on every connected client.
+   *
+   * **A burst yields between events once anybody is behind.** A client reading
+   * as fast as it can still cannot drain a socket inside the turn that filled
+   * it: the kernel takes some tens of events and then the rest have nowhere to
+   * go but the bounded queue, so a thousand events emitted in one synchronous
+   * loop used to collapse a perfectly healthy reader into a `subscriber_lag`.
+   * Measured before this: 1,000 synchronous broadcasts at a limit of 256
+   * delivered 74 and one collapse.
+   *
+   * So a broadcast that finds a subscriber behind hands the loop a turn before
+   * the next event. The turn is what lets the socket flush, which is what makes
+   * "behind" go away — and a subscriber that is genuinely stalled stays behind
+   * however many turns it is given, so the collapse still happens for the client
+   * the bound exists for. The outbox is drained in order and is bounded by the
+   * burst the producer is already holding.
+   */
   broadcast(event: HostEvent): void {
-    for (const connection of this.connections) connection.subscriptions.deliver(event);
+    this.outbox.push(event);
+    if (!this.pumping) this.pump();
+  }
+
+  private pump(): void {
+    this.pumping = true;
+    for (;;) {
+      const next = this.outbox.shift();
+      if (next === undefined) {
+        this.pumping = false;
+        return;
+      }
+      for (const connection of this.connections) connection.subscriptions.deliver(next);
+      if (this.pendingEvents() > 0) {
+        setImmediate(() => {
+          this.pump();
+        });
+        return;
+      }
+    }
   }
 
   /**
    * Relay one event from the daemon's subscription.
    *
    * Task 22's `main.ts` is the caller: the supervisor owns the one subscription
-   * per engine, and this is where it hands events on. `generation_committed` is
-   * **not** relayed — see this file's header — and an event kind this build does
-   * not know is passed through as itself, because the wire's evolution rule is
-   * that an unrecognized event degrades rather than fails, and a client of this
-   * host may well understand a daemon this host does not.
+   * per engine, and this is where it hands events on. An event kind this build
+   * does not know is passed through as itself, because the wire's evolution rule
+   * is that an unrecognized event degrades rather than fails, and a client of
+   * this host may well understand a daemon this host does not.
+   *
+   * **`generation_committed` is relayed with the daemon's own payload, held
+   * until this host's mirror has caught up to it.** Both halves matter and they
+   * pull in opposite directions:
+   *
+   * - *Unchanged*, because a client correlating this door with a direct daemon
+   *   subscription must see the same numbers. The host cannot honestly recompute
+   *   `affected_reference_count`, and `previous_generation` and `cause` are the
+   *   daemon's account of its own commit, not this host's. The first cut
+   *   synthesized all of them from the mirror's batch and every one of them
+   *   differed.
+   * - *Held*, because a client of this host pages **this host's mirror**
+   *   (`host.open_snapshot`), so an event announcing generation N before the
+   *   mirror holds N would invite a client to page a view that does not have it.
+   *
+   * So the payload is the daemon's and the moment is the mirror's:
+   * `mirror.appliedThrough() >= value.generation` is the release condition, and
+   * {@link HostServer.releaseHeldCommits} runs it on every applied batch.
+   *
+   * `config_changed` arrives here as well as through the mirror's own seam, and
+   * only the mirror's is broadcast — one announcement per raw write into the
+   * config zone, from the seam that also invalidates this host's cached config.
    */
   relayDaemonEvent(event: RuntimeEventDto): void {
-    if (isKnownRuntimeEvent(event) && event.type === "generation_committed") return;
-    // `config_changed` arrives here as well as through the mirror's own seam;
-    // only the mirror's is broadcast, so a raw write into the config zone is
-    // announced once rather than twice.
     if (isKnownRuntimeEvent(event) && event.type === "config_changed") return;
+    if (isKnownRuntimeEvent(event) && event.type === "generation_committed") {
+      const held = { generation: event.value.generation, event: { type: event.type, value: event.value } };
+      if (this.deps.mirror.appliedThrough() >= held.generation) {
+        this.broadcast(held.event);
+        return;
+      }
+      this.heldCommits.push(held);
+      return;
+    }
     this.broadcast({ type: event.type, value: event.value });
+  }
+
+  /**
+   * Deliver every held commit the mirror has now caught up to, in order.
+   *
+   * In generation order rather than arrival order, because the release condition
+   * is a watermark: a batch that lands the mirror on generation 9 releases 7, 8
+   * and 9 at once, and a client must see them the way the daemon committed them.
+   */
+  private releaseHeldCommits(): void {
+    if (this.heldCommits.length === 0) return;
+    const appliedThrough = this.deps.mirror.appliedThrough();
+    const ready = this.heldCommits.filter((held) => held.generation <= appliedThrough);
+    if (ready.length === 0) return;
+    this.heldCommits.splice(
+      0,
+      this.heldCommits.length,
+      ...this.heldCommits.filter((held) => held.generation > appliedThrough),
+    );
+    ready.sort((left, right) => left.generation - right.generation);
+    for (const held of ready) this.broadcast(held.event);
   }
 
   /**
@@ -210,10 +362,12 @@ export class HostServer {
       // `clientCount()` would then be one too high for no reason a reader could
       // see.
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      const busy = [...this.connections].some(
-        (connection) =>
-          connection.subscriptions.pending() > 0 && !connection.subscriptions.blocked(),
-      );
+      const busy =
+        this.outbox.length > 0 ||
+        [...this.connections].some(
+          (connection) =>
+            connection.subscriptions.pending() > 0 && !connection.subscriptions.blocked(),
+        );
       if (!busy && turn >= 2) return;
     }
   }
@@ -221,6 +375,9 @@ export class HostServer {
   /** Stop listening, drop every client, and detach from every event source. */
   async close(): Promise<void> {
     for (const detach of this.detachers.splice(0)) detach();
+    this.unguard();
+    this.outbox.length = 0;
+    this.heldCommits.length = 0;
     for (const connection of [...this.connections]) connection.destroy();
     this.connections.clear();
     const server = this.server;
@@ -353,9 +510,12 @@ export class HostServer {
   // --- Event sources ---------------------------------------------------------
 
   private subscribeToSources(): void {
+    // The mirror is the **clock**, not the source: a batch says how far this
+    // host's view has come, and what it releases is the daemon's own account of
+    // the generations it has now reached. See {@link relayDaemonEvent}.
     this.detachers.push(
-      this.deps.mirror.onBatch((batch) => {
-        this.broadcast(this.committedEvent(batch));
+      this.deps.mirror.onBatch(() => {
+        this.releaseHeldCommits();
       }),
     );
     this.detachers.push(
@@ -387,40 +547,6 @@ export class HostServer {
     );
   }
 
-  /**
-   * One applied batch, as `vaultd`'s `generation_committed`.
-   *
-   * `changes` is the daemon's `detailed` shape because that is what it is: this
-   * host never announces counts-only, since a batch it could not describe path
-   * by path took the resync road inside the mirror and a `resync_required` is
-   * what a subscriber hears instead.
-   *
-   * `affected_note_count` is counted here rather than carried, because the
-   * mirror's batch does not carry it; `affected_reference_count` is **not**
-   * invented, and is absent rather than reported as zero — a client that needs
-   * it is asking a question only the daemon can answer.
-   */
-  private committedEvent(batch: MirrorChangeBatch): HostEvent {
-    const previous = this.lastAnnounced;
-    this.lastAnnounced = batch.generation;
-    const paths = [...batch.created, ...batch.modified, ...batch.deleted];
-    return {
-      type: "generation_committed",
-      value: {
-        previous_generation: previous,
-        generation: batch.generation,
-        cause: batch.cause,
-        changes: {
-          kind: "detailed",
-          created: [...batch.created],
-          modified: [...batch.modified],
-          deleted: [...batch.deleted],
-        },
-        affected_note_count: paths.filter((path) => path.toLowerCase().endsWith(".md")).length,
-        synthetic: batch.synthetic,
-      },
-    };
-  }
 }
 
 /** What a {@link Connection} needs of the server that owns it. */
@@ -544,7 +670,7 @@ class Connection {
 
   private absorb(chunk: string): void {
     this.buffered += chunk;
-    if (this.buffered.length > MAX_LINE_BYTES) {
+    if (this.overLineCap()) {
       this.destroy();
       return;
     }
@@ -552,43 +678,102 @@ class Connection {
     while (newline !== -1) {
       const line = this.buffered.slice(0, newline);
       this.buffered = this.buffered.slice(newline + 1);
-      if (line.trim().length > 0) void this.handle(line);
+      if (line.trim().length > 0) this.dispatchLine(line);
       newline = this.buffered.indexOf("\n");
     }
   }
 
+  /**
+   * Is what is buffered past the cap, in **bytes**?
+   *
+   * `String.length` counts UTF-16 units, so a multi-byte payload reached roughly
+   * twice the intended cap before the destroy fired. A UTF-8 encoding is never
+   * *shorter* than the unit count and never longer than four times it, so the
+   * cheap comparison decides almost every call and the real encoding is only
+   * measured in the narrow band where it could matter.
+   */
+  private overLineCap(): boolean {
+    if (this.buffered.length > MAX_LINE_BYTES) return true;
+    if (this.buffered.length * 4 <= MAX_LINE_BYTES) return false;
+    return Buffer.byteLength(this.buffered, "utf8") > MAX_LINE_BYTES;
+  }
+
+  /**
+   * Hand one line to the handler so that **no rejection can escape**.
+   *
+   * `void this.handle(line)` was a floating promise, and a floating promise that
+   * rejects is an unhandled rejection — which Node terminates the process for by
+   * default since v15, and this host declares `node >= 24`. Five bytes (`null\n`)
+   * from a peer that had presented no nonce reached exactly that: `JSON.parse`
+   * answered `null`, reading `.id` off it threw a `TypeError`, and the whole host
+   * — every loaded plugin, every subscription, every other client — went down.
+   *
+   * So the invocation carries its own catch. A refusal that reached here rather
+   * than being answered inside `handle` is this host's own bug, not the client's,
+   * so the connection is told and then destroyed: continuing to serve a
+   * connection whose last request threw out of the dispatcher entirely is
+   * pretending to a state that was never reached.
+   */
+  private dispatchLine(line: string): void {
+    void this.handle(line).catch((error: unknown) => {
+      this.fail("", error);
+      this.destroy();
+    });
+  }
+
+  /**
+   * One request line, in the order the envelope is defined.
+   *
+   * **Parse, version, authentication, method, dispatch** — and the order is the
+   * contract rather than a convenience. `docs/protocol.md` puts version
+   * validation ahead of method dispatch so that an unsupported version is told
+   * so even when it names a method this build does not know; the nonce gate sits
+   * directly behind it, because an unauthenticated peer must not be able to
+   * reach the dispatcher, the parameter decoders, or a free retry by sending
+   * something malformed.
+   */
   private async handle(line: string): Promise<void> {
-    let envelope: { id?: unknown; request?: { method?: unknown; params?: unknown } };
-    try {
-      envelope = JSON.parse(line) as typeof envelope;
-    } catch {
-      // Input with no usable envelope is a fatal input error on the daemon's
-      // own transport, and it is one here: there is no `id` to echo, so there is
-      // no way to tell the client which of its requests this was about.
+    const parsed = parseEnvelope(line);
+    if (parsed === null) {
+      // Input with no usable envelope is a fatal input error on the daemon's own
+      // transport, and it is one here: `null`, `5`, `"x"` and `[]` all parse and
+      // none of them is a request, so there is no `id` to echo and no way to tell
+      // the client which of its lines this was about.
       this.destroy();
       return;
     }
-    const id = typeof envelope.id === "string" ? envelope.id : "";
-    const method = envelope.request?.method;
-    if (typeof method !== "string") {
+    const id = echoableId(parsed.id);
+    if (parsed.version !== HOST_PROTOCOL_VERSION) {
+      this.fail(
+        id,
+        new HostError(
+          "incompatible_version",
+          `this host speaks protocol version ${String(HOST_PROTOCOL_VERSION)}; the request ` +
+            `carried ${JSON.stringify(parsed.version)}`,
+          { supported_version: HOST_PROTOCOL_VERSION },
+        ),
+      );
+      // Pre-authentication this is still "not a well-formed `host.hello`", so
+      // the connection goes with it. An admitted client is told and kept, the
+      // way the daemon keeps a connection that sent one bad version.
+      if (!this.authenticated) this.finishAfterRefusal();
+      return;
+    }
+
+    if (!this.authenticated) {
+      await this.admit(id, parsed.method, parsed.params);
+      return;
+    }
+    if (typeof parsed.method !== "string") {
       this.fail(id, new HostError("invalid_request", "every request carries a string method"));
       return;
     }
-    const params = envelope.request?.params;
-
-    if (!this.authenticated) {
-      await this.admit(id, method, params);
-      return;
-    }
-    if (method === "host.hello") {
-      this.fail(
-        id,
-        new HostError("invalid_request", "this connection has already said hello"),
-      );
+    if (parsed.method === "host.hello") {
+      this.fail(id, new HostError("invalid_request", "this connection has already said hello"));
       return;
     }
     try {
-      this.answer(id, method, await this.deps.dispatch(method, params, this.session));
+      this.answer(id, parsed.method, await this.deps.dispatch(parsed.method, parsed.params, this.session));
     } catch (error) {
       this.fail(id, error);
     }
@@ -597,13 +782,22 @@ class Connection {
   /**
    * The nonce gate: the only thing an unauthenticated connection may do.
    *
-   * A refusal destroys the socket rather than leaving it open for a second
-   * attempt. There is nothing to guess — the nonce is 32 random bytes — so a
-   * connection that got it wrong is either a bug or a probe, and neither is
-   * owed a retry on the same connection.
+   * **Anything that is not a well-formed `host.hello` carrying the nonce is
+   * `not_owner`, and the socket goes.** Not only a wrong nonce: a missing
+   * `request`, a method that is not a string, params that are not an object, a
+   * different method entirely. The previous order checked the *shape* first and
+   * answered `invalid_request` while keeping the connection, which made a
+   * malformed line a free retry channel — measured at a hundred refusals on one
+   * unauthenticated connection followed by a successful hello on that same
+   * connection. No privilege was gained, but "one attempt, then destroyed" was
+   * not true, and the same path was how a rejection escaped the door.
+   *
+   * There is nothing to guess — the nonce is 32 random bytes — so a connection
+   * that got it wrong is either a bug or a probe, and neither is owed a retry on
+   * the same connection.
    */
-  private async admit(id: string, method: string, params: unknown): Promise<void> {
-    const offered = (params as { nonce?: unknown } | undefined)?.nonce;
+  private async admit(id: string | number, method: unknown, params: unknown): Promise<void> {
+    const offered = isObject(params) ? params["nonce"] : undefined;
     if (method !== "host.hello" || typeof offered !== "string" || !this.deps.authenticate(offered)) {
       this.fail(
         id,
@@ -613,8 +807,7 @@ class Connection {
             "from <dataDir>/nonce, which only this user can read",
         ),
       );
-      this.socket.end();
-      this.finish();
+      this.finishAfterRefusal();
       return;
     }
     this.authenticated = true;
@@ -625,7 +818,13 @@ class Connection {
     }
   }
 
-  private answer(id: string, type: string, value: unknown): void {
+  /** Let the refusal reach the peer, then take the connection down. */
+  private finishAfterRefusal(): void {
+    this.socket.end();
+    this.finish();
+  }
+
+  private answer(id: string | number, type: string, value: unknown): void {
     this.write(
       `${JSON.stringify({
         version: HOST_PROTOCOL_VERSION,
@@ -635,7 +834,7 @@ class Connection {
     );
   }
 
-  private fail(id: string, error: unknown): void {
+  private fail(id: string | number, error: unknown): void {
     this.write(
       `${JSON.stringify({
         version: HOST_PROTOCOL_VERSION,
@@ -656,6 +855,44 @@ class Connection {
  * unexpected throw is a bug in this host, and dressing it up as a typed refusal
  * would tell the client it did something wrong.
  */
+/** Is this a JSON object — not `null`, not an array, not a scalar? */
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** One line's envelope, or `null` when the line is not a request at all. */
+function parseEnvelope(
+  line: string,
+): { version: unknown; id: unknown; method: unknown; params: unknown } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isObject(parsed)) return null;
+  const request = parsed["request"];
+  return {
+    version: parsed["version"],
+    id: parsed["id"],
+    method: isObject(request) ? request["method"] : undefined,
+    params: isObject(request) ? request["params"] : undefined,
+  };
+}
+
+/**
+ * The `id` to echo.
+ *
+ * A refusal echoes the request's id so a client can pair it with what it sent,
+ * and a client that spelled its id as a number gets that number back rather than
+ * an empty string it cannot match. Anything that is neither — an object, an
+ * array, an absent key — has no useful echo, and `""` is what a client sees
+ * instead.
+ */
+function echoableId(id: unknown): string | number {
+  return typeof id === "string" || typeof id === "number" ? id : "";
+}
+
 function bodyOf(error: unknown): { code: string; message: string } {
   if (error instanceof HostError) return error.body();
   if (error instanceof VaultdError) return error.body;

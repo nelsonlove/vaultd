@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { ClientSubscriptions } from "../src/server/subscriptions";
 import { HostHarness } from "../src/testing/host-harness";
 import {
   toWireCommand,
@@ -210,6 +211,101 @@ describe("the wire converts every shape to snake_case", () => {
     expect(JSON.stringify(tab)).not.toContain("live object");
   });
 
+  it("finds no camelCase key in any event this host can emit", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      guiEnabled: [],
+      plugins: {
+        demo: (api) =>
+          class extends api.Plugin {
+            override async onload(): Promise<void> {
+              new api.Notice("hello from demo");
+              await Promise.resolve();
+            }
+          },
+      },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      await client.call("host.subscribe", {});
+
+      // Every daemon-shaped event, relayed.
+      harness.server.relayDaemonEvent({
+        type: "runtime_state_changed",
+        value: { generation: 1, live_state: "watching" },
+      });
+      harness.server.relayDaemonEvent({
+        type: "resync_required",
+        value: { current_generation: 1, reason: "watcher_overflow" },
+      });
+      // `config_changed` comes from the mirror's own seam rather than the relay,
+      // so it is driven the way a real one arrives.
+      await harness.mirror.applyEvent({
+        type: "config_changed",
+        value: { path: ".obsidian/app.json" },
+      });
+      // `generation_committed`, held by the relay and released by the mirror.
+      await harness.commitGeneration({ modified: ["A.md"] });
+      // `host.plugin_state_changed` and `host.notice`, from the enable.
+      await client.call("host.enable_plugin", { id: "demo" });
+      // `host.overlap_changed`: the first reading changes nothing, the second is
+      // a genuinely different overlap set.
+      await client.call("host.info", { refresh: true });
+      harness.setGuiEnabled(["demo"]);
+      await client.call("host.info", { refresh: true });
+
+      const events = await client.drainEvents();
+      const types = new Set(events.map((event) => event.type));
+      expect([...types].sort()).toEqual([
+        "config_changed",
+        "generation_committed",
+        "host.notice",
+        "host.overlap_changed",
+        "host.plugin_state_changed",
+        "resync_required",
+        "runtime_state_changed",
+      ]);
+      for (const event of events) noCamelCase(event, `$.${event.type}`);
+
+      // The one event no daemon sends and no plugin raises: the collapse this
+      // host synthesizes for a subscriber that fell behind. Driven through the
+      // queue directly, because forcing it over a socket is what
+      // `server-subscriptions.test.ts` is for.
+      const written: string[] = [];
+      let backedUp = true;
+      let drain: (() => void) | null = null;
+      const subscriptions = new ClientSubscriptions({
+        limit: 1,
+        currentGeneration: () => 12,
+        mintId: () => "s-1",
+        writer: {
+          write: (line) => {
+            written.push(line);
+            return !backedUp;
+          },
+          onceDrain: (listener) => {
+            drain = listener;
+          },
+        },
+      });
+      subscriptions.open();
+      for (let i = 0; i < 4; i += 1) {
+        subscriptions.deliver({ type: "generation_committed", value: { generation: i } });
+      }
+      backedUp = false;
+      (drain as unknown as () => void)();
+      const collapse = written
+        .map((line) => JSON.parse(line) as { event: { type: string } })
+        .find((frame) => frame.event.type === "resync_required");
+      expect(collapse).toBeDefined();
+      noCamelCase(collapse);
+    } finally {
+      await harness.stop();
+    }
+  });
+
   it("finds no camelCase key at any depth of a live host.info", async () => {
     const harness = await HostHarness.create({
       vault: { "A.md": "# A\n" },
@@ -241,9 +337,30 @@ describe("the wire converts every shape to snake_case", () => {
       expect(body.timers.length).toBeGreaterThan(0);
       expect(body.overlap).not.toBeNull();
       noCamelCase(info);
+      noCamelCase(client.helloPayload(), "$.hello");
       noCamelCase(await client.call("host.list_commands", {}));
       noCamelCase(await client.call("host.list_plugins", {}));
-      noCamelCase(await client.call("host.open_snapshot", {}));
+      noCamelCase(await client.call("host.list_menu_items", { context: "file-menu", path: "A.md" }));
+      noCamelCase(await client.call("host.list_protocol_handlers", {}));
+      const opened = await client.call<{ snapshot_id: string }>("host.open_snapshot", {});
+      noCamelCase(opened);
+      // **The two pages are the biggest payloads on this socket**, and the notes
+      // page with every facet asked for is the deepest: six facet arrays of
+      // daemon DTOs, two of which are renamed on the way out (`list_items`,
+      // `references`). A walk that stopped at `host.info` would never have seen
+      // them.
+      noCamelCase(
+        await client.call("host.snapshot_tree", { snapshot_id: opened.snapshot_id, cursor: null }),
+        "$.snapshot_tree",
+      );
+      noCamelCase(
+        await client.call("host.snapshot_notes", {
+          snapshot_id: opened.snapshot_id,
+          cursor: null,
+          include: ["metadata", "references", "resolutions", "backlinks", "sections", "list_items"],
+        }),
+        "$.snapshot_notes",
+      );
     } finally {
       await harness.stop();
     }

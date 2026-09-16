@@ -375,7 +375,10 @@ export class HostHarness extends ShimHarness {
     const socketPath = await this.server.listen();
     const client = await HostTestClient.open(socketPath);
     this.clients.push(client);
-    await client.call("host.hello", { nonce: this.readNonce() });
+    // Kept on the client, because `host.hello` is answered once per connection
+    // and a case that wants to assert on the payload — the casing walk does —
+    // cannot ask for it a second time.
+    client.rememberHello(await client.call("host.hello", { nonce: this.readNonce() }));
     if (options.stalled === true) client.stall();
     return client;
   }
@@ -466,6 +469,16 @@ export class HostHarness extends ShimHarness {
     deleted?: string[];
     renamed?: Array<{ from: string; to: string }>;
     sources?: Record<string, string>;
+    /**
+     * Announce the commit as the daemon would, before the mirror applies it.
+     *
+     * Default `true`, because that is the real order: the daemon commits, the
+     * subscription carries `generation_committed`, and this host's mirror
+     * catches up behind it — which is exactly the window `HostServer` holds the
+     * relay across. A case driving the relay by hand passes `false` so the only
+     * event on the wire is the one it fed in.
+     */
+    announce?: boolean;
   }): Promise<void> {
     const renamed = change.renamed ?? [];
     const generation = change.generation ?? this.mirror.generation() + 1;
@@ -500,6 +513,32 @@ export class HostHarness extends ShimHarness {
     }
     for (const path of deleted) this.fixtures.remove(path);
     this.serveFixtures(deleted);
+
+    // **The daemon announces first.** A real commit reaches this host as a
+    // subscription event and the mirror catches up behind it, so the harness
+    // hands the server the event before it applies the change — which is the
+    // window `HostServer` holds the relay across, and holding it is the only
+    // reason a client cannot page a generation the mirror does not have.
+    if (change.announce !== false) {
+      this.serverValue?.relayDaemonEvent({
+        type: "generation_committed",
+        value: {
+          previous_generation: this.mirror.generation(),
+          generation,
+          cause: "mutation",
+          changes: {
+            kind: "detailed",
+            created: [...created],
+            modified: [...modified],
+            deleted: [...deleted],
+          },
+          affected_note_count: [...created, ...modified, ...deleted].filter((path) =>
+            path.toLowerCase().endsWith(".md"),
+          ).length,
+          affected_reference_count: 0,
+        },
+      });
+    }
 
     const applying = this.mirror.applyMutation(generation, [...created, ...modified, ...deleted]);
     // The mirror asks for more paths than the change set named — the ancestors
@@ -920,6 +959,8 @@ export class HostTestClient {
   private buffered = "";
   private sequence = 0;
   private stalled = false;
+  /** What `host.hello` answered on this connection. See {@link rememberHello}. */
+  private hello: unknown = null;
 
   private constructor(private readonly socket: Socket) {
     socket.on("data", (chunk: Buffer) => {
@@ -935,6 +976,16 @@ export class HostTestClient {
       });
       socket.once("error", reject);
     });
+  }
+
+  /** Keep the hello payload; a second `host.hello` is refused by the host. */
+  rememberHello(payload: unknown): void {
+    this.hello = payload;
+  }
+
+  /** What this connection's `host.hello` answered. */
+  helloPayload(): unknown {
+    return this.hello;
   }
 
   /**

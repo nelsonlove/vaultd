@@ -15,7 +15,13 @@ Requests, responses and events are `vaultd`'s three shapes exactly.
 {"version":1,"subscription_id":"host-sub-1","event":{"type":"generation_committed","value":{}}}
 ```
 
-A response echoes the request `id`; an event carries a `subscription_id` and no `id`. Exactly one writer owns each connection's output stream, so an event line can never be interleaved with a response line.
+A response echoes the request `id` — a string as a string, a number as a number, and `""` for a request that carried neither. An event carries a `subscription_id` and no `id`. Exactly one writer owns each connection's output stream, so an event line can never be interleaved with a response line.
+
+**Responses are paired by `id`, not by order.** A client that pipelines two requests may see the second answered first: `host.hello` reads the plugin set through the daemon while a version refusal is answered inline, and the host does not hold a fast answer back behind a slow one.
+
+**`version` is validated before the method is dispatched**, which is `docs/protocol.md`'s rule and the reason version numbers exist: a `version` that is not `1`, or absent, is `incompatible_version` carrying `supported_version`, whatever method the request named. On an authenticated connection the refusal is answered and the connection kept; before authentication the connection goes with it, because a request carrying the wrong version is not a well-formed `host.hello`.
+
+**A line that is not a JSON object is a fatal input error**: `null`, `5`, `"x"`, `[]` and anything that does not parse are all input with no usable envelope, so there is no `id` to echo and no way to say which line the refusal was about. The connection is closed with no reply. A single line is capped at 17 MB **of UTF-8**, one megabyte above `write_file`'s payload cap so the largest legitimate forwarded request still fits; past the cap the connection is closed rather than served.
 
 **Every field name is `snake_case`, without exception.** The host's internal shapes are `camelCase` and `host/packages/host/src/server/wire.ts` is the one place the conversion happens; `test/server-wire.test.ts` asserts, for every shape that crosses the socket, that no key at any depth matches `/[a-z][A-Z]/`.
 
@@ -37,17 +43,24 @@ A `host.`-prefixed method the host does not know is `invalid_request`. The host 
 
 The honest summary: **directory `0700` enforces, socket `0600` is defense in depth and may be advisory on Darwin, the nonce is the portable stand-in for the peer-UID check Node cannot make.**
 
-Two further rules follow from it. A second `host.hello` on a connection that has already said it is `invalid_request` — the gate is a state, not a re-authentication. And a refused connection is destroyed rather than left open for another attempt: there is nothing to guess, so a peer that got it wrong is either a bug or a probe and neither is owed a retry.
+Two further rules follow from it.
+
+**Before authentication, anything that is not a well-formed `host.hello` carrying the nonce is `not_owner`, and the connection is destroyed.** Not only a wrong nonce: a missing `request`, a method that is not a string, params that are not an object, a different method entirely. There is nothing to guess — the nonce is 32 random bytes — so a peer that got it wrong is either a bug or a probe, and neither is owed a retry on that connection. One refusal is the most an unauthenticated peer is ever told, and a line with no usable envelope (above) is told nothing at all.
+
+**A second `host.hello` on a connection that has already said it is `invalid_request`** — the gate is a state, not a re-authentication, and that connection is kept.
 
 ### The manual cross-UID procedure
 
 The mode assertions above say what the host *wrote*. Whether another user can reach the socket is a question only a second uid can answer, and that cannot run unattended. `host/packages/host/test/server-uid.manual.test.ts` is the other half: it is skipped unless `VAULTD_HOST_UID_TEST` is set, and it runs a client as `nobody` against a live socket.
 
 ```bash
+sudo -v                                                      # authenticate first
 VAULTD_HOST_UID_TEST=1 npm --prefix host test -- server-uid.manual
 ```
 
-`sudo` prompts; the child only tries to connect. The expected result is `EACCES` (or `ENOENT`) from the **directory** walk — which is the assertion, since the directory is the layer doing the work. A `CONNECTED` there would mean the `0700` is not doing what this document says it does.
+**The case runs `sudo -n`, which never prompts**, and the two lines are why there are two: a test runner's child has no terminal to prompt on, so a prompting `sudo` would hang until the runner's timeout rather than ask anybody anything. `sudo -v` in your own shell caches the credential for a few minutes and makes the `-n` run succeed; a passwordless rule for this user works too. On a machine with neither, the case fails with sudo's own refusal rather than passing quietly.
+
+The child only tries to connect. The expected result is `EACCES` (or `ENOENT`) from the **directory** walk — which is the assertion, since the directory is the layer doing the work. A `CONNECTED` there would mean the `0700` is not doing what this document says it does.
 
 ## Operations
 
@@ -79,7 +92,7 @@ Every field below is `snake_case`. The **Task** column says which task implement
 | `host.detach_interaction` | `{}` | `{ attached: bool }` | **wired in 20b** |
 | `host.respond_interaction` | `{ prompt_id, choice_index?: number, value?: string, cancelled?: bool }` | `{ prompt_id }` | **wired in 20b** |
 
-`host.invoke_command`'s `selection` is a range — `{ from: { line, ch }, to: { line, ch } }` — rather than a string. A string would have to be searched for in the note, which is a different operation with a different failure mode; a client that sends one is told so rather than having it silently ignored.
+`host.invoke_command`'s `selection` is a range — `{ from: { line, ch }, to: { line, ch } }`, both fields zero-based — rather than a string. **This is a ratified deviation from the phase brief's pinned table**, which spells the row `selection?: string`: an `editorCallback` is handed an `Editor`, whose `setSelection` takes two positions, so a string would have to be *searched* for in the note — a different operation, with a different failure mode (no match, several matches) and a different answer for each. The controller ratified the range in Task 16a's fix round and the brief's table is amended to match. A client that sends a string is told so by name rather than having it silently ignored. The shape is pinned as `SelectionWire` in `host/packages/host/src/server/wire.ts`.
 
 ### Readiness
 
@@ -156,6 +169,10 @@ A menu is **rebuilt** for every listing and for every invocation, because a plug
 
 The enabled set is written **before** the load, which is the order that fails safely: a plugin persisted and then failing to load is retried at the next start, where one that loaded and then failed to persist would run now and vanish later with nothing to say why. A plugin Obsidian is already running is refused with `overlap_refused`; `force_shared: true` admits it for that one call, and is the per-request twin of the `--force-shared` flag rather than a mutation of the host's configuration.
 
+**`host.enable_plugin` requires the plugin to be installed; `host.disable_plugin` does not**, and the asymmetry is deliberate: disabling something this host is still running but which is no longer in the config directory is a real need, and refusing it would leave the plugin running with no way to stop it. The cost is that a typo'd id answers `{ id, state: "disabled" }` rather than `plugin_not_found`. It broadcasts nothing, though — an id neither loaded, enabled, failed nor quarantined is a no-op, and a no-op does not announce a state change for a plugin that never existed.
+
+The installed set is read from the config directory and cached between requests, so `host.info` on a hundred-plugin vault is not a hundred round trips. An enable, a disable, and `host.info { refresh: true }` each drop the cache; a plugin installed on disk under a running host is therefore seen at the next refresh.
+
 `host.subscribe` (`test/server-subscriptions.test.ts`):
 
 ```json
@@ -191,9 +208,11 @@ Three refusals are worth stating:
 
 - **A moved generation is `generation_mismatch`**, carrying `current_generation`, exactly as the daemon answers for a stale cursor or a lost pin. The client reopens. The session could serve its frozen arrays forever, but a client that asked for a coherent view of one generation and silently got a stale one would have no way to know.
 - **An unknown, closed, or another client's session is `snapshot_not_found`.** Another client's id is not distinguished: saying "that one is somebody else's" would confirm the existence of a session this client cannot address.
-- **Past `snapshot_session_cap` concurrent sessions, `too_many_snapshots`** — the same code the daemon answers for the same condition, so a client's retry logic is identical through either door.
+- **Past `snapshot_session_cap` concurrent sessions, `too_many_snapshots`** — the same code the daemon answers for the same condition, so a client's retry logic is identical through either door. The cap is **per connection**, not host-wide: a host-wide one would let a single leaking client lock every peer out of hydration until it disconnected.
 
-`limit` is **clamped** into `1..=snapshot_page_size_max` rather than refused, including `0`, which becomes `1`. That is the daemon's rule for snapshot pages and it is copied here: a hydration loop that asks for too much should page more times, not fail half way through a vault. The cursor is opaque; a client stores it and hands it back.
+`limit` is **clamped** into `1..=snapshot_page_size_max` rather than refused, including `0`, which becomes `1`. That is the daemon's rule for snapshot pages and it is copied here: a hydration loop that asks for too much should page more times, not fail half way through a vault.
+
+The cursor is opaque: a client stores it and hands it back. It carries the session it belongs to, so a cursor from one session handed to another is `invalid_cursor` rather than a page of somebody else's walk, and so is a forged one that points outside the walk.
 
 A client disconnect closes every session that client held.
 
@@ -210,15 +229,17 @@ Host events:
 | `host.overlap_changed` | `{ overlap, gui_enabled }` |
 | `host.interaction_request` | `{ prompt_id, plugin_id, kind, prompt, items, timeout_ms }` — **emitted by 20b** |
 
-Daemon-shaped events carry their `vaultd` payloads: `generation_committed`, `runtime_state_changed`, `resync_required` and `config_changed`.
+Daemon-shaped events carry their `vaultd` payloads **unchanged**: `generation_committed`, `runtime_state_changed`, `resync_required` and `config_changed`. Nothing is recomputed here, so a client correlating this door with a direct daemon subscription sees the same numbers.
 
 ```json
-{"version":1,"subscription_id":"host-sub-1","event":{"type":"generation_committed","value":{"previous_generation":1,"generation":2,"cause":"mutation","changes":{"kind":"detailed","created":[],"modified":["A.md"],"deleted":[]},"affected_note_count":1,"synthetic":false}}}
+{"version":1,"subscription_id":"host-sub-1","event":{"type":"generation_committed","value":{"previous_generation":40,"generation":41,"cause":"watcher","changes":{"kind":"detailed","created":[],"modified":["Z.md"],"deleted":[]},"affected_note_count":1,"affected_reference_count":9}}}
 ```
 
-**`generation_committed` is emitted when the host's mirror applies a batch, not relayed from the daemon's subscription, and the difference is deliberate.** A client of this host reads this host's view — `host.open_snapshot` serves from the mirror — so an event announcing a generation the mirror has not applied yet would invite a client to page a view that does not hold it. Emitting at apply time makes the event mean *the host's view is now at N*, which is the only claim this door can honestly make. Two consequences follow: `previous_generation` is where **this host** was, which after a re-hydration may be several generations back rather than the daemon's own previous; and `affected_reference_count` is **absent** rather than reported as zero, because the mirror's batch does not carry it and a client that needs it is asking a question only the daemon can answer. `changes` is always the `detailed` shape — a generation the mirror could not describe path by path took the resync road inside the mirror, and a `resync_required` is what a subscriber hears instead.
+**`generation_committed` is held until this host's mirror has caught up to it.** A client of this host reads this host's view — `host.open_snapshot` serves from the mirror — so an event announcing generation N before the mirror holds N would invite a client to page a view that does not have it. The payload is the daemon's; the moment is the mirror's, and the release condition is `appliedThrough >= value.generation`. A batch that lands the mirror several generations forward releases every held commit at once, in generation order.
 
-`config_changed` likewise comes from the mirror's own seam, so a raw write into the config zone is announced once rather than twice. `runtime_state_changed` and `resync_required` pass through from the daemon untouched: both are statements about the engine rather than about this host's view.
+The delay is bounded by how long the mirror takes to apply a change it has already been told about, and it is the only reordering this door does: a client that sees `generation_committed` for N can immediately open a snapshot at N.
+
+`config_changed` comes from the mirror's own seam rather than from the relay, so a raw write into the config zone is announced once rather than twice — the mirror's seam is also the one that invalidates this host's cached config, so the announcement and the invalidation cannot disagree. `runtime_state_changed` and `resync_required` pass through untouched and unheld: both are statements about the engine rather than about this host's view.
 
 ### A subscriber that stops reading
 
@@ -236,12 +257,16 @@ This is the same discipline and the same shape `vaultd`'s own subscriber registr
 
 At most one line is ever in flight on a connection: the write's own callback is what says the socket has caught up. That is what keeps the bounded queue the host's *only* buffer — a stream's own `write()` answers `false` only after it has buffered 16 KB of its own, so a host that waited for that signal would build a second, unbounded queue inside the socket underneath the bounded one, and slow to a crawl doing it.
 
+**A burst yields between events once a subscriber is behind.** A client reading as fast as it can still cannot drain a socket inside the turn that filled it, so a thousand events emitted in one synchronous loop would collapse a perfectly healthy reader if the host delivered them without pause. It does not: a broadcast that finds a subscriber behind hands the event loop a turn before the next event, which is what lets the socket flush and makes "behind" go away. A subscriber that is genuinely stalled stays behind however many turns it is given, so the collapse still happens for the client the bound exists for. Events are delivered in order either way.
+
 ## Errors
 
 The host's codes, **additive to `vaultd`'s** — a forwarded operation's refusal is the daemon's, unchanged:
 
 `host_not_ready`, `plugin_not_found`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `config_key_refused`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `not_owner`, `snapshot_not_found`.
 
-Daemon codes the host also answers on its own behalf: `invalid_request` (a malformed request, or a `host.` method this build does not have), `invalid_cursor` (a snapshot cursor this host did not issue, or one from another session), `generation_mismatch` and `too_many_snapshots` (snapshot sessions, above), `subscription_not_found` (`host.unsubscribe` for an id this connection does not hold), `not_found` (a path that names nothing), and `internal` (a plugin's own code threw — the message names the command and the failure is counted against that plugin's quarantine).
+Daemon codes the host also answers on its own behalf: `incompatible_version` (a `version` that is not `1`, carrying `supported_version`), `invalid_request` (a malformed request on an authenticated connection, or a `host.` method this build does not have), `invalid_cursor` (a snapshot cursor this host did not issue, or one from another session), `generation_mismatch` and `too_many_snapshots` (snapshot sessions, above), `subscription_not_found` (`host.unsubscribe` for an id this connection does not hold), `not_found` (a path that names nothing), and `internal` (a plugin's own code threw — the message names the command and the failure is counted against that plugin's quarantine).
 
-Input with no usable envelope is a fatal input error: there is no `id` to echo, so there is no way to say which request it was about, and the connection is closed.
+Input with no usable envelope is a fatal input error: there is no `id` to echo, so there is no way to say which request it was about, and the connection is closed. See *Envelope* above for exactly which lines those are.
+
+A refusal never takes the host down. Every request line is handled behind its own catch, so a bug in the dispatcher becomes a refusal on that connection rather than a rejected promise; and a process-level guard catches an unhandled rejection from anywhere else, reports it through the host's error seam under the host's own id, and keeps the host serving. Node's default is to terminate the process for one stray promise, which for this host means every loaded plugin, every subscription and every other client.

@@ -94,11 +94,23 @@ export class SnapshotStore {
     return this.sessions.size;
   }
 
+  /** How many sessions this one client holds — the number the cap bounds. */
+  countFor(owner: object): number {
+    let held = 0;
+    for (const session of this.sessions.values()) if (session.owner === owner) held += 1;
+    return held;
+  }
+
   open(owner: object): OpenSnapshotResponse {
-    if (this.sessions.size >= this.config.snapshotSessionCap) {
+    // **Per client, not host-wide.** A host-wide cap lets one leaking client
+    // lock every other client out of hydration until it disconnects — which is
+    // a denial of service by accident, from a peer that is only guilty of
+    // forgetting to close its sessions. Each client gets its own budget, and a
+    // client that exhausts it has only itself to blame.
+    if (this.countFor(owner) >= this.config.snapshotSessionCap) {
       throw new HostError(
         "too_many_snapshots",
-        `this host serves at most ${String(this.config.snapshotSessionCap)} snapshot sessions at ` +
+        `this connection may hold ${String(this.config.snapshotSessionCap)} snapshot sessions at ` +
           "once; close one before opening another",
       );
     }
@@ -295,7 +307,16 @@ function decodeCursor(cursor: string): Cursor {
     throw new HostError("invalid_cursor", "that cursor is not one this host issued");
   }
   const body = parsed as { s?: unknown; i?: unknown } | null;
-  if (typeof body?.s !== "string" || typeof body.i !== "number" || !Number.isInteger(body.i)) {
+  // **`i >= 0`, and the check is not decoration.** A cursor is opaque but a
+  // client holds the bytes, so a forged `{ i: -5 }` used to slice from the *end*
+  // of the frozen array and mint a `next_cursor` carrying `-4` — a page of the
+  // wrong rows, answered as though it were the right ones.
+  if (
+    typeof body?.s !== "string" ||
+    typeof body.i !== "number" ||
+    !Number.isInteger(body.i) ||
+    body.i < 0
+  ) {
     throw new HostError("invalid_cursor", "that cursor is not one this host issued");
   }
   return { s: body.s, i: body.i };
