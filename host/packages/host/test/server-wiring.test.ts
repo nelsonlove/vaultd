@@ -439,6 +439,38 @@ describe("wired host ops", () => {
     }
   });
 
+  it("reads unknown for a plugin the GUI already runs, which is also the host declining", async () => {
+    const harness = await HostHarness.create({
+      vault: {},
+      // Installed, not enabled host-side: the probe is what would load it, and
+      // the coexistence check is what stops the probe.
+      enabled: [],
+      plugins: { shared: HostHarness.settingsPlugin },
+      config: { dryRun: true },
+    });
+    try {
+      await harness.lifecycle.start();
+      // Obsidian has it enabled too. `assertCanEnable` re-asks rather than
+      // reading the last poll, so this is seen at the probe.
+      harness.setGuiEnabled(["shared"]);
+      // **The second half of the same rule as the case above**, and the one the
+      // brief names by example: a plugin refused because the GUI is running it
+      // has told us nothing about whether it runs here. `OverlapRefused` is not
+      // a `HostError`, so it takes the refusal road by its own type — drop it
+      // from that test and this row goes back to `fails` with an empty `notes`
+      // for a perfectly healthy plugin.
+      const report = await harness.detector.report("shared");
+      const row = report.plugins[0];
+      expect(row?.verdict).toBe("unknown");
+      expect(row?.harness).toBeNull();
+      expect(row?.harnessAttempted).toBe(true);
+      expect(row?.notes[0]).toContain("harness not run");
+      expect(row?.notes[0]).toContain("Obsidian has it enabled too");
+    } finally {
+      await harness.stop();
+    }
+  });
+
   it("carries a dry run's writes, refusals and limits, with no bytes and no credentials", async () => {
     const harness = await HostHarness.create({
       vault: {},
