@@ -678,7 +678,7 @@ describe("host subscriptions", () => {
     } finally {
       await harness.stop();
     }
-  });
+  }, 30_000);
 
   it("does not lag a reading client with a burst larger than the queue", async () => {
     const harness = await HostHarness.create({

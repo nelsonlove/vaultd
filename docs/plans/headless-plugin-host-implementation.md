@@ -6906,7 +6906,9 @@ Two of those rows changed shape from v1 and both changes are corrections, not pr
 
 Host events: `host.plugin_state_changed { id, state, reason }`, `host.notice { plugin_id, message, at_unix_ms }`, `host.interaction_request { prompt_id, plugin_id, kind, prompt, items, timeout_ms }` (emitted by 20b), `host.overlap_changed { overlap, gui_enabled }`, plus the relayed daemon events `generation_committed`, `runtime_state_changed`, `resync_required`, and `config_changed` carrying their `vaultd` payloads unchanged.
 
-Host error codes, additive to `vaultd`'s: `host_not_ready`, `plugin_not_found`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `config_key_refused`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `not_owner`, `snapshot_not_found`.
+Host error codes, additive to `vaultd`'s: `host_not_ready`, `plugin_not_installed`, `plugin_quarantined`, `command_not_found`, `menu_item_not_found`, `protocol_handler_not_found`, `headless_unsupported`, `overlap_refused`, `plugin_data_too_large`, `plugin_data_too_deep`, `interaction_unavailable`, `interaction_timeout`, `dry_run_refused`, `detector_requires_dry_run`, `not_owner`, `snapshot_not_found`.
+
+(2026-09-22: corrected to the sixteen codes the host actually ships, copied from `docs/protocol-host.md`'s Errors section — this table had drifted, still naming `plugin_not_found` and `config_key_refused`, which the final review found nothing ever throws, and missing `plugin_data_too_large`, `plugin_data_too_deep` and `detector_requires_dry_run`, which shipped since this table was written.)
 
 **Interfaces:**
 

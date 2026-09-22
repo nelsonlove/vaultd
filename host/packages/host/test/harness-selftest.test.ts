@@ -15,6 +15,7 @@
 
 import {
   chmodSync,
+  existsSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -38,7 +39,7 @@ import {
   parseFixtureRow,
 } from "../src/testing/fixture-vault";
 import { MirrorHarness } from "../src/testing/mirror-harness";
-import { scratchRoot } from "./scratch";
+import { SCRATCH_BASE, scratchRoot } from "./scratch";
 
 /**
  * Every case that can reach the fixture generator gets this instead of vitest's
@@ -53,8 +54,17 @@ import { scratchRoot } from "./scratch";
  */
 const FIXTURE_TIMEOUT_MS = 600_000;
 
+/** The host package root — `src/`, `test/`, and `worker/` all sit under this. */
+const PKG_ROOT = resolve(__dirname, "..");
+
 /** The whole host source tree, `pending/` included. */
-const SRC_ROOT = resolve(__dirname, "..", "src");
+const SRC_ROOT = resolve(PKG_ROOT, "src");
+
+/** This test tree itself — the NUL guard below now walks it too. */
+const TEST_ROOT = resolve(PKG_ROOT, "test");
+
+/** The worker bundle, when the package has one. */
+const WORKER_ROOT = resolve(PKG_ROOT, "worker");
 
 describe("TestClock", () => {
   it("fires timers in due order and advances now()", async () => {
@@ -388,26 +398,48 @@ describe("FixtureVault and the real parser", () => {
 });
 
 describe("the source tree stays text", () => {
-  it("has no NUL byte in any file under src/", () => {
+  it("has no NUL byte in any file under src/, test/, or worker/", () => {
     // A literal U+0000 inside a string literal is invisible on screen, compiles
     // and runs correctly, and makes git classify the whole file as binary — so
     // every later diff, blame and three-way merge on it is lost. It happened
-    // once in `fixture-vault.ts` (the review's Blocking finding) and again in
-    // `assemble.ts` while fixing it, which is twice more than a defect nobody
-    // can see should be allowed to happen. `"\0"` is the escape; this is the
-    // guard that says so.
+    // once in `fixture-vault.ts` (the review's Blocking finding), again in
+    // `assemble.ts` while fixing it, and a third time in `shim-dom.test.ts` —
+    // that third one landed in `test/`, which this guard never walked, so the
+    // whole of the pin it was meant to protect went invisible in the diff too.
+    // `"\0"` is the escape; this is the guard that says so, over every tree the
+    // package ships.
     const offenders: string[] = [];
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const full = join(dir, entry.name);
         if (entry.isDirectory()) walk(full);
-        else if (entry.name.endsWith(".ts") && readFileSync(full).includes(0)) {
-          offenders.push(relative(SRC_ROOT, full));
+        else if (
+          (entry.name.endsWith(".ts") || entry.name.endsWith(".js")) &&
+          readFileSync(full).includes(0)
+        ) {
+          offenders.push(relative(PKG_ROOT, full));
         }
       }
     };
     walk(SRC_ROOT);
+    walk(TEST_ROOT);
+    if (existsSync(WORKER_ROOT)) walk(WORKER_ROOT);
     expect(offenders, "write \\0 rather than a literal NUL byte").toEqual([]);
+  });
+});
+
+describe("scratchRoot", () => {
+  it("takes its base under the repository root, not the OS tmpdir", () => {
+    // The final review found no pin for this: it put `scratchRoot`'s base back
+    // on `os.tmpdir()` and every affected suite stayed green, because nothing
+    // asserted where the base actually was — the regression would only ever
+    // have shown up later, as litter in the OS tmpdir, which is exactly how the
+    // 17,533-directory leak this helper replaced was born. `REPO_ROOT` is
+    // resolved the same way `scratch.ts` resolves `SCRATCH_BASE` — from this
+    // file's own location, not `process.cwd()` — so the two can be compared
+    // directly.
+    const REPO_ROOT = resolve(__dirname, "..", "..", "..", "..");
+    expect(SCRATCH_BASE).toBe(join(REPO_ROOT, "target", "tmp"));
   });
 });
 
