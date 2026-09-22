@@ -617,6 +617,21 @@ export class HostHarness extends ShimHarness {
      */
     announce?: boolean;
   }): Promise<void> {
+    // **It refuses under `--dry-run`, rather than hanging.** `Mirror.applyMutation`
+    // returns immediately in that mode — a dry run's mirror does not move,
+    // which is the one thing it cannot pretend — so no refetch is ever sent and
+    // the `answerRefetch` below waits for a request that will never arrive.
+    // A case that reached this in a dry-run harness used to hang until vitest's
+    // timeout, naming nothing. Refusing by name is not a lesser fix: a harness
+    // cannot commit a generation on behalf of a daemon a dry run never talks
+    // to, and the case that wants one wants a host that is not pretending.
+    if (this.config.dryRun) {
+      throw new Error(
+        "commitGeneration() cannot run under --dry-run: the mirror does not apply mutations in " +
+          "that mode, so nothing would ever ask for the refetch this waits on. Build the harness " +
+          "without `dryRun` for a case about a committed generation.",
+      );
+    }
     const renamed = change.renamed ?? [];
     const generation = change.generation ?? this.mirror.generation() + 1;
     const created = [...(change.created ?? []), ...renamed.map((pair) => pair.to)];

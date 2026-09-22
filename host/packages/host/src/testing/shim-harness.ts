@@ -751,7 +751,7 @@ function freshDataDir(): string {
   // Once per process, before this process adds one of its own.
   if (!swept) {
     swept = true;
-    sweepStaleDataDirs(root);
+    sweepStaleDataDirs(root, SCRATCH_PREFIXES);
   }
   return fs.mkdtempSync(join(root, PREFIX));
 }
@@ -784,6 +784,31 @@ function configFor(options: ShimHarnessOptions): Partial<HostConfig> {
 
 /** The name every harness data dir starts with, and the sweep matches on. */
 const PREFIX = "host-state-";
+
+/**
+ * Every scratch family this suite leaves under `target/tmp`, swept together.
+ *
+ * Task 22's harness-hygiene carry: the directory had collected 2,985 entries
+ * across this phase because each family was swept only by the harness that
+ * made it, and two of them (`vaultd-guard-`, `vaultd-other-`, from an earlier
+ * spelling of the fs-guard fixtures) were made by code that no longer exists
+ * and so were never swept at all. One list, swept once per process, on the same
+ * six-hour floor — nothing a live run owns can be caught, and nothing a dead
+ * run left behind survives the next day's first test.
+ *
+ * `LiveHost` is deliberately not on this list *as its only cleanup*: it removes
+ * its own vault and state directory in `stop()`, which is the per-run cleanup
+ * the carry asked for. Its prefixes are here so a run killed mid-case is still
+ * collected.
+ */
+export const SCRATCH_PREFIXES: readonly string[] = [
+  PREFIX,
+  "host-sock-",
+  "vaultd-guard-",
+  "vaultd-other-",
+  "live-",
+  "hs-",
+];
 /** Old enough that nothing a live run made can be caught by the sweep. */
 const STALE_MS = 6 * 60 * 60 * 1000;
 /** One sweep per process, at the first harness. */
@@ -808,11 +833,12 @@ let swept = false;
  * ~104-byte socket address limit, and it needs the same collection on the same
  * terms rather than a second sweep written slightly differently.
  */
-export function sweepStaleDataDirs(root: string, prefix: string = PREFIX): void {
+export function sweepStaleDataDirs(root: string, prefix: string | readonly string[] = PREFIX): void {
+  const prefixes = typeof prefix === "string" ? [prefix] : prefix;
   const cutoff = Date.now() - STALE_MS;
   try {
     for (const name of fs.readdirSync(root)) {
-      if (!name.startsWith(prefix)) continue;
+      if (!prefixes.some((candidate) => name.startsWith(candidate))) continue;
       const full = join(root, name);
       try {
         if (fs.statSync(full).mtimeMs > cutoff) continue;

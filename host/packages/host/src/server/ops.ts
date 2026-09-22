@@ -711,7 +711,16 @@ export class HostOps {
     // the block below would be dressed up as a command failure and counted
     // against the plugin — five malformed requests would quarantine a plugin
     // that never ran.
-    const file = editorKind ? this.activeFile(params, commandId) : null;
+    // **Required for an editor command, honoured for every other kind.** An
+    // editor command with no `active_file` has nothing to act on and the
+    // refusal says so; a `checkCallback` with one has the note a human would
+    // have had open behind the palette, and several plugins' checking arms read
+    // exactly that (`workspace.getActiveFile()?.parent`). Answering `false` for
+    // those because the client's `active_file` was dropped on the floor is a
+    // command that silently does not happen.
+    const file = editorKind
+      ? this.activeFile(params, commandId)
+      : this.optionalActiveFile(params);
     const selection = editorKind ? selectionOf(params) : null;
     const mark = this.deps.noticeLog.mark();
     let ran = false;
@@ -782,6 +791,20 @@ export class HostOps {
     }
     const message = error instanceof Error ? error.message : String(error);
     return new HostError("internal", `${commandId} failed: ${message}`, { plugin_id: pluginId });
+  }
+
+  /**
+   * The file a non-editor command should be run "behind", when the client named
+   * one. A path that names nothing is still the client's error.
+   */
+  private optionalActiveFile(params: Record<string, unknown>): TFile | null {
+    const path = optionalStringOf(params, "active_file");
+    if (path === null) return null;
+    const node = this.deps.app.vault.getAbstractFileByPath(path);
+    if (!(node instanceof TFile)) {
+      throw new HostError("not_found", `${path} is not a file in this vault`);
+    }
+    return node;
   }
 
   /** The file an editor command acts on, or the refusal that says why there is none. */

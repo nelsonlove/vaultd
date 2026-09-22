@@ -192,10 +192,28 @@ export class CommandRegistry {
     if (command === undefined) return false;
     const pluginId = pluginIdOf(id);
     const kind = kindOf(command);
-    if (kind !== "editorCallback" && kind !== "editorCheckCallback") {
-      return await this.deps.queue.run(pluginId, `command:${id}`, () => this.dispatch(command));
-    }
     const file = options.file ?? null;
+    if (kind !== "editorCallback" && kind !== "editorCheckCallback") {
+      // **A plain `callback` or `checkCallback` gets the active file too, when
+      // the caller named one.** In Obsidian a command run from the palette has
+      // whatever note is open behind it, and plugins rely on that without
+      // taking an editor: folder-notes' *Create folder note for current folder*
+      // is a `checkCallback` whose checking arm reads
+      // `workspace.getActiveFile()?.parent` and answers `false` — silently, no
+      // throw — when there is none. A host that honoured `active_file` only for
+      // the two editor kinds could never run it, and the capture's own note
+      // says the host must make the file active before invoking. No editor is
+      // opened: these kinds never asked for one.
+      return await this.deps.queue.run(pluginId, `command:${id}`, () => {
+        if (file === null) return this.dispatch(command);
+        this.deps.workspace.setActiveFile(file);
+        try {
+          return this.dispatch(command);
+        } finally {
+          this.deps.workspace.setActiveFile(null);
+        }
+      });
+    }
     if (file === null) return false;
     return await this.deps.queue.run(pluginId, `command:${id}`, () =>
       // Independent of the FIFO this is already running under — see

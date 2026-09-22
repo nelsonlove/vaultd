@@ -20,8 +20,22 @@ import { configDefaults, defineConfig } from "vitest/config";
  * that silently dropped them would be a different kind of flake.
  */
 
-/** Files that spawn a real daemon, and must not race each other. */
-const REAL_DAEMON = ["packages/*/test/**/*-real-daemon.test.ts"];
+/**
+ * Files that spawn a real daemon, and must not race each other.
+ *
+ * The golden conformance suite is in the list by **directory** rather than by
+ * filename suffix, which is Task 22's one change here. Every file under
+ * `test/golden/` drives a `LiveHost` — a real `vaultd` child, a real host, a
+ * real community bundle — so each one is a real-daemon file whatever it is
+ * called, and the brief names them `golden.test.ts`, `tag-wrangler.test.ts` and
+ * `quickadd.test.ts`. Left in the parallel project they would spawn daemons
+ * beside thirty other files, which is the exact condition this split exists to
+ * prevent.
+ */
+const REAL_DAEMON = [
+  "packages/*/test/**/*-real-daemon.test.ts",
+  "packages/*/test/golden/**/*.test.ts",
+];
 
 const shared = {
   environment: "node" as const,
@@ -29,14 +43,14 @@ const shared = {
   // module namespaces, so files must never share a worker with each other.
   pool: "forks" as const,
   isolate: true,
-  // The five shim-wrapping harnesses and the shim assembler are written in
-  // Task 6b and activated one file at a time by their first consumers —
-  // `assemble.ts` and `shim-harness.ts` in Task 7, `pluginset-harness.ts` in
-  // Task 14, `host-harness.ts` in Task 15, `settings-harness.ts` in Task 17,
-  // and `live-host.ts` in Task 22 — each moved up one directory in that
-  // task's Step 1. Until then they name modules that do not exist yet, so
-  // nothing may load them.
-  exclude: [...configDefaults.exclude, "**/src/testing/pending/**"],
+  // The `src/testing/pending/` exclusion is gone: the five shim-wrapping
+  // harnesses and the shim assembler were written in Task 6b and activated one
+  // file at a time by their first consumers — `assemble.ts` and
+  // `shim-harness.ts` in Task 7, `pluginset-harness.ts` in Task 14,
+  // `host-harness.ts` in Task 15, `settings-harness.ts` in Task 17, and
+  // `live-host.ts` in Task 22 — and with the last of them moved up the
+  // directory no longer exists.
+  exclude: [...configDefaults.exclude],
 };
 
 export default defineConfig({

@@ -228,6 +228,36 @@ export class Vault extends Events {
   }
 
   /**
+   * `Vault.recurseChildren(root, cb)` — a **static**, and the published
+   * signature: visit `root` itself and then every descendant, depth first.
+   *
+   * Static because Obsidian's is, and the difference matters: the corpus calls
+   * it as `obsidian.Vault.recurseChildren(...)` off the barrel's class rather
+   * than off a vault instance, so an instance method of the same name would
+   * still be a `TypeError` at the call site. `obsidian-daily-notes-interface`
+   * — which obsidian-rollover-daily-todos bundles, and which several other
+   * daily-note plugins bundle too — enumerates the daily-notes folder with
+   * exactly this call, and with the static missing its `getAllDailyNotes()`
+   * threw, `rollover()` found no note for today, and the command *succeeded*
+   * having done nothing. That is the worst shape of gap: no refusal, no
+   * unsupported hit, and a green-looking call.
+   *
+   * The order is the documented one and the callback's return value is ignored.
+   * `children` is read live off each folder rather than copied, which matches
+   * Obsidian: a callback that creates a file inside a folder it is walking sees
+   * it.
+   */
+  static recurseChildren(root: TFolder, callback: (file: TAbstractFile) => unknown): void {
+    recordUse("Vault.recurseChildren");
+    const visit = (node: TAbstractFile): void => {
+      callback(node);
+      if (!(node instanceof TFolder)) return;
+      for (const child of [...node.children]) visit(child);
+    };
+    visit(root);
+  }
+
+  /**
    * Apply one mirror batch to the tree and report what it did.
    *
    * The seam between the mirror and the shim. Task 15's lifecycle sequencer
@@ -831,3 +861,11 @@ declarePolicy("Vault.copy", "implemented");
 declarePolicy("Vault.rename", "implemented");
 declarePolicy("Vault.delete", "implemented");
 declarePolicy("Vault.trash", "implemented");
+/**
+ * The one read-side surface in this file that **is** recorded, and it is
+ * recorded because it is a static rather than a lookup: a plugin reaching for
+ * `Vault.recurseChildren` is reaching for a walk of the tree, and a
+ * compatibility report that said nothing about it would be silent about the
+ * thing an entire family of daily-note plugins enumerates its folder with.
+ */
+declarePolicy("Vault.recurseChildren", "implemented");

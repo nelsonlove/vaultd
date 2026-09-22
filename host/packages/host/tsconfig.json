@@ -5,6 +5,5 @@
     "outDir": "dist",
     "types": ["node"]
   },
-  "include": ["src"],
-  "exclude": ["src/testing/pending"]
+  "include": ["src"]
 }
