@@ -1,6 +1,7 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { cleanupScratchRoots, scratchRoot } from "./scratch";
 
 import { Mirror } from "../src/mirror/mirror";
 import { Supervisor } from "../src/supervisor";
@@ -40,15 +41,15 @@ export const silentEvents: SupervisorEvents = {
   onStateChange: (): void => {},
 };
 
-const roots: string[] = [];
 const running: Supervisor[] = [];
 
-/** A scratch directory that `cleanupRealDaemons` removes. */
-export function scratchRoot(prefix: string): string {
-  const root = mkdtempSync(join(tmpdir(), prefix));
-  roots.push(root);
-  return root;
-}
+/**
+ * A scratch directory that `cleanupRealDaemons` removes.
+ *
+ * Re-exported rather than defined here: every scratch directory in this suite
+ * comes from one helper under `target/tmp` now, and `test/scratch.ts` says why.
+ */
+export { scratchRoot };
 
 /** A supervisor registered for cleanup, not yet started. */
 export function superviseOn(config: HostConfig, events: SupervisorEvents = silentEvents): Supervisor {
@@ -183,5 +184,5 @@ export async function diagnosed<T>(
 /** Stop every supervisor and remove every scratch root. For `afterEach`. */
 export async function cleanupRealDaemons(): Promise<void> {
   for (const supervisor of running.splice(0)) await supervisor.stop();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  cleanupScratchRoots();
 }

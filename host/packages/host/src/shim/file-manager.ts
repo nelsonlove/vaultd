@@ -127,7 +127,7 @@
  */
 
 import { VaultdError } from "../client/errors";
-import { HeadlessUnsupported, currentPluginId, declarePolicy, recordUse, stub } from "./policy";
+import { declarePolicy, recordUse, stub, unsupported } from "./policy";
 import { TFolder } from "./files";
 import { affectedPathsForRename } from "./rename-paths";
 import type { DispatchQueue } from "../runtime/queue";
@@ -519,8 +519,7 @@ export class FileManager {
    * The refusal is a **rejected promise** rather than a synchronous throw,
    * because the surface a plugin holds is an async one and a caller that wrote
    * `.catch(…)` must reach its catch. The recorded hit and the error are
-   * exactly what `unsupported()` produces — `recordUse` reports at the declared
-   * policy, which for these two is `absent`.
+   * exactly what `unsupported()` produces, because {@link refuse} calls it.
    */
   promptForFileRename(file: TAbstractFile): Promise<void> {
     void file;
@@ -540,9 +539,25 @@ export class FileManager {
     return row === undefined ? {} : plainFrontmatter(row.properties);
   }
 
-  private refuse(symbol: string): Promise<never> {
-    recordUse(symbol);
-    return Promise.reject(new HeadlessUnsupported(symbol, currentPluginId()));
+  /**
+   * `unsupported()`, turned into a rejection.
+   *
+   * **It calls `unsupported()` rather than rebuilding its two halves**, and the
+   * final review is why: this method used to call `recordUse(symbol)` and
+   * construct the error by hand, and `recordUse` reports at the declared policy
+   * with no fourth argument — so the detector's ordered call log showed these
+   * two `absent` surfaces as calls that **did not throw**, while the doc comment
+   * above asserted the opposite. The plugin saw the right error either way; the
+   * compatibility report, which is one of this phase's two contractual
+   * artifacts, saw the wrong record.
+   *
+   * `async` is what converts the synchronous throw into the rejection the
+   * surface promises: the body runs to the throw at call time, so the hit is
+   * recorded in the same turn as before.
+   */
+  // eslint-disable-next-line @typescript-eslint/require-await -- `unsupported()` throws; `async` is what makes that a rejection.
+  private async refuse(symbol: string): Promise<never> {
+    return unsupported(symbol);
   }
 
   private root(): TFolder {

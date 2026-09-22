@@ -265,7 +265,7 @@ export class HeadlessConfigDir {
    * {@link readFileOrNull}.
    */
   async readEnabledSet(): Promise<string[]> {
-    const path = `${this.configDir}/${COMMUNITY_PLUGINS}`;
+    const path = enabledSetPath(this.configDir);
     const source = await this.readFileOrNull(path);
     if (source === null) return [];
     try {
@@ -306,11 +306,17 @@ export class HeadlessConfigDir {
    * repairing the file by hand is all it takes to lift the refusal.
    */
   async writeEnabledSet(ids: readonly string[]): Promise<void> {
-    const enabledSetPath = `${this.configDir}/${COMMUNITY_PLUGINS}`;
-    if (this.reportedCorrupt.has(enabledSetPath)) throw new EnabledSetDamaged(enabledSetPath);
+    // {@link enabledSetPath}, not a template string of its own — and the same
+    // reason {@link pluginDirPath} exists: the refusal below and the path
+    // actually written have to be the same string **by construction**. They
+    // were three copies of one fact in this file (a fourth lives in
+    // `dryrun/dry-run.ts`, which already calls the helper), and a review asked
+    // for one.
+    const path = enabledSetPath(this.configDir);
+    if (this.reportedCorrupt.has(path)) throw new EnabledSetDamaged(path);
     const body = `${JSON.stringify([...ids], null, 2)}\n`;
     await this.writes.send<WriteFileResponse>("write_file", {
-      path: `${this.configDir}/${COMMUNITY_PLUGINS}`,
+      path,
       content_base64: Buffer.from(body, "utf8").toString("base64"),
     });
   }

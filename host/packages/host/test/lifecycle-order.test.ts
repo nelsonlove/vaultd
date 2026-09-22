@@ -57,6 +57,14 @@ describe("lifecycle order", () => {
       "first:resolved",
     ]);
     expect(harness.lifecycle.phase()).toBe("steady");
+    // **Every stage of the startup is timed, the mirror's snapshot walk
+    // included.** That walk runs inside `startHost` before this sequencer
+    // exists, so it is read off the mirror rather than measured here — and
+    // until it was, the design's "mirror hydration time" was instrumented in
+    // part and the baseline document had to say so. Disjoint from
+    // `hydrationMs`, which starts at `lifecycle.start()`.
+    expect(report.snapshotHydrationMs).toBe(harness.mirror.snapshotHydrationMs());
+    expect(report.snapshotHydrationMs).toBeGreaterThanOrEqual(0);
     await harness.stop();
   });
 

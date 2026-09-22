@@ -284,6 +284,43 @@ describe("failureFromReport", () => {
     expect(failure?.error.message).toContain("a bare string");
     expect(failure?.error.cause).toBe("a bare string");
   });
+
+  /**
+   * A thrown **object** renders as its JSON, not as `[object Object]`.
+   *
+   * The payload always survived on `cause`; the rendered message did not, and
+   * the message is the sentence a human reads to find out why a plugin was
+   * switched off. `String(value)` answers `[object Object]` for exactly the
+   * shape the corpus throws most — a rejection object with a `message` on it.
+   */
+  it("renders a thrown object as JSON rather than [object Object]", () => {
+    const thrown = { message: "quickadd blew up", code: 7 };
+    const failure = failureFromReport(
+      { error: thrown, pluginId: "demo", phase: "onload" },
+      7,
+    );
+    expect(failure?.error.message).not.toContain("[object Object]");
+    expect(failure?.error.message).toContain("quickadd blew up");
+    expect(failure?.error.message).toContain('"code":7');
+    expect(failure?.error.cause).toBe(thrown);
+  });
+
+  /** No JSON form, and no throw: a cycle falls back to `String`. */
+  it("falls back to String for a value with no JSON form", () => {
+    const cyclic: { self?: unknown } = {};
+    cyclic.self = cyclic;
+    const failure = failureFromReport(
+      { error: cyclic, pluginId: "demo", phase: "onload" },
+      7,
+    );
+    expect(failure?.error.message).toContain("[object Object]");
+    expect(failure?.error.cause).toBe(cyclic);
+    const symbol = failureFromReport(
+      { error: 7n, pluginId: "demo", phase: "onload" },
+      7,
+    );
+    expect(symbol?.error.message).toContain("7");
+  });
 });
 
 /**

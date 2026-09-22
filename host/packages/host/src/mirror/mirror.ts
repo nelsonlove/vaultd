@@ -795,6 +795,8 @@ export class Mirror implements MirrorQuery {
   private state = new MirrorState();
   private generationValue = 0;
   private appliedThroughValue = 0;
+  /** See {@link Mirror.snapshotHydrationMs}. Set once, by {@link Mirror.open}. */
+  private snapshotHydrationMsValue = 0;
   private queue: Promise<void> = Promise.resolve();
   private resyncingValue = false;
   /** Set by {@link Mirror.stop}: the queue is closed and applies nothing more. */
@@ -834,11 +836,32 @@ export class Mirror implements MirrorQuery {
   static async open(client: MirrorClientSource, config: HostConfig): Promise<Mirror> {
     const mirror = new Mirror(client, config);
     const staging = new MirrorState();
+    // **Timed, because nothing else could time it.** The snapshot walk runs
+    // inside `startHost` *before* `lifecycle.start()`, so `StartupReport`'s
+    // `hydrationMs` — which measures from the sequencer's own first line —
+    // never covered it, and the baseline document had to report the design's
+    // "mirror hydration time" as instrumented in part and refuse to estimate
+    // the rest by subtraction. See {@link Mirror.snapshotHydrationMs}.
+    const startedAt = config.clock.now();
     const summary = await hydrateInto(mirror.client(), config, staging);
+    mirror.snapshotHydrationMsValue = config.clock.now() - startedAt;
     mirror.state = staging;
     mirror.generationValue = summary.generation;
     mirror.appliedThroughValue = summary.generation;
     return mirror;
+  }
+
+  /**
+   * What the snapshot hydration in {@link Mirror.open} cost, in milliseconds.
+   *
+   * **The opening walk only.** A later re-hydration — a resync, an engine
+   * replacement — does not change it, and must not: this is a startup figure,
+   * read once by {@link LifecycleSequencer.start} into its report, and a number
+   * that moved under a mid-session resync would make two runs of the same
+   * baseline incomparable for a reason that has nothing to do with startup.
+   */
+  snapshotHydrationMs(): number {
+    return this.snapshotHydrationMsValue;
   }
 
   // --- The read surface -----------------------------------------------------

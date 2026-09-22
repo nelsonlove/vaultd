@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -9,6 +8,7 @@ import { EngineLostError, EngineStartError, Supervisor } from "../src/supervisor
 import type { HostConfig } from "../src/config";
 import type { RuntimeEventDto } from "../src/client/events";
 import { FakeClock } from "./fake-clock";
+import { cleanupScratchRoots, scratchRoot } from "./scratch";
 
 /**
  * The supervisor against a fake engine that is nevertheless a **real child
@@ -27,15 +27,17 @@ const fake = join(__dirname, "fixtures", "fake-vaultd.js");
  * actually reaches the spawned child. Without it the modes below would all
  * spawn the same "ok" daemon and the cases would silently assert nothing.
  */
-const roots: string[] = [];
-
+// **The roots are `scratchRoot`'s now**, under `target/tmp`, swept per file by
+// `test/scratch-setup.ts` — a case no longer has to remember to register one.
+// This `afterEach` stays because it also has to run **between** cases: a
+// supervisor spawns a real child that holds its root open, and a file's worth
+// of them is not what this file's cases mean by "a fresh daemon".
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  cleanupScratchRoots();
 });
 
 function configFor(mode: string, overrides: Partial<HostConfig> = {}): HostConfig {
-  const root = mkdtempSync(join(tmpdir(), "vaultd-sup-"));
-  roots.push(root);
+  const root = scratchRoot("vaultd-sup-");
   return {
     ...defaultHostConfig(root),
     vaultdBinary: process.execPath,
@@ -372,8 +374,7 @@ describe("Supervisor error paths", () => {
   });
 
   it("kills the engine it was spawning when stop lands mid-spawn", async () => {
-    const pidfile = join(mkdtempSync(join(tmpdir(), "vaultd-sup-pid-")), "engine.pid");
-    roots.push(join(pidfile, ".."));
+    const pidfile = join(scratchRoot("vaultd-sup-pid-"), "engine.pid");
     const states: string[] = [];
     const supervisor = new Supervisor(
       configFor("slow-health", {

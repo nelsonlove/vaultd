@@ -58,6 +58,30 @@ function commit(harness: HostHarness, generation: number, previous: number): voi
   });
 }
 
+/**
+ * The same payload, **delivered rather than held**.
+ *
+ * {@link commit} goes through `relayDaemonEvent`, which holds a
+ * `generation_committed` until this host's mirror has reached it — right for a
+ * case about the hold, and wrong for a case about the socket, where the event
+ * has to reach the subscription now. `broadcast` is the door the relay itself
+ * uses once the hold releases, so this is the same road with the wait taken
+ * out.
+ */
+function broadcastCommit(harness: HostHarness, generation: number, previous: number): void {
+  harness.server.broadcast({
+    type: "generation_committed",
+    value: {
+      previous_generation: previous,
+      generation,
+      cause: "watcher",
+      changes: { kind: "detailed", created: [], modified: ["A.md"], deleted: [] },
+      affected_note_count: 1,
+      affected_reference_count: 0,
+    },
+  });
+}
+
 describe("host subscriptions", () => {
   it("delivers one generation_committed to each of two connected clients", async () => {
     const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
@@ -174,26 +198,61 @@ describe("host subscriptions", () => {
       await client.call("host.subscribe", {});
       client.stall();
 
-      // **Fill the socket's own buffers first, however many events that takes.**
-      // How much a kernel holds for a Unix socket before it pushes back is the
+      // **One real commit, so a real daemon-caused generation is among the
+      // events this client is owed.** It goes into the paused socket's buffer
+      // and arrives when the client resumes.
+      await harness.commitGeneration({ modified: ["A.md"], sources: { "A.md": "# A\n1\n" } });
+      const base = harness.mirror.generation();
+
+      // **Fill the socket's own buffers, however many events that takes.** How
+      // much a kernel holds for a Unix socket before it pushes back is the
       // kernel's business — tens of kilobytes on Darwin, hundreds on Linux — so
-      // a fixed count would be a test about the platform. Commit until the host
+      // a fixed count would be a test about the platform. Emit until the host
       // reports a subscriber that is genuinely behind, and only then overflow
       // the queue by a known amount.
-      // Each commit supplies the note's new source rather than letting the
-      // harness append a line to it: a note that grows by two lines per commit
-      // is re-parsed and re-served on every one of the thousands below, and the
-      // quadratic that produces is the test measuring the fixture rather than
-      // the host.
-      const edit = (n: number): Promise<void> =>
-        harness.commitGeneration({ modified: ["A.md"], sources: { "A.md": `# A\n${String(n)}\n` } });
-      let commits = 0;
-      while (harness.server.pendingEvents() === 0 && commits < 20_000) {
-        commits += 1;
-        await edit(commits);
+      //
+      // **The fill is broadcast, not committed, and that is this case's fix.**
+      // It used to drive `harness.commitGeneration` for every event, and each
+      // of those is a whole dialogue with the fake daemon — a refetch answered,
+      // the mirror applied, the host settled — so filling a socket cost a few
+      // hundred round trips through the event loop. Quiet that is 130 ms; on a
+      // loaded machine, where a turn of the loop can cost tens of milliseconds,
+      // the final review measured the case **time out at 30 s**, taking the
+      // whole suite's exit code with it: one red run in four. The loop was
+      // bounded in commits and unbounded in time, which is not a bound. A
+      // broadcast is the same road — the same `HostServer`, the same
+      // `ClientSubscriptions`, the same real socket refusing the same bytes —
+      // with the daemon dialogue taken out of it, so the fill costs turns of
+      // the loop rather than round trips. The sibling case above drives the
+      // relay by hand for the same reason.
+      //
+      // Bounded three ways, so no future machine can make this the slow case
+      // again: by count, by wall clock, and by a diagnosis rather than a
+      // timeout if either bound is reached.
+      const deadline = Date.now() + 5_000;
+      const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+      let emitted = 0;
+      const emit = async (): Promise<void> => {
+        emitted += 1;
+        broadcastCommit(harness, base + emitted, base + emitted - 1);
+        // One turn per event: `HostServer.broadcast` hands the loop a turn once
+        // a subscriber is behind, so without this the events would sit in its
+        // outbox and be delivered after this case had already resumed the
+        // client — which is the one order in which no collapse happens.
+        await tick();
+      };
+      while (harness.server.pendingEvents() === 0) {
+        if (emitted >= 20_000 || Date.now() > deadline) {
+          throw new Error(
+            `the socket never pushed back: ${String(emitted)} events emitted in ` +
+              `${String(Date.now() - (deadline - 5_000))} ms, pendingEvents()=` +
+              `${String(harness.server.pendingEvents())}`,
+          );
+        }
+        await emit();
       }
       expect(harness.server.pendingEvents()).toBeGreaterThan(0);
-      for (let i = 0; i < 64 + 5; i += 1) await edit(commits + i + 1);
+      for (let i = 0; i < 64 + 5; i += 1) await emit();
 
       // **Wait for the collapse itself, not for a quiet turn of the loop.** One
       // writer owns this socket, so everything the client is still owed is
@@ -218,7 +277,7 @@ describe("host subscriptions", () => {
       // generation it names arrives after it.
       const committed = events.filter((event) => event.type === "generation_committed");
       expect(committed.length).toBeGreaterThan(0);
-      expect(committed.length).toBeLessThan(commits + 69);
+      expect(committed.length).toBeLessThan(emitted + 1);
       expect(events[events.length - 1]?.type).toBe("resync_required");
       // Never a truncated change set pretending to be whole.
       for (const event of committed) {

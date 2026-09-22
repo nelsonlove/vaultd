@@ -55,9 +55,25 @@ import type { RecordedRefusal, RecordedWrite } from "../dryrun/dry-run";
  * `note_not_found` through this socket exactly as it would through the daemon's.
  * These are the refusals only a host can make.
  */
+/*
+ * **Two codes were removed rather than wired**, and the reasoning is the same
+ * for both: a code in this union is a promise the socket makes, and nothing in
+ * `src/` ever threw either of them.
+ *
+ * - `plugin_not_found` had no case left to take. An id that is not installed is
+ *   `plugin_not_installed`, on every operation that asks; and `host.disable_plugin`
+ *   deliberately accepts an id it has never heard of, which
+ *   `docs/protocol-host.md`'s Plugins section states and gives the reason for.
+ *   Two codes for one question is how a client comes to branch on the one the
+ *   host does not send.
+ * - `config_key_refused` is a different shape from what actually happens.
+ *   `host.set_plugin_config` refuses **per key**, and a refusal is a row in
+ *   `refused[]` carrying its own reason and path — an answer, not an error. The
+ *   two whole-document failures that really do throw are
+ *   `plugin_data_too_large` and `plugin_data_too_deep`, both below.
+ */
 export type HostErrorCode =
   | "host_not_ready"
-  | "plugin_not_found"
   | "plugin_not_installed"
   | "plugin_quarantined"
   | "command_not_found"
@@ -65,7 +81,6 @@ export type HostErrorCode =
   | "protocol_handler_not_found"
   | "headless_unsupported"
   | "overlap_refused"
-  | "config_key_refused"
   // The two failures of the plugin-config pair that are **not** per-key
   // refusal rows: the service throws for both, because neither can be answered
   // about one key. A document merged past the host's write cap is

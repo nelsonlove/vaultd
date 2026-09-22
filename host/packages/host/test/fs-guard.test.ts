@@ -1,10 +1,9 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { fs, fsPromises } from "../src/runtime/fs-access";
 import { installFsWriteGuard } from "../src/testing/fs-guard";
+import { scratchRoot } from "./scratch";
 
 // The guard watches the CommonJS door: `require("node:fs")`, which is what the
 // compiled host and every esbuild-CJS plugin bundle use. These tests reach fs
@@ -15,8 +14,13 @@ import { installFsWriteGuard } from "../src/testing/fs-guard";
 // caller holding one of those bindings. Under Vitest that snapshot is taken
 // before any test code runs, which is why `fs-seam.test.ts` exists.
 
-const vault = (): string => mkdtempSync(join(tmpdir(), "vaultd-guard-"));
-const outside = (): string => mkdtempSync(join(tmpdir(), "vaultd-other-"));
+// **Both under `target/tmp`, and `outside` is still genuinely outside.** What
+// the guard decides is "inside this vault root or not", and two sibling
+// `mkdtemp` directories answer that exactly as two directories in the OS tmpdir
+// did — neither is a prefix of the other. What changes is that they are
+// registered for cleanup: these two call sites alone leaked 14,258 directories.
+const vault = (): string => scratchRoot("vaultd-guard-");
+const outside = (): string => scratchRoot("vaultd-other-");
 
 describe("installFsWriteGuard", () => {
   it("records a synchronous write inside the vault root", () => {

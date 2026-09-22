@@ -202,6 +202,18 @@ export interface StartupReport {
   readonly generation: number;
   readonly loaded: readonly string[];
   readonly failed: readonly { id: string; error: string }[];
+  /**
+   * The mirror's own snapshot walk, from {@link Mirror.snapshotHydrationMs}.
+   *
+   * **It happens before this sequencer exists**, inside `startHost`, so it is
+   * read off the mirror rather than measured here and it is **not** part of
+   * {@link StartupReport.hydrationMs} — the two are disjoint, and the design's
+   * "mirror hydration time" is the pair. Until this field shipped, the snapshot
+   * walk was inside the cold-start wall clock and nowhere else, which the
+   * baseline document named as an instrumentation gap rather than estimating it
+   * by subtraction.
+   */
+  readonly snapshotHydrationMs: number;
   readonly hydrationMs: number;
   readonly warmMs: number;
   readonly loadMs: number;
@@ -505,6 +517,7 @@ export class LifecycleSequencer {
       generation: this.deps.mirror.generation(),
       loaded: [...this.loadedIds],
       failed,
+      snapshotHydrationMs: this.deps.mirror.snapshotHydrationMs(),
       hydrationMs,
       warmMs,
       loadMs,

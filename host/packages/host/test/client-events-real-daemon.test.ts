@@ -1,11 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { VaultdClient } from "../src/client/client";
 import { KNOWN_EVENT_TYPES, isKnownChangeSet } from "../src/client/events";
+import { scratchRoot } from "./scratch";
 import type { RuntimeEventDto, SubscriptionHandle } from "../src/client/events";
 import type {
   GenerationResponse,
@@ -64,7 +64,7 @@ class SubscribedDaemon {
    * assert nothing about reasons.
    */
   constructor(watch = false) {
-    this.root = mkdtempSync(join(tmpdir(), "vaultd-host-events-"));
+    this.root = scratchRoot("vaultd-host-events-");
     this.vault = join(this.root, "vault");
     mkdirSync(this.vault);
     const args = ["--vault", this.vault, "--index", join(this.root, "index.db")];

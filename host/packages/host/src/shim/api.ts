@@ -274,6 +274,7 @@ export const GLOBAL_ONLY_SYMBOLS: readonly string[] = [
   "i18next",
   "MutationObserver",
   "CodeMirrorAdapter",
+  "CSS",
   "Element",
   "Node",
   "HTMLElement",

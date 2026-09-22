@@ -47,6 +47,8 @@ Options:
 
 Exit codes:
   0  a clean shutdown (SIGINT or SIGTERM)
+  1  any other unhandled failure, outside the shutdown window: a refusal this
+     binary has no typed code for. The message is on stderr.
   2  a usage error: an unknown flag, a missing value, or no --vault
   3  the daemon was unreachable: vaultd did not start, or did not reach a
      watching state
@@ -56,6 +58,15 @@ Exit codes:
 `;
 
 export const EXIT_OK = 0;
+/**
+ * Anything with no typed code of its own, outside the shutdown window.
+ *
+ * Named rather than left as a bare `1` at two return sites, because the README
+ * calls these codes a contract and a reachable code missing from the contract is
+ * the half of it a client cannot handle. See the `Exit codes` block in
+ * {@link USAGE}.
+ */
+export const EXIT_FAILED = 1;
 export const EXIT_USAGE = 2;
 export const EXIT_DAEMON_UNREACHABLE = 3;
 export const EXIT_CONFIG_DIR_REFUSED = 4;
@@ -254,7 +265,7 @@ export async function main(
       return error.code;
     }
     err(error instanceof Error ? (error.stack ?? error.message) : String(error));
-    return 1;
+    return EXIT_FAILED;
   } finally {
     await stopQuietly(running, err);
   }
@@ -336,7 +347,7 @@ if (require.main === module) {
     },
     (error: unknown) => {
       process.stderr.write(`${String(error)}\n`);
-      process.exitCode = 1;
+      process.exitCode = EXIT_FAILED;
     },
   );
 }

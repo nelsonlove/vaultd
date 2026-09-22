@@ -39,6 +39,12 @@ const REAL_DAEMON = [
 
 const shared = {
   environment: "node" as const,
+  // **One `afterAll` per test file, removing that file's scratch directories.**
+  // A setup file rather than a hook copied into each file that takes one: the
+  // 17,533 abandoned directories the final review counted were entirely call
+  // sites that forgot to register, so the sweep has to be something a case
+  // cannot forget. See `packages/host/test/scratch.ts`.
+  setupFiles: ["packages/host/test/scratch-setup.ts"],
   // Each test file gets its own process: the fs guard patches process-wide
   // module namespaces, so files must never share a worker with each other.
   pool: "forks" as const,

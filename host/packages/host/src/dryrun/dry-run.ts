@@ -789,7 +789,22 @@ export class DryRunGate implements WriteGate {
    *   operator this host intends to change the enabled set, which it does not.
    *
    * Everything else recorded while a probe is open is somebody else's and
-   * stays. Returns the token {@link dropProbe} takes.
+   * stays — **as long as its row carries somebody else's id**, which is the
+   * part that is a property of the attribution window rather than of this tag.
+   * Attribution is ambient over a plugin's `await`s (see `shim/policy.ts`'s
+   * {@link enterPlugin}), and the thing parked on an `await` during a probe is
+   * precisely the probed plugin's `onload`. So a row recorded by an actor that
+   * is *not* the probed plugin is only safe here if that actor sets its own id.
+   * The client road does: `server/ops.ts` dispatches every non-`host.` method
+   * inside `enterPlugin(null, …)`, so a client's `write_note` sent through a
+   * probe's window is `pluginId: null`, is not tagged, and survives
+   * {@link dropProbe}. Measured before that window existed: it was tagged with
+   * the probed plugin's id and deleted. The residual that remains is a
+   * host-internal callback firing inside a parked window, which does inherit
+   * the plugin's id; it is named under "Known limits" in
+   * `docs/design/headless-plugin-host.md`.
+   *
+   * Returns the token {@link dropProbe} takes.
    */
   beginProbe(pluginId: string): string {
     const token = `probe-${String(this.probeSeq++)}-${pluginId}`;

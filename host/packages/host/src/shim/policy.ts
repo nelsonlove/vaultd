@@ -347,9 +347,29 @@ export function setPolicyRecorder(next: PolicyRecorder | null): void {
  *
  * Attribution is ambient rather than a parameter for the same reason the event
  * bus's is: the surfaces that record hits are several layers below anything
- * that knows which plugin is running. The dispatch queue is the one caller, and
- * because it is a strict FIFO there is never a second plugin running inside the
- * window this opens.
+ * that knows which plugin is running.
+ *
+ * **What the window covers, exactly, and what it does not.** The dispatch queue
+ * is the ordinary caller, and because it is a strict FIFO there is never a
+ * second *plugin* running inside the window this opens. That is all the FIFO
+ * says. The window is open across every `await` inside `body`, so it is as wide
+ * as the longest wait in a plugin's entry point, and **anything else that runs
+ * in the process while a plugin is parked reads that plugin's id** — a timer
+ * callback of the host's own, or an operation arriving on a road that is not the
+ * queue. Two consequences, both measured by the final review:
+ *
+ * - **The client road pins itself to `null`.** `server/ops.ts`'s dispatch does
+ *   not go through the queue, so it opens its own `enterPlugin(null, …)` window
+ *   rather than inheriting whoever happens to be parked. Without it a client's
+ *   `write_note` was recorded against a parked plugin and then dropped from the
+ *   dry-run transcript by that plugin's own compatibility probe.
+ * - **A host-internal callback inside a parked window still inherits the id.**
+ *   A bare timer firing while a plugin waits is attributed to that plugin, which
+ *   can count a host-internal failure toward its quarantine. That residual is
+ *   documented under "Known limits" in `docs/design/headless-plugin-host.md`
+ *   rather than papered over: closing it needs context propagation across every
+ *   entry point (`AsyncLocalStorage`), which would undo the correctness property
+ *   {@link enterPluginSync}'s second caller exists for.
  */
 export async function enterPlugin<T>(
   id: string | null,

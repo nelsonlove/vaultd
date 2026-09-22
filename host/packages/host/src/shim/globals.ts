@@ -502,6 +502,28 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
   // Nothing records a hit on it: a plugin *assigns into* the map rather than
   // calling anything, and there is no call to intercept.
   patcher.define(globalThis, "CodeMirrorAdapter", { commands: {} });
+  // **`CSS` is a declared surface rather than an undeclared hole.** Named by
+  // the final review: `folder-notes`' `removeCSSClassFromFileExplorerEL` reads
+  // the bare global to build a selector, and with nothing installed that is a
+  // `ReferenceError` — caught by the event bus, costing the plugin nothing and
+  // telling the compatibility report nothing either. A four-way table whose
+  // whole job is to say which plugins depend on what cannot name a dependency
+  // it never sees.
+  //
+  // **`safe_stub`, not `absent`, and not `implemented`.** Refusing it would
+  // turn a working road into a typed throw for a call whose answer this host
+  // can give perfectly well — `escape` is string arithmetic, and the
+  // implementation below is the specification's own algorithm, so the string a
+  // plugin gets is the string a browser gives it. It is a stub all the same,
+  // because the *surface it exists to serve* is not here: the escaped text is
+  // fed to a `querySelector` over a document this host stubs, so a report that
+  // said `implemented` would promise a road that ends in an inert DOM. Only
+  // `escape` is declared: it is the one member the corpus reaches, and a
+  // `supports` or `registerProperty` invented with no capture behind it would
+  // be the guess this table exists to avoid.
+  patcher.define(globalThis, "CSS", {
+    escape: (value: string): string => stub("CSS.escape", cssEscape(String(value))),
+  });
 
   // The element constructors. `Element` and `HTMLElement` are the same class,
   // because nothing this host does distinguishes them and plugins use both
@@ -682,6 +704,49 @@ class GlobalPatcher {
   }
 }
 
+/**
+ * `CSS.escape`, as the CSSOM specification defines it.
+ *
+ * Written out rather than delegated, because there is nothing to delegate to:
+ * Node has no `CSS`. The algorithm is the specification's serialization of an
+ * identifier — NUL becomes the replacement character, a control character or a
+ * leading digit (or a digit after a leading hyphen) becomes a hex escape with
+ * its trailing space, a lone hyphen is backslash-escaped, everything
+ * alphanumeric, `-`, `_` or non-ASCII passes through, and everything else takes
+ * a backslash.
+ */
+function cssEscape(value: string): string {
+  let out = "";
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    const char = value.charAt(i);
+    if (code === 0x0000) {
+      out += "�";
+    } else if (
+      (code >= 0x0001 && code <= 0x001f) ||
+      code === 0x007f ||
+      (i === 0 && code >= 0x0030 && code <= 0x0039) ||
+      (i === 1 && code >= 0x0030 && code <= 0x0039 && value.charCodeAt(0) === 0x002d)
+    ) {
+      out += `\\${code.toString(16)} `;
+    } else if (i === 0 && code === 0x002d && value.length === 1) {
+      out += `\\${char}`;
+    } else if (
+      code >= 0x0080 ||
+      code === 0x002d ||
+      code === 0x005f ||
+      (code >= 0x0030 && code <= 0x0039) ||
+      (code >= 0x0041 && code <= 0x005a) ||
+      (code >= 0x0061 && code <= 0x007a)
+    ) {
+      out += char;
+    } else {
+      out += `\\${char}`;
+    }
+  }
+  return out;
+}
+
 declare global {
   interface Array<T> {
     /** Obsidian's extension: the first element, or `undefined`. */
@@ -730,6 +795,11 @@ declarePolicy("navigator.clipboard", "safe_stub");
 declarePolicy("i18next", "safe_stub");
 declarePolicy("MutationObserver", "safe_stub");
 declarePolicy("CodeMirrorAdapter", "safe_stub");
+// See the `CSS` install above for why the object is a stub although `escape`
+// answers exactly what a browser answers. `CSS` itself is a property read and
+// cannot count; `CSS.escape` is a call and does.
+declarePolicy("CSS", "safe_stub");
+declarePolicy("CSS.escape", "safe_stub");
 declarePolicy("Element", "safe_stub");
 declarePolicy("Node", "safe_stub");
 declarePolicy("DocumentFragment", "safe_stub");

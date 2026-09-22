@@ -70,6 +70,51 @@ describe("Detector.runHarness", () => {
     });
   });
 
+  /**
+   * The two `FileManager` prompts are `absent`, and the **call log** has to say
+   * so as loudly as the plugin's `catch` does.
+   *
+   * Found by the final review: both surfaces built their `HeadlessUnsupported`
+   * by hand beside a bare `recordUse(symbol)`, which records at the declared
+   * policy with no `threw`. The plugin saw the right error; the detector's
+   * ordered log showed two `absent` surfaces as calls that answered. The
+   * compatibility report reads that log, so the row an operator saw was the
+   * wrong one. `threw` is what this case is for — `policy: "absent"` alone was
+   * already true of the broken version.
+   */
+  it("records the two FileManager prompts as absent surfaces that threw", async () => {
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      config: { dryRun: true },
+      plugins: {
+        prompter: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            const file = this.app.vault.getFileByPath("A.md")!;
+            // Caught, because a plugin that let the rejection escape would fail
+            // its own load and the harness would report that instead.
+            await this.app.fileManager.promptForFileRename(file).catch(() => undefined);
+            await this.app.fileManager
+              .promptForFolderDeletion(this.app.vault.getRoot())
+              .catch(() => undefined);
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+
+    const result = await harness.detector.runHarness("prompter");
+    expect(result.loaded).toBe(true);
+    expect(result.throws.map((call) => call.symbol)).toEqual([
+      "FileManager.promptForFileRename",
+      "FileManager.promptForFolderDeletion",
+    ]);
+    for (const call of result.throws) {
+      expect(call.policy, call.symbol).toBe("absent");
+      expect(call.threw, call.symbol).toContain(call.symbol);
+    }
+  });
+
   it("records loadError and loaded false for a bundle that throws in onload", async () => {
     const harness = await HostHarness.create({
       vault: {}, enabled: [], config: { dryRun: true },

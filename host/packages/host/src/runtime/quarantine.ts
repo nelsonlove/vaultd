@@ -302,8 +302,30 @@ export function failureFromReport(
  * and the corpus does all three. The original is kept as `cause` rather than
  * discarded, because the text of a stringified object is often all a human has
  * to go on and the value itself is sometimes more.
+ *
+ * **`String(value)` is useless for exactly the case that needs it most.** A
+ * plain object renders as `[object Object]`, so the quarantine's reason — the
+ * sentence a human reads to find out why a plugin was switched off — said
+ * nothing at all about the thrown payload. The payload always survived on
+ * `cause`; what was missing was the *rendered* message, so the fallback tries
+ * `JSON.stringify` first and keeps `String(value)` for everything that has no
+ * JSON form (a `BigInt`, a symbol, a cycle, an object whose `toJSON` throws) —
+ * including the case where `JSON.stringify` answers `undefined`, which it does
+ * for a function or a bare `undefined`.
  */
 function asError(value: unknown): Error {
   if (value instanceof Error) return value;
-  return new Error(`non-Error thrown: ${String(value)}`, { cause: value });
+  return new Error(`non-Error thrown: ${rendered(value)}`, { cause: value });
+}
+
+/** `value` as text for a message: its JSON form when it has one. */
+function rendered(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    const json = JSON.stringify(value);
+    if (json !== undefined) return json;
+  } catch {
+    // A cycle, a `BigInt`, or a `toJSON` of its own that threw. `String` below.
+  }
+  return String(value);
 }

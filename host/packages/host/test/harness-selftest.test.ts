@@ -15,14 +15,12 @@
 
 import {
   chmodSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -40,6 +38,7 @@ import {
   parseFixtureRow,
 } from "../src/testing/fixture-vault";
 import { MirrorHarness } from "../src/testing/mirror-harness";
+import { scratchRoot } from "./scratch";
 
 /**
  * Every case that can reach the fixture generator gets this instead of vitest's
@@ -293,7 +292,7 @@ describe("FixtureVault and the real parser", () => {
     // cache was the one throwing the regeneration away. So it now gets a cache
     // directory of its own through the seam, and asserts the shared one came out
     // exactly as it went in.
-    const isolated = mkdtempSync(join(tmpdir(), "vaultd-fixture-cache-"));
+    const isolated = scratchRoot("vaultd-fixture-cache-");
     const shared = readdirSync(fixtureCacheDir()).sort();
     const spawnsBefore = fixtureGeneratorSpawns();
 
@@ -414,7 +413,7 @@ describe("the source tree stays text", () => {
 
 describe("DataDir", () => {
   it("refuses a path that escapes its root", () => {
-    const dir = new DataDir(mkdtempSync(join(tmpdir(), "vaultd-dd-")));
+    const dir = new DataDir(scratchRoot("vaultd-dd-"));
     expect(() => dir.resolve("../escape.json")).toThrow(/datadir escape/);
     expect(() => {
       dir.writeJson("../escape.json", {});
@@ -422,7 +421,7 @@ describe("DataDir", () => {
   });
 
   it("writes a secret at mode 0600", () => {
-    const root = mkdtempSync(join(tmpdir(), "vaultd-dd-"));
+    const root = scratchRoot("vaultd-dd-");
     const dir = new DataDir(root);
     dir.writeSecret("nonce", "abcd");
     expect(readFileSync(join(root, "nonce"), "utf8")).toBe("abcd");
@@ -433,7 +432,7 @@ describe("DataDir", () => {
     // The half the write's own `mode` cannot do: `mode` is ignored for a file
     // that already exists, so without the chmod a nonce written over anything
     // left at 0644 would stay readable by everyone.
-    const root = mkdtempSync(join(tmpdir(), "vaultd-dd-"));
+    const root = scratchRoot("vaultd-dd-");
     const dir = new DataDir(root);
     writeFileSync(join(root, "nonce"), "stale", { encoding: "utf8", mode: 0o644 });
     chmodSync(join(root, "nonce"), 0o644);
@@ -444,7 +443,7 @@ describe("DataDir", () => {
   it("reads a secret back as text, and answers null for one that is not there", () => {
     // `readJson` would `JSON.parse` a raw nonce and throw; this is the reader
     // that matches `writeSecret`.
-    const dir = new DataDir(mkdtempSync(join(tmpdir(), "vaultd-dd-")));
+    const dir = new DataDir(scratchRoot("vaultd-dd-"));
     expect(dir.readText("nonce")).toBeNull();
     dir.writeSecret("nonce", "9f2c1ab4");
     expect(dir.readText("nonce")).toBe("9f2c1ab4");
@@ -452,7 +451,7 @@ describe("DataDir", () => {
   });
 
   it("round-trips JSON and answers null for a file that is not there", () => {
-    const dir = new DataDir(mkdtempSync(join(tmpdir(), "vaultd-dd-")));
+    const dir = new DataDir(scratchRoot("vaultd-dd-"));
     expect(dir.readJson("plugins/demo/data.json")).toBeNull();
     dir.writeJson("plugins/demo/data.json", { ok: true });
     expect(dir.readJson<{ ok: boolean }>("plugins/demo/data.json")).toEqual({ ok: true });

@@ -46,6 +46,7 @@ import {
 } from "./wire";
 import { InteractionUnavailable } from "../interaction/broker";
 import { PluginDataTooDeep, PluginDataTooLarge } from "../settings/plugin-config";
+import { enterPlugin } from "../shim/policy";
 import type { App } from "../shim/app";
 import type { ClientSubscriptions } from "./subscriptions";
 import type { HostEvent } from "./subscriptions";
@@ -320,12 +321,29 @@ export class HostOps {
    * asked for it. Before this it was the one mutation path in the process that
    * bypassed the gate, and `host.hello` was answering `dry_run: true` while it
    * did. A client that genuinely wants to write has the daemon's own socket.
+   *
+   * **`pluginId: null` is made true here rather than hoped for**, which is what
+   * the {@link enterPlugin} window below is for. Attribution is ambient — it is
+   * whatever the last entry point set — and an entry point restores it when its
+   * body **returns**, not when the plugin's promise settles. So while any
+   * plugin's `onload` is parked on an `await`, `currentPluginId()` still names
+   * that plugin for everyone in the process, and this dispatch does not go
+   * through the plugin queue at all, so the queue's FIFO says nothing about it.
+   * Measured by the final review: a client's `write_note` sent inside a parked
+   * `onload` was recorded against the parked plugin, and a compatibility probe
+   * of that same plugin then **deleted the row** from the dry-run transcript,
+   * because `DryRunGate.dropProbe` removes exactly the rows the probed plugin's
+   * id tagged — a write an operator reads that transcript to find. A client
+   * operation is nobody's plugin, and opening a `null` window around it is the
+   * one place that knows so.
    */
   async dispatch(method: string, params: unknown, session: OpSession): Promise<unknown> {
     if (!method.startsWith("host.")) {
-      const writes = this.deps.writes;
-      if (writes === undefined) return await this.deps.client.request(method, params);
-      return await writes.send(method, params);
+      return await enterPlugin(null, async () => {
+        const writes = this.deps.writes;
+        if (writes === undefined) return await this.deps.client.request(method, params);
+        return await writes.send(method, params);
+      });
     }
     const handler = this.table.get(method);
     if (handler === undefined) {

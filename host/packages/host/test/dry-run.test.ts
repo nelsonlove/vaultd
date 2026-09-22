@@ -263,6 +263,77 @@ describe("dry-run", () => {
   });
 
   /**
+   * The client road is `null` **even while a plugin is parked**, and a probe of
+   * that plugin cannot take the row with it.
+   *
+   * The final review's measurement, as a case. Attribution is ambient over a
+   * plugin's `await`s: while an `onload` waits, `currentPluginId()` names that
+   * plugin for everybody in the process, and the client's dispatch does not go
+   * through the plugin queue at all. So a client's `write_note` sent through
+   * that window used to be recorded against the parked plugin — and because a
+   * compatibility probe parks precisely the probed plugin's `onload`, and
+   * {@link DryRunGate.dropProbe} deletes every row that plugin's id tagged, the
+   * client's write was then **deleted from the dry-run transcript**: the
+   * document an operator reads to decide whether the run is safe to perform for
+   * real, missing a write the host would make.
+   *
+   * Both halves are asserted, because they fail independently: the row is
+   * `pluginId: null` (attribution), and it is still there after `dropProbe`
+   * (the consequence the attribution buys).
+   */
+  it("attributes a client's write to nobody while a plugin's onload is parked, and a probe cannot drop it", async () => {
+    let park!: () => void;
+    let parked!: () => void;
+    const release = new Promise<void>((resolve) => {
+      park = resolve;
+    });
+    const reached = new Promise<void>((resolve) => {
+      parked = resolve;
+    });
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" }, enabled: [], config: { dryRun: true },
+      plugins: {
+        parker: (api) => class extends api.Plugin {
+          override async onload(): Promise<void> {
+            parked();
+            await release;
+          }
+        },
+      },
+    });
+    await harness.lifecycle.start();
+    const client = await harness.connectClient();
+    harness.dryRun.clear();
+
+    // A probe of `parker`, exactly as the detector opens one, and a load that
+    // parks inside it. `enableLate` is not awaited here: its `onload` is the
+    // thing that has to still be running when the client's write lands.
+    const token = harness.dryRun.beginProbe("parker");
+    const loading = harness.lifecycle.enableLate("parker", { probe: true });
+    await reached;
+
+    await client.call("write_note", {
+      path: "A.md",
+      content: "# by the client, mid-onload\n",
+      expected: { revision: harness.revisionOf("A.md") },
+    });
+    const written = harness.dryRun.writes().filter(
+      (write) => (write.params as { path?: string }).path === "A.md",
+    );
+    expect(written).toHaveLength(1);
+    expect(written[0]?.pluginId).toBeNull();
+
+    park();
+    await loading;
+    harness.dryRun.dropProbe(token);
+    // The probe took its own rows — the enabled-set rewrite it caused — and
+    // left the client's write standing.
+    expect(
+      harness.dryRun.writes().filter((write) => (write.params as { path?: string }).path === "A.md"),
+    ).toHaveLength(1);
+  });
+
+  /**
    * A synthetic answer is the daemon's answer or it is a lie, and the question
    * `semantic` asks is **not** the question `kind` asks.
    *
