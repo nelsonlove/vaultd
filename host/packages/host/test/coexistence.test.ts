@@ -301,7 +301,7 @@ describe("CoexistenceMonitor", () => {
   it("stops the poll when the whole host is torn down", async () => {
     const harness = await PluginSetHarness.create({ hostEnabled: [], guiEnabled: [] });
     expect(harness.clock.armed()).toBeGreaterThan(0);
-    harness.teardown();
+    await harness.teardown();
     expect(harness.clock.armed()).toBe(0);
     await harness.stop();
   });

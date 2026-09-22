@@ -171,7 +171,17 @@ export interface HostAssembly {
    * back while leaving a torn-down assembly registered would hand the next
    * bundle to load a barrel whose surfaces point at a vault that is gone.
    */
-  teardown(): void;
+  /**
+   * Put this process back the way it was found, and **join what has to be
+   * joined**.
+   *
+   * `Promise<void>` rather than `void` because of the watchdog: its `stop()`
+   * terminates a worker thread and waits for the thread's `exit`, and a
+   * teardown that fired that off and returned would let a caller assert "this
+   * host is gone" while a thread of it was still alive. Everything else here is
+   * synchronous and stays synchronous.
+   */
+  teardown(): Promise<void>;
 }
 
 /**
@@ -510,18 +520,17 @@ export function assembleShim(deps: {
   return {
     ...assembled,
     api,
-    teardown(): void {
+    async teardown(): Promise<void> {
       // Before the registries, because a poll that fired after the globals were
       // restored would read a vault this host no longer owns. Idempotent, and a
       // no-op when nothing ever started it.
       coexistence.stop();
-      // **Not awaited, because teardown is synchronous and the stop is not.**
-      // `stop()` clears the heartbeat synchronously and then waits for the
-      // worker thread to exit; the wait is the part nothing here can hold. A
-      // caller that must *prove* the thread is gone awaits `watchdog.stop()`
-      // itself before tearing down — which is what `test/watchdog.test.ts`
-      // does, and it is the only place the proof is the point.
-      void watchdog?.stop();
+      // **Awaited, and it is why this method is async.** `stop()` clears the
+      // heartbeat synchronously and then waits for the worker thread's `exit`.
+      // Firing it off would swallow a rejection as well as the wait, and would
+      // let a caller believe a torn-down host has no threads left while one of
+      // its threads was still running.
+      await watchdog?.stop();
       // The refusal sink is module-level, like the policy recorder, so a host
       // that went away while still installed would go on collecting the next
       // host's refusals into a report nobody is reading. Only the gate this

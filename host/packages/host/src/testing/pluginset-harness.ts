@@ -254,8 +254,8 @@ export class PluginSetHarness extends ShimHarness {
    * `monitor.stop()`, which is the thing it is checking teardown remembers to
    * call.
    */
-  teardown(): void {
-    this.assembly.teardown();
+  teardown(): Promise<void> {
+    return this.assembly.teardown();
   }
 
   /** `CoexistenceMonitor.stop` is synchronous and idempotent — nothing to await. */

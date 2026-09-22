@@ -54,15 +54,45 @@ const STAMP = 0;
 const STOP = 1;
 
 const options = workerData;
-const view = new Int32Array(options.buffer);
-const thresholdMs = options.thresholdMs;
+/**
+ * **64-bit slots.** An `Int32` stamp of elapsed milliseconds wraps negative
+ * after 24.855 days of uptime, and every poll after that reports a stall of
+ * about 4.29e9 ms — one line per stamp, for ever, about a host that is fine.
+ * See the note in `runtime/watchdog.ts`. `Atomics.wait` works on a
+ * `BigInt64Array`, so the loop below is otherwise unchanged.
+ */
+const view = new BigInt64Array(options.buffer);
+const thresholdMs = BigInt(options.thresholdMs);
 const pollMs = options.pollMs;
 const reportPath = options.reportPath;
+const rotateBytes = options.rotateBytes;
 
-/** This thread's own zero. See the note on the two time bases above. */
+/**
+ * This thread's own zero, and how long the main side had already been up when
+ * this thread booted.
+ *
+ * The offset is zero in every real host: a watchdog's worker starts with its
+ * watchdog. A test that needs a host which has been up for a month hands both
+ * sides the same number, so the two bases still measure the same interval.
+ */
 const epoch = Date.now();
+const uptimeMs = BigInt(options.uptimeMs === undefined ? 0 : options.uptimeMs);
 
 fs.mkdirSync(dirname(reportPath), { recursive: true });
+
+/**
+ * Append one line, rotating first if the file has reached its cap.
+ *
+ * One generation, and the rename is what makes it cheap: no copy, no read, and
+ * the file this thread then appends to is empty. A cap of `0` keeps the file
+ * unbounded, which nothing in this host asks for.
+ */
+function appendReport(line) {
+  if (rotateBytes > 0 && fs.existsSync(reportPath) && fs.statSync(reportPath).size >= rotateBytes) {
+    fs.renameSync(reportPath, `${reportPath}.1`);
+  }
+  fs.appendFileSync(reportPath, line);
+}
 
 /**
  * At most one report per stall.
@@ -75,26 +105,29 @@ let reported = false;
 let seen = Atomics.load(view, STAMP);
 
 for (;;) {
-  if (Atomics.load(view, STOP) !== 0) break;
+  if (Atomics.load(view, STOP) !== 0n) break;
   const stamp = Atomics.load(view, STAMP);
   if (stamp !== seen) {
     seen = stamp;
     reported = false;
   }
   const detectedAtUnixMs = Date.now();
-  const stalledForMs = detectedAtUnixMs - epoch - stamp;
-  if (!reported && stalledForMs >= thresholdMs) {
+  const stalled = BigInt(detectedAtUnixMs - epoch) + uptimeMs - stamp;
+  if (!reported && stalled >= thresholdMs) {
     reported = true;
+    const stalledForMs = Number(stalled);
     const report = {
       stalledForMs,
-      lastStampUnixMs: epoch + stamp,
+      // Derived from the stall rather than from the stamp, so it is the wall
+      // clock moment of the last stamp whatever base the stamp was measured in.
+      lastStampUnixMs: detectedAtUnixMs - stalledForMs,
       detectedAtUnixMs,
     };
     // The file first, then the message. The file is the half that survives a
     // main thread which never comes back; the message is the half a live host
     // can act on. Ordering them this way means a host that dies between the two
     // has still left the record.
-    fs.appendFileSync(reportPath, `${JSON.stringify(report)}\n`);
+    appendReport(`${JSON.stringify(report)}\n`);
     if (parentPort !== null) parentPort.postMessage(report);
   }
   // Wakes early on a stamp — the main side notifies after every store — and

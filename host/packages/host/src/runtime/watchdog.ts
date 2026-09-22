@@ -35,10 +35,23 @@
  *
  * ## What the buffer holds
  *
- * Two `Int32` slots. Slot {@link STAMP} is milliseconds of the main side's
- * clock since {@link Watchdog.start}; slot {@link STOP} is the flag that lets
- * the worker leave its wait and end. Nothing else crosses: the report is built
- * on the worker side from the stamp and the worker's own wall clock.
+ * Two **64-bit** slots, as a `BigInt64Array`. Slot {@link STAMP} is
+ * milliseconds of the main side's clock since {@link Watchdog.start}; slot
+ * {@link STOP} is the flag that lets the worker leave its wait and end. Nothing
+ * else crosses: the report is built on the worker side from the stamp and the
+ * worker's own wall clock.
+ *
+ * **Sixty-four bits rather than thirty-two, because the stamp is elapsed time
+ * and a daemon runs for months.** `Atomics.store` on an `Int32Array` applies
+ * `ToInt32`, so an elapsed-milliseconds stamp wraps negative at `2^31-1` ms —
+ * **24.855 days** — and every poll after that computes a stall of about
+ * 4.29e9 ms. Worse, the worker's one-report-per-stall latch re-arms on every
+ * fresh stamp, so the wrap does not produce one wrong line: it produces one per
+ * stamp, for ever, into the report file. A watchdog that screams continuously
+ * about a host that is fine is worse than no watchdog, because the next real
+ * stall is one line in a million. `BigInt64Array` removes the ceiling outright
+ * (292 million years), and `Atomics.wait` works on it, so the wait loop is
+ * unchanged. `test/watchdog.test.ts` pins it with a month of simulated uptime.
  *
  * ## Who stamps
  *
@@ -76,6 +89,27 @@ export interface WatchdogOptions {
    * poll after the threshold. See {@link pollFor}.
    */
   readonly pollMs?: number;
+  /**
+   * How large the report file may grow before the worker rotates it.
+   *
+   * One generation, kept as `<reportPath>.1`: a stall log is read after the
+   * fact and the interesting lines are the recent ones, so an unbounded file is
+   * a slow leak and a deep archive of it is nobody's question. Default
+   * {@link REPORT_ROTATE_BYTES}. `0` keeps the file unbounded, which nothing in
+   * this host asks for.
+   */
+  readonly rotateBytes?: number;
+  /**
+   * Behave as though this watchdog started `simulatedUptimeMs` ago. **Tests
+   * only.**
+   *
+   * Both sides take it: the main side's epoch moves back by it, so the first
+   * stamp is already that far along, and the worker adds it to its own elapsed
+   * time. That symmetry is what makes it a *simulation of uptime* rather than a
+   * simulated stall — and it is the only way to reach the `2^31` ms boundary in
+   * a test without waiting twenty-five days for it.
+   */
+  readonly simulatedUptimeMs?: number;
 }
 
 /** Milliseconds of the main side's clock since {@link Watchdog.start}. */
@@ -112,9 +146,9 @@ function pollFor(thresholdMs: number): number {
 }
 
 export class Watchdog {
-  /** Two `Int32` slots: see {@link STAMP} and {@link STOP}. */
-  private readonly buffer = new SharedArrayBuffer(8);
-  private readonly view = new Int32Array(this.buffer);
+  /** Two 64-bit slots: see {@link STAMP} and {@link STOP}. */
+  private readonly buffer = new SharedArrayBuffer(16);
+  private readonly view = new BigInt64Array(this.buffer);
   private worker: Worker | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
   /** The value of `clock.now()` the stamps are measured from. */
@@ -139,15 +173,21 @@ export class Watchdog {
    */
   start(): void {
     if (this.worker !== null) return;
-    this.epoch = this.options.clock.now();
-    Atomics.store(this.view, STAMP, 0);
-    Atomics.store(this.view, STOP, 0);
+    // Normally zero. A test that wants a host which has been up for a month
+    // moves the epoch back and starts the stamp there, and hands the worker the
+    // same number — see {@link WatchdogOptions.simulatedUptimeMs}.
+    const uptimeMs = Math.max(0, Math.round(this.options.simulatedUptimeMs ?? 0));
+    this.epoch = this.options.clock.now() - uptimeMs;
+    Atomics.store(this.view, STAMP, BigInt(uptimeMs));
+    Atomics.store(this.view, STOP, 0n);
     const worker = new Worker(watchdogWorkerPath(), {
       workerData: {
         buffer: this.buffer,
         thresholdMs: this.options.thresholdMs,
         pollMs: this.options.pollMs ?? pollFor(this.options.thresholdMs),
         reportPath: this.options.reportPath,
+        rotateBytes: this.options.rotateBytes ?? REPORT_ROTATE_BYTES,
+        uptimeMs,
       },
     });
     worker.on("message", (report: WatchdogReport) => {
@@ -184,8 +224,14 @@ export class Watchdog {
    * comparison whose other side is the real world.
    */
   stamp(): void {
+    // **A stamp before `start()` is a no-op.** The assembler wires the queue's
+    // `afterTask` hook when it builds the watchdog, and starting it is a later
+    // call — so between the two every task boundary would otherwise pay an
+    // `Atomics.store` and a notify to write a number measured from an epoch of
+    // zero into a slot no thread is reading.
+    if (this.worker === null) return;
     const elapsed = this.options.clock.now() - this.epoch;
-    Atomics.store(this.view, STAMP, Math.max(0, Math.round(elapsed)));
+    Atomics.store(this.view, STAMP, BigInt(Math.max(0, Math.round(elapsed))));
     // Wakes the worker out of its wait at once, so a stamp re-arms the report
     // without waiting out a poll.
     Atomics.notify(this.view, STAMP);
@@ -218,7 +264,15 @@ export class Watchdog {
     this.heartbeat = handle;
   }
 
-  /** Test seam: resolve when the worker has produced at least `n` reports. */
+  /**
+   * Test seam: resolve when the worker has produced at least `n` reports.
+   *
+   * **It can only resolve while something else keeps the loop alive.** The
+   * worker is `unref()`ed by design, so a process whose *only* pending work is
+   * this promise exits quietly rather than resolving or rejecting it. A host
+   * serving a socket and a test runner both hold the loop open; a bare probe
+   * script has to hold it itself.
+   */
   awaitReports(n: number): Promise<readonly WatchdogReport[]> {
     if (this.collected.length >= n) return Promise.resolve([...this.collected]);
     return new Promise<readonly WatchdogReport[]>((resolve, reject) => {
@@ -250,7 +304,7 @@ export class Watchdog {
     const worker = this.worker;
     if (worker === null) return;
     this.worker = null;
-    Atomics.store(this.view, STOP, 1);
+    Atomics.store(this.view, STOP, 1n);
     Atomics.notify(this.view, STAMP);
     await worker.terminate();
     await this.exit;
@@ -296,3 +350,14 @@ export function watchdogFor(config: HostConfig, dataDir: string): Watchdog | nul
 
 /** One JSON object per line, appended: a log a human reads after the fact. */
 export const WATCHDOG_REPORT_FILE = "stalls.jsonl";
+
+/**
+ * How large `stalls.jsonl` may grow before the worker rotates it.
+ *
+ * One megabyte is roughly ten thousand stall lines — far more than a host worth
+ * diagnosing produces, and small enough that the file is never the reason a
+ * data directory grows. One generation is kept (`stalls.jsonl.1`); the
+ * generation before that is gone, because a stall log is read after the fact
+ * and the recent lines are the ones that answer the question.
+ */
+export const REPORT_ROTATE_BYTES = 1024 * 1024;
