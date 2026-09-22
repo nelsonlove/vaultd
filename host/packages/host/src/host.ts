@@ -24,6 +24,16 @@
  * holds, and Node kills the process — measured as the binary exiting 1 on
  * `SIGTERM` whenever a plugin was busy. So: unload the plugins, drain the
  * dispatch queue, stop the mirror, and only then take the globals down.
+ *
+ * **What the ordering does not promise.** The drain is bounded (see
+ * `drainBudgetMs`), and work that outlives it — a plugin holding a promise of
+ * its own, on a scheduler this host does not own — runs on into a process whose
+ * globals have been restored. By then the server's own process-wide rejection
+ * guard is down too (`HostServer.close()` uninstalls it) and the binary's
+ * shutdown-window listener has been removed, so such a rejection can still make
+ * an otherwise clean shutdown exit 1. That is documented rather than guarded:
+ * a blanket swallow would hide the same class of failure during the run, where
+ * it is a real defect.
  */
 
 import { resolve } from "node:path";

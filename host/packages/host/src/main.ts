@@ -272,10 +272,23 @@ export async function main(
  * nobody holds is to kill the process, which would turn the documented "0 = a
  * clean shutdown" into a 1 whenever the host was doing something.
  *
- * So a listener is installed for the duration of the stop and **removed
- * afterwards** — never a process-wide swallow, which would hide the same class
- * of failure during the run, when it is a real defect and the host should die
- * loudly. What it does is report; what it does not do is change the answer.
+ * **What this is not: the only guard, or a guard during the run.**
+ * `HostServer`'s constructor installs a refcounted process-wide
+ * `unhandledRejection` handler for the life of the server
+ * (`guardUnhandledRejections`, uninstalled by `close()`), which reports every
+ * stray rejection to the error sink and keeps the host serving — so the host
+ * does **not** die loudly during normal operation, by design, and a plugin's
+ * stray rejection reaches the quarantine tracker rather than the process. That
+ * also says exactly where the old exit 1 came from: only *after* `close()` had
+ * disarmed the server's guard, which is when the teardown used to pull the
+ * globals. This listener covers that window and no other — installed for the
+ * duration of the stop and removed in a `finally`. What it does is report;
+ * what it does not do is change the answer.
+ *
+ * **The residue it does not cover:** once `stop()` has returned and this
+ * listener is off, the server's guard is down too, so a rejection from work
+ * that outlived the drain budget can still turn a clean shutdown into an exit
+ * 1. Documented rather than guarded — see `startHost`'s `stop()`.
  */
 async function stopQuietly(
   running: RunningHost | null,

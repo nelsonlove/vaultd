@@ -21,8 +21,20 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { BINARY, BINARY_EXISTS, cleanupRealDaemons, scratchRoot } from "./real-daemon";
 import { defaultHostConfig, systemClock } from "../src/config";
 import { startHost } from "../src/host";
+import { CliRefusal, EXIT_CONFIG_DIR_REFUSED, runHost } from "../src/main";
 import type { HostConfig } from "../src/config";
 import type { RunningHost } from "../src/host";
+
+/**
+ * Where the parked plugin writes down what it saw during its own teardown.
+ *
+ * A global because a bundle is compiled and run in this very process: there is
+ * no serialization between a plugin and the case driving it, and this is the
+ * whole of the channel.
+ */
+declare global {
+  var __t22unload: string[] | undefined;
+}
 
 /** A plugin shaped like the one that broke the binary's exit code. */
 const RETRY_BUNDLE = `
@@ -51,6 +63,73 @@ module.exports = class Retrier extends obsidian.Plugin {
 };
 `;
 
+/**
+ * A plugin parked on something that is **not a shim timer**, and that is the
+ * whole point of it.
+ *
+ * The first pin of the ordered shutdown could not tell the ordering from the
+ * timer disarm: `GlobalInstallation.restore()` disarms this host's
+ * `window.setTimeout` timers before it takes the `window` away, which defuses a
+ * retry loop *whatever order the rest of the teardown runs in*. Two halves of
+ * one fix, redundant in exactly that direction, and reversing the order left
+ * both pins green.
+ *
+ * Two things about it, and the second is what actually pins the order.
+ *
+ * It parks on a **daemon round trip** rather than a timer, so no disarm can
+ * reach it and the microtask queue cannot beat it: real I/O resolves in a
+ * macrotask, well after everything a teardown does synchronously.
+ *
+ * And its `onunload` **writes down whether the host's globals were still
+ * there**. That is the deterministic half. An in-flight loop is a race by
+ * nature — a self-stopping plugin usually loses it, because unloading is
+ * microtask work that finishes before the loop's next wake either way — but
+ * `onunload` itself runs at a moment the ordering fixes exactly: before the
+ * globals go, or after. A plugin's teardown is entitled to the host it has been
+ * running against (Obsidian gives it one), and `typeof` records what it got
+ * without throwing, so the assertion belongs to the test rather than to the
+ * plugin's manners.
+ */
+const PARKED_BUNDLE = `
+const obsidian = require("obsidian");
+module.exports = class Parked extends obsidian.Plugin {
+  async onload() {
+    this.alive = true;
+    this.addCommand({
+      id: "park",
+      name: "Park",
+      callback: () => {
+        // Parked on a **daemon round trip**, which is real I/O and cannot be
+        // beaten by the microtask queue the way a \`setImmediate\` can. The read
+        // is the only thing in the try: a ReferenceError from the global below
+        // must reach the process, not this catch.
+        (async () => {
+          for (;;) {
+            try {
+              await this.app.vault.read(this.app.vault.getMarkdownFiles()[0]);
+            } catch (error) {
+              return;
+            }
+            if (!this.alive) return;
+            void window.moment;
+          }
+        })();
+      },
+    });
+  }
+  onunload() {
+    this.alive = false;
+    // **The ordering, recorded from inside the teardown.** A plugin's
+    // \`onunload\` is entitled to the host it has been running against — Obsidian
+    // gives it one — and this writes down whether it got it. \`typeof\` on a
+    // global that is gone is "undefined" rather than a throw, so the record is
+    // made either way and the assertion is the test's, not the plugin's.
+    const seen = (globalThis.__t22unload = globalThis.__t22unload || []);
+    seen.push(typeof globalThis.window);
+  }
+};
+`;
+
 /** A plugin whose `onload` reaches for a Node builtin a dry run refuses. */
 const BUILTIN_BUNDLE = `
 const obsidian = require("obsidian");
@@ -74,6 +153,29 @@ function plant(root: string, id: string, source: string): void {
   writeFileSync(
     join(root, ".obsidian-headless", "community-plugins.json"),
     `${JSON.stringify([id], null, 2)}\n`,
+    "utf8",
+  );
+}
+
+/**
+ * A plugin that fails at module scope with "Obsidian" in its message.
+ *
+ * Not contrived: `obsidian-dev-utils`, which several corpus plugins bundle,
+ * prints exactly `Error loading plugin <Name> (<id>)`. `PluginBundleFailed`
+ * carries the reason through, so this text really does reach
+ * `StartupReport.failed[].error` — which is what the banned substring test used
+ * to read.
+ */
+const OBSIDIAN_NAMED_BUNDLE = `
+throw new Error("Error loading plugin Obsidian Thing (obsidian-thing)");
+`;
+
+/** What the GUI has enabled, in the GUI's own config directory. */
+function plantGuiEnabled(root: string, ids: readonly string[]): void {
+  mkdirSync(join(root, ".obsidian"), { recursive: true });
+  writeFileSync(
+    join(root, ".obsidian", "community-plugins.json"),
+    `${JSON.stringify([...ids], null, 2)}\n`,
     "utf8",
   );
 }
@@ -182,6 +284,76 @@ describe.skipIf(!BINARY_EXISTS)("the production host wiring", () => {
     plant(wet.vaultRoot, "builtin", BUILTIN_BUNDLE);
     running = await startHost(wet, { listen: false });
     expect(running.startup.loaded, "and allowed in an ordinary run").toEqual(["builtin"]);
+    await running.stop();
+    running = null;
+  }, 120_000);
+
+  it("stops a plugin parked on something that is not a shim timer, before the globals go", async () => {
+    // **The pin for the shutdown ORDER itself.** Its sibling below is defused
+    // by `ShimTimers.clearAll()` — disarming this host's window timers stops a
+    // retry loop whatever order the rest of the teardown runs in — so reversing
+    // the order left both green. This plugin parks on `setImmediate`, which the
+    // bundle wrapper does not shadow onto `window` and no disarm can reach, and
+    // stops only because `onunload` ran. Move `assembly.teardown()` above
+    // `lifecycle.stop()` in `src/host.ts` and the loop wakes into a process
+    // with no `window`: `ReferenceError` on a promise nobody holds, which the
+    // `afterEach` above turns into a failing assertion.
+    globalThis.__t22unload = [];
+    const config = configFor();
+    plant(config.vaultRoot, "parked", PARKED_BUNDLE);
+    running = await startHost(config, { listen: false });
+    expect(running.startup.loaded).toEqual(["parked"]);
+
+    expect(running.assembly.app.commands.executeCommandById("parked:park")).toBe(true);
+    // Several turns, so the loop is genuinely parked on a daemon read rather
+    // than not yet begun.
+    await new Promise<void>((settle) => setTimeout(settle, 60));
+
+    await running.stop();
+    running = null;
+    // And several more, in which a loop that survived would wake and read.
+    await new Promise<void>((settle) => setTimeout(settle, 60));
+
+    // **The ordering assertion, and it is deterministic.** `onunload` ran while
+    // the host's globals were still installed, which is only true if
+    // `lifecycle.stop()` came before `assembly.teardown()`. Reverse the two in
+    // `src/host.ts` and this reads "undefined" — no timing, no race, no
+    // dependence on the timer disarm that defused the sibling case.
+    expect(globalThis.__t22unload, "onunload must see the host it ran against").toEqual(["object"]);
+  }, 120_000);
+
+  it("exits 4 when the GUI has every enabled plugin, and only then", async () => {
+    // **The typed overlap path, both directions.** The mechanism matters as
+    // much as the outcome: this used to be decided by
+    // `failure.error.includes(config.configDirName) || failure.error.includes("Obsidian")`,
+    // and the second case below is the one that reinstating it turns red.
+    const overlapping = configFor();
+    plant(overlapping.vaultRoot, "shared", "module.exports = class {};");
+    plantGuiEnabled(overlapping.vaultRoot, ["shared"]);
+
+    let thrown: unknown;
+    try {
+      const host = await runHost(overlapping);
+      // Unreachable when the refusal works; stopped so a failure here does not
+      // leave a daemon behind.
+      await host.stop();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown, "a GUI that has every enabled plugin is exit 4").toBeInstanceOf(CliRefusal);
+    expect((thrown as CliRefusal).code).toBe(EXIT_CONFIG_DIR_REFUSED);
+    expect((thrown as CliRefusal).message).toContain("shared");
+
+    // **And a plugin merely *named* after Obsidian is not an overlap.** It
+    // fails to load for its own reasons, nothing loads, the GUI has nothing
+    // enabled — and the host keeps running rather than claiming a coexistence
+    // problem that does not exist.
+    const named = configFor();
+    plant(named.vaultRoot, "obsidian-thing", OBSIDIAN_NAMED_BUNDLE);
+    running = await runHost(named);
+    expect(running.startup.loaded).toEqual([]);
+    expect(running.startup.failed[0]?.error ?? "").toContain("Obsidian Thing");
+    expect(running.overlap.overlap, "the GUI has nothing enabled").toEqual([]);
     await running.stop();
     running = null;
   }, 120_000);
