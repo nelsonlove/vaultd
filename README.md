@@ -68,11 +68,7 @@ One machine-readable line goes to stdout when the host is ready — `{"ready":tr
 
 **`allowNetwork` defaults to `true` in production**, so `requestUrl` and `request` reach the network; every test harness forces it off, so no suite can phone home whatever bundle it loads. Under `--dry-run` the network is refused unless `--dry-run-allow-network` is also passed, in which case the ordinary `allowNetwork` policy governs.
 
-**Three calls are open and waiting on the maintainer**, and none of them is a bug:
-
-- **the `allowNetwork` production default.** It is `true` today, with `--dry-run-allow-network` as the documented opt-back-in under dry-run; whether a production host should reach the network by default has not been decided.
-- **the `nested-properties` verdict.** It does not load headless, because its `onload` asserts on `app.metadataTypeManager`'s registered type widgets and this host answers an empty map — a GUI rendering surface it deliberately does not have. Whether to build one is a design call.
-- **the narrow tag rule**, pending a capture. Obsidian's exact acceptance of tag characters (`#tag+more`, `#a=b`, `#c^d`, `#p$`, `#tag-☺`) has not been observed on a live 1.13.4, so the rule is not settled and nothing here guesses it.
+**Decisions, recorded 2026-09-22.** `allowNetwork` defaults to `true` in production (agreed 2026-09-17; `--dry-run-allow-network` is the opt-back-in under dry-run). `nested-properties` not loading headless is accepted (agreed 2026-09-17): its `onload` asserts on `app.metadataTypeManager`'s registered type widgets, a GUI rendering surface this host does not have. The other two non-conforming goldens, `automatic-linker` (no active Markdown view, so it writes nothing) and `tag-wrangler` (no menu cursor, so its context menu is empty), are accepted as documented limits (2026-09-22). One item is still pending a capture, not a decision: **the narrow tag rule.** Obsidian's exact acceptance of tag characters (`#tag+more`, `#a=b`, `#c^d`, `#p$`, `#tag-☺`) has not been observed on a live 1.13.4; the ruling is to match Obsidian whatever it does, and nothing here guesses it until then.
 
 Measured baselines — cold start, plugin write round trip, hydration and added RSS, per-plugin load time, and the timer registry with cadences — are in `docs/performance/headless-host-baseline.md`. The plugin-compatibility accounting, including which goldens conform and which do not, is Tier 3 of `VAULTD-COMPATIBILITY.md`. See also `docs/design/headless-plugin-host.md` and `docs/protocol-host.md`.
 
