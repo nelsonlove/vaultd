@@ -148,6 +148,8 @@ Which callback a command carries decides whether the host can invoke it at all. 
 
 These two are not negotiable and are stated here rather than anywhere else, because this is the file somebody reads before trusting a green golden.
 
+They are the implementation brief's wording with **two self-referential words changed**, both forced by the prose moving into the file it now lives in: the brief's "v1 of this plan" is "v1 of the plan" here, and its "the README says so plainly" is "this README says so plainly". Nothing else was adapted, and no claim was softened — the substitution is recorded rather than left for a reader to find by diffing.
+
 First, every `expected/` tree was produced by **observing a real Obsidian perform the action**, never by reading `app.asar` or by running the host and blessing its output.
 
 Second, obsidian-linter's primary write path in the GUI is a **CodeMirror 6 `dispatch` transaction** on the live editor — `editor.cm.dispatch({ changes })`, not `editor.setValue` — and a CM6 transaction has no headless equivalent at all: there is no CM6 instance, no view, and no state field to dispatch into. (v1 of the plan said `editor.setValue`, which is a different API and would have implied the gap was smaller than it is; the scope conclusion is unchanged, the description was wrong.) Its golden scenario therefore drives the **file** path — `vault.modify`, and the YAML `vault.process` the plugin runs from `metadataCache.on("changed")` — and this README says so plainly, so nobody later reads a passing linter case as proof the editor path works. What the host does provide is `Editor` (Task 12), a text buffer with a `write_note` flush; that is enough for `editorCallback` commands and is not a CM6 transaction.

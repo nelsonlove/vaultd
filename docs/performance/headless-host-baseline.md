@@ -48,7 +48,7 @@ Wall clock from the `startHost` call to the promise resolving: the supervisor sp
 
 **Target: under 2 s. Median 1627.4 ms — met.** Run 1 missed it at 2441.8 ms, and that sample is not noise: see "The first run of a series costs double" below, which reproduces it three times and names the mechanism.
 
-The column names are `StartupReport`'s own fields and they do not nest the way the ordering suggests. `hydrationMs` covers the phase from `lifecycle.start()` to the end of the overlap check — the position warm-up, the enabled-set read and the coexistence reading — and `warmMs` is the position warm-up alone, which is 99.8% of it in every run. The mirror's own snapshot hydration happens **before** `lifecycle.start()`, inside `startHost`, and **no shipped instrument times it**: it is inside `cold start` and outside every other column. That is a gap in the design's "mirror hydration time" instrumentation claim, recorded here rather than estimated by subtraction.
+The column names are `StartupReport`'s own fields and they do not nest the way the ordering suggests. `hydrationMs` covers the phase from `lifecycle.start()` to the end of the overlap check — the position warm-up, the enabled-set read and the coexistence reading — and `warmMs` is the position warm-up alone, which is 99.8% of it in every run. The mirror's own snapshot hydration happens **before** `lifecycle.start()`, inside `startHost`, so it is inside `cold start` and outside every other column here. **That gap is closed in the code as of 2026-09-22**, after the final review: `StartupReport` now carries `snapshotHydrationMs`, read off the mirror (`Mirror.snapshotHydrationMs()`, timed around the opening snapshot walk), and the design's "mirror hydration time" is that field plus `warmMs`. The numbers in this document were taken before the field existed and are **not** re-measured for it — the column is simply absent from these runs, and the next series will carry it.
 
 ## Case 2 — plugin write round trip
 
@@ -125,7 +125,9 @@ Every back-to-back series above has a slow first run and two fast ones, and the 
 |---|---:|---|---:|---|
 | ten plugins (Case 1) | 2441.8 ms | 1627.4 / 1624.0 ms | 1126 ms | 520 / 507 ms |
 | no plugins (Case 3) | 2118.7 ms | 1449.1 / 1544.4 ms | 1074 ms | 519 / 582 ms |
-| no plugins (an earlier series) | 2331.8 ms | 1479.5 / 1492.6 ms | 1164 ms | 528 / 522 ms |
+| no plugins (an earlier series) | 2201.1 ms | 1544.6 / 1492.6 ms | 1136 ms | 622 / 522 ms |
+
+Each row is its own raw file under `target/tmp/t22b/out/`: `plugins10-{1,2,3}.json`, `hydration-{1,2,3}.json`, and — the earlier series — `noplugins-{1,2,3}.json`. **The third row was re-derived from those files on 2026-09-22**: as first written it carried 2331.8 / 1479.5 / 1492.6 ms with a 1164 ms warm-up, two of whose three values matched no run in its own cited source. Only the numbers changed; the row still says what it said, and the conclusion below was never the third row's alone — it reproduces in all three.
 
 The whole of the difference sits in the position warm-up, which roughly doubles. That phase is the one place the host reads **every note's bytes** (`Mirror.warmPositions`, bounded at `mirrorWarmConcurrency` 16), so it is exactly the phase whose cost is decided by whether 10,000 files are in the page cache. On this machine they are not, a minute later: swap use never dropped below 9.4 GiB of 10 GiB during the session, and the gap between series was seconds to a minute of ordinary tool activity.
 
@@ -134,7 +136,7 @@ The whole of the difference sits in the position warm-up, which roughly doubles.
 ## Known limits and honest gaps
 
 - **Three samples per case, one machine, one session.** No confidence interval is implied by a three-sample median, and the machine was swapping throughout. Every number should be read as an order of magnitude with a shape, not as a figure to compare against a different machine.
-- **The mirror's snapshot hydration is not separately timed by anything that ships.** `StartupReport` gives the position warm-up and the plugin loads; the snapshot walk that precedes them is inside the cold-start wall clock and nowhere else. Closing that would be a one-field addition to `StartupReport` — a code change, and therefore not this documentation task's to make.
+- **The mirror's snapshot hydration was not separately timed by anything that shipped — it is now, and these runs predate it.** `StartupReport` gained `snapshotHydrationMs` on 2026-09-22 (the one-field addition this entry asked for), so the snapshot walk is no longer only inside the cold-start wall clock. Every number in this document was measured before that field existed and none was re-measured for it, so the figures above still decompose the way the prose says they do.
 - **RSS is the host process only**, sampled at two points, and excludes the supervised `vaultd` child. It is not a high-water mark and it is not comparable to the `peak_rss_bytes` figures in the other baseline documents, which are `getrusage` high-water marks of a whole benchmark process.
 - **The round-trip case does not decompose.** It measures the whole of Goal 5's ordering and says nothing about which of the daemon commit, the response, or the mirror apply owns the bimodality.
 - **The ten-plugin set is eight real bundles plus two fixtures.** The golden corpus holds eight community plugins; the target names ten. The two fixtures are small hand-authored bundles and contribute about 1 ms between them, so the ten-plugin figure is within a millisecond or two of what an eight-plugin figure would have been.
