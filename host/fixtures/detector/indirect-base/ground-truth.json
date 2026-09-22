@@ -1,0 +1,28 @@
+{
+  "minified": false,
+  "apiSymbols": {
+    "loadData": 1,
+    "addCommand": 1,
+    "getActiveFile": 1,
+    "process": 1
+  },
+  "genericSymbols": {
+    "on": 1
+  },
+  "lifecycleGates": {
+    "onLayoutReady": 0,
+    "layoutReadyRead": 0,
+    "metadataResolved": 1,
+    "metadataResolve": 0
+  },
+  "commandIds": [
+    "lint-file"
+  ],
+  "eventNames": [
+    "resolved"
+  ],
+  "frameworks": [],
+  "crossPlugin": [],
+  "internalPlugins": [],
+  "tierEstimate": 1
+}

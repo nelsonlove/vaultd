@@ -1,0 +1,214 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "headings": [
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 40,
+            "offset": 40
+          }
+        },
+        "heading": "Heading with inline id ^heading-inline",
+        "level": 1
+      },
+      {
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 79
+          },
+          "end": {
+            "line": 4,
+            "col": 38,
+            "offset": 117
+          }
+        },
+        "heading": "Heading followed by a standalone id",
+        "level": 2
+      }
+    ],
+    "sections": [
+      {
+        "type": "heading",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 40,
+            "offset": 40
+          }
+        },
+        "id": "heading-inline"
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 42
+          },
+          "end": {
+            "line": 2,
+            "col": 35,
+            "offset": 77
+          }
+        }
+      },
+      {
+        "type": "heading",
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 79
+          },
+          "end": {
+            "line": 4,
+            "col": 38,
+            "offset": 117
+          }
+        },
+        "id": "heading-standalone"
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 8,
+            "col": 0,
+            "offset": 140
+          },
+          "end": {
+            "line": 9,
+            "col": 11,
+            "offset": 190
+          }
+        },
+        "id": "para-block"
+      },
+      {
+        "type": "list",
+        "position": {
+          "start": {
+            "line": 11,
+            "col": 0,
+            "offset": 192
+          },
+          "end": {
+            "line": 12,
+            "col": 23,
+            "offset": 255
+          }
+        }
+      }
+    ],
+    "listItems": [
+      {
+        "position": {
+          "start": {
+            "line": 11,
+            "col": 0,
+            "offset": 192
+          },
+          "end": {
+            "line": 11,
+            "col": 39,
+            "offset": 231
+          }
+        },
+        "parent": -11,
+        "id": "item-block"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 12,
+            "col": 0,
+            "offset": 232
+          },
+          "end": {
+            "line": 12,
+            "col": 23,
+            "offset": 255
+          }
+        },
+        "parent": -11
+      }
+    ],
+    "blocks": {
+      "heading-inline": {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 40,
+            "offset": 40
+          }
+        },
+        "id": "heading-inline"
+      },
+      "heading-standalone": {
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 79
+          },
+          "end": {
+            "line": 4,
+            "col": 38,
+            "offset": 117
+          }
+        },
+        "id": "heading-standalone"
+      },
+      "para-block": {
+        "position": {
+          "start": {
+            "line": 8,
+            "col": 0,
+            "offset": 140
+          },
+          "end": {
+            "line": 9,
+            "col": 11,
+            "offset": 190
+          }
+        },
+        "id": "para-block"
+      },
+      "item-block": {
+        "position": {
+          "start": {
+            "line": 11,
+            "col": 0,
+            "offset": 192
+          },
+          "end": {
+            "line": 11,
+            "col": 39,
+            "offset": 231
+          }
+        },
+        "id": "item-block"
+      }
+    }
+  }
+}

@@ -1,0 +1,177 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "1.8.26-nl.5",
+  "settings": {
+    "syncFolderName": true,
+    "ctrlKey": true,
+    "altKey": false,
+    "hideFolderNote": true,
+    "templatePath": "",
+    "autoCreate": false,
+    "autoCreateFocusFiles": false,
+    "autoCreateForAttachmentFolder": false,
+    "autoCreateForFiles": false,
+    "enableCollapsing": false,
+    "excludeFolders": [],
+    "folderSettings": [
+      {
+        "type": "folder",
+        "id": "953b79e2-b912-416b-adbf-5ff706f956f5",
+        "path": "System/Fileclasses",
+        "string": "",
+        "subFolders": true,
+        "position": 0,
+        "hideInSettings": false,
+        "storageLocation": "parentFolder"
+      },
+      {
+        "type": "folder",
+        "id": "91583174-731b-49a3-9b9c-79a003002a54",
+        "path": "System/Task workflows",
+        "string": "",
+        "subFolders": true,
+        "position": 1,
+        "hideInSettings": false,
+        "storageLocation": "parentFolder"
+      },
+      {
+        "type": "folder",
+        "id": "8c94a3ce-c10e-4322-9496-73365f507cbd",
+        "path": "System/Templates",
+        "string": "",
+        "subFolders": true,
+        "position": 2,
+        "hideInSettings": false,
+        "storageLocation": "parentFolder"
+      }
+    ],
+    "whitelistFolders": [],
+    "showDeleteConfirmation": true,
+    "underlineFolder": true,
+    "stopWhitespaceCollapsing": true,
+    "underlineFolderInPath": true,
+    "openFolderNoteOnClickInPath": true,
+    "openInNewTab": false,
+    "focusExistingTab": false,
+    "oldFolderNoteName": "{{folder_name}}",
+    "folderNoteName": "{{folder_name}}",
+    "folderNoteType": ".md",
+    "disableFolderHighlighting": false,
+    "newFolderNoteName": "{{folder_name}}",
+    "storageLocation": "insideFolder",
+    "syncDelete": false,
+    "showRenameConfirmation": true,
+    "defaultOverview": {
+      "id": "",
+      "folderPath": "",
+      "title": "Contents (Obsidian)",
+      "showTitle": true,
+      "depth": 2,
+      "includeTypes": [
+        "folder",
+        "markdown"
+      ],
+      "style": "list",
+      "disableFileTag": false,
+      "sortBy": "name",
+      "sortByAsc": true,
+      "showEmptyFolders": false,
+      "onlyIncludeSubfolders": false,
+      "storeFolderCondition": true,
+      "showFolderNotes": false,
+      "disableCollapseIcon": true,
+      "alwaysCollapse": false,
+      "autoSync": true,
+      "allowDragAndDrop": true,
+      "hideLinkList": true,
+      "hideFolderOverview": false,
+      "useActualLinks": true,
+      "fmtpIntegration": false,
+      "titleSize": 2,
+      "isInCallout": false,
+      "useWikilinks": true
+    },
+    "useSubmenus": true,
+    "syncMove": true,
+    "frontMatterTitle": {
+      "enabled": false,
+      "explorer": true,
+      "path": true
+    },
+    "settingsTab": "general",
+    "supportedFileTypes": [
+      "md",
+      "canvas",
+      "base"
+    ],
+    "boldName": false,
+    "boldNameInPath": false,
+    "cursiveName": false,
+    "cursiveNameInPath": false,
+    "disableOpenFolderNoteOnClick": false,
+    "openByClick": true,
+    "openWithCtrl": false,
+    "openWithAlt": false,
+    "excludeFolderDefaultSettings": {
+      "type": "folder",
+      "path": "",
+      "id": "9244cb66-7a67-4b73-9dcf-d95b04944c76",
+      "subFolders": true,
+      "disableSync": true,
+      "disableAutoCreate": true,
+      "disableFolderNote": false,
+      "enableCollapsing": false,
+      "position": 0,
+      "excludeFromFolderOverview": false,
+      "string": "",
+      "hideInSettings": false,
+      "detached": false,
+      "showFolderNote": false
+    },
+    "excludePatternDefaultSettings": {
+      "type": "pattern",
+      "path": "",
+      "id": "f8aed6eb-1e86-4706-b9bc-ea483e1df764",
+      "subFolders": true,
+      "disableSync": true,
+      "disableAutoCreate": true,
+      "disableFolderNote": false,
+      "enableCollapsing": false,
+      "position": 0,
+      "excludeFromFolderOverview": false,
+      "string": "",
+      "hideInSettings": false,
+      "detached": false,
+      "showFolderNote": false
+    },
+    "hideCollapsingIcon": false,
+    "hideCollapsingIconForEmptyFolders": false,
+    "tabManagerEnabled": true,
+    "ignoreAttachmentFolder": true,
+    "deleteFilesAction": "obsidianTrash",
+    "openSidebar": {
+      "mobile": false,
+      "desktop": true
+    },
+    "highlightFolder": true,
+    "persistentSettingsTab": {
+      "afterRestart": true,
+      "afterChangingTab": true
+    },
+    "firstTimeInsertOverview": true,
+    "fvGlobalSettings": {
+      "autoUpdateLinks": false
+    },
+    "hideFolderNoteNameInPath": false,
+    "fileExplorerRevealMargin": 4
+  },
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "folder-notes:create-folder-note-for-current-folder",
+      "active_file": "Project/Existing note.md"
+    }
+  },
+  "humanAction": "Opened Project/Existing note.md in a new tab, then ran \"Folder notes: Create folder note for current folder\" from the command palette. The plugin created Project/Project.md (empty; templatePath is \"\").",
+  "notes": "The command is registered with a checkCallback that requires an active markdown file, so the host must make active_file active before invoking. settings is the live data.json with autoCreate and autoCreateFocusFiles forced to false, which is what was in force at capture time: they were switched off in memory while the scratch trees were staged so that bulk folder creation would not fabricate folder notes in the other seven fixtures. Replaying with autoCreate true would create Project/Project.md on folder creation instead of on the command, which is a different outcome. Nothing was written to the live data.json; the two flags were restored after the capture run."
+}

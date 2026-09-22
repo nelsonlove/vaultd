@@ -1,0 +1,134 @@
+.find-replace-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 8px;
+  gap: 8px;
+}
+
+.fr-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fr-input {
+  width: 100%;
+}
+
+.fr-options,
+.fr-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fr-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  user-select: none;
+}
+
+.fr-scope {
+  flex: 0 0 auto;
+}
+
+.fr-folder {
+  flex: 1 1 auto;
+  min-width: 6em;
+}
+
+.fr-search {
+  align-self: flex-start;
+}
+
+.fr-results {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 6px;
+}
+
+.fr-empty,
+.fr-capped {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  padding: 6px 2px;
+}
+
+.fr-file {
+  margin-bottom: 8px;
+}
+
+.fr-file-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: var(--font-semibold);
+  position: sticky;
+  top: 0;
+  background-color: var(--background-primary);
+  padding: 2px 0;
+}
+
+.fr-file-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-ui-smaller);
+}
+
+.fr-file-count {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.fr-match {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 0 1px 14px;
+  font-size: var(--font-ui-smaller);
+}
+
+.fr-line {
+  color: var(--text-faint);
+  min-width: 2.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.fr-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fr-before {
+  background-color: var(--text-highlight-bg);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.fr-after {
+  color: var(--text-accent);
+}
+
+.fr-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 6px;
+}
+
+.fr-count {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}

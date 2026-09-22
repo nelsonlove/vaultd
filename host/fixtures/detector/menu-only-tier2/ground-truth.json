@@ -1,0 +1,30 @@
+{
+  "minified": false,
+  "apiSymbols": {
+    "getPluginById": 1,
+    "getPlugin": 1,
+    "getFileCache": 1,
+    "process": 1
+  },
+  "genericSymbols": {
+    "on": 1
+  },
+  "lifecycleGates": {
+    "onLayoutReady": 0,
+    "layoutReadyRead": 0,
+    "metadataResolved": 0,
+    "metadataResolve": 0
+  },
+  "commandIds": [],
+  "eventNames": [
+    "file-menu"
+  ],
+  "frameworks": [],
+  "crossPlugin": [
+    "tag-wrangler"
+  ],
+  "internalPlugins": [
+    "tag-pane"
+  ],
+  "tierEstimate": 2
+}

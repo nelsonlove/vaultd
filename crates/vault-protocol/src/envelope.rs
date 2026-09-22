@@ -49,6 +49,18 @@ impl ResponseEnvelope {
     }
 }
 
+/// A success payload or a typed refusal.
+///
+/// `clippy::large_enum_variant` is allowed rather than silenced by boxing.
+/// `Response`'s largest variant is `get_note`'s — a whole note, its metadata
+/// vectors, and since the structural facets two more optional ones — which
+/// puts the `Ok` side a few hundred bytes above the `Err` side. Boxing it
+/// would trade one stack move for a heap allocation **on the most common read
+/// in the protocol**, and this value is built once per request and serialized
+/// straight to a line: it is never stored, never collected, and never held
+/// across an await. The transport dwarfs the move either way, so the lint's
+/// remedy would cost more than the lint's subject.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum ResponseOutcome {

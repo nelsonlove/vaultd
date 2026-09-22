@@ -1,6 +1,6 @@
 use crate::frontmatter::parse_frontmatter;
 use crate::markdown::parse_markdown;
-use crate::obsidian::{scan_property_wikilinks, scan_text_ranges};
+use crate::obsidian::{scan_property_references, scan_text_ranges};
 use crate::{BlockId, ParsedNote, Section, SectionKind, SourceDocument};
 
 /// Parse a document's frontmatter properties and nothing else.
@@ -21,7 +21,7 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     let markdown = parse_markdown(&source, frontmatter.body_start);
     let body = scan_text_ranges(&source, &markdown.text_ranges);
     let (property_references, property_diagnostics) =
-        scan_property_wikilinks(&source, &frontmatter.properties);
+        scan_property_references(&source, &frontmatter.properties);
 
     let mut note = ParsedNote::empty(source);
     note.properties = frontmatter.properties;
@@ -46,6 +46,7 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     }
     note.sections.extend(markdown.sections);
     attach_section_block_ids(&mut note.sections, &note.blocks);
+    fold_standalone_block_id_sections(&mut note.sections, note.source.text());
 
     note.list_items = markdown.list_items;
 
@@ -86,6 +87,89 @@ pub fn parse_note(source: SourceDocument) -> ParsedNote {
     note.diagnostics.dedup();
 
     note
+}
+
+/// Fold a `^id` written on a line of its own onto the block it names.
+///
+/// Obsidian attaches a standalone anchor to the **preceding** block and emits
+/// no section for the anchor line itself: `parity-blocks` captures
+/// `## Heading followed by a standalone id` (line 4, 79..117) carrying
+/// `id: "heading-standalone"` with nothing between it and the next paragraph,
+/// and `blocks["heading-standalone"]` reported at the heading's own position.
+/// This is the form Obsidian itself writes when a block link is copied from a
+/// heading, a table, or a list.
+///
+/// [`attach_section_block_ids`] already folds the no-blank-line form, where the
+/// anchor is a lazy continuation of the paragraph above it and mdast hands back
+/// one section covering both lines (`^para-block`, 140..190 in the same
+/// capture). The blank-line form reaches mdast as a paragraph of its own, which
+/// is the inconsistency this closes.
+///
+/// The anchor's own [`BlockId`] span is untouched — it still points at the
+/// `^id` text, which is where it was written — so a caller that wants the
+/// owning block's extent reads it off the section that now declares the id.
+///
+/// Three shapes decline the fold, and **no capture covers any of them**. Each
+/// is left exactly as it parsed before this pass existed, which is the
+/// conservative choice where there is no evidence either way:
+///
+/// - **After a `List`.** A list section never carries a block id — an id
+///   written inside a list item surfaces on the `ListItem`
+///   (`13-block-ids`) — so folding here would hand the id to a section that
+///   cannot declare one. Note that `13-block-ids` settles only the *inline*
+///   form; a standalone anchor line after a list is a different shape, and
+///   the corpus is silent on it. Both branches are guesses; this one keeps
+///   the id reachable on a section of its own.
+/// - **After the `yaml` section.** No capture ever shows an `id` on `yaml`,
+///   and folding there would report the block at the frontmatter's own span.
+/// - **Onto a section that already declares an id.** `Para one. ^inline-id`
+///   followed by a standalone `^standalone-id` would otherwise overwrite the
+///   inline id and leave it with no declaring section. Both ids keep theirs.
+///
+/// A section already folded away is never a fold target either: two anchor
+/// lines in a row would otherwise put the second id on a section that no
+/// longer exists, losing it.
+fn fold_standalone_block_id_sections(sections: &mut Vec<Section>, text: &str) {
+    let mut folded = vec![false; sections.len()];
+    let mut any = false;
+    for index in 0..sections.len() {
+        let Some(id) = sections[index].block_id.clone() else {
+            continue;
+        };
+        if !matches!(sections[index].kind, SectionKind::Paragraph) {
+            continue;
+        }
+        let Some(slice) = text.get(sections[index].span.start()..sections[index].span.end()) else {
+            continue;
+        };
+        // The whole section is this one anchor and nothing else.
+        if slice.trim_end().strip_prefix('^') != Some(id.as_str()) {
+            continue;
+        }
+        let Some(previous) = index.checked_sub(1) else {
+            continue;
+        };
+        if matches!(
+            sections[previous].kind,
+            SectionKind::List | SectionKind::Yaml
+        ) || sections[previous].block_id.is_some()
+            || folded[previous]
+        {
+            continue;
+        }
+        sections[previous].block_id = Some(id);
+        folded[index] = true;
+        any = true;
+    }
+    if !any {
+        return;
+    }
+    let mut index = 0;
+    sections.retain(|_| {
+        let keep = !folded[index];
+        index += 1;
+        keep
+    });
 }
 
 /// Carry a trailing `^id` through to the owning top-level section, reusing

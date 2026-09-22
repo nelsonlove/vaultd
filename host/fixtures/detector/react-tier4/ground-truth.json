@@ -1,0 +1,25 @@
+{
+  "minified": false,
+  "apiSymbols": {
+    "registerView": 1,
+    "addRibbonIcon": 1,
+    "onLayoutReady": 1,
+    "getLeaf": 1,
+    "setViewState": 1
+  },
+  "genericSymbols": {},
+  "lifecycleGates": {
+    "onLayoutReady": 1,
+    "layoutReadyRead": 0,
+    "metadataResolved": 0,
+    "metadataResolve": 0
+  },
+  "commandIds": [],
+  "eventNames": [],
+  "frameworks": [
+    "react"
+  ],
+  "crossPlugin": [],
+  "internalPlugins": [],
+  "tierEstimate": 4
+}

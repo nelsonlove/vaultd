@@ -1,0 +1,5 @@
+- [ ] open task
+- [x] done task
+- [/] partial task
+- plain item with no checkbox
+    - [ ] nested open task

@@ -32,13 +32,14 @@ pub use model::{
     PublishedStatus,
 };
 pub use mutate::{
-    CONFIG_ZONE, CopyConflict, DEFAULT_MAX_FILE_BYTES, DeleteMode, FrontmatterEdit, IoKind,
-    LOCAL_TRASH, LinkRewriteFailure, LinkRewriteReason, Mutation, MutationEngine, MutationError,
-    MutationOutcome, PatchValue, Precondition, Reservation, in_config_zone, is_unindexable,
-    patch_source, revision_of,
+    CONFIG_ZONE, CopyConflict, DEFAULT_MAX_FILE_BYTES, DeleteMode, DirEntry, DirEntryKind,
+    FrontmatterEdit, IoKind, LOCAL_TRASH, LinkRewriteFailure, LinkRewriteReason, Mutation,
+    MutationEngine, MutationError, MutationOutcome, PatchValue, Precondition, Reservation,
+    in_config_zone, is_unindexable, is_unindexable_folder, patch_source, revision_of,
 };
 pub use query::{
-    DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus, VaultInfo,
+    DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus,
+    StructuralFacets, VaultInfo,
 };
 pub use reader::IndexReader;
 #[doc(hidden)]

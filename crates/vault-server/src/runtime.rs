@@ -1327,18 +1327,37 @@ impl Coordinator {
             // notice — deliberately not a generation event, because there is
             // no generation to name.
             //
+            // Two verbs reach the zone: `write_file` puts bytes there, and
+            // `create_folder` makes the directory those bytes need (the one
+            // gap the phase-5 protocol left open — `write_file` never creates
+            // parents). Both announce it, by the same rule and through the
+            // same notice; nothing else can write inside `.obsidian` at all.
+            //
             // Decided on `outcome.written`, never on the requested path. The
-            // caller's spelling is not where the bytes went: an alias resolves
+            // caller's spelling is not where the write went: an alias resolves
             // into the zone under any name at all, and `.OBSIDIAN` reaches it
             // with no symlink on a case-folding filesystem. A host told
             // nothing in either case is a host running on configuration it
             // does not know changed, and one told the *alias* cannot match the
             // notice to the file it knows.
-            if let (Mutation::WriteFile { .. }, Some(written)) = (&mutation, &outcome.written) {
-                if vault_index::in_config_zone(written) {
-                    self.emit(RuntimeNotice::ConfigChanged {
-                        path: written.clone(),
-                    });
+            //
+            // A `create_folder` of a zone folder that was already there
+            // announces itself too. Nothing moved, and the notice is a
+            // "re-read this path" rather than a claim about a delta, so the
+            // cost is one redundant read and the alternative — a second
+            // outcome field saying whether `mkdir` did anything — buys a
+            // client nothing it can act on.
+            let announces_config = matches!(
+                &mutation,
+                Mutation::WriteFile { .. } | Mutation::CreateFolder { .. }
+            );
+            if announces_config {
+                if let Some(written) = &outcome.written {
+                    if vault_index::in_config_zone(written) {
+                        self.emit(RuntimeNotice::ConfigChanged {
+                            path: written.clone(),
+                        });
+                    }
                 }
             }
             return Ok(self.report(&outcome, self.committed_generation()));

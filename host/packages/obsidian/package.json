@@ -1,0 +1,10 @@
+{
+  "name": "obsidian",
+  "version": "0.0.0-headless",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "dependencies": {
+    "@vaultd/host": "*"
+  }
+}

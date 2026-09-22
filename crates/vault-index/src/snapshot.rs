@@ -48,7 +48,8 @@ use crate::cursor::{CursorPosition, decode_cursor, encode_cursor};
 use crate::error::IndexError;
 use crate::model::Generation;
 use vault_core::{
-    Diagnostic, ListItemParent, Resolution, ResolvedReference, SourceSpan, VaultPath,
+    Diagnostic, ListItem, ListItemParent, Resolution, ResolvedReference, Section, SourceSpan,
+    VaultPath,
 };
 
 /// What one tree entry is, mirroring `tree_entries.kind`.
@@ -418,6 +419,26 @@ pub struct SectionRow {
     pub block_id: Option<String>,
 }
 
+impl SectionRow {
+    /// The row a freshly parsed section is stored as, without going through
+    /// the store.
+    ///
+    /// This exists for a caller that has a [`vault_core::ParsedNote`] in hand
+    /// and needs the rows a snapshot page would serve for it — the host's
+    /// `fixture-row` binary is the one in tree, so its test fixtures are
+    /// produced by the real parser rather than by hand. It goes through
+    /// `codec::encode_section_kind`, the same function `IndexStore` writes the
+    /// column with, so there is still exactly one spelling table for a section
+    /// kind.
+    pub fn from_parsed(section: &Section) -> Self {
+        Self {
+            kind: crate::codec::encode_section_kind(&section.kind).to_string(),
+            span: section.span,
+            block_id: section.block_id.clone(),
+        }
+    }
+}
+
 /// One parsed list item, from the schema-v3 `list_items` rows.
 ///
 /// The parent is a **line number**. A top-level item names the start line of
@@ -435,6 +456,29 @@ pub struct ListItemRow {
     /// The raw character inside the brackets, `None` for a non-task item.
     /// One character wide by construction.
     pub task: Option<String>,
+}
+
+impl ListItemRow {
+    /// The row a freshly parsed list item is stored as. See
+    /// [`SectionRow::from_parsed`] for why this exists; it splits the parent
+    /// through `codec::encode_list_item_parent`, the same function the store
+    /// writes the two columns with.
+    pub fn from_parsed(item: &ListItem) -> Self {
+        let (list_start_line, parent_start_line) =
+            crate::codec::encode_list_item_parent(item.parent);
+        // Both halves came out of a `u32` a moment ago, so neither can be out
+        // of range; the store round-trips them through `i64` only because that
+        // is what a SQLite column is.
+        let line = |value: Option<i64>| {
+            value.map(|value| u32::try_from(value).expect("a parent line fits u32"))
+        };
+        Self {
+            span: item.span,
+            list_start_line: line(list_start_line),
+            parent_start_line: line(parent_start_line),
+            task: crate::codec::encode_task(item.task),
+        }
+    }
 }
 
 /// One note's requested facets.
@@ -523,13 +567,31 @@ impl SnapshotSessions {
             let path = crate::codec::decode_path(&path)?;
             let metadata = if facets.metadata {
                 let loaded = crate::store::load_metadata_with(&session.connection, &path)?;
+                // `load_metadata_with`'s own `diagnostics` field is
+                // note-local only (`note_diagnostics`, the table a fresh
+                // parse populates) — exactly what `load_all_notes`'s
+                // graph-rebuild callers need it to stay. `get_note` answers
+                // with the full union (`note_diagnostics` ∪
+                // `resolution_diagnostics` ∪ `scan_diagnostics`, see
+                // `crate::query::diagnostics::note_diagnostics`), and this
+                // facet must match it row for row — a `[[wikilink]]` to a
+                // note that does not exist stores its
+                // `unresolved_reference` diagnostic in
+                // `resolution_diagnostics` only, so reusing the union here
+                // (rather than `loaded.diagnostics`) is what keeps a
+                // snapshot-hydrated client and a `get_note` refresh in
+                // agreement about the same note at the same generation.
+                let diagnostics = crate::query::diagnostics::note_diagnostics(
+                    &session.connection,
+                    path.as_str(),
+                )?;
                 Some(SnapshotMetadata {
                     properties: loaded.properties,
                     aliases: loaded.aliases,
                     headings: loaded.headings,
                     blocks: loaded.blocks,
                     tags: loaded.tags,
-                    diagnostics: loaded.diagnostics,
+                    diagnostics,
                 })
             } else {
                 None
@@ -632,7 +694,14 @@ fn load_backlinks(
         .collect()
 }
 
-fn load_sections(connection: &Connection, path: &VaultPath) -> Result<Vec<SectionRow>, IndexError> {
+/// Also the per-path read `get_note`'s `sections` facet is served from — one
+/// query text for both, so a page and a single-note refetch can never disagree
+/// about what a section is. `&Transaction` derefs to `&Connection`, so the
+/// reader's own transaction runs byte-identical SQL to a snapshot session's.
+pub(crate) fn load_sections(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Vec<SectionRow>, IndexError> {
     let mut statement = connection.prepare(
         "SELECT kind, span_start, span_end, block_id FROM sections \
          WHERE note_path = ?1 ORDER BY ordinal",
@@ -661,7 +730,8 @@ fn load_sections(connection: &Connection, path: &VaultPath) -> Result<Vec<Sectio
         .collect()
 }
 
-fn load_list_items(
+/// The `list_items` half of the same pairing — see [`load_sections`].
+pub(crate) fn load_list_items(
     connection: &Connection,
     path: &VaultPath,
 ) -> Result<Vec<ListItemRow>, IndexError> {

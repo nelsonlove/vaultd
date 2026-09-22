@@ -3,17 +3,17 @@ use vault_core::{
     ResolvedReference, Severity, SourceSpan, Subpath,
 };
 use vault_index::{
-    CopyConflict, DeleteMode, FrontmatterEdit, IndexError, IndexState, IndexedNote, NoteSummary,
-    PatchValue, Precondition, VaultInfo,
+    CopyConflict, DeleteMode, DirEntry, DirEntryKind, FrontmatterEdit, IndexError, IndexState,
+    IndexedNote, NoteSummary, PatchValue, Precondition, VaultInfo,
 };
 use vault_protocol::{
-    AliasDto, BlockDto, CopyConflictDto, DeleteModeDto, DiagnosticDto, ErrorCode, ExpectedDto,
-    FrontmatterEditDto, GetVaultInfoResponse, HeadingDto, IndexStateDto, LinkRewriteFailureDto,
-    ListItemDto, LiveStateDto, NoteDto, NoteFacetDto, NoteMetadataDto, NoteSummaryDto,
-    PatchValueDto, PropertyDto, PropertyMappingEntryDto, PropertyValueDto, ProtocolError,
-    ReferenceDto, ReferenceKindDto, ReferenceOriginDto, ResolutionDto, SectionDto, SeverityDto,
-    SnapshotNoteDto, SpanDto, SpannedPropertyValueDto, SubpathDto, TagDto, TreeEntryDto,
-    TreeEntryKindDto,
+    AliasDto, BlockDto, CopyConflictDto, DeleteModeDto, DiagnosticDto, DirEntryDto,
+    DirEntryKindDto, ErrorCode, ExpectedDto, FrontmatterEditDto, GetVaultInfoResponse, HeadingDto,
+    IndexStateDto, LinkRewriteFailureDto, ListItemDto, LiveStateDto, NoteDto, NoteFacetDto,
+    NoteMetadataDto, NoteSummaryDto, PatchValueDto, PropertyDto, PropertyMappingEntryDto,
+    PropertyValueDto, ProtocolError, ReferenceDto, ReferenceKindDto, ReferenceOriginDto,
+    ResolutionDto, SectionDto, SeverityDto, SnapshotNoteDto, SpanDto, SpannedPropertyValueDto,
+    SubpathDto, TagDto, TreeEntryDto, TreeEntryKindDto,
 };
 
 use crate::runtime::{MutationFailure, RefreshFailure};
@@ -237,7 +237,42 @@ pub(crate) fn note(value: IndexedNote) -> NoteDto {
             .collect(),
         diagnostics: value.diagnostics.iter().map(diagnostic).collect(),
         outgoing: value.outgoing.iter().map(reference).collect(),
+        // Present exactly when the request's `include` named them, through the
+        // same two mappers a `snapshot_notes` page uses — so a per-note
+        // refetch and a bulk page cannot disagree about a section's shape any
+        // more than they can about its rows.
+        sections: value
+            .sections
+            .as_ref()
+            .map(|sections| sections_dto(sections)),
+        list_items: value.list_items.as_ref().map(|items| list_items_dto(items)),
     }
+}
+
+fn sections_dto(sections: &[vault_index::SectionRow]) -> Vec<SectionDto> {
+    sections
+        .iter()
+        .map(|section| SectionDto {
+            kind: section.kind.clone(),
+            span: span(section.span),
+            block_id: section.block_id.clone(),
+        })
+        .collect()
+}
+
+fn list_items_dto(items: &[vault_index::ListItemRow]) -> Vec<ListItemDto> {
+    items
+        .iter()
+        .map(|item| ListItemDto {
+            span: span(item.span),
+            // Both carried through unchanged: the wire mirrors the stored
+            // line-number model, and a host does its own negation to reach
+            // Obsidian's single `parent` number.
+            list_start_line: item.list_start_line,
+            parent_start_line: item.parent_start_line,
+            task: item.task.clone(),
+        })
+        .collect()
 }
 
 fn index_state(value: IndexState) -> IndexStateDto {
@@ -568,23 +603,40 @@ pub(crate) fn patch_value(value: &PatchValueDto) -> PatchValue {
     }
 }
 
-/// Split each wire dot-path into segments. An empty path, or a path with an
-/// empty segment, is a client bug rather than a key named "".
+/// Resolve each wire `key_path` into segments: a dot-string splits on every
+/// `.`, an array is already its own segments and splits on nothing — which is
+/// the only way to address a key whose *name* holds a dot. An empty path, or
+/// a path with an empty segment, is a client bug rather than a key named "".
+///
+/// `set_null` becomes [`PatchValue::Null`], which writes a YAML null and is
+/// deliberately not the deletion `None`: the wire's explicit JSON `value:
+/// null` keeps that meaning. The two arriving together has no defined result
+/// and never decodes, so nothing here has to choose between them.
 pub(crate) fn frontmatter_edits(
     edits: &[FrontmatterEditDto],
 ) -> Result<Vec<FrontmatterEdit>, ProtocolError> {
     let mut converted = Vec::with_capacity(edits.len());
     for edit in edits {
-        let segments: Vec<String> = edit.key_path.split('.').map(str::to_string).collect();
-        if segments.iter().any(String::is_empty) {
+        let segments: Vec<String> = edit
+            .key_path
+            .segments()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if segments.is_empty() || segments.iter().any(String::is_empty) {
             return Err(invalid_request(&format!(
                 "invalid frontmatter key path: {:?}",
-                edit.key_path
+                edit.key_path.display()
             )));
         }
+        let value = if edit.set_null {
+            Some(PatchValue::Null)
+        } else {
+            edit.value.as_ref().map(patch_value)
+        };
         converted.push(FrontmatterEdit {
             key_path: segments,
-            value: edit.value.as_ref().map(patch_value),
+            value,
         });
     }
     Ok(converted)
@@ -619,6 +671,50 @@ pub(crate) fn tree_entry(value: &vault_index::TreeEntryRow) -> TreeEntryDto {
 /// and is answered `invalid_request` — the same strictness the mutation params
 /// get. An empty list is the documented default and stays legal: it pages
 /// identities, which is what a client resuming a mirror asks for.
+/// Which structural facets a `get_note` request asked for.
+///
+/// `get_note` accepts only the two row-set facets. The other four are already
+/// unconditional fields of its answer, so naming one is `invalid_request`
+/// rather than a redundant ask: a request that names something the server does
+/// not serve *in that position* must not be answered as though it named
+/// nothing, which is the evolution rule's own value-versus-field split. An
+/// unknown name never reaches here at all — `NoteFacetDto` has no unknown
+/// variant, so a misspelling fails the request's deserialization exactly as it
+/// does for `snapshot_notes`.
+///
+/// The rejected facet is named back through its own `Serialize`, not a second
+/// spelling table: a name written out here by hand would be free to drift from
+/// the wire spelling it is complaining about.
+pub(crate) fn structural_facets(
+    include: &[NoteFacetDto],
+) -> Result<vault_index::StructuralFacets, ProtocolError> {
+    let mut facets = vault_index::StructuralFacets::default();
+    for facet in include {
+        match facet {
+            NoteFacetDto::Sections => facets.sections = true,
+            NoteFacetDto::ListItems => facets.list_items = true,
+            NoteFacetDto::Metadata
+            | NoteFacetDto::References
+            | NoteFacetDto::Resolutions
+            | NoteFacetDto::Backlinks => {
+                let name =
+                    serde_json::to_string(facet).unwrap_or_else(|_| "that facet".to_string());
+                return Err(ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!(
+                        "get_note already carries {name}; `include` accepts only \
+                         \"sections\" and \"list_items\""
+                    ),
+                    supported_version: None,
+                    current_generation: None,
+                    current_revision: None,
+                });
+            }
+        }
+    }
+    Ok(facets)
+}
+
 pub(crate) fn note_facets(include: &[NoteFacetDto]) -> vault_index::NoteFacets {
     let mut facets = vault_index::NoteFacets::default();
     for facet in include {
@@ -703,30 +799,11 @@ pub(crate) fn snapshot_note(value: &vault_index::SnapshotNoteRow) -> SnapshotNot
             .backlinks
             .as_ref()
             .map(|backlinks| backlinks.iter().map(reference).collect()),
-        sections: value.sections.as_ref().map(|sections| {
-            sections
-                .iter()
-                .map(|section| SectionDto {
-                    kind: section.kind.clone(),
-                    span: span(section.span),
-                    block_id: section.block_id.clone(),
-                })
-                .collect()
-        }),
-        list_items: value.list_items.as_ref().map(|items| {
-            items
-                .iter()
-                .map(|item| ListItemDto {
-                    span: span(item.span),
-                    // Both carried through unchanged: the wire mirrors the
-                    // stored line-number model, and a host does its own
-                    // negation to reach Obsidian's single `parent` number.
-                    list_start_line: item.list_start_line,
-                    parent_start_line: item.parent_start_line,
-                    task: item.task.clone(),
-                })
-                .collect()
-        }),
+        sections: value
+            .sections
+            .as_ref()
+            .map(|sections| sections_dto(sections)),
+        list_items: value.list_items.as_ref().map(|items| list_items_dto(items)),
     }
 }
 
@@ -762,6 +839,25 @@ pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ProtocolError> {
             current_generation: None,
             current_revision: None,
         })
+}
+
+/// One directory entry on the wire.
+///
+/// The kind vocabularies are one-to-one and deliberately so: `DirEntryKindDto`
+/// carries an extra `Unknown` only as a *decoder's* catch-all, which this
+/// server never emits, so every engine kind has exactly one wire spelling and
+/// the mapping can never silently widen.
+pub(crate) fn dir_entry(entry: DirEntry) -> DirEntryDto {
+    DirEntryDto {
+        name: entry.name,
+        kind: match entry.kind {
+            DirEntryKind::File => DirEntryKindDto::File,
+            DirEntryKind::Folder => DirEntryKindDto::Folder,
+            DirEntryKind::Symlink => DirEntryKindDto::Symlink,
+            DirEntryKind::Other => DirEntryKindDto::Other,
+        },
+        size: entry.size,
+    }
 }
 
 pub(crate) fn encode_base64(bytes: &[u8]) -> String {

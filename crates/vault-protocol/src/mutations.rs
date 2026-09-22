@@ -178,8 +178,123 @@ impl<'de> Deserialize<'de> for PatchValueDto {
     }
 }
 
+/// How one patch entry addresses its key. Two spellings, both protocol
+/// version 1, and the second is purely additive.
+///
+/// * [`KeyPathDto::Dotted`] is the original `a.b.c`, unchanged in meaning:
+///   every `.` starts a new segment. That is why it cannot address a key
+///   whose *own name* holds a dot — `my.key` means "`key` inside `my`", and a
+///   host that sent it for a literal `my.key` grew a phantom nested mapping
+///   beside the key it meant to edit.
+/// * [`KeyPathDto::Segments`] is an array in which each element is one
+///   literal key, dots included. It splits on nothing.
+///
+/// Tolerant on both sides: a string decodes as `Dotted` and serializes back
+/// as a string, an array decodes as `Segments` and serializes back as an
+/// array, so neither form is rewritten into the other in transit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyPathDto {
+    Dotted(String),
+    Segments(Vec<String>),
+}
+
+impl KeyPathDto {
+    /// The segments this path addresses, in order — the dot-split for
+    /// `Dotted`, the elements themselves for `Segments`.
+    pub fn segments(&self) -> Vec<&str> {
+        match self {
+            Self::Dotted(text) => text.split('.').collect(),
+            Self::Segments(segments) => segments.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// A rendering for an error message. Never re-parsed: the array form is
+    /// bracketed precisely so a segment carrying a dot is not mistaken for
+    /// two segments in the text a client reads back.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Dotted(text) => text.clone(),
+            Self::Segments(segments) => format!("[{}]", segments.join(", ")),
+        }
+    }
+}
+
+/// Equality against a dot-string compares what the two **address**, not how
+/// they are spelled: `Segments(["my.key"])` is not equal to `"my.key"`,
+/// because the string form addresses `key` inside `my` and the array form
+/// addresses one literal key.
+impl PartialEq<str> for KeyPathDto {
+    fn eq(&self, other: &str) -> bool {
+        self.segments() == other.split('.').collect::<Vec<_>>()
+    }
+}
+
+impl PartialEq<&str> for KeyPathDto {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl Serialize for KeyPathDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Dotted(text) => text.serialize(serializer),
+            Self::Segments(segments) => segments.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyPathDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KeyPathVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for KeyPathVisitor {
+            type Value = KeyPathDto;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a dot-path string or an array of literal key segments")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(KeyPathDto::Dotted(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(KeyPathDto::Dotted(value))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut segments = Vec::new();
+                while let Some(segment) = seq.next_element::<String>()? {
+                    segments.push(segment);
+                }
+                Ok(KeyPathDto::Segments(segments))
+            }
+        }
+
+        deserializer.deserialize_any(KeyPathVisitor)
+    }
+}
+
 /// One addressed key and what becomes of it. `key_path` is a dot-path
-/// (`a.b.c`) addressing nested keys; an explicit JSON `value: null` deletes.
+/// (`a.b.c`) or an array of literal segments (see [`KeyPathDto`]); an
+/// explicit JSON `value: null` deletes, and `set_null: true` — carried
+/// **instead of** `value` — writes a YAML null.
 ///
 /// `Deserialize` is hand-written rather than derived: the brief's own spec
 /// text only ever describes an *explicit* JSON `null` as the deletion
@@ -191,10 +306,49 @@ impl<'de> Deserialize<'de> for PatchValueDto {
 /// be present (null or not) and rejects anything else as `deny_unknown_fields`
 /// would, so a misspelled key at this nesting level is also a typed error
 /// rather than a silently-ignored field.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+///
+/// `set_null` is the third action, additive and mutually exclusive with
+/// `value`. Obsidian's `processFrontMatter` writes `key: null` when a plugin
+/// assigns `fm.key = null`, and until this field existed the wire could not
+/// say it at all: a JSON `null` in `value` is the deletion spelling, so the
+/// key would have vanished instead of holding a null. An entry carrying both
+/// `set_null` and `value` says two contradictory things about one key and is
+/// refused here rather than silently ordered; over the transport a decode
+/// failure is reported as `invalid_request`.
+///
+/// `Serialize` is hand-written for the same mutual exclusion: a `set_null`
+/// entry must not also carry a `value` key, and a `value` entry must keep
+/// spelling its explicit `null`, which a skipped `Option` would swallow.
+#[derive(Clone, Debug, PartialEq)]
 pub struct FrontmatterEditDto {
-    pub key_path: String,
+    pub key_path: KeyPathDto,
+    /// `None` is the deletion spelling — an explicit JSON `null` — and is
+    /// also what a `set_null` entry carries, since it has no `value` key at
+    /// all. `set_null` is what tells the two apart.
     pub value: Option<PatchValueDto>,
+    /// Write a YAML null for the addressed key, creating it when absent.
+    pub set_null: bool,
+}
+
+impl Serialize for FrontmatterEditDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("key_path", &self.key_path)?;
+        // A `set_null` entry spells no `value`, which is the only shape that
+        // decodes back into itself. The in-memory state carrying both never
+        // came off the wire — that pair is a decode error — so serializing
+        // one writes the action it names.
+        if self.set_null {
+            map.serialize_entry("set_null", &true)?;
+        } else {
+            map.serialize_entry("value", &self.value)?;
+        }
+        map.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for FrontmatterEditDto {
@@ -207,6 +361,7 @@ impl<'de> Deserialize<'de> for FrontmatterEditDto {
         enum Field {
             KeyPath,
             Value,
+            SetNull,
         }
 
         struct FrontmatterEditVisitor;
@@ -215,18 +370,21 @@ impl<'de> Deserialize<'de> for FrontmatterEditDto {
             type Value = FrontmatterEditDto;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a frontmatter edit with `key_path` and `value`")
+                formatter.write_str(
+                    "a frontmatter edit with `key_path` and either `value` or `set_null`",
+                )
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where
                 A: serde::de::MapAccess<'de>,
             {
-                let mut key_path: Option<String> = None;
+                let mut key_path: Option<KeyPathDto> = None;
                 // The outer `Option` records whether the `value` key was
                 // seen at all; the inner one is the deletion sentinel an
                 // explicit JSON `null` produces.
                 let mut value: Option<Option<PatchValueDto>> = None;
+                let mut set_null: Option<bool> = None;
                 while let Some(field) = map.next_key::<Field>()? {
                     match field {
                         Field::KeyPath => {
@@ -241,12 +399,39 @@ impl<'de> Deserialize<'de> for FrontmatterEditDto {
                             }
                             value = Some(map.next_value::<Option<PatchValueDto>>()?);
                         }
+                        Field::SetNull => {
+                            if set_null.is_some() {
+                                return Err(serde::de::Error::duplicate_field("set_null"));
+                            }
+                            set_null = Some(map.next_value::<bool>()?);
+                        }
                     }
                 }
                 let key_path =
                     key_path.ok_or_else(|| serde::de::Error::missing_field("key_path"))?;
-                let value = value.ok_or_else(|| serde::de::Error::missing_field("value"))?;
-                Ok(FrontmatterEditDto { key_path, value })
+                let set_null = set_null.unwrap_or(false);
+                // Two contradictory actions on one key. Refused rather than
+                // ordered, and refused for `value: null` too: "delete this
+                // key" and "write a null here" are different outcomes and
+                // picking one silently is the hazard this whole entry type
+                // is shaped against.
+                if set_null && value.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "`set_null` cannot be combined with `value`",
+                    ));
+                }
+                // `set_null: false` says nothing, so an omitted `value`
+                // beside it is the decode error it always was.
+                let value = match value {
+                    Some(value) => value,
+                    None if set_null => None,
+                    None => return Err(serde::de::Error::missing_field("value")),
+                };
+                Ok(FrontmatterEditDto {
+                    key_path,
+                    value,
+                    set_null,
+                })
             }
         }
 
@@ -361,6 +546,25 @@ pub struct ReadFileParams {
     pub path: String,
 }
 
+/// `read_dir`'s parameters: the one directory whose immediate entries a
+/// caller wants.
+///
+/// The **empty string names the vault root**, which is the only spelling it
+/// could have: a `VaultPath` is never empty, so `""` can mean nothing else,
+/// and listing the root is the only way a client learns that `.obsidian/` and
+/// `.obsidian-headless/` are there at all.
+///
+/// `deny_unknown_fields` matches [`ReadFileParams`] rather than the read
+/// family's usual tolerance. The two raw path operations are spelled the same
+/// way on purpose — a client that misspells a key on one must not get a
+/// quietly different answer from the other — and a single-field params object
+/// has no optional key a server could later add without saying so.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDirParams {
+    pub path: String,
+}
+
 /// A content-bearing mutation's answer: the generation containing it, and
 /// the revision it wrote.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -371,9 +575,20 @@ pub struct MutationResponse {
 
 /// A mutation with no content revision to report — a folder operation, or a
 /// delete (a deleted file has no revision).
+///
+/// `generation` is absent for exactly one case: a `create_folder` that landed
+/// on an **unindexable** path — the configuration zone, or any hidden folder.
+/// The scan never lists such a folder, so no generation will ever contain it,
+/// and naming one would be a generation the client could read at and never
+/// find its own write in. It is the same rule, and the same absent-not-zero
+/// spelling, `WriteFileResponse::generation` already follows; `0` is a
+/// well-formed generation a client would act on, so the key is omitted
+/// outright instead. Every indexed create, every delete, and every folder
+/// rename keeps reporting one, byte-identically.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenerationResponse {
-    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -424,4 +639,97 @@ pub struct WriteFileResponse {
 pub struct ReadFileResponse {
     pub content_base64: String,
     pub revision: String,
+}
+
+/// What one entry of a `read_dir` listing is.
+///
+/// Deliberately **not** [`crate::TreeEntryKindDto`]. That vocabulary is the
+/// index's — it separates a `note` from an ordinary `file`, because a note is
+/// a row the index holds — and `read_dir` answers a filesystem question about
+/// paths the index does not hold at all. What a listing must distinguish is
+/// what a host may walk into: a `folder` it can descend, a `file` it can read,
+/// a `symlink` it must not follow blindly, and `other` for everything a
+/// filesystem can still hold. Reusing the tree's kind would have forced a
+/// choice between calling `.obsidian/plugins/x/manifest.json` a `file` (true,
+/// but then `note` is a variant this operation can never emit) and teaching
+/// the index's vocabulary two words about links it has no rows for.
+///
+/// Tolerant on decode, exactly as [`crate::TreeEntryKindDto`] is, and for the
+/// evolution rule's reason: a client must degrade a kind it has never heard of
+/// to [`DirEntryKindDto::Unknown`] rather than fail the whole listing.
+/// `Deserialize` is hand-written because `#[serde(other)]` is rejected on an
+/// externally tagged enum, which is what a plain unit-variant enum is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirEntryKindDto {
+    File,
+    Folder,
+    Symlink,
+    /// A fifo, a socket, a device — anything on disk that is none of the
+    /// three above.
+    Other,
+    /// A kind this build does not know. Never produced by this server, which
+    /// is what separates it from `Other`: `other` is a real answer about a
+    /// real filesystem object, `unknown` is a client's catch-all for a word a
+    /// later `vaultd` might teach it.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for DirEntryKindDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "file" => Self::File,
+            "folder" => Self::Folder,
+            "symlink" => Self::Symlink,
+            "other" => Self::Other,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+/// One immediate entry of a directory.
+///
+/// `name` is the entry's own name, never a path: the request already fixed
+/// where the directory is, and joining the two here would put a second
+/// spelling of that path on the wire.
+///
+/// `size` is present for a regular file and absent for everything else — a
+/// folder has no size worth reporting, and a symlink's is the length of its
+/// target string rather than of anything a client could read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DirEntryDto {
+    pub name: String,
+    pub kind: DirEntryKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// `read_dir`'s answer: one directory's immediate entries, sorted by `name` in
+/// byte order.
+///
+/// `path` echoes **the spelling the request used** — the parsed vault path, or
+/// `""` for the root — so a client pairing answers to asks never has to
+/// re-derive it. It is never the canonicalized filesystem path (that would
+/// leak where the vault lives and could name a directory outside the client's
+/// own vocabulary), and it is never re-spelled to match the filesystem's own
+/// casing: a request for `folder` on a case-insensitive filesystem lists
+/// `Folder`'s entries and still answers `"path":"folder"`.
+///
+/// Deliberately **not** the "stored spelling" `MutationOutcome::changed_paths`
+/// reports, which is defined as the way the filesystem holds a name and never
+/// the way the caller spelled it. The two are opposites, and a client that
+/// needs an entry's on-disk spelling takes it from that entry's `name`, which
+/// is the filesystem's own.
+///
+/// The listing carries no generation. Nothing it reports is indexed — hidden
+/// paths and the configuration zone are exactly what it exists to reach — so
+/// there is no generation this answer could be true at, and naming one would
+/// invite a client to treat a listing as a delta.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReadDirResponse {
+    pub path: String,
+    pub entries: Vec<DirEntryDto>,
 }

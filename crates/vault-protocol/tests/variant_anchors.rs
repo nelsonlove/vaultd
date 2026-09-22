@@ -11,7 +11,8 @@
 //! test land in the same change.
 
 use vault_protocol::{
-    ErrorCode, GenerationCauseDto, LiveStateDto, ResyncReasonDto, RuntimeEventDto, TreeEntryKindDto,
+    DirEntryKindDto, ErrorCode, GenerationCauseDto, LiveStateDto, ResyncReasonDto, RuntimeEventDto,
+    TreeEntryKindDto,
 };
 
 #[test]
@@ -86,6 +87,15 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
             | TreeEntryKindDto::Unknown => {}
         }
     }
+    fn witness_dir_kind(kind: &DirEntryKindDto) {
+        match kind {
+            DirEntryKindDto::File
+            | DirEntryKindDto::Folder
+            | DirEntryKindDto::Symlink
+            | DirEntryKindDto::Other
+            | DirEntryKindDto::Unknown => {}
+        }
+    }
     fn witness_event(event: &RuntimeEventDto) {
         match event {
             RuntimeEventDto::GenerationCommitted(_)
@@ -101,5 +111,6 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
     witness_cause(&GenerationCauseDto::Watcher);
     witness_reason(&ResyncReasonDto::SubscriberLag);
     witness_tree_kind(&TreeEntryKindDto::Note);
+    witness_dir_kind(&DirEntryKindDto::Symlink);
     witness_event(&RuntimeEventDto::Unknown);
 }

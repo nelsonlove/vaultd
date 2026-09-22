@@ -1,0 +1,4 @@
+- item with a [[Parity target]] wikilink
+- item with an ![[Parity target]] embed
+- item with a [markdown link](Parity%20target.md) and a #list-tag
+    - nested item with [[Parity target#Some heading|alias]]

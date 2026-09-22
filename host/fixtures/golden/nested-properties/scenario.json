@@ -1,0 +1,16 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "1.6.0",
+  "settings": {
+    "initialExpandLevel": 0,
+    "isFullKeyDisplayEnabled": false
+  },
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "nested-properties:toggle-full-key-display"
+    }
+  },
+  "humanAction": "Not performed in the live vault. toggle-full-key-display is the plugin's one command with a plain callback and no modal; it flips how nested property keys are rendered in the property editor and writes no files.",
+  "notes": "NO SAFE FILE-MUTATING ACTION EXISTS FOR THIS PLUGIN IN A LIVE VAULT. Its two file-mutating commands, rename-nested-property-across-vault and delete-nested-property-across-vault, are both modal-driven AND vault-wide: invoking either in the human's vault would rewrite frontmatter across every note. They were therefore not captured. The scenario drives the one harmless command instead, and expected/ is byte-identical to vault/: the assertion is that loading the plugin and invoking its non-modal command changes no files. The plugin's visible behaviour is a property-editor rendering change with no file effect. Capturing a real vault-wide rename needs a scratch vault driven by hand."
+}

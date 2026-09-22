@@ -105,6 +105,28 @@ pub(crate) struct Publication<'a> {
     pub tree: &'a TreeDelta,
 }
 
+/// One note's stored content revision, or `None` when no note row exists at
+/// that path.
+///
+/// A free function over `&Connection` rather than a method, so the writer's
+/// own handle and a reader's transaction (`&Transaction` derefs to
+/// `&Connection`) run the same query text. `get_tree_entries` needs it because
+/// `tree_entries.content_revision` is written NULL for every kind — only the
+/// `notes` row ever carries one — which is the same fact `snapshot_tree`'s
+/// `COALESCE` join encodes.
+pub(crate) fn note_revision_with(
+    connection: &Connection,
+    path: &VaultPath,
+) -> Result<Option<String>, IndexError> {
+    Ok(connection
+        .query_row(
+            "SELECT content_revision FROM notes WHERE path = ?1",
+            params![path.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 pub(crate) fn usize_to_i64(value: usize, field: &str) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| IndexError::Storage(format!("{field} exceeds i64 range")))
 }
@@ -742,14 +764,7 @@ impl IndexStore {
     }
 
     pub(crate) fn stored_revision(&self, path: &VaultPath) -> Result<Option<String>, IndexError> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT content_revision FROM notes WHERE path = ?1",
-                params![path.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?)
+        note_revision_with(&self.connection, path)
     }
 
     /// Operational update after an unchanged refresh: refresh fingerprints,

@@ -1,0 +1,233 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "links": [
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 15,
+            "offset": 15
+          },
+          "end": {
+            "line": 0,
+            "col": 32,
+            "offset": 32
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target]]",
+        "displayText": "Parity target"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 11,
+            "offset": 46
+          },
+          "end": {
+            "line": 2,
+            "col": 39,
+            "offset": 74
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target|shown text]]",
+        "displayText": "shown text"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 16,
+            "offset": 93
+          },
+          "end": {
+            "line": 4,
+            "col": 46,
+            "offset": 123
+          }
+        },
+        "link": "Parity target#Some heading",
+        "original": "[[Parity target#Some heading]]",
+        "displayText": "Parity target > Some heading"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 6,
+            "col": 14,
+            "offset": 140
+          },
+          "end": {
+            "line": 6,
+            "col": 40,
+            "offset": 166
+          }
+        },
+        "link": "Parity target#^blockid",
+        "original": "[[Parity target#^blockid]]",
+        "displayText": "Parity target > ^blockid"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 8,
+            "col": 14,
+            "offset": 183
+          },
+          "end": {
+            "line": 8,
+            "col": 41,
+            "offset": 210
+          }
+        },
+        "link": "Parity target.md",
+        "original": "[shown](Parity%20target.md)",
+        "displayText": "shown"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 10,
+            "col": 25,
+            "offset": 238
+          },
+          "end": {
+            "line": 10,
+            "col": 44,
+            "offset": 257
+          }
+        },
+        "link": "Parity%20target",
+        "original": "[[Parity%20target]]",
+        "displayText": "Parity%20target"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 12,
+            "col": 28,
+            "offset": 288
+          },
+          "end": {
+            "line": 12,
+            "col": 56,
+            "offset": 316
+          }
+        },
+        "link": "sub/folder/Other.md",
+        "original": "[other](sub/folder/Other.md)",
+        "displayText": "other"
+      }
+    ],
+    "sections": [
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 0,
+            "col": 33,
+            "offset": 33
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 0,
+            "offset": 35
+          },
+          "end": {
+            "line": 2,
+            "col": 40,
+            "offset": 75
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 0,
+            "offset": 77
+          },
+          "end": {
+            "line": 4,
+            "col": 47,
+            "offset": 124
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 6,
+            "col": 0,
+            "offset": 126
+          },
+          "end": {
+            "line": 6,
+            "col": 41,
+            "offset": 167
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 8,
+            "col": 0,
+            "offset": 169
+          },
+          "end": {
+            "line": 8,
+            "col": 42,
+            "offset": 211
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 10,
+            "col": 0,
+            "offset": 213
+          },
+          "end": {
+            "line": 10,
+            "col": 45,
+            "offset": 258
+          }
+        }
+      },
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 12,
+            "col": 0,
+            "offset": 260
+          },
+          "end": {
+            "line": 12,
+            "col": 57,
+            "offset": 317
+          }
+        }
+      }
+    ]
+  }
+}

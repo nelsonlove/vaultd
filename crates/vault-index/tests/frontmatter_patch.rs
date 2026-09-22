@@ -400,6 +400,475 @@ fn deleting_a_nested_leaf_reserializes_its_property_without_it() {
     );
 }
 
+/// One edit whose segments are given literally rather than dot-split — the
+/// wire's array `key_path` form, which is the only way to address a key whose
+/// own name carries a `.`.
+fn segments(key_path: &[&str], value: Option<PatchValue>) -> FrontmatterEdit {
+    FrontmatterEdit {
+        key_path: key_path
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect(),
+        value,
+    }
+}
+
+const DOTTED_KEY_DOCUMENT: &str =
+    "---\ntitle: Original\nmy.key: old\ncount: 3\n---\n# Body\n\nProse.\n";
+
+/// Task 1e (a): a literal dot in a key name is addressable by segment, and a
+/// set, a create, and a delete each touch that key alone.
+#[test]
+fn a_literal_dot_segment_edits_creates_and_deletes_that_key() {
+    let set = patch_source(
+        &path(),
+        DOTTED_KEY_DOCUMENT,
+        &[segments(
+            &["my.key"],
+            Some(PatchValue::String("new".into())),
+        )],
+    )
+    .expect("set a key whose name holds a dot");
+    assert_eq!(
+        set, "---\ntitle: Original\nmy.key: new\ncount: 3\n---\n# Body\n\nProse.\n",
+        "every other byte survives"
+    );
+
+    let created = patch_source(
+        &path(),
+        DOTTED_KEY_DOCUMENT,
+        &[segments(
+            &["other.key"],
+            Some(PatchValue::String("fresh".into())),
+        )],
+    )
+    .expect("create a key whose name holds a dot");
+    assert_eq!(
+        created,
+        "---\ntitle: Original\nmy.key: old\ncount: 3\nother.key: fresh\n---\n# Body\n\nProse.\n"
+    );
+
+    let deleted = patch_source(&path(), DOTTED_KEY_DOCUMENT, &[segments(&["my.key"], None)])
+        .expect("delete a key whose name holds a dot");
+    assert_eq!(
+        deleted,
+        "---\ntitle: Original\ncount: 3\n---\n# Body\n\nProse.\n"
+    );
+}
+
+/// With no dot in play, the two forms address the same key: one segment
+/// spelled literally is the dot-path of the same name.
+#[test]
+fn a_single_segment_and_a_dot_free_dot_path_address_the_same_key() {
+    let by_segment = patch_source(
+        &path(),
+        DOCUMENT,
+        &[segments(
+            &["title"],
+            Some(PatchValue::String("Same".into())),
+        )],
+    )
+    .expect("segment form");
+    let by_dot_path = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit("title", Some(PatchValue::String("Same".into())))],
+    )
+    .expect("dot-path form");
+    assert_eq!(by_segment, by_dot_path);
+
+    let nested_by_segment = patch_source(
+        &path(),
+        DOCUMENT,
+        &[segments(
+            &["nested", "inner", "leaf"],
+            Some(PatchValue::String("same".into())),
+        )],
+    )
+    .expect("nested segment form");
+    let nested_by_dot_path = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit(
+            "nested.inner.leaf",
+            Some(PatchValue::String("same".into())),
+        )],
+    )
+    .expect("nested dot-path form");
+    assert_eq!(nested_by_segment, nested_by_dot_path);
+}
+
+/// Task 1e (b): [`PatchValue::Null`] writes a YAML null rather than deleting
+/// the key — the `fm.key = null` case `processFrontMatter` writes as
+/// `key: null`. Deletion keeps its own spelling (`value: None`).
+#[test]
+fn an_explicit_null_writes_a_yaml_null_rather_than_deleting_the_key() {
+    let overwritten = patch_source(&path(), DOCUMENT, &[edit("title", Some(PatchValue::Null))])
+        .expect("overwrite a scalar with a null");
+    assert!(overwritten.contains("title: null\n"), "{overwritten}");
+    assert_eq!(read_back(&overwritten, "title"), PropertyValue::Null);
+    assert_eq!(
+        outside_property(&overwritten, "title"),
+        outside_property(DOCUMENT, "title"),
+        "only the addressed key's line changed"
+    );
+    assert_eq!(body(&overwritten), body(DOCUMENT));
+
+    let created = patch_source(
+        &path(),
+        DOCUMENT,
+        &[edit("reviewed", Some(PatchValue::Null))],
+    )
+    .expect("create a key holding a null");
+    assert!(created.contains("reviewed: null\n"), "{created}");
+    assert_eq!(read_back(&created, "reviewed"), PropertyValue::Null);
+    assert_eq!(body(&created), body(DOCUMENT));
+
+    let deleted =
+        patch_source(&path(), DOCUMENT, &[edit("title", None)]).expect("deletion still deletes");
+    assert!(!deleted.contains("title"), "{deleted}");
+}
+
+/// The comment inside `outer` is load-bearing, not decoration: a
+/// re-serialization of that property drops the comments between its own
+/// lines, so asserting the comment survives is what makes the block-scalar
+/// test below *discriminate* the narrowing from the re-emit. Without it the
+/// test passes either way, because re-emitting `outer` happens to produce the
+/// same bytes for this fixture.
+const LIST_OF_MAPS: &str = "---\ntitle: Original\nitems:\n  - name: a\n    value: 9\n  - name: b\n    value: 10\nouter:\n  # how the description is used\n  desc: |\n    line one\n    line two\n  other: kept\n---\n# Body\n";
+
+/// Task 1e (c): a scalar leaf has a span of its own, so setting one splices
+/// that scalar and leaves the item's block layout alone. Before this, the
+/// whole `items` property was re-emitted and each map item collapsed into
+/// `- {name: a, value: 9}`.
+#[test]
+fn patching_a_leaf_inside_a_block_list_of_maps_keeps_the_item_layout() {
+    let patched = patch_source(
+        &path(),
+        LIST_OF_MAPS,
+        &[segments(
+            &["items", "0", "value"],
+            Some(PatchValue::Integer(99)),
+        )],
+    )
+    .expect("patch one leaf inside a list of maps");
+    assert_eq!(
+        patched,
+        LIST_OF_MAPS.replace("    value: 9\n", "    value: 99\n"),
+        "only the addressed scalar's own bytes moved"
+    );
+}
+
+/// The same narrowing for a multi-line block scalar: it is a scalar, so a
+/// plain scalar replaces exactly its span — the `|` and its indented lines —
+/// and the sibling key below keeps its bytes. The block form is gone because
+/// the caller replaced the value, not because the property was reflowed.
+///
+/// The comment inside `outer` is what makes this discriminate: a re-emit of
+/// the property drops it, so removing the narrowing turns this red. Without
+/// that assertion the re-emit produced the same bytes for this fixture and
+/// the test passed either way.
+#[test]
+fn replacing_a_block_scalar_leaf_with_a_plain_scalar_leaves_its_sibling_alone() {
+    let patched = patch_source(
+        &path(),
+        LIST_OF_MAPS,
+        &[segments(
+            &["outer", "desc"],
+            Some(PatchValue::String("short".into())),
+        )],
+    )
+    .expect("replace a nested block scalar");
+    assert!(
+        patched.contains("  # how the description is used\n"),
+        "the property was re-emitted rather than spliced: {patched}"
+    );
+    assert_eq!(
+        patched,
+        LIST_OF_MAPS.replace("  desc: |\n    line one\n    line two\n", "  desc: short\n"),
+        "the block scalar's own span, and nothing else"
+    );
+}
+
+/// The boundary the narrowing deliberately stops at, pinned so a later change
+/// to it is a decision rather than a surprise: a **non-scalar** new value
+/// still re-serializes the whole enclosing top-level property, and the block
+/// items reflow into flow style. `VAULTD-COMPATIBILITY.md` records this.
+#[test]
+fn a_non_scalar_value_still_reserializes_the_enclosing_property() {
+    let patched = patch_source(
+        &path(),
+        LIST_OF_MAPS,
+        &[segments(
+            &["items", "0", "value"],
+            Some(PatchValue::Sequence(vec![PatchValue::Integer(9)])),
+        )],
+    )
+    .expect("set a nested leaf to a sequence");
+    assert!(
+        patched.contains("items:\n  - {name: a, value: [9]}\n  - {name: b, value: 10}\n"),
+        "{patched}"
+    );
+    assert!(patched.contains("title: Original\n"), "{patched}");
+    assert!(patched.contains("  other: kept\n"), "{patched}");
+}
+
+const FLOW_MAP: &str = "---\ntitle: Original\ntop: {a: 1, b: 2}\n---\n# Body\n";
+const FLOW_SEQUENCE_OF_MAPS: &str = "---\ntitle: Original\nitems: [{a: 1}, {a: 2}]\n---\n# Body\n";
+const BLOCK_SEQUENCE_OF_FLOW_MAPS: &str =
+    "---\ntitle: Original\nitems:\n  - {a: 1, b: 2}\n  - {a: 3, b: 4}\n---\n# Body\n";
+
+/// A leaf inside a **flow** collection is the one place the narrowing must
+/// not go. Inside `{…}` or `[…]` a `,` ends the token, so a block-context
+/// scalar written there splits one value into two — `{a: x, y, b: 2}` parses
+/// as valid YAML holding `a: "x"` and a stray key `y`, which is exactly the
+/// silent corruption `flow_scalar` exists to prevent. The splice declines and
+/// the re-emit, which quotes for flow context, takes over.
+///
+/// The four fixtures below are a reviewer's reproduced failures, run through
+/// the parser rather than compared as bytes: what matters is what the value
+/// reads back as, not which path produced it.
+#[test]
+fn a_scalar_inside_a_flow_mapping_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        FLOW_MAP,
+        &[segments(
+            &["top", "a"],
+            Some(PatchValue::String("x, y".into())),
+        )],
+    )
+    .expect("set a leaf inside a flow mapping");
+    assert_eq!(
+        read_back_nested(&patched, &["top", "a"]),
+        PropertyValue::String("x, y".into()),
+        "one value, not two: {patched}"
+    );
+    assert_eq!(
+        mapping_keys(&read_back(&patched, "top")),
+        vec!["a", "b"],
+        "no stray key was invented: {patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["top", "b"]),
+        PropertyValue::Integer(2),
+        "the sibling is untouched: {patched}"
+    );
+}
+
+/// The same leaf set to a string holding a closing brace. Before the context
+/// check this produced unparsable YAML, which the output re-parse guard then
+/// refused — so a legal edit failed, with a message about an unterminated
+/// frontmatter block that described neither the input nor what happened.
+#[test]
+fn a_scalar_inside_a_flow_mapping_survives_a_closing_brace() {
+    let patched = patch_source(
+        &path(),
+        FLOW_MAP,
+        &[segments(
+            &["top", "a"],
+            Some(PatchValue::String("p} q".into())),
+        )],
+    )
+    .expect("a closing brace in a value is not a refusal");
+    assert_eq!(
+        read_back_nested(&patched, &["top", "a"]),
+        PropertyValue::String("p} q".into()),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["top", "b"]),
+        PropertyValue::Integer(2),
+        "{patched}"
+    );
+}
+
+#[test]
+fn a_scalar_inside_a_flow_sequence_of_maps_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        FLOW_SEQUENCE_OF_MAPS,
+        &[segments(
+            &["items", "0", "a"],
+            Some(PatchValue::String("x, y".into())),
+        )],
+    )
+    .expect("set a leaf inside a flow sequence of maps");
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "a"]),
+        PropertyValue::String("x, y".into()),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["items", "1", "a"]),
+        PropertyValue::Integer(2),
+        "the other item is untouched: {patched}"
+    );
+}
+
+/// A flow mapping on a block sequence item: the `- ` marker opens the line,
+/// but the addressed key does not, so this is flow context too.
+#[test]
+fn a_scalar_inside_a_flow_map_on_a_block_item_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        BLOCK_SEQUENCE_OF_FLOW_MAPS,
+        &[segments(
+            &["items", "0", "b"],
+            Some(PatchValue::String("z, w".into())),
+        )],
+    )
+    .expect("set a leaf inside a flow map on a block item");
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "b"]),
+        PropertyValue::String("z, w".into()),
+        "{patched}"
+    );
+    assert_eq!(
+        mapping_keys(&read_back_nested(&patched, &["items", "0"])),
+        vec!["a", "b"],
+        "no stray key was invented: {patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "a"]),
+        PropertyValue::Integer(1),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["items", "1", "b"]),
+        PropertyValue::Integer(4),
+        "{patched}"
+    );
+}
+
+const MULTILINE_FLOW_MAP: &str = "---\ntop: {\n  a: 1,\n  b: 2 }\nother: keep\n---\n# Body\n";
+const MULTILINE_FLOW_SEQUENCE_OF_MAPS: &str =
+    "---\nitems: [\n  {\n    a: 1,\n    b: 2\n  }\n]\nother: keep\n---\n# Body\n";
+
+/// A flow mapping written across several lines. The addressed key *does*
+/// open its own line — the `{` ended the line before it — so a line-local
+/// test says "block" and the splice writes block quoting into flow context
+/// again, with the same stray-key result. Flow style is a property of the
+/// **container**, and the container's span is where to ask.
+#[test]
+fn a_scalar_inside_a_multiline_flow_mapping_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        MULTILINE_FLOW_MAP,
+        &[segments(
+            &["top", "a"],
+            Some(PatchValue::String("x, y".into())),
+        )],
+    )
+    .expect("set a leaf inside a multi-line flow mapping");
+    assert_eq!(
+        read_back_nested(&patched, &["top", "a"]),
+        PropertyValue::String("x, y".into()),
+        "one value, not two: {patched}"
+    );
+    assert_eq!(
+        mapping_keys(&read_back(&patched, "top")),
+        vec!["a", "b"],
+        "no stray key was invented: {patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["top", "b"]),
+        PropertyValue::Integer(2),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back(&patched, "other"),
+        PropertyValue::String("keep".into()),
+        "the sibling property is untouched: {patched}"
+    );
+}
+
+/// The same shape one level deeper: a flow sequence holding a flow mapping,
+/// both written across several lines, so every key opens its own line.
+#[test]
+fn a_scalar_inside_a_multiline_flow_sequence_of_maps_survives_a_comma() {
+    let patched = patch_source(
+        &path(),
+        MULTILINE_FLOW_SEQUENCE_OF_MAPS,
+        &[segments(
+            &["items", "0", "a"],
+            Some(PatchValue::String("x, y".into())),
+        )],
+    )
+    .expect("set a leaf inside a multi-line flow sequence of maps");
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "a"]),
+        PropertyValue::String("x, y".into()),
+        "{patched}"
+    );
+    assert_eq!(
+        mapping_keys(&read_back_nested(&patched, &["items", "0"])),
+        vec!["a", "b"],
+        "no stray key was invented: {patched}"
+    );
+    assert_eq!(
+        read_back_nested(&patched, &["items", "0", "b"]),
+        PropertyValue::Integer(2),
+        "{patched}"
+    );
+    assert_eq!(
+        read_back(&patched, "other"),
+        PropertyValue::String("keep".into()),
+        "{patched}"
+    );
+}
+
+/// The hostile-string matrix the top-level path already has, against a
+/// **nested** leaf — the one scalar-replacement path in this module that had
+/// no coverage of it. Every spelling here reads back as YAML's own bool,
+/// null, number, anchor, alias, or item-marker unless the emitter quotes it,
+/// so a regression is a silent type change rather than a visible break.
+///
+/// Both contexts are exercised from the same list: the block-context leaf
+/// takes the narrow splice, and the flow-context leaf takes the re-emit. Both
+/// must return the caller's string unchanged.
+#[test]
+fn hostile_scalars_round_trip_at_a_nested_leaf_in_either_context() {
+    for hostile in [
+        "a: b", "yes", "null", "1e3", "0x1A", "*star", "&amp", "- x", ".inf", "",
+    ] {
+        let block = patch_source(
+            &path(),
+            DOCUMENT,
+            &[segments(
+                &["nested", "inner", "leaf"],
+                Some(PatchValue::String(hostile.to_string())),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("set {hostile:?} at a block-context leaf: {error}"));
+        assert_eq!(
+            read_back_nested(&block, &["nested", "inner", "leaf"]),
+            PropertyValue::String(hostile.to_string()),
+            "block context changed {hostile:?}: {block}"
+        );
+
+        let flow = patch_source(
+            &path(),
+            FLOW_MAP,
+            &[segments(
+                &["top", "a"],
+                Some(PatchValue::String(hostile.to_string())),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("set {hostile:?} at a flow-context leaf: {error}"));
+        assert_eq!(
+            read_back_nested(&flow, &["top", "a"]),
+            PropertyValue::String(hostile.to_string()),
+            "flow context changed {hostile:?}: {flow}"
+        );
+        assert_eq!(
+            read_back_nested(&flow, &["top", "b"]),
+            PropertyValue::Integer(2),
+            "flow context lost the sibling for {hostile:?}: {flow}"
+        );
+    }
+}
+
 /// The value `key` holds once `vault-core` has read `document` back. This is
 /// the only honest test of the serializer: what matters is not what bytes it
 /// emitted but what the parser makes of them.
@@ -428,6 +897,46 @@ fn read_back(document: &str, key: &str) -> PropertyValue {
         .value
         .value
         .clone()
+}
+
+/// The value an addressed **path** holds once `vault-core` has read
+/// `document` back — the nested counterpart of [`read_back`], and the only
+/// honest test of a nested splice for the same reason: what the bytes are
+/// matters less than what the parser makes of them.
+fn read_back_nested(document: &str, key_path: &[&str]) -> PropertyValue {
+    let mut value = read_back(document, key_path[0]);
+    for segment in &key_path[1..] {
+        value = match value {
+            PropertyValue::Mapping(entries) => entries
+                .iter()
+                .find(|(key, _)| &key.value == segment)
+                .unwrap_or_else(|| panic!("no key {segment} in {document:?}"))
+                .1
+                .value
+                .clone(),
+            PropertyValue::Sequence(items) => {
+                let index: usize = segment
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{segment} is not an index in {document:?}"));
+                items
+                    .get(index)
+                    .unwrap_or_else(|| panic!("no item {index} in {document:?}"))
+                    .value
+                    .clone()
+            }
+            other => panic!("{segment} does not address anything in {other:?}"),
+        };
+    }
+    value
+}
+
+/// A mapping's keys in order, so an expectation can say "no stray key was
+/// invented" without naming every value.
+fn mapping_keys(value: &PropertyValue) -> Vec<String> {
+    let PropertyValue::Mapping(entries) = value else {
+        panic!("not a mapping: {value:?}");
+    };
+    entries.iter().map(|(key, _)| key.value.clone()).collect()
 }
 
 /// A sequence's items as plain strings, so an expectation does not have to

@@ -343,7 +343,10 @@ fn the_protocol_reaches_the_engine_for_a_write_a_delete_and_a_read() {
     );
     match deleted.outcome {
         ResponseOutcome::Ok(Response::DeleteNote(response)) => {
-            assert!(response.generation >= generation);
+            // A delete always joins a generation — only an unindexable
+            // `create_folder` may omit the key — so the `Option` is proof of
+            // presence here, not a case to tolerate.
+            assert!(response.generation.expect("a delete names its generation") >= generation);
         }
         other => panic!("delete_note did not reach the engine: {other:?}"),
     }

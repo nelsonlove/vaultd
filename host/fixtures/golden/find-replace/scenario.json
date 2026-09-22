@@ -1,0 +1,13 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "0.1.0",
+  "settings": {},
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "find-replace:open"
+    }
+  },
+  "humanAction": "Not performed in the live vault. In the GUI the flagship flow is: run \"Find & Replace: Open\" (or right-click a folder and choose Find & Replace), type a query and a replacement in the panel, tick the hits, and press Replace; the panel then writes each file.",
+  "notes": "NO FILE MUTATION IS REACHABLE FROM THE INVOKABLE SURFACE. The plugin registers exactly two commands, find-replace:open and find-replace:open-folder, and both do nothing but open a panel; the replacement step lives inside that panel and its applyReplacements function is module-local, not exposed on the plugin instance. The capture therefore asserts the honest outcome of the host-invokable action: the vault tree is unchanged, so expected/ is byte-identical to vault/. The command was NOT invoked in the human's live session, because doing so leaves a panel open in their window and it changes no files either way. Capturing a real replacement needs a scratch vault driven by hand."
+}

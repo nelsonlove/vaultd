@@ -1,0 +1,55 @@
+{
+  "tasknotes": {
+    "state_keys": [
+      "pomodoroState",
+      "googleCalendarSyncQueue",
+      "lastSyncCursor",
+      "migrations"
+    ],
+    "secret_keys": [
+      "apiAuthToken",
+      "googleCalendarSyncTokens",
+      "microsoftCalendarSyncTokens"
+    ]
+  },
+  "obsidian42-brat": {
+    "state_keys": [],
+    "secret_keys": ["personalAccessToken"]
+  },
+  "recent-files-obsidian": {
+    "state_keys": ["recentFiles"],
+    "secret_keys": []
+  },
+  "settings-sidebar-organizer": {
+    "state_keys": ["collapsedGroups", "seenPlugins"],
+    "secret_keys": []
+  },
+  "breadcrumbs": {
+    "state_keys": ["is_dirty", "_bc_migrations"],
+    "secret_keys": []
+  },
+  "quickadd": {
+    "state_keys": ["migrations"],
+    "secret_keys": []
+  },
+  "iconic": {
+    "state_keys": ["lastOpenTab"],
+    "secret_keys": []
+  },
+  "execute-code": {
+    "state_keys": ["lastOpenTab"],
+    "secret_keys": []
+  },
+  "folder-notes": {
+    "state_keys": ["lastOpenTab"],
+    "secret_keys": []
+  },
+  "forge": {
+    "state_keys": [],
+    "secret_keys": []
+  },
+  "governor": {
+    "state_keys": [],
+    "secret_keys": []
+  }
+}

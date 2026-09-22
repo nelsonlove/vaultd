@@ -4,13 +4,56 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::frontmatter::is_valid_tag_text;
+use crate::markdown::split_markdown_target;
 use crate::{
     BlockId, Diagnostic, DiagnosticCode, Property, PropertyValue, Reference, ReferenceKind,
     ReferenceOrigin, Severity, SourceDocument, SourceSpan, Spanned, Subpath, Tag,
 };
 
+/// The run of characters a `#` can start.
+///
+/// Obsidian documents a tag as letters, numbers, underscore, hyphen and
+/// forward slash — and `parity-tags-nested-unicode` shows it also keeping a
+/// Unicode **symbol** inside the value: `#tag-🙂` is captured whole, where this
+/// class once stopped at the emoji and reported `#tag-`. That is a *category*
+/// question and not an astral-plane one — `#tag-☺` (U+263A) is in the BMP and
+/// truncated the same way, while `#tag-𝐀` (U+1D400) is astral and never did,
+/// because it is a letter.
+///
+/// So the class is the documented set plus the Unicode Symbol categories
+/// **outside ASCII** — `[\p{S}&&[^\x00-\x7F]]`. Punctuation stays out, which
+/// is what ends `#parent/child/grandchild.` before its full stop in the same
+/// capture.
+///
+/// **Why the ASCII symbols are excluded, though `\p{S}` would cover them.**
+/// The capture demonstrates one thing: a *non-ASCII* symbol stays inside a tag
+/// value. Admitting non-ASCII symbols explains that completely; admitting
+/// `+ = ^ $ ~ < > |` and the backtick as well explains nothing further and
+/// changes what nine characters that appear constantly in ASCII prose mean.
+/// The two errors are not symmetric. Too narrow truncates a tag exactly where
+/// this scanner already truncated it before the fix — no regression, and the
+/// damage is visible as a short tag. Too wide silently **invents** tag values
+/// Obsidian never reported: new rows in the tag index, changed values and end
+/// offsets, and tag searches that disagree with Obsidian over the same vault.
+/// Widening later on a new capture is a one-character edit; unwinding a wrong
+/// widening means re-indexing. Accepting U+1F642 is equally consistent with
+/// "stop at ASCII punctuation and ASCII symbols, keep everything else", which
+/// is what Obsidian's own documentation describes for the ASCII range.
+///
+/// ASCII-versus-non-ASCII is not a principled Unicode boundary, so this is a
+/// holding position, not a finding. **The capture that settles it** is
+/// `#tag+more #a=b #c^d #p$ #tag-☺` written into a scratch note and read back
+/// through `app.metadataCache.getFileCache` on a live Obsidian 1.13.4 — a
+/// minute's work for whoever next has the app open, and it belongs in the
+/// corpus before this reaches a real vault. Characters a symbol sequence can
+/// carry but no capture shows — a variation selector (`Mn`), a zero-width
+/// joiner (`Cf`) — are outside the class for the same reason.
+///
+/// [`crate::frontmatter::is_valid_tag_text`] validates the same set, for tags
+/// that arrive through frontmatter rather than through this scan.
 static TAG_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"#[\p{Alphabetic}\p{N}_/-]+").expect("tag candidate pattern compiles")
+    Regex::new(r"#[\p{Alphabetic}\p{N}_/\-[\p{S}&&[^\x00-\x7F]]]+")
+        .expect("tag candidate pattern compiles")
 });
 
 pub(crate) struct ObsidianScan {
@@ -50,9 +93,29 @@ pub(crate) fn scan_text_ranges(document: &SourceDocument, ranges: &[SourceSpan])
     scan
 }
 
-/// Scan every string-valued property's raw scalar source for wikilinks. The
+/// Scan every string-valued property's raw scalar source for references. The
 /// scalar span is the anchor, so offsets stay correct even for quoted YAML.
-pub(crate) fn scan_property_wikilinks(
+///
+/// Both written forms count. Obsidian reports a Markdown link in a property
+/// under `frontmatterLinks` exactly as it reports a wikilink there —
+/// `parity-frontmatter-links` captures `related.1` as
+/// `[Markdown target](Parity%20target.md)` with `link: "Parity target.md"` —
+/// so scanning only the wikilink form dropped the reference entirely. The
+/// wikilink scan runs first and the Markdown scan sees only what it did not
+/// consume, which is what keeps `[[Target]]` from also reading as a Markdown
+/// label.
+///
+/// **Known gap: a `"…"` link title inside a double-quoted YAML scalar.** The
+/// scan reads the *raw source* deliberately, so that a span stays correct for
+/// a quoted scalar; the cost is that YAML's own escapes are still in the text
+/// it reads. `t: "[Label](Target.md \"A title\")"` therefore finds `\"` where
+/// a closing quote belongs, fails the closing-paren check, and yields no
+/// reference. The single-quoted spellings — `t: '[Label](Target.md "A
+/// title")'` and a `'…'` title — both work, as does the same link in the body.
+/// This is the same raw-source-versus-YAML-escape tension the wikilink scan
+/// already lives with rather than a new one, and no capture covers it;
+/// unescaping would have to keep a byte-exact map back to the raw span.
+pub(crate) fn scan_property_references(
     document: &SourceDocument,
     properties: &[Property],
 ) -> (Vec<Reference>, Vec<Diagnostic>) {
@@ -84,14 +147,23 @@ pub(crate) fn scan_property_wikilinks(
             let Some(slice) = text.get(spanned.span.start()..spanned.span.end()) else {
                 continue;
             };
+            let mut consumed: Vec<Range<usize>> = Vec::new();
             scan_wikilinks(
                 slice,
                 spanned.span.start(),
                 ReferenceOrigin::Property,
                 &mut references,
                 &mut diagnostics,
-                None,
+                Some(&mut consumed),
             );
+            for unconsumed in subtract(0..slice.len(), &consumed) {
+                scan_markdown_links(
+                    &slice[unconsumed.clone()],
+                    spanned.span.start() + unconsumed.start,
+                    ReferenceOrigin::Property,
+                    &mut references,
+                );
+            }
         }
     }
     (references, diagnostics)
@@ -195,6 +267,173 @@ fn scan_wikilinks(
         }
         search = close + 2;
     }
+}
+
+/// One inline Markdown link, located in raw source text. Every range is
+/// relative to the slice it was found in.
+struct MarkdownLinkMatch {
+    whole: Range<usize>,
+    label: Range<usize>,
+    destination: Range<usize>,
+    kind: ReferenceKind,
+}
+
+/// Scan a slice of raw source for inline Markdown links and embeds.
+///
+/// This is the property-value counterpart of the body's CommonMark walk, which
+/// never sees frontmatter. It reads the source directly — a property value is
+/// a YAML scalar, not a Markdown document, so there is no mdast to walk — and
+/// recognises the inline form only: a reference-style link has no destination
+/// to resolve inside a property, and no capture shows Obsidian resolving one
+/// there. The embed form (`![label](target)`) is scanned for symmetry with the
+/// wikilink scanner, which reads `![[…]]` in a property; no capture exercises
+/// it.
+fn scan_markdown_links(
+    slice: &str,
+    base: usize,
+    origin: ReferenceOrigin,
+    references: &mut Vec<Reference>,
+) {
+    let mut search = 0;
+    while let Some(offset) = slice[search..].find('[') {
+        let index = search + offset;
+        let Some(found) = parse_markdown_link(slice, index) else {
+            // With no `]` left after this bracket, no later `[` can close
+            // either — so a run of unmatched brackets ends the scan here
+            // instead of rescanning the tail once per bracket.
+            if !slice[index + 1..].contains(']') {
+                return;
+            }
+            search = index + 1;
+            continue;
+        };
+        let raw_target = slice[found.destination.clone()].to_string();
+        let (file_target, subpath) = split_markdown_target(&raw_target);
+        let display = slice[found.label].to_string();
+        let target_span =
+            SourceSpan::new(base + found.destination.start, base + found.destination.end)
+                .expect("destination span is ordered");
+        references.push(Reference {
+            kind: found.kind,
+            origin,
+            raw_target,
+            file_target,
+            subpath,
+            display: (!display.is_empty()).then_some(display),
+            span: SourceSpan::new(base + found.whole.start, base + found.whole.end)
+                .expect("reference span is ordered"),
+            target_span,
+        });
+        search = found.whole.end;
+    }
+}
+
+/// Parse one inline Markdown link whose label opens at `index`, or return
+/// `None` when the text there is not one.
+///
+/// Byte scanning is safe over UTF-8: every position this function stops at is
+/// an ASCII delimiter, and a continuation byte matches no arm.
+///
+/// Escaping is [`is_escaped`]'s, which reads one byte back and so treats `\\[`
+/// — an escaped backslash *before* a bracket — as an escaped bracket. That is
+/// pre-existing and shared with [`scan_wikilinks`]; the two stay consistent
+/// rather than one of them being quietly stricter.
+fn parse_markdown_link(slice: &str, index: usize) -> Option<MarkdownLinkMatch> {
+    let bytes = slice.as_bytes();
+    if bytes.get(index) != Some(&b'[') || is_escaped(bytes, index) {
+        return None;
+    }
+    let mut start = index;
+    let mut kind = ReferenceKind::MarkdownLink;
+    if index >= 1 && bytes[index - 1] == b'!' && !is_escaped(bytes, index - 1) {
+        start = index - 1;
+        kind = ReferenceKind::MarkdownEmbed;
+    }
+
+    let mut cursor = index + 1;
+    let mut depth = 1usize;
+    while cursor < bytes.len() && depth > 0 {
+        match bytes[cursor] {
+            b'\\' => cursor += 1,
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b'\n' => return None,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if depth != 0 || bytes.get(cursor) != Some(&b'(') {
+        return None;
+    }
+    let label = index + 1..cursor - 1;
+    cursor += 1;
+
+    while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_whitespace()) {
+        cursor += 1;
+    }
+    let destination = if bytes.get(cursor) == Some(&b'<') {
+        let opened = cursor + 1;
+        let mut end = opened;
+        loop {
+            match bytes.get(end) {
+                Some(b'\\') => end += 2,
+                Some(b'>') => break,
+                Some(_) => end += 1,
+                None => return None,
+            }
+        }
+        cursor = end + 1;
+        opened..end
+    } else {
+        let opened = cursor;
+        let mut parens = 0usize;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\\' => cursor += 1,
+                b'(' => parens += 1,
+                b')' => {
+                    if parens == 0 {
+                        break;
+                    }
+                    parens -= 1;
+                }
+                byte if byte.is_ascii_whitespace() => break,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        opened..cursor.min(bytes.len())
+    };
+
+    // An optional title, then the closing parenthesis.
+    while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_whitespace()) {
+        cursor += 1;
+    }
+    if let Some(&quote @ (b'"' | b'\'')) = bytes.get(cursor) {
+        cursor += 1;
+        loop {
+            match bytes.get(cursor) {
+                Some(b'\\') => cursor += 2,
+                Some(byte) if *byte == quote => break,
+                Some(_) => cursor += 1,
+                None => return None,
+            }
+        }
+        cursor += 1;
+        while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+    }
+    if bytes.get(cursor) != Some(&b')') {
+        return None;
+    }
+
+    Some(MarkdownLinkMatch {
+        whole: start..cursor + 1,
+        label,
+        destination,
+        kind,
+    })
 }
 
 fn find_unescaped(text: &str, needle: u8) -> Option<usize> {

@@ -1,0 +1,109 @@
+{
+  "obsidianVersion": "1.13.4",
+  "cache": {
+    "links": [
+      {
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 10,
+            "offset": 10
+          },
+          "end": {
+            "line": 0,
+            "col": 27,
+            "offset": 27
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target]]",
+        "displayText": "Parity target"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 1,
+            "col": 14,
+            "offset": 42
+          },
+          "end": {
+            "line": 1,
+            "col": 31,
+            "offset": 59
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target]]",
+        "displayText": "Parity target"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 2,
+            "col": 17,
+            "offset": 77
+          },
+          "end": {
+            "line": 2,
+            "col": 34,
+            "offset": 94
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target]]",
+        "displayText": "Parity target"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 3,
+            "col": 8,
+            "offset": 103
+          },
+          "end": {
+            "line": 3,
+            "col": 25,
+            "offset": 120
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target]]",
+        "displayText": "Parity target"
+      },
+      {
+        "position": {
+          "start": {
+            "line": 4,
+            "col": 25,
+            "offset": 146
+          },
+          "end": {
+            "line": 4,
+            "col": 42,
+            "offset": 163
+          }
+        },
+        "link": "Parity target",
+        "original": "[[Parity target]]",
+        "displayText": "Parity target"
+      }
+    ],
+    "sections": [
+      {
+        "type": "paragraph",
+        "position": {
+          "start": {
+            "line": 0,
+            "col": 0,
+            "offset": 0
+          },
+          "end": {
+            "line": 4,
+            "col": 42,
+            "offset": 163
+          }
+        }
+      }
+    ]
+  }
+}

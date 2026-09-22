@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use vault_index::{IndexConfig, LiveState};
 use vault_protocol::{
-    GetDiagnosticsParams, GetNoteResponse, ListReferencesParams, LiveStateDto, NotePathParams,
-    PageParams, PathPageParams, ReferenceStatusFilter, Request, RequestEnvelope, ResolveLinkParams,
-    Response, ResponseEnvelope, ResponseOutcome, SeverityDto,
+    GetDiagnosticsParams, GetNoteResponse, GetTreeEntriesParams, ListReferencesParams,
+    LiveStateDto, NotePathParams, PageParams, PathPageParams, ReferenceStatusFilter, Request,
+    RequestEnvelope, ResolveLinkParams, Response, ResponseEnvelope, ResponseOutcome, SeverityDto,
 };
 use vault_server::Server;
 use vault_server::runtime::{Runtime, RuntimeNotice, RuntimeOptions, RuntimeTestHooks};
@@ -100,6 +100,7 @@ fn configured_server_dispatches_indexed_reads_and_refresh() {
         "note-1",
         Request::GetNote(NotePathParams {
             path: "Note.md".into(),
+            include: Vec::new(),
         }),
     ));
 
@@ -121,6 +122,27 @@ fn health_only_server_keeps_health_and_refuses_indexed_reads() {
             "note-2",
             Request::GetNote(NotePathParams {
                 path: "Note.md".into(),
+                include: Vec::new(),
+            }),
+        ),
+        &mut subscriptions,
+    );
+    assert!(matches!(
+        response.outcome,
+        ResponseOutcome::Err(ref error)
+            if error.code == vault_protocol::ErrorCode::IndexUnavailable
+    ));
+
+    // `get_tree_entries` takes the same arm, and this is the one branch of it
+    // `tests/tree_entries.rs` cannot reach: that suite always has a vault. A
+    // read with no index behind it answers `index_unavailable` rather than an
+    // empty answer, because "nothing is there" and "I cannot tell you" are
+    // different statements and only one of them is safe to act on.
+    let response = server.handle(
+        RequestEnvelope::new(
+            "tree-2",
+            Request::GetTreeEntries(GetTreeEntriesParams {
+                paths: vec!["Note.md".into()],
             }),
         ),
         &mut subscriptions,
@@ -282,6 +304,7 @@ fn invalid_paths_and_missing_notes_map_to_stable_errors() {
         "d-invalid",
         Request::GetNote(NotePathParams {
             path: "../escape.md".into(),
+            include: Vec::new(),
         }),
     ));
     assert!(matches!(
@@ -294,6 +317,7 @@ fn invalid_paths_and_missing_notes_map_to_stable_errors() {
         "d-missing",
         Request::GetNote(NotePathParams {
             path: "Nope.md".into(),
+            include: Vec::new(),
         }),
     ));
     assert!(matches!(

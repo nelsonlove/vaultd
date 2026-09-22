@@ -3,9 +3,10 @@
 //! break, not a refactor.
 
 use vault_protocol::{
-    CopyConflictDto, DeleteModeDto, ExpectedDto, GenerationResponse, LinkRewriteFailureDto,
-    MutationResponse, PatchValueDto, ReadFileResponse, RenameResponse, Request, RequestEnvelope,
-    Response, ResponseEnvelope, ResponseOutcome, WriteFileResponse, WriteNoteParams,
+    CopyConflictDto, DeleteModeDto, DirEntryDto, DirEntryKindDto, ExpectedDto, GenerationResponse,
+    KeyPathDto, LinkRewriteFailureDto, MutationResponse, PatchValueDto, ReadDirResponse,
+    ReadFileResponse, RenameResponse, Request, RequestEnvelope, Response, ResponseEnvelope,
+    ResponseOutcome, WriteFileResponse, WriteNoteParams,
 };
 
 #[test]
@@ -190,7 +191,7 @@ fn a_rename_response_reports_rewrites_and_the_files_it_skipped() {
 /// The module header claims every wire spelling here is pinned. Before this
 /// test, only `write_note` and `patch_frontmatter` actually were — nothing
 /// guarded `create_folder`, `rename_note`, `rename_folder`, `copy_file`,
-/// `delete_note`, `delete_folder`, `write_file`, or `read_file`, nor their
+/// `delete_note`, `delete_folder`, `write_file`, `read_file`, or `read_dir`, nor their
 /// field names. A rename during a later refactor would otherwise be a
 /// silent protocol break with a green suite.
 #[test]
@@ -206,6 +207,11 @@ fn every_new_method_name_and_field_spelling_round_trips_through_its_exact_json()
         r##"{"version":1,"id":"8","request":{"method":"patch_frontmatter","params":{"path":"a.md","patch":[],"expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"9","request":{"method":"write_file","params":{"path":"a.png","content_base64":"Zm9v","expected":{"any":true}}}}"##,
         r##"{"version":1,"id":"10","request":{"method":"read_file","params":{"path":"a.png"}}}"##,
+        r##"{"version":1,"id":"11","request":{"method":"read_dir","params":{"path":"a"}}}"##,
+        // The root, which is `read_dir`'s alone: no other operation gives the
+        // empty string a meaning, and a decoder that started rejecting it here
+        // would take the one listing that can discover `.obsidian/` with it.
+        r##"{"version":1,"id":"12","request":{"method":"read_dir","params":{"path":""}}}"##,
     ];
     for line in lines {
         let envelope: RequestEnvelope =
@@ -223,7 +229,7 @@ fn every_new_method_name_and_field_spelling_round_trips_through_its_exact_json()
 /// entirely when absent rather than serializing as `null`.
 #[test]
 fn every_new_response_shape_round_trips_through_its_exact_json() {
-    let cases: [(Response, &str); 11] = [
+    let cases: [(Response, &str); 15] = [
         (
             Response::WriteNote(MutationResponse {
                 generation: 1,
@@ -232,8 +238,18 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
             r#"{"type":"write_note","value":{"generation":1,"revision":"r"}}"#,
         ),
         (
-            Response::CreateFolder(GenerationResponse { generation: 2 }),
+            Response::CreateFolder(GenerationResponse {
+                generation: Some(2),
+            }),
             r#"{"type":"create_folder","value":{"generation":2}}"#,
+        ),
+        // The unindexable half of the same verb: a folder the index will never
+        // list joins no generation, and the key is omitted outright rather
+        // than fabricated as `0` — which is a well-formed generation a client
+        // would then read at.
+        (
+            Response::CreateFolder(GenerationResponse { generation: None }),
+            r#"{"type":"create_folder","value":{}}"#,
         ),
         (
             Response::RenameNote(RenameResponse {
@@ -261,11 +277,15 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
             r#"{"type":"copy_file","value":{"generation":5,"revision":"r"}}"#,
         ),
         (
-            Response::DeleteNote(GenerationResponse { generation: 6 }),
+            Response::DeleteNote(GenerationResponse {
+                generation: Some(6),
+            }),
             r#"{"type":"delete_note","value":{"generation":6}}"#,
         ),
         (
-            Response::DeleteFolder(GenerationResponse { generation: 7 }),
+            Response::DeleteFolder(GenerationResponse {
+                generation: Some(7),
+            }),
             r#"{"type":"delete_folder","value":{"generation":7}}"#,
         ),
         (
@@ -297,6 +317,48 @@ fn every_new_response_shape_round_trips_through_its_exact_json() {
                 revision: "r".into(),
             }),
             r#"{"type":"read_file","value":{"content_base64":"Zm9v","revision":"r"}}"#,
+        ),
+        (
+            Response::ReadDir(ReadDirResponse {
+                path: "a".into(),
+                entries: vec![
+                    DirEntryDto {
+                        name: "b".into(),
+                        kind: DirEntryKindDto::Folder,
+                        size: None,
+                    },
+                    DirEntryDto {
+                        name: "c.png".into(),
+                        kind: DirEntryKindDto::File,
+                        size: Some(3),
+                    },
+                ],
+            }),
+            r#"{"type":"read_dir","value":{"path":"a","entries":[{"name":"b","kind":"folder"},{"name":"c.png","kind":"file","size":3}]}}"#,
+        ),
+        // A symlink carries no size: the number a `stat` hands back for one is
+        // the length of its target string, which is not a fact about anything
+        // a client could read, so the key is omitted rather than reported.
+        (
+            Response::ReadDir(ReadDirResponse {
+                path: String::new(),
+                entries: vec![DirEntryDto {
+                    name: "Link".into(),
+                    kind: DirEntryKindDto::Symlink,
+                    size: None,
+                }],
+            }),
+            r#"{"type":"read_dir","value":{"path":"","entries":[{"name":"Link","kind":"symlink"}]}}"#,
+        ),
+        // An empty directory is an empty list, never a refusal: "nothing is in
+        // here" is an answer a host acts on, and a plugin folder a client just
+        // created is exactly that.
+        (
+            Response::ReadDir(ReadDirResponse {
+                path: ".obsidian/plugins".into(),
+                entries: vec![],
+            }),
+            r#"{"type":"read_dir","value":{"path":".obsidian/plugins","entries":[]}}"#,
         ),
     ];
     for (response, expected_value) in cases {
@@ -377,4 +439,118 @@ fn a_revision_conflict_carries_both_the_current_revision_and_generation() {
         }
         other => panic!("expected an error outcome, got {other:?}"),
     }
+}
+
+/// Task 1e (a): `key_path` also accepts an **array of literal segments**, so a
+/// key whose own name carries a `.` can be addressed at all. The dot-string
+/// form is unchanged and still splits on every `.`; the array form splits on
+/// nothing.
+#[test]
+fn a_key_path_may_be_an_array_of_literal_segments() {
+    let line = r#"{"version":1,"id":"p2","request":{"method":"patch_frontmatter","params":{"path":"One.md","patch":[{"key_path":["my.key","sub"],"value":"set"}],"expected":{"any":true}}}}"#;
+    let envelope: RequestEnvelope = serde_json::from_str(line).expect("decode an array key path");
+    match &envelope.request {
+        Request::PatchFrontmatter(params) => {
+            assert_eq!(
+                params.patch[0].key_path,
+                KeyPathDto::Segments(vec!["my.key".into(), "sub".into()]),
+                "each element is one literal key, dots included"
+            );
+            assert_eq!(
+                params.patch[0].key_path.segments(),
+                vec!["my.key", "sub"],
+                "the array form splits on nothing"
+            );
+        }
+        other => panic!("expected patch_frontmatter, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_string(&envelope).expect("re-encode"),
+        line,
+        "the array form round-trips as an array"
+    );
+}
+
+/// What an array `key_path` is **not**. A segment is a string; anything else
+/// is a typed decode error rather than a panic or a coerced value, and the
+/// transport reports every one of them as `invalid_request` with the serde
+/// text carried through. The empty array is pinned end to end in
+/// `vault-server`'s `frontmatter_patch_wire.rs`, because it decodes fine and
+/// is refused one layer later.
+#[test]
+fn an_array_key_path_takes_strings_and_nothing_else() {
+    for spelling in [
+        r#"{"key_path":["a",3],"value":"set"}"#,
+        r#"{"key_path":["a",null],"value":"set"}"#,
+        r#"{"key_path":[["a"]],"value":"set"}"#,
+        r#"{"key_path":{"a":1},"value":"set"}"#,
+        r#"{"key_path":7,"value":"set"}"#,
+    ] {
+        let error = serde_json::from_str::<vault_protocol::FrontmatterEditDto>(spelling)
+            .expect_err("a key path is a string or an array of strings");
+        assert!(
+            error.to_string().contains("invalid type"),
+            "error should name the type mismatch for {spelling}: {error}"
+        );
+    }
+}
+
+/// The dot-string form keeps its meaning exactly: every `.` starts a new
+/// segment, which is why the array form had to exist.
+#[test]
+fn the_dot_string_key_path_still_splits_on_every_dot() {
+    let dotted: vault_protocol::FrontmatterEditDto =
+        serde_json::from_str(r#"{"key_path":"my.key","value":"set"}"#).expect("decode a dot path");
+    assert_eq!(dotted.key_path, KeyPathDto::Dotted("my.key".into()));
+    assert_eq!(dotted.key_path.segments(), vec!["my", "key"]);
+}
+
+/// Task 1e (b): `set_null: true` with **no** `value` key writes a YAML null
+/// for the addressed key. It is the one action that is neither a set nor a
+/// deletion, and `processFrontMatter` parity needs it: a plugin setting
+/// `fm.key = null` must not delete the key.
+#[test]
+fn set_null_decodes_as_its_own_action_without_a_value_key() {
+    let line = r#"{"version":1,"id":"p3","request":{"method":"patch_frontmatter","params":{"path":"One.md","patch":[{"key_path":"reviewed","set_null":true}],"expected":{"any":true}}}}"#;
+    let envelope: RequestEnvelope = serde_json::from_str(line).expect("decode set_null");
+    match &envelope.request {
+        Request::PatchFrontmatter(params) => {
+            assert!(params.patch[0].set_null);
+            assert_eq!(params.patch[0].value, None);
+        }
+        other => panic!("expected patch_frontmatter, got {other:?}"),
+    }
+    assert_eq!(serde_json::to_string(&envelope).expect("re-encode"), line);
+}
+
+/// `set_null` and `value` say contradictory things about one key — write a
+/// null, or set/delete it — so the pair is refused rather than silently
+/// resolved. Both spellings of `value` are covered, the explicit `null`
+/// (deletion) included; over the transport either is `invalid_request`.
+#[test]
+fn set_null_together_with_value_is_refused_rather_than_ordered() {
+    for spelling in [
+        r#"{"key_path":"a","value":"set","set_null":true}"#,
+        r#"{"key_path":"a","value":null,"set_null":true}"#,
+    ] {
+        let error = serde_json::from_str::<vault_protocol::FrontmatterEditDto>(spelling)
+            .expect_err("`set_null` with a `value` has no defined meaning");
+        assert!(
+            error.to_string().contains("set_null"),
+            "error should name the conflict: {error}"
+        );
+    }
+}
+
+/// `set_null: false` says nothing, so an omitted `value` beside it is the
+/// same decode error it was before (b) existed.
+#[test]
+fn an_omitted_value_beside_a_false_set_null_is_still_a_decode_error() {
+    let spelling = r#"{"key_path":"a","set_null":false}"#;
+    let error = serde_json::from_str::<vault_protocol::FrontmatterEditDto>(spelling)
+        .expect_err("an omitted `value` must not silently mean deletion");
+    assert!(
+        error.to_string().contains("value"),
+        "error should name the missing field: {error}"
+    );
 }

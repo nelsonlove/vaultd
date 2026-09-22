@@ -2,6 +2,14 @@
 //! the real protocol types: each block must parse as JSON and deserialize
 //! cleanly as a `RequestEnvelope`, `ResponseEnvelope`, or `EventEnvelope`.
 //!
+//! What this proves and what it does not: every block PARSES into the
+//! shipped types — it never checks a documented VALUE. A well-formed but
+//! wrong number (the `get_note` `include` example once said `end: 18` where
+//! the daemon answers `17`) passes here untouched; documented values are
+//! pinned where a live daemon is spawned over the example's own source
+//! (see `tests/tree_entries.rs`), and the phase-6 docs task carries the
+//! general live-truth check for examples.
+//!
 //! This exists because the documentation drifted from the shipped types
 //! once already (the `get_vault_info` example was missing `live_state`
 //! until Task 12's checkpoint caught it by hand). A doc example that no
@@ -112,21 +120,27 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
         }
     }
 
-    // One request/response pair per documented operation — the eleven read
-    // and subscription operations, the ten mutation and raw-file operations,
-    // and the four snapshot-session operations — plus the four event examples
+    // One request/response pair per documented operation — the twelve read
+    // and subscription operations, the eleven mutation and raw-path
+    // operations (`read_dir` is the eleventh, the raw listing half of the
+    // pair `read_file` reads bytes through), and the four snapshot-session
+    // operations — plus the four event examples
     // and the three extra error-outcome examples under "Errors"
     // (`generation_mismatch`, `vault_changed_during_refresh`, and the
     // `storage_failure` shape that carries `current_revision` to say a write
-    // reached disk). A count regression here means an operation lost its
-    // documented example, not just that a JSON block became unparseable.
+    // reached disk). Two operations carry a second pair, because a second
+    // shape of their answer is contractual: `get_note` with `include` (the
+    // structural facets, absent from the first) and `create_folder` inside the
+    // `.obsidian` zone (whose `generation` key is absent, not zero). A count
+    // regression here means an operation lost its documented example, not just
+    // that a JSON block became unparseable.
     assert_eq!(
-        requests, 25,
-        "expected 25 request examples, see docs/protocol.md"
+        requests, 29,
+        "expected 29 request examples, see docs/protocol.md"
     );
     assert_eq!(
-        responses, 28,
-        "expected 28 response examples (25 success + 3 error), see docs/protocol.md"
+        responses, 32,
+        "expected 32 response examples (29 success + 3 error), see docs/protocol.md"
     );
     assert_eq!(events, 4, "expected 4 event examples, see docs/protocol.md");
 }

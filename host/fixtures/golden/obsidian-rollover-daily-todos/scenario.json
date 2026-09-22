@@ -1,0 +1,20 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "1.2.0",
+  "settings": {
+    "templateHeading": "## Todos",
+    "deleteOnComplete": true,
+    "removeEmptyTodos": true,
+    "rolloverChildren": true,
+    "rolloverOnFileCreate": true,
+    "doneStatusMarkers": "xX-"
+  },
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "obsidian-rollover-daily-todos:obsidian-rollover-daily-todos-rollover"
+    }
+  },
+  "humanAction": "Ran \"Rollover Daily Todos: Rollover Todos Now\" from the command palette with the core daily-notes folder pointed at Daily/, format YYYY-MM-DD, no template. Unfinished todos moved out of Daily/2026-09-08.md into Daily/2026-09-09.md under the \"## Todos\" heading; the finished todo stayed behind.",
+  "notes": "DATE-DEPENDENT: the capture ran on 2026-09-09, so Daily/2026-09-09.md is \"today\" and Daily/2026-09-08.md is the previous daily note. A replay must either pin the clock to 2026-09-09 or shift both fixture file names to the replay date. HOST PRECONDITION: the core daily-notes plugin must be enabled with options {folder: \"Daily\", format: \"YYYY-MM-DD\", template: \"\"}; the plugin reads them through getDailyNoteSettings on every call. Calling rollover(file) with an explicit file is refused unless the file was created within the plugin's MAX_TIME_SINCE_CREATION window, so the command path (file undefined, which sets ignoreCreationTime) is the only reliable entry point. deleteOnComplete is true, which is why the rolled-over todos are removed from the previous day's note. The plugin is not enabled in the capture vault; it was loaded at runtime with enablePlugin (never enablePluginAndSave), guarded so it could only see the scratch daily notes, and unloaded again."
+}

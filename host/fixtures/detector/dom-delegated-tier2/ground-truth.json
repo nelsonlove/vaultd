@@ -1,0 +1,25 @@
+{
+  "minified": false,
+  "apiSymbols": {
+    "registerDomEvent": 1,
+    "addEventListener": 1,
+    "showAtMouseEvent": 1
+  },
+  "genericSymbols": {
+    "on": 1
+  },
+  "lifecycleGates": {
+    "onLayoutReady": 0,
+    "layoutReadyRead": 0,
+    "metadataResolved": 0,
+    "metadataResolve": 0
+  },
+  "commandIds": [],
+  "eventNames": [
+    "contextmenu"
+  ],
+  "frameworks": [],
+  "crossPlugin": [],
+  "internalPlugins": [],
+  "tierEstimate": 2
+}

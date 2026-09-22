@@ -1,0 +1,98 @@
+{
+  "obsidianVersion": "1.13.4",
+  "pluginVersion": "2.24.2",
+  "settings": {
+    "choices": [
+      {
+        "id": "template-daily",
+        "name": "Daily from template",
+        "type": "Template",
+        "command": true,
+        "templatePath": "Templates/Daily.md",
+        "fileNameFormat": {
+          "enabled": true,
+          "format": "Journal/2026-08-30"
+        },
+        "discoverExistingNotesBeforeCreate": false,
+        "folder": {
+          "enabled": false,
+          "folders": [],
+          "chooseWhenCreatingNote": false,
+          "createInSameFolderAsActiveFile": false,
+          "chooseFromSubfolders": false
+        },
+        "appendLink": false,
+        "copyLinkToClipboard": false,
+        "openFile": false,
+        "fileExistsBehavior": {
+          "kind": "increment"
+        }
+      },
+      {
+        "id": "macro-hash",
+        "name": "Hash with a user script",
+        "type": "Macro",
+        "command": true,
+        "macro": {
+          "id": "macro-hash-body",
+          "name": "Hash",
+          "commands": [
+            {
+              "id": "macro-hash-step",
+              "name": "hash",
+              "type": "UserScript",
+              "path": "Scripts/hash.md",
+              "settings": {}
+            }
+          ]
+        }
+      },
+      {
+        "id": "choose-folder",
+        "name": "Choose a folder",
+        "type": "Template",
+        "command": true,
+        "templatePath": "Templates/Daily.md",
+        "fileNameFormat": {
+          "enabled": true,
+          "format": "Chosen note"
+        },
+        "discoverExistingNotesBeforeCreate": false,
+        "folder": {
+          "enabled": true,
+          "folders": [
+            "Journal",
+            "Archive"
+          ],
+          "chooseWhenCreatingNote": true,
+          "createInSameFolderAsActiveFile": false,
+          "chooseFromSubfolders": false
+        },
+        "appendLink": false,
+        "copyLinkToClipboard": false,
+        "openFile": false,
+        "fileExistsBehavior": {
+          "kind": "increment"
+        }
+      }
+    ],
+    "inputPrompt": "single-line",
+    "devMode": false,
+    "templateFolderPaths": [
+      "Templates"
+    ],
+    "announceUpdates": "none",
+    "version": "2.24.2",
+    "globalVariables": {},
+    "disableOnlineFeatures": true,
+    "enableRibbonIcon": false
+  },
+  "action": {
+    "op": "host.invoke_command",
+    "params": {
+      "command_id": "quickadd:choice:template-daily"
+    }
+  },
+  "humanAction": "NOT PERFORMED IN A LIVE OBSIDIAN. The capture ran \"QuickAdd: Run QuickAdd\", which only opens a suggester, so it mutated nothing and expected/ is byte-identical to vault/. This scenario instead names the non-interactive Template choice, which really writes a note - Task 22 needs a headless-invokable choice, and a choice only exists if data.json declares it. The three choices below are authored for this repository, not captured.",
+  "notes": "SETTINGS ARE AUTHORED, NOT CAPTURED (Task 22). The live data.json is 99 KB of the human's personal QuickAdd choices, full of their own vault paths, and vendoring it would be both noise and a privacy leak; the captured action mutated nothing, so the real settings were never load-bearing here. These three choices are the minimum that makes QuickAdd's headless surface testable, and they are named in the same order Task 22's brief names them: a non-interactive Template choice (quickadd:choice:template-daily), a Macro whose one step is a user script that requires node:crypto (quickadd:choice:macro-hash), and an interactive Template choice whose folder step opens a suggester (quickadd:choice:choose-folder). EXPECTED/ IS NOT A CAPTURE OF THIS ACTION. It is byte-identical to vault/, which was the honest outcome of runQuickAdd; the Template choice writes Journal/2026-08-30.md and NO live Obsidian produced that tree. The golden driver therefore does not compare quickadd's tree at all (compare: none) and test/golden/quickadd.test.ts asserts the content against the template the fixture supplies instead. Capturing the real outcome needs a scratch vault driven by hand. OBSERVED COMMAND SHAPE: besides the six fixed commands (runQuickAdd, resumePrompt, runTemplateFromFolder, applyTemplateToActiveFile, reloadQuickAdd, openQuickAddSettings) QuickAdd registers one command per configured choice, with the id quickadd:choice:<choice id>."
+}

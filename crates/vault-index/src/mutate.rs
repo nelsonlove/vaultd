@@ -924,6 +924,41 @@ pub struct LinkRewriteFailure {
     pub reason: LinkRewriteReason,
 }
 
+/// What one entry of a directory listing is.
+///
+/// Deliberately **not** the tree index's kind. That vocabulary is semantic —
+/// it separates a `note` from an ordinary `file`, because a note is a row the
+/// index holds — and a directory listing answers a filesystem question about
+/// paths the index does not hold at all. What a listing must distinguish
+/// instead is what a host may walk into: a folder it can descend, a file it
+/// can read, a symlink it must not follow blindly, and everything else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirEntryKind {
+    File,
+    Folder,
+    Symlink,
+    /// A fifo, a socket, a device — anything on disk that is none of the
+    /// three above. The vocabulary is total by construction, so it never has
+    /// to grow to describe something a filesystem can hold.
+    Other,
+}
+
+/// One immediate entry of a directory.
+///
+/// `name` is the entry's own name, never a path: a client that asked for a
+/// directory already knows where it is, and joining the two here would invite
+/// a second spelling of a path the request already fixed.
+///
+/// `size` is present for a regular file and absent for everything else. A
+/// folder has no size worth reporting, and a symlink's is the length of its
+/// target string rather than of anything a client could read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: DirEntryKind,
+    pub size: Option<u64>,
+}
+
 /// What one applied mutation did on disk.
 #[derive(Clone, Debug, Default)]
 pub struct MutationOutcome {
@@ -947,17 +982,19 @@ pub struct MutationOutcome {
     /// re-observes a path and finds nothing changed — while under-naming is a
     /// missing generation.
     pub changed_paths: BTreeSet<VaultPath>,
-    /// The **stored spelling of the file a raw write landed on**, which is not
+    /// The **stored spelling of the path a write landed on**, which is not
     /// always a path `changed_paths` may name.
     ///
-    /// It exists because `write_file` is the only verb whose *answer* varies
-    /// with where the bytes went rather than with what the caller called them.
-    /// Every other verb refuses outright any path that resolves somewhere its
-    /// answer would differ — `write_note` re-asks [`is_unindexable`] on the
-    /// stored spelling and refuses — so for those two the named path and the
-    /// landed path can never disagree in a way a client could see, and they
-    /// leave this `None`. The raw pair deliberately *serves* both sides of
-    /// that predicate, so only it has to carry the answer out.
+    /// It exists because `write_file` and `create_folder` are the two verbs
+    /// whose *answer* varies with where the write went rather than with what
+    /// the caller called it. Every other verb refuses outright any path that
+    /// resolves somewhere its answer would differ — `write_note` re-asks
+    /// [`is_unindexable`] on the stored spelling and refuses — so for those the
+    /// named path and the landed path can never disagree in a way a client
+    /// could see, and they leave this `None`. These two deliberately *serve*
+    /// both sides of that predicate, so they have to carry the answer out:
+    /// `write_file` for its `semantic` and its generation, `create_folder` for
+    /// its generation and for whether the configuration zone was touched.
     ///
     /// The caller's spelling is not a substitute. `.OBSIDIAN/app.json` reaches
     /// the real zone on any case-folding filesystem, a symlink named anything
@@ -1072,7 +1109,16 @@ pub fn is_unindexable(path: &VaultPath) -> bool {
 /// with the post-resolve one — a target that does not exist has no stored
 /// spelling to check, and `.git/hooks` must be refused as a zone violation
 /// rather than reported as merely absent.
-fn is_unindexable_folder(path: &VaultPath) -> bool {
+///
+/// `create_folder` is the one verb that *serves* the paths this answers `true`
+/// for rather than refusing them, so for it the two applications mean
+/// different things: the caller's spelling grants the permission, and the
+/// stored spelling only refuses the mismatch (an ordinary name that resolves
+/// onto an unindexable folder). Public because it is also the **wire's**
+/// folder predicate — the server decides `create_folder`'s reported generation
+/// from it, applied to the landed spelling, exactly as `write_file` decides
+/// `semantic` from [`is_unindexable`].
+pub fn is_unindexable_folder(path: &VaultPath) -> bool {
     is_unindexable(path) || path.name().starts_with('.')
 }
 
@@ -1593,6 +1639,106 @@ impl MutationEngine {
         }
     }
 
+    /// The immediate entries of one directory, straight off the filesystem.
+    ///
+    /// `None` names the **vault root**, which has no [`VaultPath`] spelling at
+    /// all — `VaultPath::new("")` is an error, and `resolve` of a root-shaped
+    /// path would check the root's *parent* for containment and refuse it. So
+    /// the root is a distinct argument rather than a path this function
+    /// special-cases after parsing.
+    ///
+    /// Off the index on purpose. The vault scan excludes every hidden
+    /// *directory* by design — a hidden *file* such as `.gitignore` is an
+    /// ordinary tree row, which is the rule [`VaultPath::is_hidden`] states —
+    /// so nothing built on the index can answer "what is inside
+    /// `.obsidian-headless/plugins/`", which is precisely the question a
+    /// plugin host asks first. This walks the directory itself, takes the same
+    /// containment [`MutationEngine::read_file`] takes, and joins no
+    /// generation.
+    ///
+    /// No payload cap applies. [`MutationEngine::read_file`] weighs the file on
+    /// its `stat` before reading it; there is no equivalent here, so a very
+    /// large directory produces a very large answer rather than a refusal. It
+    /// is bounded by the one directory a caller named — this never recurses —
+    /// and a page or a cap is the follow-up if that stops being enough.
+    ///
+    /// Not gated on `read_only`, for [`MutationEngine::read_file`]'s reason: a
+    /// read writes nothing.
+    ///
+    /// Three rules shape what comes back:
+    ///
+    /// * **A symlink is a kind, never a door.** Each entry is classified from
+    ///   its own `lstat`, so a link is reported as [`DirEntryKind::Symlink`]
+    ///   and never as the thing it points at. Following one here would let a
+    ///   listing describe files outside the vault, which is exactly what
+    ///   `resolve`'s containment exists to prevent. A caller that wants the
+    ///   target asks for the link's own path and meets that containment.
+    /// * **Sorted by name in byte order.** `read_dir` yields in whatever order
+    ///   the filesystem stored, which differs between machines and after any
+    ///   write; a client diffing two listings needs one order.
+    /// * **A name that is not UTF-8 is omitted.** A [`VaultPath`] is a
+    ///   `String`, so no operation in this protocol could name such an entry
+    ///   afterwards; reporting it would describe a file the client can never
+    ///   act on.
+    ///
+    /// An entry removed between the directory walk and its `lstat` is omitted
+    /// too. It was there when the walk started and is not there now, and both
+    /// facts are true of a listing that is a point-in-time answer either way.
+    pub fn read_dir(&self, path: Option<&VaultPath>) -> Result<Vec<DirEntry>, MutationError> {
+        let resolved = match path {
+            None => self.canonical_root.clone(),
+            Some(path) => {
+                let resolved = self.resolve(path)?;
+                match std::fs::metadata(&resolved) {
+                    Ok(metadata) if !metadata.is_dir() => {
+                        // `read_file`'s refusal, mirrored: the taxonomy's
+                        // "something else already occupies this name" is the
+                        // honest answer for a name that is occupied by a
+                        // non-directory. Reading it would answer `ENOTDIR`,
+                        // which reaches a client as `storage_failure` — a
+                        // claim the daemon is broken and an invitation to
+                        // retry a request that can never succeed.
+                        return Err(MutationError::TargetExists { path: path.clone() });
+                    }
+                    Ok(_) => resolved,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(MutationError::NotFound { path: path.clone() });
+                    }
+                    Err(error) => return Err(io(error)),
+                }
+            }
+        };
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&resolved).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let metadata = match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io(error)),
+            };
+            let file_type = metadata.file_type();
+            // Symlink first: a link to a directory answers `true` to
+            // `is_dir()` on a `metadata` that followed it, and this one did
+            // not, but ordering the test first makes that independent of which
+            // stat produced the type.
+            let (kind, size) = if file_type.is_symlink() {
+                (DirEntryKind::Symlink, None)
+            } else if file_type.is_dir() {
+                (DirEntryKind::Folder, None)
+            } else if file_type.is_file() {
+                (DirEntryKind::File, Some(metadata.len()))
+            } else {
+                (DirEntryKind::Other, None)
+            };
+            entries.push(DirEntry { name, kind, size });
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
+
     /// Edit a note's frontmatter in place, changing only the addressed keys'
     /// bytes.
     ///
@@ -1722,17 +1868,38 @@ impl MutationEngine {
     /// caller wants is "a folder is there", and Obsidian's own
     /// `createFolder` is the only thing that would tell them otherwise.
     ///
-    /// The outcome names **every folder segment this call actually created**,
-    /// and nothing else. Per `MutationOutcome::changed_paths`: since the tree
-    /// pre-task the index holds a row per folder, so a created directory the
-    /// outcome does not name is a `tree_entries` row that never lands, and
-    /// `snapshot_tree` at the generation this call published would serve a
-    /// tree missing the daemon's own write. A segment that was already there
-    /// is named by no one, because nothing about it moved.
+    /// The outcome names **every folder segment this call actually created
+    /// that the index will list**, and nothing else. Per
+    /// `MutationOutcome::changed_paths`: since the tree pre-task the index
+    /// holds a row per folder, so a created directory the outcome does not
+    /// name is a `tree_entries` row that never lands, and `snapshot_tree` at
+    /// the generation this call published would serve a tree missing the
+    /// daemon's own write. A segment that was already there is named by no
+    /// one, because nothing about it moved — and an **unindexable** segment is
+    /// named by no one either, because the scan never lists it and a hint for
+    /// it could only ever produce a phantom row.
+    ///
+    /// **This verb serves unindexable folders too**, which is the one place it
+    /// differs from every other folder operation. A plugin host has to make
+    /// `.obsidian/plugins/<id>/` and its own `.obsidian-headless/`, and
+    /// `write_file` deliberately never creates parents — so without this the
+    /// two rules composed into a hole no client could work around. `delete_folder`
+    /// and `rename_folder` still refuse: making a directory is recoverable by
+    /// removing it, while removing `.git` or emptying `.trash` is not.
+    ///
+    /// What is **not** lifted is the resolved-path half of the guard. A
+    /// request that names an ordinary folder may not *land* on an unindexable
+    /// one — that is the symlink called `Link` pointing at `.obsidian`, which
+    /// carries no dot and names no zone, and it stays a `zone_violation`. The
+    /// permission is granted to a caller that said out loud where it was
+    /// writing, never to a spelling that hides it. Every other gate is
+    /// untouched: NUL, containment under the vault root, a file at the name, and
+    /// the final segment's case guard all refuse exactly as before.
     fn create_folder(&self, path: &VaultPath) -> Result<MutationOutcome, MutationError> {
-        if is_unindexable_folder(path) {
-            return Err(MutationError::ZoneViolation { path: path.clone() });
-        }
+        // Whether the *request* named a path outside the indexed universe.
+        // Not a refusal any more — it is the permission the resolved-path
+        // check below is measured against.
+        let requested_unindexable = is_unindexable_folder(path);
         // Called here rather than inherited from `resolve`, which this verb
         // never reaches: see [`refuse_nul`].
         refuse_nul(path)?;
@@ -1769,6 +1936,23 @@ impl MutationEngine {
             }
             match current.canonicalize() {
                 Ok(canonical) => {
+                    // The vault boundary, and it must be asked **first**.
+                    //
+                    // `stored_path` below refuses an outside path too (its
+                    // `strip_prefix` fails), so for a segment that resolves to
+                    // a *directory* outside the vault this check looks
+                    // redundant — deleting it changes no answer. It is not
+                    // redundant for a segment that resolves to a regular
+                    // **file** outside the vault: without it `is_file()` on
+                    // the next line answers first, and the daemon reports
+                    // `target_exists` — "something already occupies that
+                    // name" — about a path that is not in the vault at all.
+                    // That is both the wrong direction of refusal and a small
+                    // existence oracle for files outside the vault.
+                    //
+                    // Witnessed by
+                    // `an_escape_onto_a_regular_file_outside_the_vault_is_a_zone_violation_not_target_exists`,
+                    // which flips to `target_exists` the moment this goes.
                     if !canonical.starts_with(&self.canonical_root) {
                         return Err(MutationError::ZoneViolation { path: path.clone() });
                     }
@@ -1779,8 +1963,15 @@ impl MutationEngine {
                     // see a segment which *resolves* somewhere the caller's
                     // spelling never mentions: a symlink named `Link` pointing
                     // at `.obsidian` carries no dot and names no zone.
+                    //
+                    // Now conditional on the request, and only in the
+                    // direction that widens nothing: a caller that spelled an
+                    // unindexable path is served there, a caller that did not
+                    // may not be laundered into one. Without the condition the
+                    // lifted refusal would be unreachable — every path under
+                    // `.obsidian` passes through the zone folder itself.
                     let stored = self.stored_path(path, &canonical)?;
-                    if is_unindexable_folder(&stored) {
+                    if !requested_unindexable && is_unindexable_folder(&stored) {
                         return Err(MutationError::ZoneViolation { path: path.clone() });
                     }
                     current = canonical;
@@ -1797,9 +1988,24 @@ impl MutationEngine {
                 Err(error) => return Err(io(error)),
             }
         }
+        // The stored spelling of the folder this call was *about*, taken from
+        // the fully canonicalized walk. Reported for the same reason
+        // `write_file` reports one: the answer — whether a generation contains
+        // this folder, and whether the configuration zone was touched — is
+        // decided by where the call landed, not by how the request spelled it.
+        let target = self.stored_path(path, &current)?;
+        // Filtered rather than emptied. A pure zone or hidden create names
+        // nothing at all, which is what makes it publish no generation; but
+        // `Visible/.hidden` really did create `Visible`, and the scan really
+        // will list it, so dropping that path would be the under-naming
+        // hazard `changed_paths` exists to prevent.
+        let changed_paths: BTreeSet<VaultPath> = created
+            .into_iter()
+            .filter(|created| !is_unindexable_folder(created))
+            .collect();
         Ok(MutationOutcome {
-            changed_paths: created,
-            written: None,
+            changed_paths,
+            written: Some(target),
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),

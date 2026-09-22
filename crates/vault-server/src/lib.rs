@@ -1,4 +1,5 @@
 mod convert;
+pub mod fixture_row;
 pub mod runtime;
 pub mod stdio;
 pub mod subscriptions;
@@ -9,10 +10,11 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use vault_core::VaultPath;
 use vault_index::{IndexConfig, IndexError, IndexReader, LiveState, ReferenceStatus};
 use vault_protocol::{
-    CloseSnapshotResponse, ErrorCode, GenerationResponse, MutationResponse, OpenSnapshotResponse,
-    PageResponse, ProtocolError, ReadFileResponse, ReferenceStatusFilter, RefreshIndexResponse,
-    RenameResponse, Request, RequestEnvelope, ResolveLinkResponse, Response, ResponseEnvelope,
-    SeverityDto, SnapshotNotesResponse, SnapshotTreeResponse, WriteFileResponse, validate_version,
+    CloseSnapshotResponse, ErrorCode, GenerationResponse, GetTreeEntriesResponse, MutationResponse,
+    OpenSnapshotResponse, PageResponse, ProtocolError, ReadDirResponse, ReadFileResponse,
+    ReferenceStatusFilter, RefreshIndexResponse, RenameResponse, Request, RequestEnvelope,
+    ResolveLinkResponse, Response, ResponseEnvelope, SeverityDto, SnapshotNotesResponse,
+    SnapshotTreeResponse, WriteFileResponse, validate_version,
 };
 
 use crate::runtime::{MutationReport, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions};
@@ -131,14 +133,50 @@ fn runtime_not_ready(message: &str) -> ProtocolError {
     }
 }
 
+/// The one door every path-taking request comes through, read and write alike.
+///
+/// A NUL byte is refused here rather than left to each operation. `VaultPath`
+/// is a string-level type: it rejects an empty component, `.`, `..`, a leading
+/// `/`, and `\`, but a NUL is none of those and tightening that constructor is
+/// a `vault-core` change this crate does not own. The **write** path never
+/// noticed, because `MutationEngine::refuse_nul` compensates for every verb
+/// that reaches the filesystem — but a *read* has no engine gate behind it, so
+/// `get_tree_entries` shipped answering `ok` for a NUL path and echoing the
+/// byte back inside `absent`. Refusing at this door closes every read at once,
+/// and closes any read added later without its author having to know.
+///
+/// The engine's own `refuse_nul` deliberately stays: it guards a caller
+/// holding a `MutationEngine` directly, which never passes through here.
+/// A NUL is `invalid_path` — "a parameter is not a valid vault-relative path" —
+/// rather than the `zone_violation` the engine answers, which was always an
+/// overload of the one refusal the engine had a variant for.
 fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
-    VaultPath::new(value).map_err(|_| ProtocolError {
+    let invalid = |value: &str| ProtocolError {
         code: ErrorCode::InvalidPath,
         message: format!("invalid vault path: {value:?}"),
         supported_version: None,
         current_generation: None,
         current_revision: None,
-    })
+    };
+    if value.contains('\0') {
+        return Err(invalid(value));
+    }
+    VaultPath::new(value).map_err(|_| invalid(value))
+}
+
+/// The same parse, plus the one path `read_dir` can name that no other
+/// operation can: the **vault root**, spelled `""`.
+///
+/// `VaultPath::new("")` is an error and must stay one — every other operation
+/// names a file or a folder inside the vault, and an empty path there is a
+/// client bug. `read_dir` is the exception because listing the root is how a
+/// client discovers the configuration folders in the first place, so the empty
+/// string is given a meaning here and nowhere else.
+fn parse_directory_path(value: &str) -> Result<Option<VaultPath>, ProtocolError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_path(value).map(Some)
 }
 
 fn status_filter(value: ReferenceStatusFilter) -> ReferenceStatus {
@@ -312,6 +350,22 @@ impl Server {
         engine.read_file(path).map_err(convert::mutation_error)
     }
 
+    /// List one directory's immediate entries, off the coordinator thread for
+    /// [`Server::read_file`]'s reasons and through the engine for the same one:
+    /// `resolve` is where containment lives.
+    ///
+    /// `None` is the vault root, which no [`VaultPath`] can spell.
+    fn read_dir(
+        &self,
+        path: Option<&VaultPath>,
+    ) -> Result<Vec<vault_index::DirEntry>, ProtocolError> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| runtime_not_ready("no vault is configured"))?;
+        engine.read_dir(path).map_err(convert::mutation_error)
+    }
+
     /// The generation a mutation response reports. `None` means nothing has
     /// ever been committed, which a client cannot act on — every mutation
     /// that reaches a running runtime has a generation, so this is a
@@ -398,6 +452,69 @@ impl Server {
         })
     }
 
+    /// `create_folder`'s reported generation — `None` for a folder the index
+    /// will never list.
+    ///
+    /// Decided from the landed spelling, `raw_write_response`'s rule applied
+    /// to the verb that now shares its reach: a folder inside the
+    /// configuration zone or under any hidden component is not scanned, so no
+    /// generation will ever contain it and reporting one would name a
+    /// generation the caller could read at and never find its folder in. Every
+    /// indexed create still reports the real published generation, including
+    /// the idempotent one that created nothing.
+    ///
+    /// [`is_unindexable_folder`](vault_index::is_unindexable_folder) rather
+    /// than `is_unindexable`: the latter deliberately never judges a path's
+    /// last component, because nothing lexical separates a hidden *file* from
+    /// a hidden *directory* — and this caller knows its target is a directory.
+    /// Using the file predicate here would report a generation for `.hidden`.
+    ///
+    /// A report with no landed path is an internal error rather than a guess,
+    /// for `raw_write_response`'s reason: both answers this could default to
+    /// are one of the two lies the landed path exists to prevent.
+    fn folder_create_generation(report: &MutationReport) -> Result<Option<u64>, ProtocolError> {
+        let Some(written) = report.written.as_ref() else {
+            return Err(ProtocolError {
+                code: ErrorCode::Internal,
+                message: "the folder create reported no path".into(),
+                supported_version: None,
+                current_generation: None,
+                current_revision: None,
+            });
+        };
+        match vault_index::is_unindexable_folder(written) {
+            true => Ok(None),
+            false => Ok(Some(Self::mutation_generation(report)?)),
+        }
+    }
+
+    /// `get_tree_entries`' requested paths, validated once before anything is
+    /// read.
+    ///
+    /// The cap is the transport's own per-generation detail limit, reused
+    /// rather than restated: a mirror asks about the paths one change set
+    /// named, and a change set larger than that limit is already reported as
+    /// counts plus a resync rather than as paths — so a caller with more than
+    /// 1024 paths in hand is not working from a detailed change set and has no
+    /// answer this operation could give it. Refused as `invalid_request`,
+    /// before the reader is touched, so an oversized ask costs one comparison.
+    fn tree_entry_paths(paths: &[String]) -> Result<Vec<VaultPath>, ProtocolError> {
+        if paths.len() > subscriptions::DETAILED_PATH_LIMIT {
+            return Err(ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "get_tree_entries accepts at most {} paths, got {}",
+                    subscriptions::DETAILED_PATH_LIMIT,
+                    paths.len()
+                ),
+                supported_version: None,
+                current_generation: None,
+                current_revision: None,
+            });
+        }
+        paths.iter().map(|path| parse_path(path)).collect()
+    }
+
     fn subscribe(
         &self,
         subscriptions: &mut SubscriptionRegistry,
@@ -465,9 +582,12 @@ impl Server {
             },
             Request::GetNote(params) => match reader {
                 None => ResponseEnvelope::error(id, index_unavailable()),
-                Some(reader) => match parse_path(&params.path) {
-                    Err(error) => ResponseEnvelope::error(id, error),
-                    Ok(path) => match reader.get_note(&path) {
+                Some(reader) => match (
+                    parse_path(&params.path),
+                    convert::structural_facets(&params.include),
+                ) {
+                    (Err(error), _) | (_, Err(error)) => ResponseEnvelope::error(id, error),
+                    (Ok(path), Ok(facets)) => match reader.get_note_with(&path, facets) {
                         Ok(indexed) => {
                             let generation = indexed.generation.get();
                             ResponseEnvelope::success(
@@ -475,6 +595,39 @@ impl Server {
                                 Response::GetNote(vault_protocol::GetNoteResponse {
                                     generation,
                                     note: convert::note(indexed),
+                                }),
+                            )
+                        }
+                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                    },
+                },
+            },
+            // A read, so it is served on a `--read-only` daemon exactly as
+            // every other read is, and through the same reader barrier: one
+            // generation covers the whole answer.
+            Request::GetTreeEntries(params) => match reader {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(reader) => match Self::tree_entry_paths(&params.paths) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(paths) => match reader.tree_entries_for(&paths) {
+                        Ok((generation, rows)) => {
+                            let mut entries = Vec::new();
+                            let mut absent = Vec::new();
+                            // Zipped against the *request's* spellings, so an
+                            // absentee is named back the way the caller asked
+                            // — it has no stored spelling to be named by.
+                            for (requested, row) in params.paths.iter().zip(rows.iter()) {
+                                match row {
+                                    Some(row) => entries.push(convert::tree_entry(row)),
+                                    None => absent.push(requested.clone()),
+                                }
+                            }
+                            ResponseEnvelope::success(
+                                id,
+                                Response::GetTreeEntries(GetTreeEntriesResponse {
+                                    generation: generation.get(),
+                                    entries,
+                                    absent,
                                 }),
                             )
                         }
@@ -635,7 +788,7 @@ impl Server {
                 Err(error) => ResponseEnvelope::error(id, error),
                 Ok(path) => match self.mutate(vault_index::Mutation::CreateFolder { path }) {
                     Err(error) => ResponseEnvelope::error(id, error),
-                    Ok(report) => match Self::mutation_generation(&report) {
+                    Ok(report) => match Self::folder_create_generation(&report) {
                         Err(error) => ResponseEnvelope::error(id, error),
                         Ok(generation) => ResponseEnvelope::success(
                             id,
@@ -748,7 +901,9 @@ impl Server {
                             Err(error) => ResponseEnvelope::error(id, error),
                             Ok(generation) => ResponseEnvelope::success(
                                 id,
-                                Response::DeleteNote(GenerationResponse { generation }),
+                                Response::DeleteNote(GenerationResponse {
+                                    generation: Some(generation),
+                                }),
                             ),
                         },
                     },
@@ -766,7 +921,9 @@ impl Server {
                         Err(error) => ResponseEnvelope::error(id, error),
                         Ok(generation) => ResponseEnvelope::success(
                             id,
-                            Response::DeleteFolder(GenerationResponse { generation }),
+                            Response::DeleteFolder(GenerationResponse {
+                                generation: Some(generation),
+                            }),
                         ),
                     },
                 },
@@ -838,6 +995,33 @@ impl Server {
                         Response::ReadFile(ReadFileResponse {
                             content_base64: convert::encode_base64(&bytes),
                             revision,
+                        }),
+                    ),
+                },
+            },
+            Request::ReadDir(params) => match (self.reader(), parse_directory_path(&params.path)) {
+                (None, _) => ResponseEnvelope::error(id, index_unavailable()),
+                (_, Err(error)) => ResponseEnvelope::error(id, error),
+                (Some(_), Ok(path)) => match self.read_dir(path.as_ref()) {
+                    Err(error) => ResponseEnvelope::error(id, error),
+                    Ok(entries) => ResponseEnvelope::success(
+                        id,
+                        Response::ReadDir(ReadDirResponse {
+                            // The spelling the request used, echoed back: the
+                            // parsed `VaultPath`, or `""` for the root. A
+                            // client pairing answers to asks then needs no
+                            // bookkeeping of its own. This is **not** the
+                            // "stored spelling" a mutation reports — a
+                            // case-folded ask is echoed as it was asked, not
+                            // re-spelled to match the filesystem — and
+                            // canonicalizing here would leak where the vault
+                            // lives.
+                            path: path
+                                .as_ref()
+                                .map(VaultPath::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            entries: entries.into_iter().map(convert::dir_entry).collect(),
                         }),
                     ),
                 },
@@ -961,6 +1145,40 @@ mod tests {
     /// rather than assumed here and stated somewhere else. A fabricated `""`
     /// would be worse than an error, because `""` is a well-formed revision
     /// on the wire and a client would compare-and-swap against it.
+    /// The third doctored-report guard, and the one that keeps the new
+    /// optional `generation` honest: `create_folder` decides whether to report
+    /// a generation from the landed path, so a report without one has no
+    /// answer to give. Both defaults are a lie — `Some` claims a generation
+    /// contains a folder that may be in the zone, `None` withholds one from a
+    /// folder the index really did list.
+    #[test]
+    fn a_folder_create_with_no_landed_path_is_an_internal_error_not_a_guess() {
+        let error = Server::folder_create_generation(&report(None))
+            .expect_err("a folder create that named no path cannot be answered");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            !error.message.is_empty() && error.current_generation.is_none(),
+            "the refusal says nothing a client could act on, and leaks nothing: {error:?}"
+        );
+    }
+
+    /// The predicate is the **folder** one. `is_unindexable` deliberately
+    /// never judges a path's last component — nothing lexical separates a
+    /// hidden file from a hidden directory — so using it here would report a
+    /// generation for `.hidden`, a folder the scan never lists.
+    #[test]
+    fn a_top_level_hidden_folder_reports_no_generation() {
+        let mut doctored = report(None);
+        doctored.written = Some(VaultPath::new(".hidden").expect("valid path"));
+        doctored.generation = None;
+        assert_eq!(
+            Server::folder_create_generation(&doctored).expect("a hidden folder is answerable"),
+            None,
+            "a hidden folder is outside the indexed universe even though only its \
+             last component says so"
+        );
+    }
+
     #[test]
     fn a_content_mutation_with_no_revision_is_an_internal_error_not_an_empty_string() {
         let error = Server::mutation_revision(&report(None))

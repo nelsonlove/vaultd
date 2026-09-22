@@ -46,6 +46,11 @@ fn every_mutating_operation_is_refused_with_the_read_only_code() {
     let attempts = [
         r#"{"version":1,"id":"1","request":{"method":"write_note","params":{"path":"New.md","content":"x\n","expected":{"absent":true}}}}"#,
         r#"{"version":1,"id":"2","request":{"method":"create_folder","params":{"path":"Folder"}}}"#,
+        // The zone half of the same verb. `create_folder` is the one folder
+        // operation that serves unindexable paths, so it is the one that could
+        // have grown a way past this flag — a read-only daemon writes nothing
+        // anywhere in the vault, `.obsidian/` included.
+        r#"{"version":1,"id":"2b","request":{"method":"create_folder","params":{"path":".obsidian/plugins"}}}"#,
         r#"{"version":1,"id":"3","request":{"method":"rename_note","params":{"from":"One.md","to":"Two.md","expected":{"any":true},"rewrite_links":true}}}"#,
         r#"{"version":1,"id":"4","request":{"method":"rename_folder","params":{"from":"A","to":"B","rewrite_links":true}}}"#,
         r#"{"version":1,"id":"5","request":{"method":"copy_file","params":{"from":"One.md","to":"Copy.md","expected_source":{"any":true},"if_exists":"error"}}}"#,
@@ -90,6 +95,10 @@ fn every_mutating_operation_is_refused_with_the_read_only_code() {
         !vault.path().join(".trash").exists(),
         "a trash move is a mutating operation too"
     );
+    assert!(
+        !vault.path().join(".obsidian/plugins").exists(),
+        "making a zone folder is a mutating operation too"
+    );
 }
 
 #[test]
@@ -110,6 +119,24 @@ fn reads_and_snapshots_are_unaffected_by_read_only() {
         r#"{"version":1,"id":"g","request":{"method":"get_note","params":{"path":"One.md"}}}"#,
     );
     assert!(matches!(note.outcome, ResponseOutcome::Ok(_)));
+
+    // The structural facets are a read too: they page rows out of the index
+    // and write nothing.
+    let structural = daemon.call(
+        r#"{"version":1,"id":"gs","request":{"method":"get_note","params":{"path":"One.md","include":["sections","list_items"]}}}"#,
+    );
+    assert!(matches!(structural.outcome, ResponseOutcome::Ok(_)));
+
+    let entries = daemon.call(
+        r#"{"version":1,"id":"te","request":{"method":"get_tree_entries","params":{"paths":["One.md","gone.md"]}}}"#,
+    );
+    match entries.outcome {
+        ResponseOutcome::Ok(Response::GetTreeEntries(response)) => {
+            assert_eq!(response.entries.len(), 1);
+            assert_eq!(response.absent, vec!["gone.md".to_string()]);
+        }
+        other => panic!("get_tree_entries is a read: {other:?}"),
+    }
 
     let opened =
         daemon.call(r#"{"version":1,"id":"o","request":{"method":"open_snapshot","params":{}}}"#);

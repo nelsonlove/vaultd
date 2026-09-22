@@ -17,17 +17,18 @@ pub use events::{
 };
 pub use mutations::{
     CopyConflictDto, CopyFileParams, DeleteFolderParams, DeleteModeDto, DeleteNoteParams,
-    ExpectedDto, FolderParams, FrontmatterEditDto, GenerationResponse, LinkRewriteFailureDto,
-    MutationResponse, PatchFrontmatterParams, PatchValueDto, ReadFileParams, ReadFileResponse,
-    RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams, WriteFileResponse,
-    WriteNoteParams,
+    DirEntryDto, DirEntryKindDto, ExpectedDto, FolderParams, FrontmatterEditDto,
+    GenerationResponse, KeyPathDto, LinkRewriteFailureDto, MutationResponse,
+    PatchFrontmatterParams, PatchValueDto, ReadDirParams, ReadDirResponse, ReadFileParams,
+    ReadFileResponse, RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams,
+    WriteFileResponse, WriteNoteParams,
 };
 pub use operations::{
-    GetDiagnosticsParams, GetNoteResponse, GetVaultInfoResponse, HealthResponse,
-    ListReferencesParams, NotePathParams, PageParams, PageResponse, PathPageParams,
-    ReferenceStatusFilter, RefreshIndexParams, RefreshIndexResponse, Request, ResolveLinkParams,
-    ResolveLinkResponse, Response, SubscribeEventsParams, SubscribeEventsResponse,
-    UnsubscribeParams, UnsubscribeResponse,
+    GetDiagnosticsParams, GetNoteResponse, GetTreeEntriesParams, GetTreeEntriesResponse,
+    GetVaultInfoResponse, HealthResponse, ListReferencesParams, NotePathParams, PageParams,
+    PageResponse, PathPageParams, ReferenceStatusFilter, RefreshIndexParams, RefreshIndexResponse,
+    Request, ResolveLinkParams, ResolveLinkResponse, Response, SubscribeEventsParams,
+    SubscribeEventsResponse, UnsubscribeParams, UnsubscribeResponse,
 };
 pub use semantic::{
     AliasDto, BlockDto, DiagnosticDto, HeadingDto, IndexStateDto, NoteDto, NoteSummaryDto,
