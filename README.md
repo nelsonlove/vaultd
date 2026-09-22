@@ -29,8 +29,52 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 - `vault-core`: semantic types and runtime ports
 - `vault-protocol`: stable external contract
 - `vault-server`: daemon composition and stdio proof transport
+- `host/`: a Node/TypeScript npm workspace, outside the Cargo workspace — the headless Obsidian plugin host and the `vaultd-host` binary. Built and tested on its own (`npm --prefix host run build`, `npm --prefix host test`); it supervises a `vaultd` child rather than linking against the crates.
 
 ## Current milestone
+
+### On the branch `feat/headless-plugin-host`: the headless Obsidian plugin host
+
+**Experimental.** `host/` runs unmodified Obsidian community plugin bundles with no Electron, no DOM and no window. It supervises `vaultd` as a child engine, keeps a mirror of the vault tree and semantic state, loads plugin bundles against a shim that impersonates the Obsidian API, and serves what the plugins registered — commands, menu items, protocol handlers, settings — as machine-readable capabilities over its own Unix socket.
+
+The binary:
+
+```
+vaultd-host --vault <path> [options]
+
+  --vault <path>            The vault to run over. Required; resolved to an absolute path,
+                            because it is both the daemon's argument and the key the default
+                            socket path's digest comes from.
+  --config-dir <name>       The host's own config directory inside the vault.
+                            Default: .obsidian-headless. Never ".obsidian" — that is the GUI's,
+                            and sharing it is refused.
+  --socket <path>           Where to bind the host's control socket.
+                            Default: <state dir>/run/<vault digest>/host.sock.
+  --vaultd <path>           The vaultd binary to run. Default: "vaultd" on PATH.
+  --dry-run                 Intercept every write instead of performing it, and refuse the
+                            file system, process spawning and the network to plugin bundles.
+  --dry-run-allow-network   Under --dry-run, let requestUrl through anyway.
+  --force-shared <id>       Run <id> even though the GUI has it enabled too. Repeatable.
+  -h, --help                Print the usage and exit 0.
+```
+
+One machine-readable line goes to stdout when the host is ready — `{"ready":true,"socket":…,"vault":…,"dry_run":…,"loaded":[…],"failed":[…]}` — so whatever started the host knows where to knock without recomputing the digest.
+
+**Exit codes are a contract:** `0` a clean shutdown on `SIGINT` or `SIGTERM`; `2` a usage error (an unknown flag, a missing value, or no `--vault`); `3` the daemon was unreachable — it did not start, or never reached a watching state; `4` the config directory was refused, either because `--config-dir` named the GUI's own directory or because the GUI has every enabled plugin open too and there was nothing left to run. The overlap case is decided from the coexistence monitor's typed report, never from the text of a failure message.
+
+**One copy of the wiring.** `host/packages/host/src/host.ts`'s `startHost(config)` is the entry point: it builds and starts the whole host in the one order that works, and returns a `RunningHost` with an ordered `stop()`. `src/main.ts` is the process half alone — parse the flags, start, print the ready line, wait for a signal, stop — and the live-host test seam drives the same function, so every golden test exercises the code the binary runs. There is deliberately no second copy: four separate mutations of an earlier private copy survived the whole suite because the copy under test was the harness's.
+
+**Dry-run** intercepts an explicit, enumerated list of surfaces and is **not a sandbox**: plugins run with the host's Node privileges exactly as they do under Electron. What is intercepted, what is deliberately not, and what the dry-run overlay pretends instead are all listed in `docs/protocol-host.md`'s **Dry-run** section rather than restated here.
+
+**`allowNetwork` defaults to `true` in production**, so `requestUrl` and `request` reach the network; every test harness forces it off, so no suite can phone home whatever bundle it loads. Under `--dry-run` the network is refused unless `--dry-run-allow-network` is also passed, in which case the ordinary `allowNetwork` policy governs.
+
+**Three calls are open and waiting on the maintainer**, and none of them is a bug:
+
+- **the `allowNetwork` production default.** It is `true` today, with `--dry-run-allow-network` as the documented opt-back-in under dry-run; whether a production host should reach the network by default has not been decided.
+- **the `nested-properties` verdict.** It does not load headless, because its `onload` asserts on `app.metadataTypeManager`'s registered type widgets and this host answers an empty map — a GUI rendering surface it deliberately does not have. Whether to build one is a design call.
+- **the narrow tag rule**, pending a capture. Obsidian's exact acceptance of tag characters (`#tag+more`, `#a=b`, `#c^d`, `#p$`, `#tag-☺`) has not been observed on a live 1.13.4, so the rule is not settled and nothing here guesses it.
+
+Measured baselines — cold start, plugin write round trip, hydration and added RSS, per-plugin load time, and the timer registry with cadences — are in `docs/performance/headless-host-baseline.md`. The plugin-compatibility accounting, including which goldens conform and which do not, is Tier 3 of `VAULTD-COMPATIBILITY.md`. See also `docs/design/headless-plugin-host.md` and `docs/protocol-host.md`.
 
 ### Completed: vault mutations and bulk reads
 

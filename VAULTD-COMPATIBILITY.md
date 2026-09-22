@@ -49,9 +49,54 @@ Recoverable transactions, search, CLI commands beyond daemon configuration, and 
 
 ## Tier 3 — Headless Obsidian plugin API compatibility
 
-**Research contract:** A separate Node runtime may implement documented non-UI portions of `App`, `Vault`, `MetadataCache`, and `FileManager` against `vaultd`. Plugin compatibility will be measured per plugin and API surface.
+**Contract:** A separate Node runtime — the `vaultd-host` binary in the `host/` workspace — implements documented non-UI portions of `App`, `Vault`, `MetadataCache`, `FileManager`, `Plugin`, `Editor`, `app.plugins` and `app.internalPlugins` against `vaultd`, and runs unmodified Obsidian community plugin bundles with no Electron, no DOM and no window. Plugin compatibility is measured per plugin and per API surface, and what follows is the measurement, not the intention.
 
 Undocumented Obsidian internals are best-effort and never part of the stable core contract.
+
+**Parity is pinned against observed behaviour at a named version, and is never derived from Obsidian's source.** Every golden outcome below was produced by watching a **live Obsidian 1.13.4** perform the action on **2026-09-09** and committing the resulting tree verbatim; nothing was read out of `app.asar`, and no `expected/` tree was produced by running this host and blessing its output. The same rule governs Tier 1's structural fixtures, above. Where the published typings and a capture disagreed, the capture won.
+
+### The API surface, by policy
+
+Every symbol this host exposes carries one of four policies: **implemented** (real behaviour), **harvested** (recorded as an invokable capability rather than rendered), **safe-stub** (an inert value or a silent no-op, logged once per plugin and symbol and reported by the compatibility detector), or **absent** (a typed `HeadlessUnsupported` throw). Anything undeclared defaults to absent, so a gap surfaces in the compatibility report rather than as mystery breakage.
+
+Measured from the shipped table at commit `8661010`: **269 declared symbols — 104 implemented, 82 safe-stub, 74 absent, 9 harvested.** 105 of the 269 are dotted members owned by their declaring module rather than names a plugin can import. `host/packages/host/test/api-policy.test.ts` holds the table to its own claims in both directions — an export with no policy and a policy with no export are both failures — and additionally checks the shape of the value behind each row, because a table can be consistently wrong.
+
+### Golden-plugin conformance: three of eight
+
+Eight real community bundles are committed under `host/fixtures/golden/`, each with its input vault, the bundle that ran, the tree a live Obsidian produced, and a machine-readable scenario. **Three of the eight reproduce a mutation a live Obsidian made. That is the conformance claim, and it is not five and not eight.** The other five each compare something weaker, and the reason is stated per plugin rather than folded into a total:
+
+| plugin | version | what the suite compares | conformance? |
+| --- | --- | --- | --- |
+| `folder-notes` | 1.8.26-nl.5 | the whole tree, against a tree Obsidian changed (`Project/Project.md` created) | **yes** |
+| `obsidian-linter` | 1.32.1-nl.1 | the whole tree, against a tree Obsidian changed (`Messy note.md` rewritten), with `created`/`modified` normalised as wall-clock | **yes** |
+| `obsidian-rollover-daily-todos` | 1.2.0 | the whole tree, against a tree Obsidian changed (unfinished todos moved), date-remapped | **yes** |
+| `find-replace` | 0.1.0 | an unchanged tree — both its commands only open a panel, and the replacement step is module-local | no: smoke |
+| `nested-properties` | 1.6.0 | an unchanged tree — the plugin does not load at all, and the case asserts that | no: see below |
+| `tag-wrangler` | 0.6.5-nl.2 | an unchanged vault, with the captured `editor-menu` excluded from the comparison | no on the menu |
+| `automatic-linker` | 4.9.0 | its own input — the command runs and writes nothing | no: see below |
+| `quickadd` | 2.24.2 | nothing: its `expected/` is not a capture of the action the scenario names | no |
+
+The suite additionally asserts **which** goldens carry a real mutation and which are byte-identical, so a case cannot drift from conformance into vacuity unnoticed, and it asserts that every golden reaches **zero** absent surfaces — all eight do.
+
+**Two limits inside the three that do conform.** `obsidian-linter`'s primary GUI write path is a CodeMirror 6 `dispatch` transaction on the live editor, which has no headless equivalent at all — no CM6 instance, no view, no state field — so its golden drives the **file** path (`vault.modify`, and the YAML `vault.process` it runs from `metadataCache.on("changed")`). A passing linter case is therefore not evidence that the editor path works. And `obsidian-rollover-daily-todos` is date-dependent: the capture's 2026-09-09 is "today", so the fixture is remapped rather than replayed verbatim.
+
+### Three surfaces this host deliberately does not have — the maintainer's open calls
+
+Each of the three non-conformances below is a recorded design decision, not a defect, and each has a golden pinning its consequence. **Reversing any of them is a design call rather than a bug fix, and all three are open.**
+
+- **`automatic-linker` writes nothing, because `getActiveViewOfType(MarkdownView)` is `null` headless.** Its `format-file` body is gated on `{ file: getActiveFile(), editor: getActiveViewOfType(MarkdownView)?.editor }` and returns early unless **both** are present. The host makes the active file active and answers the view with `null` on purpose: a `MarkdownView` would satisfy `instanceof` and then promise a `previewMode` and a `getMode()` that do not exist, which is a worse lie than the null. The capture's `expected/` was produced by calling the pure transform plus `vault.modify` directly, which the fixture README states.
+- **`nested-properties` does not load, because `app.metadataTypeManager`'s registered type widgets are a GUI surface this host lacks.** Its `onload` builds property-editor widgets off `registeredTypeWidgets` and asserts each is non-null; this host answers an empty map, the plugin's own assertion fires, the load is rolled back, its command is refused and the vault is unchanged. It is **not** a typed `HeadlessUnsupported` — the plugin's assertion fires before any absent symbol is reached — so nothing lands in the unsupported tally.
+- **`tag-wrangler`'s context menu is empty headless, because `host.list_menu_items` has no cursor.** The host builds an editor-menu subject of a headless editor stub plus `{ file }`, and the plugin's one `editor-menu` hook needs a cursor position to know which tag it is over. The capture's six items are therefore not reproduced and the captured `editor-menu.json` is excluded from the tree comparison. Separately, and independent of the cursor: tag-wrangler's remaining surface is DOM-delegated listeners, which are structurally unreachable with no DOM and are recorded as `HarvestedUnreachable` rather than silently missing — the shipped bundle yields **17** such rows at runtime, of which **3** are `contextmenu`-typed, against the capture record's ten call sites; the difference is unexplained and is an open capture item.
+
+### Bundle scan — information, not a claim
+
+The compatibility detector's static scanner was run over all eight golden bundles and reported minification, a tier estimate with its reason, framework fingerprints, required Node builtins, command counts and bundle size. Those figures were **scanned on 2026-09-16, not asserted**: no test depends on any of them, and a plugin update would change them. They live in the Task 20 report. The two facts from that scan worth carrying here are that `nested-properties` is the only golden requiring Node builtins (`buffer`, `fs`, `os`, `util`, `zlib`), which a shipped `--dry-run` refuses by name, and that no golden requires Electron.
+
+### What the host does not do
+
+It writes no vault byte directly. Every shim write path funnels through a `vaultd` mutation operation, and that is proven by instrumentation rather than asserted: a filesystem write guard counts direct writes during the golden suite and the suite fails on any, and a static check bans the import form the runtime guard cannot see, with exactly two declared exempt writers (the filesystem seam and the watchdog worker), measured rather than assumed. It runs no UI: Tier 4 is unchanged. It is not a sandbox — plugins run with the host's Node privileges exactly as they do under Electron, and `--dry-run` is an evaluation tool with an enumerated intercepted-surface list, not a containment boundary.
+
+The host's own protocol, its operations, its error codes and the full dry-run surface are in `docs/protocol-host.md`; the design and its execution-time rulings are in `docs/design/headless-plugin-host.md`; measured startup, write round trip, hydration, per-plugin load and timer cadences are in `docs/performance/headless-host-baseline.md`.
 
 ## Tier 4 — UI runtime compatibility
 
@@ -68,7 +113,7 @@ Sync is orthogonal to the tiers. Adapters exchange generic blobs, revisions, con
 | MCP                    | Documented consumer  | Protocol adapter                              |
 | CLI and URI handling   | Documented consumers | Protocol adapters                             |
 | Obsidian accelerator   | Documented consumer  | Protocol client plugin                        |
-| Node Obsidian API shim | Research target      | Plugin API facade                             |
+| Node Obsidian API shim | Implemented (`host/`) | Plugin API facade                            |
 | Swift clients          | Documented consumers | Protocol / future FFI                         |
 | GNU Emacs/Elisp host   | Documented consumer  | Protocol client                               |
 | Sync adapters          | Documented consumers | Generic sync boundary                         |
