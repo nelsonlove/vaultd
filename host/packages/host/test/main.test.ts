@@ -7,7 +7,10 @@
  * clean `SIGTERM` — is `test/main-real-daemon.test.ts`.
  */
 
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { socketPathFor } from "../src/config";
 
 import {
   CliRefusal,
@@ -24,10 +27,20 @@ describe("vaultd-host argument parsing", () => {
     const { config, help } = parseArgs(["--vault", "/tmp/vault"]);
     expect(help).toBe(false);
     expect(config.vaultRoot).toBe("/tmp/vault");
+    // An absolute path is left alone; the relative case is below.
     expect(config.configDirName).toBe(".obsidian-headless");
     expect(config.dryRun).toBe(false);
     // The socket defaults under the state directory, never beside the vault.
     expect(config.socketPath.startsWith(config.dataDir)).toBe(true);
+  });
+
+  it("makes a relative --vault absolute, so one vault is one socket", () => {
+    // The vault root is the daemon's `--vault` argument *and* the key the
+    // socket digest comes from. Left relative, the same vault reached from two
+    // directories is two hosts with two sockets, each believing it is alone.
+    const { config } = parseArgs(["--vault", "some/vault"]);
+    expect(config.vaultRoot).toBe(resolve("some/vault"));
+    expect(config.socketPath).toBe(socketPathFor(config.dataDir, resolve("some/vault")));
   });
 
   it("carries every flag the help text advertises", () => {

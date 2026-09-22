@@ -1,54 +1,28 @@
 #!/usr/bin/env node
 /**
- * `vaultd-host` — the binary.
+ * `vaultd-host` - the binary.
  *
- * It is deliberately thin. Everything it does is done somewhere else in this
- * package already, and the value of the file is that the *order* is written
- * down once, in production, rather than being re-derived by each harness:
+ * It is deliberately thin, and thinner since fix round 1: the wiring it used to
+ * hold is `src/host.ts`, which `src/testing/live-host.ts` drives as well, so the
+ * order the binary runs is the order every golden exercises. What is left here
+ * is the process: parse the flags, start a host, print one machine-readable
+ * ready line, wait for a signal, stop.
  *
- * 1. parse the flags into a {@link HostConfig};
- * 2. start the engine through the {@link Supervisor} and hydrate a {@link Mirror};
- * 3. `assembleShim` — which builds the {@link DryRunGate} from `config.dryRun`,
- *    the policy recorder with `recordCalls` on in that mode, and the watchdog
- *    when its threshold is positive;
- * 4. install the module interception, with `allowNodeBuiltins: !config.dryRun`,
- *    **before** any bundle can be compiled;
- * 5. the loader, the quarantine and the {@link LifecycleSequencer};
- * 6. the plugin config service, then the {@link Detector} over the *same* gate,
- *    recorder and service — after the sequencer, because the detector drives
- *    one;
- * 7. the {@link HostServer}, with `attachWiring` for all three late services;
- * 8. `lifecycle.start()`, then `watchdog.start()`, then `listen()`.
+ * Exit codes are a contract; see {@link USAGE}. Two of them are decided here
+ * from **typed** failures rather than from anything's message: a
+ * {@link DaemonUnreachable} becomes 3, and the GUI overlap report becomes 4.
  *
- * **It never injects a `deps.writes` of its own.** The assembly builds the
- * write gate from the configuration, and a binary that handed one in would be
- * the one place in the system where `--dry-run` and the gate could disagree.
- *
- * **It names no fs function.** The socket and the state directory are reached
- * through {@link DataDir}, which is the one module allowed to write outside the
- * vault and asserts that every target resolves under `config.dataDir`.
- *
- * Exit codes are a contract; see {@link USAGE}.
+ * **It names no fs function.** The state directory is reached through
+ * {@link DataDir}, the one module allowed to write outside the vault.
  */
 
 import { resolve } from "node:path";
 
-import { BundleLoader, provisionUserScriptGlobals } from "./runtime/loader";
-import { DataDir } from "./datadir";
-import { Detector } from "./detector/harness";
-import { DEFAULT_KEY_REGISTRY, PluginConfigService } from "./settings/plugin-config";
-import { HostServer } from "./server/server";
-import { LifecycleSequencer, bundlePluginLoader } from "./runtime/lifecycle";
-import { Mirror } from "./mirror/mirror";
+import { DaemonUnreachable, startHost } from "./host";
 import { OBSIDIAN_CONFIG_DIR } from "./pluginset/config-dir";
-import { QuarantineTracker } from "./runtime/quarantine";
-import { SchemaLadder } from "./settings/ladder";
-import { Supervisor } from "./supervisor";
-import { assembleShim } from "./testing/assemble";
 import { defaultHostConfig, socketPathFor, systemClock } from "./config";
-import { installModuleInterception } from "./runtime/intercept";
 import type { HostConfig } from "./config";
-import type { VaultdClient } from "./client/client";
+import type { RunningHost } from "./host";
 
 /** What `--help` prints, and the whole of this binary's interface. */
 export const USAGE = `vaultd-host — run Obsidian community plugins headless against a vaultd vault
@@ -175,13 +149,20 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     );
   }
 
-  const base = defaultHostConfig(vault);
+  // **Absolute, once, here.** The vault root is two things downstream: the
+  // daemon's `--vault` argument and the key the socket digest is derived from.
+  // Left as the operator typed it, one vault reached from two directories is
+  // two different hosts with two different sockets, each believing it is the
+  // only one — and `./vault` means nothing at all to a daemon spawned with a
+  // different working directory.
+  const vaultRoot = resolve(vault);
+  const base = defaultHostConfig(vaultRoot);
   const config: HostConfig = {
     ...base,
     clock: systemClock(),
     ...(configDirName === null ? {} : { configDirName }),
     ...(vaultdBinary === null ? {} : { vaultdBinary }),
-    ...(socketPath === null ? { socketPath: socketPathFor(base.dataDir, vault) } : { socketPath }),
+    ...(socketPath === null ? { socketPath: socketPathFor(base.dataDir, vaultRoot) } : { socketPath }),
     dryRun,
     dryRunAllowNetwork,
     forceShared,
@@ -189,217 +170,48 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   return { config, help: false };
 }
 
-/** A running host, and the one call that takes it down. */
-export interface RunningHost {
-  readonly config: HostConfig;
-  readonly socketPath: string;
-  readonly loaded: readonly string[];
-  readonly failed: readonly { id: string; error: string }[];
-  stop(): Promise<void>;
-}
-
 /**
- * Bring a host up over `config`, in the one order that works.
+ * Bring a host up over `config`, and turn the typed startup failures into the
+ * exit codes `--help` documents.
  *
- * Exported and separate from {@link main} so the wiring can be driven by a test
- * without a process to signal, and so the process half of this file stays what
- * it looks like: parse, run, wait for a signal, stop.
+ * **The wiring itself lives in `src/host.ts`**, which `src/testing/live-host.ts`
+ * drives too. That is not tidiness: four separate mutations of the order this
+ * file used to hold -- the watchdog never started, `allowNodeBuiltins` forced
+ * true, the user-script globals never provisioned, the shutdown order reversed
+ * -- survived the whole suite, because the copy under test was the harness's.
+ * One copy means every golden is a test of the code the binary runs.
  */
 export async function runHost(config: HostConfig): Promise<RunningHost> {
-  const state = new DataDir(config.dataDir);
-  state.ensureSecureDir(".");
-
-  const supervisor = new Supervisor(config, {
-    onClientReady: () => {},
-    onEngineLost: () => {},
-    onStateChange: () => {},
-  });
+  let running: RunningHost;
   try {
-    await supervisor.start();
-    await supervisor.whenWatching();
+    running = await startHost(config);
   } catch (error) {
-    await supervisor.stop();
-    throw new CliRefusal(
-      EXIT_DAEMON_UNREACHABLE,
-      `the daemon did not come up: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    if (error instanceof DaemonUnreachable) {
+      throw new CliRefusal(EXIT_DAEMON_UNREACHABLE, error.message);
+    }
+    throw error;
   }
 
-  const clientOf = (): VaultdClient => supervisor.client();
-  const mirror = await Mirror.open(clientOf, config);
-  await supervisor.subscribe((event) => {
-    void mirror.applyEvent(event).catch(() => undefined);
-  });
-
-  // **No `writes` and no `policyRecorder` are passed.** The assembly builds the
-  // `DryRunGate` from `config.dryRun` and turns `recordCalls` on in the same
-  // breath; handing either in from here is how the two come apart.
-  const assembly = assembleShim({ config, client: clientOf, mirror, clock: config.clock });
-  // **Before anything can compile a bundle.** `allowNodeBuiltins` follows the
-  // mode: a shipped dry run has to refuse the file-system modules to a plugin
-  // that requires one by name (the specifiers are not spelled out here, because
-  // `test/fs-seam.test.ts` bans them under `src/` and a grep cannot tell a
-  // quoted example from a call), and
-  // an ordinary run must not.
-  const interception = installModuleInterception({
-    hostModulePaths: hostModulePaths(),
-    allowNodeBuiltins: !config.dryRun,
-    harvest: assembly.harvest,
-  });
-
-  // **Task 13's provisioning, and nothing else in production did it.** A
-  // QuickAdd user script is loaded with
-  // `new Function("require", "module", "exports", src)` and handed a one-line
-  // shim that forwards to `window.require`, so that global being a real
-  // function bound to this host's resolver is the whole of the feature. Without
-  // this call the shim's Task 11a refusal stands and every user script in the
-  // corpus fails with `window.require is not available headless` — measured,
-  // not supposed: it is what the golden macro case reported before this line
-  // existed. The resolver is this module's own `require`, which goes through
-  // the patched `Module._load` above, so a dry run still refuses a script the
-  // file system, process spawning and the network.
-  const userScripts = provisionUserScriptGlobals(require);
-
-  const loader = new BundleLoader({
-    app: assembly.app,
-    queue: assembly.queue,
-    events: assembly.events,
-    harvest: assembly.harvest,
-    errors: assembly.errors,
-  });
-  assembly.app.plugins.setLoader(loader);
-
-  let sequencer: LifecycleSequencer | null = null;
-  const quarantine = new QuarantineTracker(config, (id, failures) =>
-    sequencer === null ? Promise.resolve() : sequencer.onQuarantine(id, failures),
-  );
-  sequencer = new LifecycleSequencer({
-    supervisor,
-    mirror,
-    app: assembly.app,
-    harvest: assembly.harvest,
-    events: assembly.events,
-    errors: assembly.errors,
-    dir: assembly.dir,
-    coexistence: assembly.coexistence,
-    quarantine,
-    queue: assembly.queue,
-    config,
-    plugins: bundlePluginLoader({
-      dir: assembly.dir,
-      loader,
-      config,
-      hostModulePaths: hostModulePaths(),
-    }),
-  });
-  // The `let` above exists only so the quarantine's callback can name the
-  // sequencer before it is built; everything below holds the real thing.
-  const lifecycle = sequencer;
-
-  // After the sequencer, over the assembly's own objects. The three traps, all
-  // from Task 20b's report: the detector's `writes` must be the assembly's
-  // `DryRunGate` (`inDryRun()` is an `instanceof` check); its recorder must be
-  // the one built with `recordCalls` on, or the harness reports `runs` on an
-  // empty call log; and one `PluginConfigService` is shared by the detector and
-  // the socket, because the cache and the key registry are what the two must
-  // agree about.
-  const pluginConfig = new PluginConfigService(
-    assembly.dir,
-    new SchemaLadder(config.dataDir, config.clock),
-    DEFAULT_KEY_REGISTRY,
-    config,
-    { plugins: assembly.app.plugins, queue: assembly.queue, errors: assembly.errors },
-  );
-  const detector = new Detector({
-    config,
-    clock: config.clock,
-    dir: assembly.dir,
-    lifecycle,
-    harvest: assembly.harvest,
-    recorder: assembly.policyRecorder,
-    writes: assembly.writes,
-    quarantine,
-    pluginConfig,
-  });
-
-  const server = new HostServer({
-    config,
-    lifecycle,
-    harvest: assembly.harvest,
-    mirror,
-    client: assembly.client,
-    writes: assembly.writes,
-    quarantine,
-    coexistence: assembly.coexistence,
-    noticeLog: assembly.noticeLog,
-    app: assembly.app,
-    dir: assembly.dir,
-    queue: assembly.queue,
-    errors: assembly.errors,
-    policyRecorder: assembly.policyRecorder,
-    liveState: () => supervisor.liveState(),
-  });
-  server.attachWiring({ broker: assembly.broker, pluginConfig, detector });
-
-  const startup = await lifecycle.start();
-  // **After the sequencer starts, and nothing else starts it** — Task 21's
-  // concern 1. The assembly builds it when `config.watchdogThresholdMs` is
-  // positive and leaves it stopped, because an assembler that spawned a thread
-  // would spawn one in every harness that merely assembled a host.
-  assembly.watchdog?.start();
-  const socketPath = await server.listen();
-
-  // The overlap check refuses a plugin the GUI has open; `--force-shared` is
-  // the documented escape. A host where that accounted for *everything* has
-  // nothing to run and says so with its own exit code rather than idling.
-  const overlapRefused = startup.failed.filter((failure) =>
-    failure.error.includes(config.configDirName) || failure.error.includes("Obsidian"),
-  );
-  if (startup.loaded.length === 0 && overlapRefused.length > 0) {
-    await shutdown();
+  // **Decided from the typed overlap report, never from a failure message.**
+  // The GUI overlap check refuses a plugin the GUI already has enabled, and
+  // `--force-shared` is the documented escape; a host where that accounted for
+  // *everything* has nothing to run and says so with its own exit code rather
+  // than idling. The first version of this read `failure.error.includes(...)`,
+  // which any plugin whose display name contains "Obsidian" -- the corpus's own
+  // obsidian-linter among them -- would have tripped, exiting 4 about a GUI
+  // overlap that did not exist.
+  const forced = new Set(running.overlap.forced);
+  const refused = running.overlap.overlap.filter((id) => !forced.has(id));
+  if (running.startup.loaded.length === 0 && refused.length > 0) {
+    await running.stop();
     throw new CliRefusal(
       EXIT_CONFIG_DIR_REFUSED,
       `every enabled plugin is also enabled in the GUI's ${OBSIDIAN_CONFIG_DIR}: ` +
-        `${overlapRefused.map((failure) => failure.id).join(", ")}. Disable them there, or ` +
-        "pass --force-shared <id> for each one you mean to share.",
+        `${refused.join(", ")}. Disable them there, or pass --force-shared <id> for each one ` +
+        "you mean to share.",
     );
   }
-
-  async function shutdown(): Promise<void> {
-    // The order is the reverse of the order things were started, and it matters
-    // at both ends: the sequencer unloads every plugin (and stops the engine
-    // with them) before the socket stops answering, so a client's last call is
-    // answered by a host that still has the plugin it names; and the watchdog
-    // is stopped last, so a shutdown that itself wedges is still reported.
-    await lifecycle.stop();
-    await server.close();
-    await assembly.watchdog?.stop();
-    userScripts.restore();
-    interception.restore();
-    await assembly.teardown();
-    await supervisor.stop();
-  }
-
-  return {
-    config,
-    socketPath,
-    loaded: startup.loaded,
-    failed: startup.failed,
-    stop: shutdown,
-  };
-}
-
-/**
- * `host/node_modules`, where the workspace links `obsidian` and `electron`.
- *
- * Derived from this module's own location rather than from `process.cwd()`: a
- * binary is run from wherever the operator happens to be standing, and the two
- * packages sit beside the compiled host. From `dist/main.js` that is two levels
- * up (`packages/host/dist` → `packages/host` → `packages` → `host`); the same
- * arithmetic holds from `src/main.ts`.
- */
-function hostModulePaths(): readonly string[] {
-  return [resolve(__dirname, "..", "..", "..", "node_modules")];
+  return running;
 }
 
 /**
@@ -429,8 +241,8 @@ export async function main(
         socket: running.socketPath,
         vault: running.config.vaultRoot,
         dry_run: running.config.dryRun,
-        loaded: running.loaded,
-        failed: running.failed,
+        loaded: running.startup.loaded,
+        failed: running.startup.failed,
       }),
     );
     await untilSignal();
@@ -444,7 +256,48 @@ export async function main(
     err(error instanceof Error ? (error.stack ?? error.message) : String(error));
     return 1;
   } finally {
-    await running?.stop();
+    await stopQuietly(running, err);
+  }
+}
+
+/**
+ * Stop the host, and do not let a plugin's parting shot change the exit code.
+ *
+ * **Targeted, and only for the shutdown window.** `startHost`'s teardown is
+ * ordered precisely so that nothing of a plugin's is still running when the
+ * globals go — plugins unloaded, queue drained, mirror stopped, timers
+ * disarmed — and that ordering is the fix. This is the residue: a plugin can
+ * hold a promise of its own that rejects for its own reasons at any moment, and
+ * `SIGTERM` is exactly when a busy one does. Node's default for a rejection
+ * nobody holds is to kill the process, which would turn the documented "0 = a
+ * clean shutdown" into a 1 whenever the host was doing something.
+ *
+ * So a listener is installed for the duration of the stop and **removed
+ * afterwards** — never a process-wide swallow, which would hide the same class
+ * of failure during the run, when it is a real defect and the host should die
+ * loudly. What it does is report; what it does not do is change the answer.
+ */
+async function stopQuietly(
+  running: RunningHost | null,
+  err: (line: string) => void,
+): Promise<void> {
+  if (running === null) return;
+  const duringShutdown = (reason: unknown): void => {
+    err(
+      `a promise rejected while the host was shutting down, after its plugins were unloaded: ${
+        reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
+      }`,
+    );
+  };
+  process.on("unhandledRejection", duringShutdown);
+  try {
+    await running.stop();
+    // One turn of the loop after the teardown, so a rejection raised by the
+    // teardown itself lands while the listener is still up rather than after it
+    // has been removed.
+    await new Promise<void>((settle) => setImmediate(settle));
+  } finally {
+    process.off("unhandledRejection", duringShutdown);
   }
 }
 

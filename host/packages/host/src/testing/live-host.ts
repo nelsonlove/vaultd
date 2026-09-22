@@ -9,68 +9,47 @@
  * two halves actually fit". The two kinds of test are complementary and neither
  * substitutes for the other.
  *
- * It writes only inside the vault root it is given — a scratch directory under
- * the repository's own `target/tmp`, never the developer's vault — plus the
- * host's own data directory, which is redirected into that same root so a live
- * test can never touch the developer's real `$XDG_STATE_HOME`.
+ * **The host itself is `startHost` in `src/host.ts` -- the binary's own
+ * function**, which is fix round 1's first change. There used to be two copies
+ * of the wiring, the binary's and this one, and only this one was under test:
+ * four mutations of the binary's copy (the watchdog never started,
+ * `allowNodeBuiltins` forced true, the user-script globals never provisioned,
+ * the shutdown order reversed) survived the whole suite. What is left in this
+ * file is what a *test* needs on top of a running host: staging a fixture on
+ * disk, a client on the socket, a rendezvous with the vault, and a teardown
+ * that also removes the scratch directories.
+ *
+ * It writes only inside the vault root it is given -- a scratch directory under
+ * the repository's own `target/tmp`, never the developer's vault -- plus the
+ * host's own state directory, which is a second scratch directory outside the
+ * vault so a live test can never touch the developer's real `$XDG_STATE_HOME`.
  *
  * **Reconciled against the code, Task 22 Step 1.** The scaffold this file grew
- * from was written in Task 6b against interface sketches and every constructor
- * it named has moved since. What changed, and why each change was forced:
- *
- * - **It assembled a shim and never built a lifecycle**, so no plugin would
- *   ever have loaded. `bindHost` in {@link HostHarness} is the current pattern
- *   and this file follows it: quarantine and sequencer first (each names the
- *   other, so the arrow defers one read), then the config service, then the
- *   detector over the *same* gate, recorder and service, then `attachWiring`.
- * - **`server.start({ wireLateOps: true })` does not exist.** `listen()` binds
- *   the socket and `attachWiring` is how the late services arrive.
- * - **`spawn`ing the engine by hand is not how a host runs one.** A
- *   {@link Supervisor} is, and it is also what `LifecycleSequencer.stop()`
- *   stops — a hand-spawned child would have been left for the test to kill.
- * - **`Mirror.settled()` never existed.** The rendezvous here is the real one:
- *   ask the daemon what generation it is on, wait for the mirror to have
- *   applied through it, then let the sequencer's delivery chain drain. No
- *   sleeps, which is the property the scaffold's note asked for.
- * - **`PolicyRecorder.unsupportedHits()` never existed either.** The tally is
- *   `entries()`, and an unsupported surface is the `absent` policy — see
- *   {@link LiveHost.unsupportedHits}.
- * - **`startWithGoldenPlugin` installed the plugin from the vault root**, which
- *   holds the test's notes and no bundle. It installs from the golden fixture's
- *   `plugin/` directory.
- * - **Module interception is installed here**, because a live host is the first
- *   thing in this repository that loads a community bundle for real: the
- *   `@codemirror/*` specifiers have no package behind them, and under a dry run
- *   the node-builtin refusals have to be armed. Production's `main.ts` installs
- *   it the same way and with the same `allowNodeBuiltins: !config.dryRun`.
+ * from was written in Task 6b against interface sketches, and every constructor
+ * it named had moved: it assembled a shim and never built a lifecycle, so no
+ * plugin would have loaded; `server.start({ wireLateOps: true })` does not
+ * exist (`listen()` binds and `attachWiring` carries the late services);
+ * `Mirror.settled()` and `PolicyRecorder.unsupportedHits()` never existed; and
+ * `startWithGoldenPlugin` installed the plugin from the vault root, which holds
+ * the case's notes and no bundle. `task-22a-report.md` has the full table.
  */
 
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
-import { BundleLoader, provisionUserScriptGlobals } from "../runtime/loader";
-import { Detector } from "../detector/harness";
-import { DEFAULT_KEY_REGISTRY, PluginConfigService } from "../settings/plugin-config";
-import { HostServer } from "../server/server";
 import { HostTestClient } from "./host-harness";
-import { LifecycleSequencer, bundlePluginLoader } from "../runtime/lifecycle";
-import { Mirror } from "../mirror/mirror";
-import { QuarantineTracker } from "../runtime/quarantine";
-import { SchemaLadder } from "../settings/ladder";
-import { Supervisor } from "../supervisor";
-import { assembleShim } from "./assemble";
 import { defaultHostConfig, systemClock } from "../config";
 import { fs } from "../runtime/fs-access";
-import { installModuleInterception } from "../runtime/intercept";
+import { startHost } from "../host";
 import { workspaceRoot } from "./fixture-vault";
-import type { HostAssembly } from "./assemble";
-import type { HostConfig } from "../config";
-import type { Interception } from "../runtime/intercept";
 import type { App } from "../shim/app";
 import type { GetVaultInfoResponse } from "../client/protocol";
 import type { Harvest } from "../shim/harvest";
+import type { HostConfig } from "../config";
 import type { PolicyRecorder } from "../shim/policy";
+import type { QuarantineTracker } from "../runtime/quarantine";
+import type { LifecycleSequencer } from "../runtime/lifecycle";
+import type { RunningHost } from "../host";
 import type { StartupReport } from "../runtime/lifecycle";
-import type { VaultdClient } from "../client/client";
 
 export interface LiveHostSpec {
   vaultRoot: string;
@@ -120,21 +99,18 @@ export class LiveHost {
   private stopped = false;
 
   private constructor(
-    private readonly supervisor: Supervisor,
-    private readonly mirror: Mirror,
-    private readonly server: HostServer,
-    private readonly assembly: HostAssembly,
-    private readonly quarantineTracker: QuarantineTracker,
-    private readonly sequencer: LifecycleSequencer,
-    private readonly interception: Interception,
-    private readonly userScripts: { restore(): void },
+    /** Everything `startHost` built, including its ordered `stop()`. */
+    readonly running: RunningHost,
     private readonly client: HostTestClient,
     private readonly root: string,
     private readonly dataDirPath: string,
     private readonly removeRootOnStop: boolean,
-    /** What `lifecycle.start()` reported: which plugins loaded, and which did not. */
-    readonly startup: StartupReport,
   ) {}
+
+  /** What `lifecycle.start()` reported: which plugins loaded, and which did not. */
+  get startup(): StartupReport {
+    return this.running.startup;
+  }
 
   /**
    * Put the vault, the bundle and the settings on disk, and answer the config
@@ -204,140 +180,21 @@ export class LiveHost {
   }
 
   /** Run a host over a config {@link stage} already put on disk. */
+  /**
+   * Run a host over a config {@link stage} already put on disk.
+   *
+   * **The wiring is `startHost`'s, not this file's**, which is the fix round's
+   * first change: the binary and this harness used to hold two copies of the
+   * same order, and only the harness's was under test -- four mutations of the
+   * binary's copy survived the whole suite. Everything below is what a *test*
+   * needs on top of a running host: a client on its socket, a rendezvous, and
+   * a teardown that also removes the scratch directories.
+   */
   static async startOn(config: HostConfig, removeRootOnStop = false): Promise<LiveHost> {
-    const dataDir = config.dataDir;
-    const supervisor = new Supervisor(config, {
-      onClientReady: () => {},
-      onEngineLost: () => {},
-      onStateChange: () => {},
-    });
-    await supervisor.start();
-    await supervisor.whenWatching();
-    const clientOf = (): VaultdClient => supervisor.client();
-    const mirror = await Mirror.open(clientOf, config);
-    await supervisor.subscribe((event) => {
-      void mirror.applyEvent(event).catch(() => undefined);
-    });
-
-    const assembly = assembleShim({ config, client: clientOf, mirror, clock: config.clock, dataDir });
-    // **Before any bundle is compiled**, which is the only placement that
-    // works: a bundle that resolved `@codemirror/view` first would take Node's
-    // answer (there is no such package) rather than the host's stub.
-    const interception = installModuleInterception({
-      hostModulePaths: hostModulePaths(),
-      allowNodeBuiltins: !config.dryRun,
-      harvest: assembly.harvest,
-    });
-    // **After the globals exist and before any plugin runs.** Task 13's
-    // provisioning: `window.require` is the whole of what a QuickAdd user
-    // script needs from this host, because its loader is
-    // `new Function("require", "module", "exports", src)` called with a shim
-    // that forwards to it. Without this the shim's Task 11a refusal stands and
-    // every user script in the corpus fails with
-    // `window.require is not available headless`. It goes through this host's
-    // own resolver, which means through the patched `Module._load` above — so
-    // a dry run still refuses a script the file system.
-    const userScripts = provisionUserScriptGlobals(require);
-    const loader = new BundleLoader({
-      app: assembly.app,
-      queue: assembly.queue,
-      events: assembly.events,
-      harvest: assembly.harvest,
-      errors: assembly.errors,
-    });
-    assembly.app.plugins.setLoader(loader);
-
-    // The tracker's callback reaches back into the sequencer and the sequencer
-    // takes the tracker as a dependency, so one of the two has to be named
-    // before it exists. The arrow defers that read to the moment a plugin is
-    // actually quarantined, by which time both are built.
-    let sequencer: LifecycleSequencer | null = null;
-    const quarantine = new QuarantineTracker(config, (id, failures) =>
-      sequencer === null ? Promise.resolve() : sequencer.onQuarantine(id, failures),
-    );
-    sequencer = new LifecycleSequencer({
-      supervisor,
-      mirror,
-      app: assembly.app,
-      harvest: assembly.harvest,
-      events: assembly.events,
-      errors: assembly.errors,
-      dir: assembly.dir,
-      coexistence: assembly.coexistence,
-      quarantine,
-      queue: assembly.queue,
-      config,
-      plugins: bundlePluginLoader({
-        dir: assembly.dir,
-        loader,
-        config,
-        hostModulePaths: hostModulePaths(),
-      }),
-    });
-
-    // **After the sequencer, because the detector drives one**, and over the
-    // assembly's own objects: the same `DryRunGate` (`inDryRun()` is an
-    // `instanceof` check), the same `PolicyRecorder` (the assembly turns
-    // `recordCalls` on under `--dry-run`; an injected one without it yields an
-    // empty call log and a `runs` verdict on no evidence), and one
-    // `PluginConfigService` shared by the detector and the socket.
-    const pluginConfig = new PluginConfigService(
-      assembly.dir,
-      new SchemaLadder(config.dataDir, config.clock),
-      DEFAULT_KEY_REGISTRY,
-      config,
-      { plugins: assembly.app.plugins, queue: assembly.queue, errors: assembly.errors },
-    );
-    const detector = new Detector({
-      config,
-      clock: config.clock,
-      dir: assembly.dir,
-      lifecycle: sequencer,
-      harvest: assembly.harvest,
-      recorder: assembly.policyRecorder,
-      writes: assembly.writes,
-      quarantine,
-      pluginConfig,
-    });
-    const server = new HostServer({
-      config,
-      lifecycle: sequencer,
-      harvest: assembly.harvest,
-      mirror,
-      client: assembly.client,
-      writes: assembly.writes,
-      quarantine,
-      coexistence: assembly.coexistence,
-      noticeLog: assembly.noticeLog,
-      app: assembly.app,
-      dir: assembly.dir,
-      queue: assembly.queue,
-      errors: assembly.errors,
-      policyRecorder: assembly.policyRecorder,
-      liveState: () => supervisor.liveState(),
-    });
-    server.attachWiring({ broker: assembly.broker, pluginConfig, detector });
-
-    const startup = await sequencer.start();
-    const socketPath = await server.listen();
-    const client = await HostTestClient.open(socketPath);
+    const running = await startHost(config);
+    const client = await HostTestClient.open(running.socketPath);
     client.rememberHello(await client.call("host.hello", { nonce: readNonce(config) }));
-
-    return new LiveHost(
-      supervisor,
-      mirror,
-      server,
-      assembly,
-      quarantine,
-      sequencer,
-      interception,
-      userScripts,
-      client,
-      config.vaultRoot,
-      dataDir,
-      removeRootOnStop,
-      startup,
-    );
+    return new LiveHost(running, client, config.vaultRoot, config.dataDir, removeRootOnStop);
   }
 
   /**
@@ -387,36 +244,36 @@ export class LiveHost {
    * flushed to the socket.
    */
   async quiesce(): Promise<void> {
-    const info = await this.supervisor.client().request<GetVaultInfoResponse>("get_vault_info");
+    const info = await this.running.supervisor.client().request<GetVaultInfoResponse>("get_vault_info");
     await waitFor(
       `the mirror to apply through generation ${String(info.generation)}`,
-      () => this.mirror.appliedThrough() >= info.generation && !this.mirror.resyncing(),
+      () => this.running.mirror.appliedThrough() >= info.generation && !this.running.mirror.resyncing(),
       () =>
-        `the mirror is at generation ${String(this.mirror.generation())}, applied through ` +
-        `${String(this.mirror.appliedThrough())}, resyncing=${String(this.mirror.resyncing())}`,
+        `the mirror is at generation ${String(this.running.mirror.generation())}, applied through ` +
+        `${String(this.running.mirror.appliedThrough())}, resyncing=${String(this.running.mirror.resyncing())}`,
     );
-    await this.sequencer.settled();
-    await this.server.quiesce();
+    await this.running.lifecycle.settled();
+    await this.running.server.quiesce();
   }
 
   app(): App {
-    return this.assembly.app;
+    return this.running.assembly.app;
   }
 
   harvest(): Harvest {
-    return this.assembly.harvest;
+    return this.running.assembly.harvest;
   }
 
   quarantine(): QuarantineTracker {
-    return this.quarantineTracker;
+    return this.running.quarantine;
   }
 
   lifecycle(): LifecycleSequencer {
-    return this.sequencer;
+    return this.running.lifecycle;
   }
 
   recorder(): PolicyRecorder {
-    return this.assembly.policyRecorder;
+    return this.running.assembly.policyRecorder;
   }
 
   /** The vault this host is running over. */
@@ -434,7 +291,7 @@ export class LiveHost {
    * `(symbol, plugin)` pair, which is what makes a failure readable.
    */
   unsupportedHits(): readonly { symbol: string; pluginId: string | null }[] {
-    return this.assembly.policyRecorder
+    return this.running.assembly.policyRecorder
       .entries()
       .filter((entry) => entry.policy === "absent")
       .map((entry) => ({ symbol: entry.symbol, pluginId: entry.pluginId }));
@@ -449,14 +306,12 @@ export class LiveHost {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    // The client first, so the host is not answering a socket while it is
+    // being taken down; then the host's own ordered teardown, which is the
+    // binary's — plugins unloaded, queue drained, mirror stopped, timers
+    // disarmed, and only then the process-wide globals.
     await this.client.disconnect();
-    await this.server.close();
-    // The sequencer unloads every plugin and stops the supervisor with them.
-    await this.sequencer.stop();
-    await this.supervisor.stop();
-    this.userScripts.restore();
-    this.interception.restore();
-    await this.assembly.teardown();
+    await this.running.stop();
     // **Always the state directory, and the vault only when this host made it.**
     // A per-run cleanup rather than a sweep: `target/tmp` collected tens of
     // thousands of entries across this phase because every harness made a
@@ -480,11 +335,6 @@ export class LiveHost {
  */
 function liveBinary(): string {
   return join(workspaceRoot(), "target", "release", "vaultd");
-}
-
-/** `host/node_modules`, where the workspace links `obsidian` and `electron`. */
-export function hostModulePaths(): readonly string[] {
-  return [resolve(workspaceRoot(), "host", "node_modules")];
 }
 
 /**

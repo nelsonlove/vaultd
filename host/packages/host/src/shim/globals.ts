@@ -535,6 +535,12 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
     document,
     localStorage,
     restore: () => {
+      // **Timers first, globals second, and the order is the whole point.**
+      // A timer armed through this `window` runs a callback that will read
+      // this `window`; restore the globals while one is armed and the callback
+      // finds nothing, throws a `ReferenceError` onto a promise nobody holds,
+      // and takes the process with it. See `ShimTimers.clearAll`.
+      timers.clearAll();
       patcher.restore();
     },
   };

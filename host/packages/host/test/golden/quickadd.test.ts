@@ -198,7 +198,14 @@ describe.skipIf(!BINARY_EXISTS)("quickadd non-interactive flows", () => {
       }>("host.compat_report", { plugin_id: "quickadd" });
       const entry = report.report.plugins[0]!;
       expect(entry.id).toBe("quickadd");
-      expect(entry.scan.tier_estimate).toBeGreaterThanOrEqual(1);
+      // **Exactly 3, and the brief said 1.** The number is measured rather
+      // than predicted, and it is asserted exactly rather than as a floor: a
+      // tier that drifted would mean the scan reads a different plugin. The
+      // brief's 1 was written before the scanner existed; what the scanner
+      // actually reports for this bundle — 2.24.2, the one in the fixtures —
+      // is 3, and tag-wrangler's 2 (its own case) matches the brief. Recorded
+      // as a deviation in task-22a-report.md rather than weakened away.
+      expect(entry.scan.tier_estimate).toBe(3);
       // Not "runs": its interactive choices genuinely do not work headless, and
       // a report that said they did would be a lie of omission. The detector
       // only runs its probe harness under `--dry-run`, so outside that mode the

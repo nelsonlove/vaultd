@@ -54,6 +54,8 @@ export class DispatchQueue {
   private depthValue = 0;
   private running: { pluginId: string | null; label: string } | null = null;
   private readonly pathLocks = new Map<string, Promise<void>>();
+  /** Waiters on {@link DispatchQueue.idle}, resolved at the next empty boundary. */
+  private readonly idleWaiters: Array<() => void> = [];
 
   constructor(private readonly options: DispatchQueueOptions = {}) {}
 
@@ -157,6 +159,28 @@ export class DispatchQueue {
    */
   private boundary(): void {
     this.options.afterTask?.();
+    if (this.depthValue > 0 || this.idleWaiters.length === 0) return;
+    for (const settle of this.idleWaiters.splice(0)) settle();
+  }
+
+  /**
+   * Resolve when nothing is queued or running.
+   *
+   * **The drain a shutdown needs.** Stopping a host unloads its plugins and
+   * then takes the process-wide globals down; a handler still inside its
+   * dispatch slot when that happens is a plugin running against a `window`
+   * that is being removed underneath it. Waiting on the queue is what makes
+   * the teardown ordered rather than merely sequential.
+   *
+   * It resolves immediately when the queue is already empty, and it is
+   * resolved from {@link boundary}, so it costs nothing while nobody is
+   * waiting. It is **not** a promise that the host is quiet: work a plugin
+   * dropped on the floor is by definition not in this queue, which is why a
+   * shutdown also disarms the timers such work runs on.
+   */
+  idle(): Promise<void> {
+    if (this.depthValue === 0) return Promise.resolve();
+    return new Promise<void>((settle) => this.idleWaiters.push(settle));
   }
 
   /** How many tasks are queued or running, across both serializations. */

@@ -31,7 +31,7 @@
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, relative } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { BINARY_EXISTS, cleanupRealDaemons, scratchRoot } from "../real-daemon";
 import { LiveHost, goldenRoot, goldenScenario } from "../../src/testing/live-host";
@@ -48,12 +48,14 @@ const GOLDEN_ROOT = goldenRoot();
  *   golden tree a moving target.
  * - `.obsidian-headless` — the host's own config dir: plugin bundles,
  *   `data.json`. Not vault content and deliberately divergent.
- * - `.host-state` — where a {@link LiveHost} keeps its data directory and its
- *   socket, inside the vault root so a live case can never reach the
- *   developer's `$XDG_STATE_HOME`. Not vault content either.
  * - `.trash` — local trash, whose contents depend on delete mode.
+ *
+ * **Three, and only three.** A fourth, `.host-state`, was here with a reason
+ * that was not true — a `LiveHost` keeps its state directory *outside* the
+ * vault, on purpose — so it excluded nothing and would have hidden a real
+ * write under that name. Dispatch ruling 1 names three; three is what this is.
  */
-const EXCLUDED_DIRS = new Set([".obsidian", ".obsidian-headless", ".host-state", ".trash"]);
+const EXCLUDED_DIRS = new Set([".obsidian", ".obsidian-headless", ".trash"]);
 
 /**
  * Text is compared as text so a failure diff is readable. Everything else is
@@ -126,6 +128,17 @@ interface CasePolicy {
    * measures the flattening rather than the plugin.
    */
   readonly stageUnder?: string;
+  /**
+   * Unsupported symbols this golden is allowed to reach, and nothing else.
+   *
+   * **The brief's assertion is `expect(unsupportedHits()).toEqual([])`, and
+   * that is the default here: an empty list.** A plugin newly reaching an
+   * `absent` surface is a compatibility regression, and printing it in a
+   * failure diagnosis without asserting it makes it invisible for as long as
+   * the tree still matches. Where a golden legitimately reaches one, it is
+   * named — with the reason — rather than the assertion being dropped.
+   */
+  readonly allowedUnsupported?: readonly string[];
   /** Why this case claims what it claims. Quoted in a failure. */
   readonly why: string;
 }
@@ -288,8 +301,45 @@ function seedConfigFiles(root: string, policy: CasePolicy): void {
   }
 }
 
+/**
+ * Every rejection nobody held, in this process, for the life of the file.
+ *
+ * **The suite reported green and the process exited 1, in half its runs.** Two
+ * teardown races — a plugin's retry timer waking after the globals were
+ * restored, and the mirror's refetch reaching for an engine the supervisor had
+ * replaced — surfaced *after* a case finished, so every assertion passed and
+ * vitest still failed the run. A suite that can be green and red at once
+ * cannot gate anything, and a reader looking at test counts alone would never
+ * see it.
+ *
+ * So the file watches for them itself and fails a case that leaves one behind.
+ * It is a test of this host, not of the runner: an unhandled rejection is the
+ * shape teardown bugs take here, and naming it as a failing assertion is what
+ * makes it findable.
+ */
+const unhandled: unknown[] = [];
+const recordUnhandled = (reason: unknown): void => {
+  unhandled.push(reason);
+};
+
+beforeAll(() => {
+  process.on("unhandledRejection", recordUnhandled);
+});
+
+afterAll(() => {
+  process.off("unhandledRejection", recordUnhandled);
+});
+
 afterEach(async () => {
   await cleanupRealDaemons();
+  // One turn of the loop, so a rejection raised by the teardown itself is
+  // recorded before this check rather than after it.
+  await new Promise<void>((settle) => setTimeout(settle, 0));
+  const found = unhandled.splice(0);
+  expect(
+    found.map((reason) => (reason instanceof Error ? reason.message : String(reason))),
+    "a promise rejected with nobody holding it — see the header of this file",
+  ).toEqual([]);
 });
 
 describe.skipIf(!BINARY_EXISTS)("golden plugin conformance", () => {
@@ -306,6 +356,34 @@ describe.skipIf(!BINARY_EXISTS)("golden plugin conformance", () => {
 
   it("has a declared policy for every golden", () => {
     expect(Object.keys(POLICY).sort()).toEqual(cases.sort());
+  });
+
+  it("says which tree comparisons are conformance and which are vacuous", () => {
+    // **A `tree` case whose `expected/` equals its `vault/` proves only that
+    // nothing changed.** That is a real assertion and four cases legitimately
+    // make it — but it is not conformance, and the difference must not be
+    // something a reader has to re-derive by diffing fixtures. So the two sets
+    // are written down, and a case that drifts from one to the other — a
+    // capture regenerated with a mutation in it, or a mutating fixture
+    // flattened into a no-op — turns this red rather than passing quietly.
+    const mutating: string[] = [];
+    const unchanged: string[] = [];
+    for (const [id, policy] of Object.entries(POLICY)) {
+      if (policy.compare !== "tree") continue;
+      const before = treeOf(join(GOLDEN_ROOT, id, "vault"), policy);
+      const after = treeOf(join(GOLDEN_ROOT, id, "expected"), policy);
+      (JSON.stringify(before) === JSON.stringify(after) ? unchanged : mutating).push(id);
+    }
+    expect(mutating.sort(), "goldens whose capture changed the vault").toEqual([
+      "folder-notes",
+      "obsidian-linter",
+      "obsidian-rollover-daily-todos",
+    ]);
+    expect(unchanged.sort(), "goldens whose capture changed nothing — smoke, not conformance").toEqual([
+      "find-replace",
+      "nested-properties",
+      "tag-wrangler",
+    ]);
   });
 
   for (const pluginId of cases) {
@@ -339,6 +417,7 @@ describe.skipIf(!BINARY_EXISTS)("golden plugin conformance", () => {
       const guard = installFsWriteGuard(work);
       let host: LiveHost | null = null;
       let diagnosis = "the host never started";
+      let unsupported: readonly { symbol: string; pluginId: string | null }[] = [];
       try {
         host = await LiveHost.startOn(config);
         const live = host;
@@ -432,6 +511,9 @@ describe.skipIf(!BINARY_EXISTS)("golden plugin conformance", () => {
         // the plugin load, did the command run, what did it reach for that this
         // host does not have. Without it every failure here starts with a
         // re-run to find out.
+        // Read **before** the host stops: `unsupportedHits()` is the assembly's
+        // recorder, and the teardown clears the module-level recorder slot.
+        unsupported = host.unsupportedHits();
         diagnosis = view(answer);
       } finally {
         await host?.stop();
@@ -439,6 +521,12 @@ describe.skipIf(!BINARY_EXISTS)("golden plugin conformance", () => {
       }
 
       guard.assertClean();
+      // **The brief's per-case assertion, restored.** Empty unless the policy
+      // names what this golden is allowed to reach and why.
+      expect(
+        unsupported.map((hit) => hit.symbol).sort(),
+        `${pluginId} reached an unsupported surface.\n\n${policy.why}\n\nThe host's own view:\n${diagnosis}`,
+      ).toEqual([...(policy.allowedUnsupported ?? [])].sort());
       if (policy.compare !== "none") {
         // `tree` is the capture; `input` is the fixture's own input tree, which
         // is what "this action changes nothing here" means as an assertion.

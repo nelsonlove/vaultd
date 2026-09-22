@@ -140,6 +140,17 @@ export function clearTimersOwnedBy(pluginId: string): number {
  * return value to a plugin would be handing it a value it may not pass back.
  */
 export class ShimTimers {
+  /**
+   * Every id **this** installation handed out and has not yet disarmed.
+   *
+   * Per instance rather than per plugin, because {@link clearAll} answers a
+   * question ownership cannot: "whose `window` was this armed against". A
+   * plugin's *async continuation* arms a timer with the attribution window
+   * shut, so `pluginId` is `null` and `clearTimersOwnedBy` cannot see it —
+   * which is exactly the timer that fires after the host's globals are gone.
+   */
+  private readonly armed = new Set<number>();
+
   constructor(private readonly clock: Clock) {}
 
   setInterval(callback: () => void, ms: number): number {
@@ -158,12 +169,42 @@ export class ShimTimers {
     clearTimerById(id);
   }
 
+  /**
+   * Disarm every timer this `window` handed out, and say how many.
+   *
+   * **Called by `GlobalInstallation.restore()`, and it is what makes a
+   * teardown safe.** A plugin that retries on a timer — folder-notes waits for
+   * a file-explorer element it will never see, `await new Promise(r =>
+   * window.setTimeout(r, 100))`, recursing — holds a promise whose
+   * continuation reads `window` when it resolves. Restore the globals with
+   * that timer still armed and the continuation finds no `window`, throws a
+   * `ReferenceError` onto a promise nobody holds, and Node kills the process:
+   * measured as the binary exiting 1 on `SIGTERM` whenever a plugin was busy,
+   * and as the golden suite exiting non-zero in half its runs.
+   *
+   * Disarming instead leaves the continuation simply never resuming, which is
+   * the honest end for work whose host has gone. It is deliberately not
+   * filtered by owner: this host's `window` is what is being taken away, so
+   * everything armed through it goes, including the timers the host armed for
+   * itself through the same surface.
+   */
+  clearAll(): number {
+    let cleared = 0;
+    for (const id of [...this.armed]) {
+      this.armed.delete(id);
+      clearTimerById(id);
+      cleared += 1;
+    }
+    return cleared;
+  }
+
   private arm(callback: () => void, ms: number, repeating: boolean): number {
     // Taken here and not later: this is the one moment the attribution window
     // is open around the call that armed it.
     const pluginId = currentPluginId();
     const id = nextTimerId;
     nextTimerId += 1;
+    this.armed.add(id);
     if (repeating) {
       const handle = this.clock.setInterval(callback, ms);
       liveTimers.set(id, {
@@ -177,9 +218,12 @@ export class ShimTimers {
       return id;
     }
     // A one-shot forgets itself when it fires, or the table would grow by one
-    // entry per `setTimeout` for the life of the host.
+    // entry per `setTimeout` for the life of the host — and it leaves this
+    // installation's set with it, so {@link clearAll} stays the live set
+    // rather than everything this host ever armed.
     const handle = this.clock.setTimeout(() => {
       liveTimers.delete(id);
+      this.armed.delete(id);
       callback();
     }, ms);
     liveTimers.set(id, {

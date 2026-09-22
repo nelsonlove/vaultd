@@ -797,6 +797,15 @@ export class Mirror implements MirrorQuery {
   private appliedThroughValue = 0;
   private queue: Promise<void> = Promise.resolve();
   private resyncingValue = false;
+  /** Set by {@link Mirror.stop}: the queue is closed and applies nothing more. */
+  private stopped = false;
+  /**
+   * Failures already announced through {@link onApplyError}.
+   *
+   * A `WeakSet`, so an error object is held only as long as something else
+   * holds it: this is a dedup key, never a log.
+   */
+  private readonly reported = new WeakSet<object>();
   private pendingResync: { reason: MirrorResyncReason } | null = null;
   private lastResyncReasonValue: MirrorResyncReason | null = null;
   private resyncCountValue = 0;
@@ -1256,8 +1265,52 @@ export class Mirror implements MirrorQuery {
 
   // --- Internals ------------------------------------------------------------
 
+  /**
+   * The current engine's client — **and an engine that is not there is the
+   * resync road, not a rejection nobody can act on.**
+   *
+   * `Supervisor.client()` throws a bare `Error("no engine is running")` in the
+   * window between an engine dying and its replacement being ready. That
+   * window is real and ordinary: the supervisor is already bringing another
+   * engine up, and its synthesized `runtime_recovered` will re-hydrate
+   * everything. Letting the bare error out of here made it a *different* kind
+   * of failure from {@link EngineLostError}, which every other layer already
+   * treats as "wait for the recovery" — so a refetch that happened to be in
+   * flight rejected with something nothing recognised, and on a promise the
+   * caller had dropped it took the whole process down. Measured: it is one of
+   * the two unhandled rejections that made the golden suite exit non-zero in
+   * half its runs.
+   *
+   * So the conversion happens once, here, at the one place the mirror reaches
+   * for a client: mark the resync (the road this generation's paths now have
+   * to take) and raise the typed error the rest of the host knows.
+   */
   private client(): VaultdClient {
-    return this.clientSource();
+    try {
+      return this.clientSource();
+    } catch (error) {
+      this.markResync("runtime_recovered");
+      throw new EngineLostError(
+        `the engine was replaced while the mirror was reading it: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Stop applying anything. **Idempotent, and the last thing a teardown does
+   * to a mirror.**
+   *
+   * A host stops its supervisor as part of shutting down, and anything the
+   * mirror had queued behind that moment would reach for a client that is
+   * deliberately gone. Nothing useful can come of running it — the host is
+   * going away — so the queue is closed instead: a task enqueued after this
+   * resolves without running, and one already running finishes against the
+   * engine it started on.
+   */
+  stop(): void {
+    this.stopped = true;
   }
 
   /**
@@ -1267,11 +1320,40 @@ export class Mirror implements MirrorQuery {
    * different paths and has its own answer to give.
    */
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    // **Closed by `stop()`.** A task queued after the host began shutting down
+    // would reach for an engine the teardown has already stopped.
+    if (this.stopped) return Promise.resolve(undefined as T);
     const run = this.queue.then(task, task);
     this.queue = run.then(
       () => undefined,
       () => undefined,
     );
+    // **The returned promise is handled here as well as by its caller, and
+    // that is the whole of the fix for a class of process-killing failure.**
+    // Several callers drop this promise on purpose — a mutation's refetch is
+    // fire-and-forget behind a plugin that dropped its own promise, and a
+    // subscription fan-out is a `void` by design — so a rejection inside the
+    // chain had nobody holding it and Node killed the process. Attaching a
+    // handler to `run` (rather than returning a wrapped promise) means the
+    // caller that *does* await it still sees the rejection, exactly as before,
+    // while one that drops it gets a reported failure instead of a dead host.
+    //
+    // It goes to {@link onApplyError}, which is the seam an application
+    // failure already reports through, with a `null` event: nobody told this
+    // mirror to do the work, so no event is to blame for it.
+    run.catch((error: unknown) => {
+      // **Attached now, reported at the end of the turn.** Attaching the
+      // handler is what stops Node killing the process; *reporting* has to
+      // wait, because this handler runs before the caller's own — `applyEvent`
+      // announces every application failure with the event that caused it,
+      // which is the more useful report, and it is registered later in the
+      // chain. So the last-resort report is deferred by one turn and then
+      // skipped if something better already made it.
+      setImmediate(() => {
+        if (typeof error === "object" && error !== null && this.reported.has(error)) return;
+        this.fanOutApplyError(error, null);
+      });
+    });
     return run;
   }
 
@@ -1930,6 +2012,16 @@ export class Mirror implements MirrorQuery {
 
   /** Every apply-error listener, and a throw stays local. */
   private fanOutApplyError(error: unknown, event: RuntimeEventDto | null): void {
+    // **Once per failure, whichever road it came down.** The queue's own
+    // rejection handler exists so a dropped promise cannot kill the process,
+    // and it reports what it catches — but a failure that already went out
+    // through `applyEvent`, with the event that caused it, travels through the
+    // queue as well and would otherwise be announced twice. The first report
+    // is the informative one, so the first report is the one that stands.
+    if (typeof error === "object" && error !== null) {
+      if (this.reported.has(error)) return;
+      this.reported.add(error);
+    }
     for (const listener of [...this.applyErrorListeners]) {
       try {
         listener(error, event);

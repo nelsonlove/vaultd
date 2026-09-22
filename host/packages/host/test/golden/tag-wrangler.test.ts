@@ -57,7 +57,9 @@ describe.skipIf(!BINARY_EXISTS)("tag-wrangler harvest", () => {
       const report = await host.call<{
         report: { plugins: Array<{ scan: { tier_estimate: number } }> };
       }>("host.compat_report", { plugin_id: "tag-wrangler" });
-      expect(report.report.plugins[0]?.scan.tier_estimate).toBeGreaterThanOrEqual(1);
+      // The brief asserts 2, and an exact number is the point: a tier that
+      // drifted would say the scan now reads a different plugin.
+      expect(report.report.plugins[0]?.scan.tier_estimate).toBe(2);
 
       // **DOM-delegated listeners, unreachable with no DOM.** Not "at least
       // one": the count is ground truth and a drift in either direction means
