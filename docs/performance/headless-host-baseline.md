@@ -26,12 +26,17 @@ Ten plugins are installed into the fixture's `.obsidian-headless/plugins/`, in t
 
 ## Commands
 
+The three scratch scripts that produced the numbers below now live in the repository as one command, `host/scripts/headless-host-baseline.js`, so a second machine can reproduce them without reconstructing a harness:
+
 ```bash
 npm --prefix host run build
-node target/tmp/t22b/gen-vault.js <vault> 10000
-node target/tmp/t22b/install-plugins.js <repo> <vault>
-node target/tmp/t22b/bench.js <vault> <index.sqlite> <dataDir> <socket> <roundTripSamples> <out.json>
+cargo build --release -p vault-server
+node host/scripts/headless-host-baseline.js --repeat 3 --label <machine>
 ```
+
+That builds the 10,000-note fixture, installs the ten bundles, warms the engine index with one discarded run, takes three measured runs one process each, writes `target/tmp/baseline/out/<machine>-{1,2,3}.json` plus a `<machine>-summary.json`, and prints the series and its medians. `--repeat N` sets the number of measured runs and `--label NAME` names the reports, which is what makes two machines' series comparable in one directory. The other flags: `--no-plugins` for the mirror-only case (Case 3), `--round-trip N` to add Case 2's `vault.modify` samples, `--notes N` for a smaller fixture, `--keep-vault` to reuse one, and `--vault` / `--index` / `--out` / `--binary` to move the pieces. `--help` prints the same list.
+
+The original scratch scripts were `target/tmp/t22b/gen-vault.js`, `install-plugins.js` and `bench.js`; the committed script is those three merged, with the hard-coded absolute paths replaced by paths derived from the repository root. Nothing about the measured path changed.
 
 The harness calls `startHost` from `host/packages/host/dist/host.js` — **the same function the `vaultd-host` binary calls**, and the single copy of the wiring that `main.ts` and the live-host test seam both drive — so every number here is of the shipped startup order rather than of a harness's own. One host per process, one process per run, the engine spawned and supervised exactly as in production, `allowNetwork` forced off. The daemon's index is built once and kept warm across runs; the first run against a freshly built index pays a full 10k cold build (`vault-live-bench`'s `startup_catch_up` measures that separately at about 1.75 s on this machine) and is not what "host cold start" means.
 
@@ -133,8 +138,13 @@ The whole of the difference sits in the position warm-up, which roughly doubles.
 
 **This is machine-bound, not a host defect, and it is reported rather than averaged away.** It means the 2 s cold-start target is met on a warm page cache and missed — at 2118–2442 ms, three times out of three — on a cold one. A second machine, or the same machine not under memory pressure, would very likely tell a different story; nothing here was run on one, so nothing here claims it.
 
+**Every cold-start figure in this document is Air-only, and it is the one number that most wants a second machine.** The measurement was taken on a 16 GiB MacBook Air that never had less than 9.4 GiB of 10 GiB in swap, which is precisely the condition the position warm-up is sensitive to. The final review's recommendation was to keep the 2 s target, treat the miss as machine-bound, and take one series on a machine that is not swapping before calling the target met or missed at all — so until such a series exists, the honest reading of Case 1 is "met at 1627.4 ms on this machine with a warm page cache", not "met".
+
+To take that series elsewhere: clone the repository on the other machine, `npm --prefix host run build`, `cargo build --release -p vault-server`, then `node host/scripts/headless-host-baseline.js --repeat 3 --label <machine>` for Case 1 and `--no-plugins --repeat 3 --label <machine>-noplugins` for Case 3. Record the machine, its RAM, its swap use and its load average beside the series, as the Environment section above does — a cold-start number with no memory-pressure reading beside it cannot be compared with these. Add the result as a second series in this document rather than replacing this one: two machines disagreeing is the evidence, and one overwriting the other is not.
+
 ## Known limits and honest gaps
 
+- **The cold start is measured on one machine, and that machine was swapping.** Named again here because it is the only figure with a target attached: see the reproduction recipe at the end of the page-cache section. `host/scripts/headless-host-baseline.js` exists so the second machine is one command away.
 - **Three samples per case, one machine, one session.** No confidence interval is implied by a three-sample median, and the machine was swapping throughout. Every number should be read as an order of magnitude with a shape, not as a figure to compare against a different machine.
 - **The mirror's snapshot hydration was not separately timed by anything that shipped — it is now, and these runs predate it.** `StartupReport` gained `snapshotHydrationMs` on 2026-09-22 (the one-field addition this entry asked for), so the snapshot walk is no longer only inside the cold-start wall clock. Every number in this document was measured before that field existed and none was re-measured for it, so the figures above still decompose the way the prose says they do.
 - **RSS is the host process only**, sampled at two points, and excludes the supervised `vaultd` child. It is not a high-water mark and it is not comparable to the `peak_rss_bytes` figures in the other baseline documents, which are `getrusage` high-water marks of a whole benchmark process.
