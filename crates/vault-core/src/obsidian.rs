@@ -42,6 +42,8 @@ use crate::{
 ///
 /// ASCII-versus-non-ASCII is not a principled Unicode boundary, so this is a
 /// holding position, not a finding. **The capture that settles it** is
+/// **Captured 2026-09-24 on a live Obsidian: `#tag #a #c #p #tag-☺`,**
+/// **exactly this class.** The line below was the pending experiment:
 /// `#tag+more #a=b #c^d #p$ #tag-☺` written into a scratch note and read back
 /// through `app.metadataCache.getFileCache` on a live Obsidian 1.13.4 — a
 /// minute's work for whoever next has the app open, and it belongs in the
