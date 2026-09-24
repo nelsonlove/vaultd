@@ -107,11 +107,38 @@ describe("the MetadataCache policy rows", () => {
     expect(declared).toContain("MetadataCache.getFileCache");
     expect(declared).toContain("MetadataCache.getBacklinksForFile");
     expect(policyOf("MetadataCache.getCachedFiles")).toBe("implemented");
-    // Absent with policy, not forgotten: the compatibility report has to be
-    // able to say the footnote gap exists.
-    expect(policyOf("CachedMetadata.footnotes")).toBe("absent");
-    expect(policyOf("CachedMetadata.footnoteRefs")).toBe("absent");
-    expect(policyOf("CachedMetadata.referenceLinks")).toBe("absent");
+    // Declared with a policy, not forgotten: the compatibility report has to be
+    // able to say the footnote gap exists. `absent_field` and not `absent`,
+    // because none of the three is callable — a plugin reading one gets
+    // `undefined`, and a row spelled `absent` would claim a throw that never
+    // happens. `test/policy.test.ts` pins one of each kind against the
+    // behaviour; these three are the whole `absent_field` set in the host.
+    expect(policyOf("CachedMetadata.footnotes")).toBe("absent_field");
+    expect(policyOf("CachedMetadata.footnoteRefs")).toBe("absent_field");
+    expect(policyOf("CachedMetadata.referenceLinks")).toBe("absent_field");
+  });
+
+  /**
+   * The behaviour the `absent_field` word claims, against a real cache.
+   *
+   * The row is a claim about what a plugin sees, so it is worth reading one:
+   * the three fields come back `undefined` from a cache this host really built,
+   * and nothing throws on the way. That is the difference from `absent`, whose
+   * rows throw a typed HeadlessUnsupported when touched — pinned beside this
+   * one in `test/policy.test.ts`.
+   */
+  it("read undefined off a real cache, and throw nothing", async () => {
+    const harness = await ShimHarness.withVault(TAGGED_VAULT);
+    const file = harness.vault.getFileByPath("A.md") as TFile;
+    const cache = harness.app.metadataCache.getFileCache(file);
+    expect(cache).not.toBeNull();
+    const fields = cache as unknown as Record<string, unknown>;
+    expect(fields.footnotes).toBeUndefined();
+    expect(fields.footnoteRefs).toBeUndefined();
+    expect(fields.referenceLinks).toBeUndefined();
+    // And the cache is a real one, not an empty object that would make the
+    // three reads pass for the wrong reason.
+    expect(cache?.frontmatter).toMatchObject({ tags: ["alpha", "beta"] });
   });
 });
 

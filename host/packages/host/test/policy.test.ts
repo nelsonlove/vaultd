@@ -109,7 +109,7 @@ describe("the policy table", () => {
     expect(declaredSymbols()).not.toContain("Invented.forThisCase");
     // Restored with their policies, not merely their names.
     expect(policyOf("MetadataCache.getFileCache")).toBe("implemented");
-    expect(policyOf("CachedMetadata.footnotes")).toBe("absent");
+    expect(policyOf("CachedMetadata.footnotes")).toBe("absent_field");
   });
 
   it("captures the import-time set at module scope, before any hook", () => {
@@ -179,6 +179,40 @@ describe("recording", () => {
     });
     expect(recorded(recorder)).toEqual(["Modal.open:absent:1"]);
     expect(recorder.entries()[0]?.pluginId).toBe("quickadd");
+    setPolicyRecorder(null);
+  });
+
+  /**
+   * One row of each absent kind, because `absent` used to mean both.
+   *
+   * A callable declared `absent` throws and is recorded as a hit a report reads
+   * as "this plugin reached for something this host refuses". A field-shaped
+   * row declared `absent_field` has no call site at all: nothing throws and
+   * nothing is recorded, so the every-filter-in-the-host spelling of "refused"
+   * — `policy === "absent"`, in `server/ops.ts`'s `host.info`, in
+   * `testing/live-host.ts` and in `detector/report.ts` — must not pick it up.
+   * The filter is written out here against a live recorder rather than asserted
+   * of the table, because the table saying the right word is only half of it.
+   */
+  it("records an absent callable as a refusal and an absent_field as nothing", async () => {
+    const recorder = memoryPolicyRecorder();
+    setPolicyRecorder(recorder);
+    expect(policyOf("Modal.open")).toBe("absent");
+    expect(policyOf("CachedMetadata.footnotes")).toBe("absent_field");
+
+    await enterPlugin("quickadd", () => {
+      expect(() => {
+        unsupported("Modal.open");
+      }).toThrow(HeadlessUnsupported);
+    });
+
+    // What `host.info` puts in `unsupported`, and what the detector reads as a
+    // plugin that hit a missing surface.
+    const refusals = recorder.entries().filter((entry) => entry.policy === "absent");
+    expect(refusals.map((entry) => entry.symbol)).toEqual(["Modal.open"]);
+    expect(recorder.entries().map((entry) => entry.symbol)).not.toContain(
+      "CachedMetadata.footnotes",
+    );
     setPolicyRecorder(null);
   });
 

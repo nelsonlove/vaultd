@@ -188,7 +188,7 @@ Harness      { plugin_id, loaded, load_error: string|null, calls: Call[], throws
                refusals: { surface, detail }[],
                harvest: { commands, menu_hooks, protocol_handlers, unreachable },
                harness_limits: string[] }
-Call         { symbol, plugin_id, policy: "implemented"|"harvested"|"safe_stub"|"absent", threw: string|null, at_unix_ms }
+Call         { symbol, plugin_id, policy: "implemented"|"harvested"|"safe_stub"|"absent"|"absent_field", threw: string|null, at_unix_ms }
 ```
 
 **The scan's tallies are rows, not objects keyed by symbol name.** `api_symbols`, `generic_symbols` and `registrations` count Obsidian's own members — `getFileCache`, `onLayoutReady` — and an object keyed by those names would put `camelCase` *keys* on a socket whose one rule is that it has none. As `{ symbol, hits }` rows the symbol is a value, which is what it is: the plugin's evidence, not this host's field name. The rows keep the order the scanner found them in.

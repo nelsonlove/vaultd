@@ -1,13 +1,15 @@
 /**
- * The four-way API policy table, and the one way this host refuses a call.
+ * The five-way API policy table, and the one way this host refuses a call.
  *
- * Every surface a plugin can touch is one of four things, and saying which is
+ * Every surface a plugin can touch is one of five things, and saying which is
  * the whole point of the compatibility report: `implemented` (the host does the
  * real thing), `harvested` (the call is recorded and answered rather than
  * performed, because there is no GUI to perform it in), `safe_stub` (an inert
- * value that lets the plugin keep going) and `absent` (a typed throw). Task 8
- * and Task 11a/11b build the report out of {@link policyOf} and
- * {@link declaredSymbols}, so the names here are the names that reach a human.
+ * value that lets the plugin keep going), `absent` (a typed throw) and
+ * `absent_field` (a field-shaped symbol that is simply not there, so a reader
+ * gets `undefined` and nothing throws). Task 8 and Task 11a/11b build the
+ * report out of {@link policyOf} and {@link declaredSymbols}, so the names here
+ * are the names that reach a human.
  *
  * **Module-level, deliberately.** A policy lookup happens inside a getter on a
  * frozen barrel object, several layers below anything holding a reference to
@@ -22,7 +24,29 @@
  * not inherit the previous one's.
  */
 
-export type ApiPolicy = "implemented" | "harvested" | "safe_stub" | "absent";
+/**
+ * What this host claims about one symbol.
+ *
+ * **`absent` and `absent_field` are separated because `absent` meant two
+ * things.** A callable declared `absent` throws {@link HeadlessUnsupported}
+ * when a plugin reaches it, and the throw is the claim — the detector records
+ * it with a `threw` message and a reader of the compatibility report can see
+ * which plugins hit it. A *field-shaped* symbol — `CachedMetadata.footnotes`
+ * and the two beside it, the frontmatter fields `vaultd` does not parse — is
+ * never called at all: it is read off an object, the read answers `undefined`,
+ * and nothing throws or is recorded. Declaring both `absent` made the table say
+ * "typed throw" about three rows where the honest answer is "not populated", so
+ * a report could count a missing field as a refusal. The two are different
+ * claims, so they are different kinds.
+ *
+ * A fifth kind rather than a note on the row because the distinction has to
+ * hold for a machine: every filter in this host that means "this host refused
+ * it" is written `policy === "absent"`, and a note beside the row would leave
+ * each of those filters free to be wrong. `absent_field` never reaches the wire
+ * in a recorded call — nothing records a field read, because there is no call
+ * site to record from — so it appears in the policy table and nowhere else.
+ */
+export type ApiPolicy = "implemented" | "harvested" | "safe_stub" | "absent" | "absent_field";
 
 /**
  * ONE constructor signature, used at every call site in this plan. `name` is
@@ -219,7 +243,9 @@ export function declarePolicy(symbol: string, policy: ApiPolicy): void {
  *
  * Undeclared means absent on purpose: a name nobody bound is a name this host
  * does not have, and the honest answer to "what is your policy for it" is the
- * same as the answer for a name declared absent.
+ * same as the answer for a name declared absent. Never `absent_field`: a field
+ * this host does not populate is a row somebody wrote down deliberately, and
+ * guessing that an unknown name is one would be inventing the claim.
  */
 export function policyOf(symbol: string): ApiPolicy {
   return declarations.get(symbol) ?? "absent";
