@@ -170,6 +170,12 @@ PluginState { id, name, version, state: "loaded"|"disabled"|"failed"|"quarantine
 Command     { plugin_id, id, local_id, name, icon: string|null, kind, hotkeys: { modifiers: string[], key: string }[] }
 MenuItem    { hook_id, plugin_id, id, title, icon: string|null, section: string|null, checked: boolean|null }
 Overlap     { host_enabled: string[], gui_enabled: string[], overlap: string[], forced: string[], gui_readable: bool, checked_at_ms, overlap_poll_ms }
+Timer       { plugin_id, interval_ms: number|null, created_at: number }
+PolicyUse   { symbol, policy: "implemented"|"harvested"|"safe_stub"|"absent"|"absent_field", plugin_id: string|null, hits: number }
+Counters    { generation: number, applied_through: number, resync_count: number,
+              resyncs_by_reason: { [reason]: number }, resyncing: bool,
+              last_resync_reason: string|null, notices: number, quarantined: string[],
+              snapshot_sessions: number, pending_batches: number }
 
 Path        (string | number)[]
 SchemaItem  { key, control, name?, description?, default_value?, options?: { value, label }[] }
@@ -196,6 +202,25 @@ Call         { symbol, plugin_id, policy: "implemented"|"harvested"|"safe_stub"|
 `values` in `host.get_plugin_config` is the **plugin's own document**, so its keys are the plugin author's spelling (`taskTag`, `myApiKey`) and are never converted — renaming them would rename a user's settings. The `snake_case` rule governs the fields this host names.
 
 `version` is the empty string for a plugin whose manifest this host cannot read — unknown rather than invented, because a version nobody verified should not be printed as though it were `0.0.0`.
+
+**`host.info`'s other three substructures, field by field.** They are the host's own instrumentation rather than a plugin's evidence, and a client reads them to answer "is this host healthy and what is it carrying".
+
+`timers` is one `Timer` row per interval a plugin registered through `Plugin.registerInterval`, in registration order. A plugin's rows go when the plugin does: unloading or quarantining it drops everything it registered, so the list is what the plugins loaded right now have armed — the idle-cost census of a running host. `plugin_id` is the registering plugin. `interval_ms` is the cadence, and is `null` — never `0` — when the timer was armed outside the shim's own `window.setInterval` and there is no cadence to read back; `0` would read as a timer firing as fast as the loop allows, which is the one shape a census must not invent. `created_at` is the host clock's reading when the registration happened, which is `Date.now()` under the real clock.
+
+`unsupported` is one `PolicyUse` row per `(symbol, plugin)` pair whose policy is `absent` — the policy recorder's tally, filtered. It is what plugins **reached for and were refused**, so a symbol nobody touched is not in it however absent it is, and `hits` is the number of times that plugin hit that symbol. `plugin_id` is `null` for a hit made outside any plugin's window. `absent_field` rows never appear here: a field read has no call site to record from, and counting one as a refusal is exactly what the fifth policy kind exists to prevent.
+
+`counters` is a flat object of host state, every field a plain number, boolean, string or array:
+
+- `generation` — the highest daemon generation any row in the mirror was fetched at.
+- `applied_through` — the highest generation whose change set has been applied. Never above `generation`, and often below it while a fetch is in flight.
+- `resync_count` — how many re-hydrations this mirror has actually run, for any reason. Two requests folded into one run count once, and a run that found the vault exactly as the mirror already held it still counts.
+- `resyncs_by_reason` — the same total split by reason, as an object keyed by the reason name (`subscriber_lag`, `oversized_change_set`, `runtime_recovered`, `watcher_overflow`, `root_invalidated`, and the mirror's own `apply_failed`, `generation_gap`, `refetch_oversized`). A reason that has never fired is absent rather than `0`. The keys are reason names, which are values the daemon and the mirror both spell in `snake_case`, so the no-`camelCase` rule is unaffected.
+- `resyncing` — whether a resync is marked or running right now. It goes true the moment one is asked for and false when the last one finishes with none queued behind it.
+- `last_resync_reason` — the reason of the most recent run, or `null` if there has never been one. Overwritten by the next run, which is why the split above exists.
+- `notices` — how many entries the notice log holds (`new Notice(...)` from any plugin).
+- `quarantined` — the ids of plugins the quarantine is holding, as an array.
+- `snapshot_sessions` — open snapshot sessions across every client, not only the asking one.
+- `pending_batches` — mirror batches buffered because the host has not reached `steady` yet. It drains to `0` at `steady`; a number that keeps climbing on a started host is the signal that something never finished starting.
 
 `Overlap` is `null` before the first coexistence reading. `overlap_poll_ms` rides beside the reading rather than inside it: it is the **width of the window in which this host can be wrong** about what the GUI has enabled. There is no event for "the user enabled a plugin in Obsidian" — a GUI writing `.obsidian/community-plugins.json` through its own writer raises nothing — so the host polls, and the period is part of the answer rather than a fact only the source knows. `host.info` with `refresh: true` takes a fresh reading first.
 
