@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig, systemClock } from "../src/config";
+import { forwardingSink } from "../src/runtime/forwarding-sink";
 import { EngineLostError, EngineStartError, Supervisor } from "../src/supervisor";
 import type { HostConfig } from "../src/config";
 import type { RuntimeEventDto } from "../src/client/events";
@@ -239,6 +240,42 @@ describe("Supervisor", () => {
     expect(supervisor.state()).toBe("stopped");
     expect(() => supervisor.client()).toThrow(/no engine/);
     expect(supervisor.restartCount()).toBe(0);
+  });
+
+  /**
+   * The no-engine window is typed, on every road out of the supervisor.
+   *
+   * The Mirror has always converted this into {@link EngineLostError} at its
+   * own client seam, because a bare `Error` was a different kind of failure
+   * from the one every other layer knows how to wait out. The shim's road does
+   * not go through the Mirror: `runtime/forwarding-sink.ts` resolves the
+   * supplier per call and deliberately lets a supplier throw travel, so a
+   * plugin whose call was in flight when the supervisor replaced the engine met
+   * an untyped `Error` where everyone else met the typed one. Typing it at the
+   * source is what makes the refusal the same on both roads; the message is
+   * unchanged, so anything matching on it still matches.
+   */
+  it("refuses with a typed EngineLostError on every road, not a bare Error", async () => {
+    const supervisor = new Supervisor(configFor("ok"), silent);
+    await supervisor.start();
+    await supervisor.stop();
+
+    expect(() => supervisor.client()).toThrow(EngineLostError);
+    // The engine that is gone is still describable, which is the difference
+    // between a typed refusal and a sentence: a caller can read how it ended.
+    try {
+      supervisor.client();
+      expect.unreachable("client() must throw with no engine");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineLostError);
+      expect((error as EngineLostError).exit).toEqual(supervisor.lastExit());
+    }
+    await expect(supervisor.whenWatching()).rejects.toThrow(EngineLostError);
+
+    // The shim's own road: one sink over the same supplier, which is exactly
+    // what `assembleShim` hands every shim surface.
+    const sink = forwardingSink(() => supervisor.client());
+    await expect(sink.request("health")).rejects.toThrow(EngineLostError);
   });
 
   it("does not restart an engine that exits after stop", async () => {

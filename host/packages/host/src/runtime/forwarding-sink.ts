@@ -36,7 +36,13 @@ import type { VaultdClient } from "../client/client";
  * The supplier may throw (the supervisor's `client()` does when there is no
  * engine at all), and the throw is left to travel: "there is no engine" is a
  * real answer to a request, and a sink that swallowed it would hand the caller
- * a promise that never settles.
+ * a promise that never settles. **What travels is typed.** The supervisor
+ * raises `EngineLostError`, which is what the Mirror's own seam raises and what
+ * every layer reads as "the engine is being replaced, wait for the recovery" —
+ * so a plugin whose call was in flight at the moment of a replacement gets the
+ * same refusal here as it would on any other road. Nothing is converted in this
+ * file: a sink that re-wrapped would be a second place the class is decided,
+ * and the supplier is the one that knows.
  */
 export function forwardingSink(supplier: () => VaultdClient): RequestSink {
   return {

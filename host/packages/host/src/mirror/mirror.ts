@@ -1292,17 +1292,21 @@ export class Mirror implements MirrorQuery {
    * The current engine's client — **and an engine that is not there is the
    * resync road, not a rejection nobody can act on.**
    *
-   * `Supervisor.client()` throws a bare `Error("no engine is running")` in the
-   * window between an engine dying and its replacement being ready. That
-   * window is real and ordinary: the supervisor is already bringing another
-   * engine up, and its synthesized `runtime_recovered` will re-hydrate
-   * everything. Letting the bare error out of here made it a *different* kind
-   * of failure from {@link EngineLostError}, which every other layer already
-   * treats as "wait for the recovery" — so a refetch that happened to be in
-   * flight rejected with something nothing recognised, and on a promise the
-   * caller had dropped it took the whole process down. Measured: it is one of
-   * the two unhandled rejections that made the golden suite exit non-zero in
-   * half its runs.
+   * `Supervisor.client()` refuses in the window between an engine dying and its
+   * replacement being ready. That window is real and ordinary: the supervisor
+   * is already bringing another engine up, and its synthesized
+   * `runtime_recovered` will re-hydrate everything. It used to refuse with a
+   * bare `Error("no engine is running")`, and letting that out of here made it
+   * a *different* kind of failure from {@link EngineLostError}, which every
+   * other layer already treats as "wait for the recovery" — so a refetch that
+   * happened to be in flight rejected with something nothing recognised, and on
+   * a promise the caller had dropped it took the whole process down. Measured:
+   * it is one of the two unhandled rejections that made the golden suite exit
+   * non-zero in half its runs. **Since 2026-09-24 the supervisor raises
+   * `EngineLostError` itself**, so the shim's road is typed too; this catch
+   * stays because the conversion is not the only thing it does — the resync
+   * mark below is the mirror's own, and a supplier that is not a supervisor is
+   * still free to throw anything.
    *
    * So the conversion happens once, here, at the one place the mirror reaches
    * for a client: mark the resync (the road this generation's paths now have

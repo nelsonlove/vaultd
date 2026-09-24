@@ -328,9 +328,31 @@ export class Supervisor {
     return this.restarts;
   }
 
-  /** The current engine's client. Throws when there is no engine. */
+  /**
+   * The current engine's client. Throws {@link EngineLostError} when there is
+   * no engine.
+   *
+   * **Typed at the source, because two roads leave here and only one of them
+   * used to convert.** The Mirror wraps whatever this throws into an
+   * {@link EngineLostError} at its own client seam, so it always met the typed
+   * refusal every layer knows how to wait out. The shim does not go through the
+   * Mirror: `runtime/forwarding-sink.ts` resolves this supplier per call and
+   * deliberately lets its throw travel, so a plugin whose call was in flight
+   * while the supervisor replaced the engine met a bare `Error` — the one road
+   * out of a hundred where the same event had a different type. There is
+   * nothing the shim could have done with it that it does not already do with
+   * `EngineLostError`, so the honest fix is to raise the right class here
+   * rather than to convert it in a second place.
+   *
+   * The message is unchanged, so anything matching on the sentence still
+   * matches, and the exit is read through {@link lastExit} at the moment a
+   * caller asks — the engine that just went away is still describable, which is
+   * the difference between a typed refusal and a sentence.
+   */
   client(): VaultdClient {
-    if (!this.engine) throw new Error("no engine is running");
+    if (!this.engine) {
+      throw new EngineLostError("no engine is running", () => this.lastExitValue);
+    }
     return this.engine.client;
   }
 
@@ -374,7 +396,12 @@ export class Supervisor {
    */
   whenWatching(): Promise<void> {
     const engine = this.engine;
-    if (!engine) return Promise.reject(new Error("no engine is running"));
+    // Typed for the same reason `client()` is: a caller waiting for readiness
+    // and a caller making a request are the same caller a moment apart, and one
+    // of the two getting a bare `Error` is a distinction nothing wants.
+    if (!engine) {
+      return Promise.reject(new EngineLostError("no engine is running", () => this.lastExitValue));
+    }
     return this.openSubscription(engine).then(() => engine.watching.promise);
   }
 
