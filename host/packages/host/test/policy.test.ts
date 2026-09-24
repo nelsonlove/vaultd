@@ -206,13 +206,26 @@ describe("recording", () => {
       }).toThrow(HeadlessUnsupported);
     });
 
+    // **A recorded hit on the field row, which is the only way to make this
+    // half of the case mean anything.** Asserting that a field read is absent
+    // from the recorder would be vacuous: nothing ever records one, because
+    // reading a field has no call site to record from, and the assertion would
+    // pass whichever kind the row carried. So the hit is made here by hand —
+    // `recordUse` records at whatever the symbol declares — and what is
+    // asserted is the property the compatibility report actually rests on: a
+    // row of this kind does not answer to the `absent` filter, however it got
+    // into the tally.
+    recordUse("CachedMetadata.footnotes");
+
     // What `host.info` puts in `unsupported`, and what the detector reads as a
     // plugin that hit a missing surface.
     const refusals = recorder.entries().filter((entry) => entry.policy === "absent");
     expect(refusals.map((entry) => entry.symbol)).toEqual(["Modal.open"]);
-    expect(recorder.entries().map((entry) => entry.symbol)).not.toContain(
-      "CachedMetadata.footnotes",
-    );
+    // Present in the tally, and not a refusal. Under the old single `absent`
+    // spelling this row was in the filter above, which is the whole defect.
+    expect(
+      recorder.entries().map((entry) => `${entry.symbol}:${entry.policy}`),
+    ).toContain("CachedMetadata.footnotes:absent_field");
     setPolicyRecorder(null);
   });
 

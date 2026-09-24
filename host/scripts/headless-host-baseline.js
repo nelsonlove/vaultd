@@ -37,6 +37,8 @@
 //   --out DIR        where reports land (default target/tmp/baseline/out)
 //   --binary PATH    the vaultd to supervise (default target/release/vaultd)
 //   --keep-vault     reuse an existing fixture instead of regenerating it
+//                    (also the way to use a non-empty directory outside target/,
+//                    which is otherwise refused rather than deleted)
 //   --json           print the summary as JSON instead of a table
 
 const { spawnSync } = require("node:child_process");
@@ -47,6 +49,7 @@ const {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -60,11 +63,39 @@ const DIST = join(REPO, "host", "packages", "host", "dist");
 // --- The fixture -------------------------------------------------------------
 
 /**
+ * Refuse to delete anything that is not obviously this harness's own fixture.
+ *
+ * {@link buildVault} starts with `rmSync(root, { recursive: true, force: true })`,
+ * and `--vault` is an arbitrary path a human types. In a repository whose
+ * standing rule is "never a real vault", a committed script that deletes a
+ * directory somebody named — with nothing but a prose warning in its header —
+ * is a footgun waiting for a tired evening. So: a path under `target/` is the
+ * harness's own scratch and is rebuilt without ceremony; anywhere else, an
+ * existing non-empty directory is refused and the caller is told the two ways
+ * forward. An empty directory, or one that does not exist, is fine anywhere.
+ */
+function assertSafeToRebuild(root) {
+  const scratch = join(REPO, "target");
+  if (root === scratch || root.startsWith(`${scratch}/`)) return;
+  if (!existsSync(root)) return;
+  const entries = readdirSync(root);
+  if (entries.length === 0) return;
+  throw new Error(
+    `refusing to rebuild the fixture at ${root}: it exists and is not empty, and it is not ` +
+      `under ${scratch}. Building it would delete everything in it. Pass --keep-vault to use ` +
+      `it as it is, or point --vault at a new or empty directory.`,
+  );
+}
+
+/**
  * Reproduces `build_synthetic_vault` / `synthetic_note` from
  * `crates/vault-server/src/bin/vault-live-bench.rs`, byte for byte, so the
  * fixture measured here is the fixture that binary builds. That binary makes
  * its vault in a `TempDir` and drops it, with no flag to emit one, which is why
  * this reproduces the two functions instead of calling it.
+ *
+ * Guarded by {@link assertSafeToRebuild} at its one call site, because the
+ * first thing it does is delete what is there.
  */
 function buildVault(root, count) {
   rmSync(root, { recursive: true, force: true });
@@ -438,6 +469,7 @@ function main() {
   if (options.keepVault && existsSync(options.vault)) {
     process.stdout.write(`baseline: reusing the fixture at ${options.vault}\n`);
   } else {
+    assertSafeToRebuild(options.vault);
     process.stdout.write(`baseline: building a ${String(options.notes)}-note fixture\n`);
     buildVault(options.vault, options.notes);
   }
