@@ -250,9 +250,30 @@ export class ShimEventBus {
    */
   private tryTrigger(registration: Registration, data: never[]): void {
     try {
-      enterPluginSync(registration.owner, () =>
+      const answer: unknown = enterPluginSync(registration.owner, () =>
         registration.callback.apply(registration.context, data),
       );
+      // **An `async` listener fails by rejecting, and until 2026-09-24 that
+      // rejection was nobody's.** The `catch` above sees a synchronous throw
+      // only; a handler declared `async` — `vault.on("create", async (file) =>
+      // …)`, which is how half the corpus writes one — hands back a promise
+      // this fan-out did not hold, so its failure was neither reported nor
+      // caught, and Node's answer to a rejection nobody holds is to kill the
+      // process. It stayed invisible while such handlers happened not to fail.
+      // The `Vault.create` race fix made them fail: a write whose read-back was
+      // abandoned now refuses, and `obsidian-rollover-daily-todos`'s
+      // create-handler floated `the engine was replaced before the mirror could
+      // read back the write at generation 3` out of a golden run.
+      //
+      // So a thenable answer is held here and its rejection reported through
+      // the same seam a synchronous throw takes — same owner, same event name,
+      // same listener. The difference from the sync road is only *when* the
+      // report happens, which is when the failure actually happens.
+      if (answer instanceof Promise) {
+        answer.catch((error: unknown) => {
+          this.report({ event: registration.name, owner: registration.owner, error });
+        });
+      }
     } catch (error) {
       this.report({ event: registration.name, owner: registration.owner, error });
     }

@@ -24,6 +24,7 @@
 import { basename, posix } from "node:path";
 
 import { stub } from "./policy";
+import { guardDroppedWrites } from "./errors";
 import { overlayBytes, readThroughOverlay } from "../dryrun/dry-run";
 import type { Vault, VaultDeps } from "./vault";
 import type {
@@ -39,6 +40,25 @@ export interface ListedFiles {
   folders: string[];
 }
 
+/**
+ * Every write road on the adapter, named for {@link guardDroppedWrites}.
+ *
+ * `trashSystem` is here although it answers a boolean rather than nothing: it
+ * still sends and still settles, so it can still reject.
+ */
+const ADAPTER_WRITE_ROADS = [
+  "write",
+  "writeBinary",
+  "append",
+  "mkdir",
+  "remove",
+  "rmdir",
+  "rename",
+  "copy",
+  "trashSystem",
+  "trashLocal",
+] as const;
+
 export class DataAdapter {
   /**
    * `vault` is a thunk rather than the vault itself: the adapter is built
@@ -49,7 +69,14 @@ export class DataAdapter {
   constructor(
     protected readonly deps: VaultDeps,
     private readonly vault: () => Vault,
-  ) {}
+  ) {
+    // The same last-resort handler `Vault` puts on its own roads, for the same
+    // reason: every one of these awaits `settle`, which awaits
+    // `Mirror.applyMutation`, which since 2026-09-24 refuses when nothing
+    // applied the generation. A plugin that drops an `adapter.write` promise
+    // must not take the process with it.
+    guardDroppedWrites(this, ADAPTER_WRITE_ROADS, deps.errors);
+  }
 
   /** The vault's own name, which is the last segment of its root. */
   getName(): string {

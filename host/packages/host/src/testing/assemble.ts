@@ -415,14 +415,14 @@ export function assembleShim(deps: {
   // lines below, and nothing reads them in between: only the assembler is
   // running.
   const globals = installGlobals(app, config, { dataDir, errors, harvest, clock });
-  const vault = new Vault({ config, client, mirror, events, writes, queue });
+  const vault = new Vault({ config, client, mirror, events, writes, queue, errors });
   // After the vault, because it resolves link paths to the `TFile` instances
   // the vault's index owns — and it reads that index rather than holding a
   // copy, so a file the vault renames is the same object this answers with.
   const metadataCache = new MetadataCache({ mirror, events, index: vault.index });
   // Third, because it reads both of the others: the vault's index for the files
   // it moves and the metadata cache's resolver for the links it composes.
-  const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue });
+  const fileManager = new FileManager({ mirror, vault, metadataCache, writes, queue, errors });
   // How a plugin asks a human. Built before the `App`'s surfaces are installed
   // because two of them need it, and it reads nothing during construction.
   const broker = new InteractionBroker({ config, errors });

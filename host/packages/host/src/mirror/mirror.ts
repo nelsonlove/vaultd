@@ -190,6 +190,26 @@ import type {
 } from "./types";
 
 /**
+ * The write could not be read back because the host is shutting down.
+ *
+ * **A subclass of {@link EngineLostError}, not a sibling.** The two say the
+ * same thing to every layer that catches one — the engine behind this mirror is
+ * not reachable, it is not the caller's fault, and there is nothing to retry —
+ * and a subclass means no catch site had to learn a second name to keep
+ * behaving correctly. What it adds is the distinction a human reading a log
+ * wants: an engine being *replaced* is a recovery in progress, and a teardown
+ * is not. A caller that needs to tell them apart asks `instanceof`.
+ *
+ * `exit` is `null`: nothing died. The host asked its mirror to stop.
+ */
+export class MirrorStoppedError extends EngineLostError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MirrorStoppedError";
+  }
+}
+
+/**
  * The facets a refetch asks `get_note` for.
  *
  * Exactly the two that are optional on `NoteDto`. Everything else the mirror
@@ -1230,6 +1250,33 @@ export class Mirror implements MirrorQuery {
     // `dryrun/dry-run.ts` says so in its header, because it is the one thing a
     // dry run cannot pretend.
     if (this.config.dryRun) return Promise.resolve();
+    // **A stopped mirror can read nothing back, so it must not say it did.**
+    // {@link enqueue} closes the queue at teardown and answers a task enqueued
+    // after it with a resolved promise that never ran — right for an event,
+    // which is a fan-out nobody is waiting on, and wrong here for the reason
+    // the assertion below exists. Before this check the shutdown window gave
+    // two roads a *wrong* rejection and the rest silence: `Vault.create` and
+    // `copy` asked for a row that was never installed and threw `the daemon
+    // accepted a write to X but the mirror has no row for it`, the exact
+    // sentence this round removed, while `modify`, `delete` and `rename`
+    // resolved as though the mirror had caught up.
+    //
+    // A subclass of {@link EngineLostError} rather than a sibling, deliberately:
+    // every layer that already knows "the engine is not there, this is not the
+    // caller's fault and there is nothing to retry" does the right thing with
+    // it unchanged, and a caller that wants to tell a teardown from a
+    // replacement can still ask `instanceof MirrorStoppedError`. It is raised
+    // before the enqueue, so it cannot be mistaken for a refetch failure inside
+    // an apply.
+    if (this.stopped) {
+      return Promise.reject(
+        new MirrorStoppedError(
+          `the host is shutting down, so the mirror could not read back the write at generation ${String(
+            generation,
+          )}: ${paths.join(", ")}`,
+        ),
+      );
+    }
     return this.enqueue(async () => {
       // `event: null` — a mutation is this host's own write, not a generation
       // somebody told it about, so a warm failure here is attributable to no

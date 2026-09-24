@@ -128,9 +128,11 @@
 
 import { VaultdError } from "../client/errors";
 import { declarePolicy, recordUse, stub, unsupported } from "./policy";
+import { guardDroppedWrites } from "./errors";
 import { TFolder } from "./files";
 import { affectedPathsForRename } from "./rename-paths";
 import type { DispatchQueue } from "../runtime/queue";
+import type { HostErrors } from "./errors";
 import type { Mirror } from "../mirror/mirror";
 import type { MetadataCache } from "./metadata-cache";
 import type { TAbstractFile, TFile } from "./files";
@@ -174,7 +176,17 @@ export interface FileManagerDeps {
   queue: DispatchQueue;
   /** Attached by Task 18 when a human is reachable; absent means nobody is. */
   confirm?: ConfirmBroker | null;
+  /** Where a write whose promise the plugin dropped is reported. */
+  errors: HostErrors;
 }
+
+/** Every write road on this surface, named for `guardDroppedWrites`. */
+const FILE_MANAGER_WRITE_ROADS = [
+  "processFrontMatter",
+  "renameFile",
+  "trashFile",
+  "createNewFolder",
+] as const;
 
 /**
  * How many times `processFrontMatter` re-reads and re-runs its callback.
@@ -254,6 +266,13 @@ export class FileManager {
 
   constructor(private readonly deps: FileManagerDeps) {
     this.confirmBroker = deps.confirm ?? null;
+    // The same last-resort handler the vault and the adapter put on their write
+    // roads: each of these awaits `Mirror.applyMutation`, which since
+    // 2026-09-24 refuses when nothing applied the generation, and a plugin that
+    // drops its promise must not take the process with it. `promptForDeletion`
+    // is not here on purpose — it never writes without an answer and it is
+    // documented never to throw. See `guardDroppedWrites` in `shim/errors.ts`.
+    guardDroppedWrites(this, FILE_MANAGER_WRITE_ROADS, deps.errors);
   }
 
   // --- Frontmatter ----------------------------------------------------------

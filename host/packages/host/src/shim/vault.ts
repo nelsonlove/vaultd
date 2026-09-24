@@ -46,6 +46,7 @@ import { Events } from "./events";
 import { FileIndex, TFile, TFolder } from "./files";
 import { affectedPathsForRename } from "./rename-paths";
 import { declarePolicy, recordUse, stub } from "./policy";
+import { guardDroppedWrites } from "./errors";
 import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
 import type { RequestSink } from "../client/request-sink";
 import type {
@@ -56,6 +57,7 @@ import type {
   WriteFileResponse,
 } from "../client/protocol";
 import type { HostConfig } from "../config";
+import type { HostErrors } from "./errors";
 // The seam itself is declared with its implementations; this file re-exports
 // the type a few lines below, and needs it in scope for `VaultDeps`.
 import { readThroughOverlay } from "../dryrun/dry-run";
@@ -85,7 +87,32 @@ export interface VaultDeps {
   events: ShimEventBus;
   writes: WriteGate;
   queue: DispatchQueue;
+  /** Where a write whose promise the plugin dropped is reported. */
+  errors: HostErrors;
 }
+
+/**
+ * Every write road a plugin can reach on this surface.
+ *
+ * Named rather than discovered, so a road left unguarded is a decision rather
+ * than an omission, and {@link guardDroppedWrites} throws at assembly time if
+ * one of them stops being a method. `process` is here although it is not
+ * declared `async`: it returns the promise its retry loop builds, and a plugin
+ * drops that one exactly as easily.
+ */
+const VAULT_WRITE_ROADS = [
+  "create",
+  "createBinary",
+  "createFolder",
+  "modify",
+  "modifyBinary",
+  "process",
+  "append",
+  "copy",
+  "rename",
+  "delete",
+  "trash",
+] as const;
 
 /** How many times `process` re-reads and re-runs its callback before giving up. */
 const PROCESS_ATTEMPTS = 5;
@@ -159,6 +186,12 @@ export class Vault extends Events {
     this.index = new FileIndex(deps.mirror, this, deps.writes.overlay ?? null);
     this.index.rebuild();
     this.adapter = new DataAdapter(deps, () => this);
+    // **Every write road gets the last-resort handler.** Since the
+    // `applyMutation` contract assertion landed, each of them can reject in the
+    // window where the engine is replaced, and a plugin that drops its write
+    // promise would otherwise take the process with it. See
+    // {@link guardDroppedWrites}; the adapter guards its own roads.
+    guardDroppedWrites(this, VAULT_WRITE_ROADS, deps.errors);
     // Wired, not assumed: a GUI or a plugin writing into the config zone drops
     // the cache, and the next `getConfig` re-reads. Without this the host would
     // serve a stale `attachmentFolderPath` for the rest of the session, which
