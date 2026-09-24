@@ -27,8 +27,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DaemonHarness } from "../src/testing/daemon-harness";
+import { DispatchQueue } from "../src/runtime/queue";
+import { EngineLostError } from "../src/supervisor";
 import { Mirror } from "../src/mirror/mirror";
+import { ShimEventBus } from "../src/shim/events";
+import { Vault } from "../src/shim/vault";
 import { answerHydrationOn } from "../src/testing/mirror-harness";
+import { forwardingWriteGate } from "../src/testing/assemble";
 import type { RuntimeEventDto } from "../src/client/protocol";
 
 const harnesses: DaemonHarness[] = [];
@@ -188,6 +193,72 @@ describe("the mirror when the engine is gone", () => {
     expect(reported.join(" | "), "the apply-error seam must hear it").toMatch(
       /the daemon fell over/,
     );
+  });
+
+  /**
+   * **The `Vault.create` race, reproduced at the seam.**
+   *
+   * The 22a implementer saw `the daemon accepted a write to X but the mirror
+   * has no row for it` twice and nobody reproduced it: two reviewers ran the
+   * goldens ten serial times each and never saw it. It is not a timing
+   * coincidence, it is a swallow. `applyMutation` reads an `EngineLostError`
+   * out of its refetch the same way an event apply does — "a
+   * `runtime_recovered` marker is on its way, nothing here is worth failing a
+   * subscription fan-out over" — and **returns**, which for a mutation is a
+   * claim that the paths were refetched when they were not. `Vault.create`
+   * takes that promise as a success and asks the mirror for the row that was
+   * never installed, so the sentence it throws describes the symptom and names
+   * the wrong culprit: the daemon really did accept the write.
+   *
+   * Why the goldens never reproduced it: the engine has to be replaced in the
+   * window between the daemon answering a write and this host refetching it.
+   * The daemon does replace it there — a root-level `create_folder` under a
+   * live watcher answers `resync_required { watcher_overflow }` and the resync
+   * can take the engine with it (`docs/protocol-host.md`, and the note on
+   * `Journal/` in `test/golden/quickadd.test.ts`) — but only sometimes, and the
+   * goldens pre-create the folders that provoke it.
+   *
+   * Deterministic here because the engine is taken away between the write's
+   * request and its response, which is exactly that window and needs no timing
+   * at all. What the mutation must do is refuse, with the typed error the rest
+   * of the host already knows: the write landed, the mirror could not read it
+   * back, and the supervisor's replacement will re-hydrate.
+   */
+  it("refuses a create whose read-back meets a replaced engine, instead of claiming a missing row", async () => {
+    const { mirror, harness, loseEngine } = await mirrorOverSwitchableEngine();
+    // A `Vault` primes its `app.json` cache the moment it is built, from the
+    // host config directory first and `.obsidian/` second. Answered here so
+    // those two reads never reach the request queue this case is stepping
+    // through; a vault with no settings file is an ordinary vault.
+    harness.unserveFile(`${harness.config.configDirName}/app.json`);
+    harness.unserveFile(".obsidian/app.json");
+    const vault = new Vault({
+      config: harness.config,
+      client: harness.client,
+      mirror,
+      events: new ShimEventBus(),
+      writes: forwardingWriteGate(harness.client),
+      queue: new DispatchQueue(),
+    });
+
+    const creating = vault.create("New.md", "body\n");
+    const sent = await harness.expectRequest("write_note");
+    // The engine is replaced while the write is in flight. The write itself is
+    // already the daemon's business and still answers; the *refetch* is what
+    // meets the gap.
+    loseEngine();
+    harness.respondOk(sent.id, "write_note", { generation: 6, revision: "blake3:n1" });
+
+    await expect(creating).rejects.toThrow(EngineLostError);
+    await expect(creating).rejects.toThrow(/New\.md/);
+    // Not the sentence that blamed the mirror for a row the daemon supposedly
+    // wrote. That message is the symptom this case exists to remove.
+    await expect(creating).rejects.not.toThrow(/has no row for it/);
+    // The road is the same one every other engine loss takes: the mirror knows
+    // generation 6 is unread and is waiting to be re-hydrated rather than
+    // believing itself current.
+    expect(mirror.resyncing()).toBe(true);
+    expect(mirror.appliedThrough()).toBe(5);
   });
 
   it("ignores a late delta once stopped, and sends nothing for it", async () => {

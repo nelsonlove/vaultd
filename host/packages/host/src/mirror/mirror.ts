@@ -1238,6 +1238,44 @@ export class Mirror implements MirrorQuery {
         guarded: false,
         event: null,
       });
+      // **The contract, asserted, because two roads out of the apply return
+      // without having applied anything.** Both read an `EngineLostError` as a
+      // background condition and stop quietly: `applyChangeSet` catches one out
+      // of its refetch ("a `runtime_recovered` marker is on its way, nothing
+      // here is worth failing a subscription fan-out over"), and `runResync`
+      // catches one out of a re-hydration ("the previous view keeps serving,
+      // stale but coherent"). Both are right for an **event**, whose caller is
+      // a fan-out nobody is holding. Both are wrong for a **mutation**, whose
+      // caller is a shim write still in progress and whose whole promise is
+      // that these paths have been read back.
+      //
+      // Measured, not reasoned: this is the `Vault.create` race the final
+      // review left open. `create` took the quiet return for a success, asked
+      // the mirror for the row that was never installed, and threw `the daemon
+      // accepted a write to X but the mirror has no row for it` — a sentence
+      // that describes the symptom and blames the wrong component, since the
+      // daemon really did accept the write. Reproduced deterministically in
+      // `test/mirror-engine-lost.test.ts` by replacing the engine between the
+      // write's request and its response.
+      //
+      // `appliedThrough` is the exact witness and needs no flag threaded
+      // through the apply: every road that really applied this generation
+      // advances it — the delta install and a re-hydration alike — and no road
+      // that abandoned the work does. An event that applied the same generation
+      // first also advances it, which is correct: the row is installed either
+      // way, and the mutation's refetch was then belt and braces.
+      //
+      // Typed, and not a retry: the write landed, this host could not read it
+      // back, and the supervisor's replacement engine will re-hydrate the
+      // mirror. That is exactly what `EngineLostError` means everywhere else,
+      // so a plugin meets one refusal for one event on every road.
+      if (this.appliedThroughValue < generation) {
+        throw new EngineLostError(
+          `the engine was replaced before the mirror could read back the write at generation ${String(
+            generation,
+          )}: ${paths.join(", ")}`,
+        );
+      }
     });
   }
 
