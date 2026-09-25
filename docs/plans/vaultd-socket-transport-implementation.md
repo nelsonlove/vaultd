@@ -67,14 +67,17 @@ Expected: a clean tree on `feat/socket-transport`, `cargo` at 1.85 or above, `no
 
 ### `crates/vault-server/tests`
 
-- Modify `tests/daemon/mod.rs` — `Transport`, `Daemon::start_on`, socket connection, `socket_path()`.
+- Create `tests/socket/mod.rs` — the socket-side harness: `ListeningDaemon` (a spawned `vaultd --listen`, with its readiness probe) and `Client` (one connection, with `send`/`response`/`call`/`call_raw`/`wait_for_event`/`drain_events`/`stop_reading`/`resume_reading`/`disconnect`). **The socket route is this harness, not an extension of the stdio one:** `tests/daemon/mod.rs`'s `Daemon` owns a child's stdio pipes and a socket connection owns neither, so widening it would have meant one struct with two disjoint halves.
+- Modify `tests/daemon/mod.rs` — `call_raw` (Task 6), then `Transport` and `drain_events` (Task 7). Nothing else: `Daemon` stays the stdio harness it is.
 - Create `tests/socket_lifecycle.rs` — stale file, live daemon, non-socket file, SIGTERM drain, socket gone after exit, stdin-closed daemon.
 - Create `tests/socket_clients.rs` — two clients, the slow client, connection-scoped sessions.
+- Create `tests/socket_info.rs` — `socket_path` present, absent, and equal to the documented default path.
 - Create `tests/conformance.rs` — one fixture set over both transports, transcripts compared after named normalization.
 - Create `tests/fixtures/conformance.jsonl` — the fixture set.
 
 ### `host/packages/host`
 
+- Modify `src/client/protocol.ts` — `GetVaultInfoResponse.socket_path?: string`, the TypeScript mirror of the Rust wire type (Task 6, with the Rust field).
 - Modify `src/config.ts` — `EngineMode`, `engine`, `engineSocketPath`, `leaveEngineRunning`, `vaultdSocketPathFor`.
 - Create `src/engine-probe.ts` — `probeEngineSocket`.
 - Modify `src/supervisor.ts` — connect-or-spawn, `engineSource()`, SIGTERM at shutdown.
@@ -2917,6 +2920,7 @@ The one additive protocol change in this phase: an optional field so a client on
 - Modify: `crates/vault-protocol/src/operations.rs:215-224` (`GetVaultInfoResponse`)
 - Modify: `crates/vault-server/src/convert.rs:290-303` (`vault_info`)
 - Modify: `crates/vault-server/src/lib.rs` (the `Request::GetVaultInfo` arm, and the `socket_path` accessor beside the setter Task 4 added)
+- Modify: `host/packages/host/src/client/protocol.ts:601-610` (the TypeScript mirror of the same wire type)
 - Modify: `docs/protocol.md:56-66` (the `get_vault_info` example and its prose)
 - Create: `crates/vault-server/tests/socket_info.rs`
 
@@ -2945,6 +2949,23 @@ pub struct GetVaultInfoResponse {
 ```rust
 impl Server {
     pub fn socket_path(&self) -> Option<&str>;
+}
+```
+
+and its TypeScript mirror, which **ships in this task and not in Task 11**, because the field and the type that describes it are one change:
+
+```ts
+export interface GetVaultInfoResponse {
+  generation: number;
+  canonical_root: string;
+  vault_identity: string;
+  state: IndexStateDto;
+  note_count: number;
+  refreshed_at_unix_ms: number | null;
+  /** Absent in health-only mode, where there is no runtime to describe. */
+  live_state?: LiveStateDto;
+  /** Absent when the daemon has no socket. See the Rust field above. */
+  socket_path?: string;
 }
 ```
 
@@ -3184,30 +3205,55 @@ and add, immediately after it:
 
 `socket_path` is present only when the daemon was started with `--listen`, and names the path it actually bound. It is how a client that reached the daemon one way tells another client where to knock; the path can also be computed from the vault root alone, by the rule in **Transports** below.
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 5: Mirror the field in the host's client types**
+
+The host has its own hand-written description of every wire type, and a field that exists on the Rust side and not on the TypeScript side is a field the host cannot read under `strict`. It lands here, with the Rust field, rather than in the task that first reads it — `host/packages/host/src/client/protocol.ts`, appending one member to `GetVaultInfoResponse`:
+
+```ts
+  /**
+   * Where the daemon is listening, absent when it has no socket.
+   *
+   * Optional rather than `string | null` because the daemon **skips** the key
+   * rather than serializing `null` — so a host that tests `info.socket_path`
+   * for undefined is testing what the wire actually does.
+   */
+  socket_path?: string;
+```
+
+Nothing else in `protocol.ts` changes, and no host code reads the field yet: Task 11's engine-mode tests are its first reader, and they compile because of this step.
+
+- [ ] **Step 6: Typecheck the host workspace**
+
+Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && npm --prefix host run typecheck; echo "exit=$?"`
+
+Expected: `exit=0`. An optional field added to an interface breaks nothing that did not read it, so this is a one-command confirmation rather than a round of fixes — and it is run here so the host workspace is never left red between two tasks.
+
+- [ ] **Step 7: Run the Rust tests**
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test socket_info --test protocol_doc_examples --test docs; echo "exit=$?"`
 
 Expected: the three `socket_info` cases `ok`; `protocol_doc_examples` still green, which is what proves the amended example still deserializes against the shipped type; `exit=0`. The prose sentence names **Transports**, a section Task 13 adds — `docs.rs` asserts on required phrases rather than on links, so it stays green meanwhile.
 
-- [ ] **Step 6: Clippy and the whole workspace**
+- [ ] **Step 8: Clippy and the whole workspace**
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && cargo clippy --workspace --all-targets -- -D warnings && TMPDIR="$PWD/target/tmp" cargo test --workspace; echo "exit=$?"`
 
 Expected: no warnings; the whole workspace green, `vault-protocol`'s own tests included, `exit=0`. A `GetVaultInfoResponse` literal anywhere else in the tree will fail to compile until it names the new field — fix each by adding `socket_path: None`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 cd ~/repos/system/vaultd/.claude/worktrees/live-impl
-git add crates/vault-protocol/src/operations.rs crates/vault-server/src/convert.rs crates/vault-server/src/lib.rs crates/vault-server/tests/socket_info.rs crates/vault-server/tests/daemon/mod.rs docs/protocol.md
+git add crates/vault-protocol/src/operations.rs crates/vault-server/src/convert.rs crates/vault-server/src/lib.rs crates/vault-server/tests/socket_info.rs crates/vault-server/tests/daemon/mod.rs host/packages/host/src/client/protocol.ts docs/protocol.md
 git commit -F - <<'COMMIT'
 feat(protocol): get_vault_info reports the socket path
 
 One optional field, skipped rather than serialized as null, so a version 1
 client that never asked sees the bytes it always saw. A client that reached
 the daemon one way can now tell another where to knock, and the default path
-is pinned against the digest rule the host applies.
+is pinned against the digest rule the host applies. The host's hand-written
+mirror of the type gains the field in the same commit, because a wire field
+the TypeScript side cannot describe is a field the host cannot read.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 COMMIT
@@ -5054,24 +5100,38 @@ Append to `host/packages/host/test/main-real-daemon.test.ts`:
   });
 ```
 
-Append to `host/packages/host/test/server-ops.test.ts`, in whatever `describe` covers `host.info`:
+Append to `host/packages/host/test/server-ops.test.ts`, inside the same `describe` as `"reports the host's own state through hello and info"`, and in that case's exact shape — a harness, a client, `client.call`, and a `finally` that stops the harness:
 
 ```ts
   it("reports the engine in snake_case, without moving host.hello's live_state", async () => {
-    const info = (await dispatch("host.info", {})) as {
-      engine: Record<string, unknown>;
-    };
-    expect(Object.keys(info.engine).sort()).toEqual([
-      "live_state",
-      "mode",
-      "socket_path",
-      "source",
-    ]);
-    expect(info.engine.mode).toBe("auto");
-    const hello = (await dispatch("host.hello", {})) as Record<string, unknown>;
-    expect(hello).toHaveProperty("live_state");
+    const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const info = await client.call<{ engine: Record<string, unknown> }>("host.info", {});
+      expect(Object.keys(info.engine).sort()).toEqual([
+        "live_state",
+        "mode",
+        "socket_path",
+        "source",
+      ]);
+      expect(info.engine.mode).toBe(harness.config.engine);
+      expect(info.engine.socket_path).toBe(harness.config.engineSocketPath);
+      // **`host.hello` is answered once per connection**, and `connectClient`
+      // already consumed this one's — so the payload is read back off the
+      // client rather than asked for again, which is what the neighbouring
+      // case does and why it asserts a second hello rejects. The point here is
+      // only that `live_state` is still on `hello`: the `engine` object adds a
+      // second place to read the runtime's state, and moving the first would
+      // break every client reading it today.
+      expect(client.helloPayload()).toHaveProperty("live_state");
+    } finally {
+      await harness.stop();
+    }
   });
 ```
+
+`HostHarness`, `client.call<T>` and `client.helloPayload()` are all already in use in this file and in `src/testing/host-harness.ts`; nothing new is introduced.
 
 Create `host/packages/host/test/engine-lost-connected-real-daemon.test.ts`:
 
@@ -5420,9 +5480,9 @@ Every section of `docs/design/vaultd-socket-transport.md`, and the task that imp
 
 **1. Spec coverage.** The table above walks every section heading of the spec — Architecture, Connection lifecycle, The host supervisor, Error handling, Performance requirements, Testing, Documentation — and every bullet under each. The Non-goals section needs no task by construction, and the Deferred follow-on list is named in the documentation Task 13 writes (cross-connection sweeping and the SSH forward both appear in the Transports section) rather than implemented. Ruling 5 (one server, one loop per connection) is the architecture of Tasks 1 to 4; Ruling 6 (the spec lives repo-local) is already satisfied; Rulings 1 to 4 are about a private deployment and need no task here.
 
-**2. Placeholder scan.** No `TBD`, `TODO`, "implement later", "add error handling", "add validation", "handle edge cases", "write tests for the above", or "similar to Task N" appears. Every test step carries runnable code; every implementation step carries the code it asks for; every run step names its command and the exit code it expects. Where a task repeats a helper another task also defines — `answer_one_health`, `call_raw`, `drain_events` — the code is written out again rather than cross-referenced, because a task's implementer sees only their own task.
+**2. Placeholder scan.** No `TBD`, `TODO`, "implement later", "add error handling", "add validation", "handle edge cases", "write tests for the above", or "similar to Task N" appears. Every test step carries runnable code; every implementation step carries the code it asks for; every run step names its command and the exit code it expects. One helper is genuinely written twice, in two tasks, and the code is given in full both times rather than cross-referenced, because a task's implementer sees only their own task: `call_raw`, for `Daemon` in Task 6 and for `Client` in Task 7. `drain_events` is written twice inside Task 7 alone, for the same two structs. `answer_one_health` is defined exactly once, in Task 3's `listener.rs` test module, and is used only there.
 
-**3. Type consistency.** The names that cross task boundaries, checked in each place they appear: `connection::serve` (Tasks 1, 4) keeps its six parameters and its `after_dispatch` seam; `ThreadLabels::for_connection` (1, 4); `Broadcaster::{new, register, unregister, offer, connection_count}` and `CONNECTION_NOTICE_CAPACITY` (2, 4, 5, 8); `ConnectionId` is `Copy + Display` because Task 4 formats it into a thread name; `SocketListener::{bind, path, accept, wake}` and `ListenError`'s five variants (3, 4, 5); `Server::{set_socket_path, socket_path}` (4, 6) with the field added in Task 4 and read in Task 6; `convert::vault_info`'s third parameter (6); `Transport` lives in `tests/daemon/mod.rs` and is used by `tests/conformance.rs` (7); `Client::{stop_reading, resume_reading}` are exact inverses (4, 8); on the host, `EngineMode` and `EngineSource` are two distinct types and are never interchanged — the config field is `engine: EngineMode`, the report field is `engineSource: EngineSource`, and `Supervisor.engineSource()` returns `EngineSource | null`; `vaultdSocketPathFor` (10, 11, 13) is never confused with `socketPathFor`, which keeps its own meaning and its own test; `probeEngineSocket`'s `ProbeResult` is consumed only by `Supervisor.engineOnce` (10, 11). The wire keys added to `host.info` are `snake_case` throughout (`socket_path`, `live_state`), matching the Global Constraint the phase-6 plan set and `test/server-wire.test.ts` enforces.
+**3. Type consistency.** The names that cross task boundaries, checked in each place they appear: `connection::serve` (Tasks 1, 4) keeps its six parameters and its `after_dispatch` seam; `ThreadLabels::for_connection` (1, 4); `Broadcaster::{new, register, unregister, offer, connection_count}` and `CONNECTION_NOTICE_CAPACITY` (2, 4, 5, 8); `ConnectionId` is `Copy + Display` because Task 4 formats it into a thread name; `SocketListener::{bind, path, accept, wake}` and `ListenError`'s five variants (3, 4, 5); `Server::{set_socket_path, socket_path}` (4, 6) with the field added in Task 4 and read in Task 6; `convert::vault_info`'s third parameter (6); `GetVaultInfoResponse.socket_path` exists on **both** sides of the wire and both land in Task 6 — `Option<String>` with `skip_serializing_if` in `crates/vault-protocol/src/operations.rs`, and the optional `socket_path?: string` in `host/packages/host/src/client/protocol.ts` that Task 11's engine-mode tests read; `Transport` lives in `tests/daemon/mod.rs` and is used by `tests/conformance.rs` (7); `Client::{stop_reading, resume_reading}` are exact inverses (4, 8); on the host, `EngineMode` and `EngineSource` are two distinct types and are never interchanged — the config field is `engine: EngineMode`, the report field is `engineSource: EngineSource`, and `Supervisor.engineSource()` returns `EngineSource | null`; `vaultdSocketPathFor` (10, 11, 13) is never confused with `socketPathFor`, which keeps its own meaning and its own test; `probeEngineSocket`'s `ProbeResult` is consumed only by `Supervisor.engineOnce` (10, 11). The wire keys added to `host.info` are `snake_case` throughout (`socket_path`, `live_state`), matching the Global Constraint the phase-6 plan set and `test/server-wire.test.ts` enforces.
 
 ## Execution handoff
 
