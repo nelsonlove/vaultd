@@ -2,6 +2,7 @@ pub mod broadcast;
 pub mod connection;
 mod convert;
 pub mod fixture_row;
+pub mod listener;
 pub mod runtime;
 pub mod stdio;
 pub mod subscriptions;
