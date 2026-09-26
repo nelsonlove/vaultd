@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig, systemClock } from "../src/config";
-import { EngineLostError, EngineVaultMismatchError } from "../src/supervisor";
+import { EngineAbsentError, EngineLostError, EngineVaultMismatchError } from "../src/supervisor";
 import { probeEngineSocket } from "../src/engine-probe";
 import {
   BINARY,
@@ -169,12 +169,98 @@ describe.skipIf(!BINARY_EXISTS)("engine modes", () => {
     await expectEventually(() => !alive(pid as number), "the left-behind daemon to stop");
   });
 
-  it("connect refuses when nothing is listening", async () => {
-    const config = configFor("connect");
-    const supervisor = superviseOn(config);
-    await expect(supervisor.start()).rejects.toThrow(/no vaultd is listening/i);
+  it("connect refuses after the first probe, without climbing the ladder", async () => {
+    // **The spec is about startup: "if the socket is absent at startup, exit
+    // 3".** A mode that never spawns learns everything it can learn from the
+    // first probe, so re-asking on every rung spends the whole window on an
+    // answer already given and reports the same absence as a fresh loss each
+    // time. The ladder here is deliberately slow — three five-second rungs —
+    // so the two behaviours differ by a *configured* budget rather than by
+    // machine speed: climbing it would take at least ten seconds.
+    const config = { ...configFor("connect"), restartBackoffMs: [5_000, 5_000, 5_000] };
+    const lost: Error[] = [];
+    const supervisor = superviseOn(config, {
+      onClientReady: (): void => {},
+      onEngineLost: (error): void => {
+        lost.push(error);
+      },
+      onStateChange: (): void => {},
+    });
+
+    const began = Date.now();
+    let thrown: unknown;
+    await supervisor.start().catch((error: unknown) => {
+      thrown = error;
+    });
+    const took = Date.now() - began;
+
+    // The typed refusal itself, not the "failed after N attempt(s)" wrapper a
+    // spent ladder produces — that wrapper is how the diagnosis gets buried.
+    expect(thrown).toBeInstanceOf(EngineAbsentError);
+    expect((thrown as EngineAbsentError).socketPath).toBe(config.engineSocketPath);
+    expect((thrown as Error).message).toMatch(/no vaultd is listening/i);
+    expect((thrown as Error).message).not.toMatch(/attempt\(s\)/);
     expect(supervisor.engineSource()).toBeNull();
-  });
+    expect(supervisor.state()).toBe("stopped");
+    // One probe, so one report. Four more would be one outage counted five
+    // times, which is the same rule the reconnect window follows.
+    expect(lost.length).toBe(1);
+    expect(took).toBeLessThan(5_000);
+    // The case's own budget is far past the ladder's, so a supervisor that
+    // climbs it fails on the duration assertion above — which names the
+    // defect — rather than on a bare vitest timeout, which names nothing.
+  }, 60_000);
+
+  it("connect climbs the ladder when its socket drops, and reconnects without ever spawning", async () => {
+    // The other half of the same ruling. A socket that is absent *at startup*
+    // is final; one that goes away later is a daemon that may be restarting,
+    // and waiting for it on the ladder is the only recovery `connect` has —
+    // it must never become a spawn.
+    const config = configFor("auto");
+    const owner = await startedOn({ ...config, leaveEngineRunning: true });
+    const daemon = owner.pid() as number;
+    // The owner leaves its daemon behind, so the guest below is the only
+    // supervisor with an opinion about it.
+    await owner.stop();
+
+    const lost: Error[] = [];
+    const guest = superviseOn(
+      // Twenty half-second rungs: ten seconds of patience, which is a real
+      // daemon's start with room for a loaded machine.
+      { ...config, engine: "connect", restartBackoffMs: new Array<number>(20).fill(500) },
+      {
+        onClientReady: (): void => {},
+        onEngineLost: (error): void => {
+          lost.push(error);
+        },
+        onStateChange: (): void => {},
+      },
+    );
+    await guest.start();
+    expect(guest.engineSource()).toBe("connected");
+
+    process.kill(daemon, "SIGKILL");
+    await expectEventually(() => lost.length > 0, "the guest to be told its engine is gone");
+    expect(guest.engineSource()).toBeNull();
+
+    // A replacement daemon on the same path, arriving inside the guest's
+    // ladder. It is spawned by somebody else — the guest never spawns.
+    const replacement = await startedOn(config);
+    expect(replacement.engineSource()).toBe("spawned");
+
+    await expectEventually(
+      () => guest.engineSource() === "connected",
+      "the guest to reconnect to the replacement daemon",
+      30_000,
+    );
+    expect(guest.state()).toBe("running");
+    expect(guest.pid()).toBeNull();
+    expect(lost.length).toBe(1);
+    const info = await guest.client().request<GetVaultInfoResponse>("get_vault_info");
+    expect(info.socket_path).toBe(config.engineSocketPath);
+    // Past the 30 s rendezvous above, so a supervisor that refuses to climb
+    // fails on that wait's own message rather than on a bare vitest timeout.
+  }, 60_000);
 
   it("connect takes the engine-lost road when the daemon is killed", async () => {
     const config = configFor("auto");

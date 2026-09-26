@@ -302,7 +302,15 @@ export async function main(
         vault: running.config.vaultRoot,
         dry_run: running.config.dryRun,
         engine_source: running.engineSource,
-        engine_socket: running.config.engineSocketPath,
+        // **`null` under `spawn`, and the key stays either way.** The config
+        // always *has* an `engineSocketPath` — `defaultHostConfig` derives one
+        // from the vault root whatever the mode — but `spawnOnce` passes
+        // `--listen` only under `auto`, so under `spawn` that path names a
+        // socket nothing bound and nothing ever will. Printing it there
+        // advertises an address a client would knock on and find empty. The
+        // key is not dropped, because a key that comes and goes is worse to
+        // consume than one whose value says "there is no socket".
+        engine_socket: running.config.engine === "spawn" ? null : running.config.engineSocketPath,
         loaded: running.startup.loaded,
         failed: running.startup.failed,
       }),

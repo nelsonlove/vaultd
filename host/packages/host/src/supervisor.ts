@@ -150,6 +150,38 @@ export class EngineVaultMismatchError extends EngineStartError {
 }
 
 /**
+ * `engine: "connect"` found nothing listening **at startup**.
+ *
+ * The spec is one sentence — "if the socket is absent at startup, exit 3" —
+ * and a sentence about startup is a sentence about the *first* probe. A mode
+ * that never spawns learns everything it can learn from that one answer, so
+ * climbing the restart ladder spends the whole window (3.75 s on the default
+ * rungs) re-asking a question already answered, and reports the same absence
+ * as a fresh loss on every rung. Its own class so {@link Supervisor.climb}
+ * stops at once and the typed refusal travels intact to `startHost`, which
+ * still turns it into `DaemonUnreachable` and the binary into exit 3.
+ *
+ * **Only at startup.** A `connect` host whose socket goes away *later* takes
+ * the ladder exactly as before — the daemon it was using may be restarting,
+ * and waiting for it is the whole of what `connect` can do. It still never
+ * spawns.
+ */
+export class EngineAbsentError extends EngineStartError {
+  /** The socket that was probed and did not answer. */
+  readonly socketPath: string;
+
+  constructor(socketPath: string) {
+    super(
+      `no vaultd is listening at ${socketPath}, and engine: "connect" never spawns one`,
+      null,
+      "",
+    );
+    this.name = "EngineAbsentError";
+    this.socketPath = socketPath;
+  }
+}
+
+/**
  * A rung spent waiting for a daemon that may still come back.
  *
  * Not a loss and not reported as one: under `auto`, a connected engine whose
@@ -651,6 +683,13 @@ export class Supervisor {
           this.setState("stopped");
           throw error;
         }
+        // **And an absent socket at a cold `connect` start is the same shape.**
+        // Every remaining rung would re-probe a path this mode will never put
+        // a daemon on. See {@link EngineAbsentError}.
+        if (error instanceof EngineAbsentError) {
+          this.setState("stopped");
+          throw error;
+        }
         const wait = attempt + 1 < ladder.length ? ladder[attempt] : undefined;
         if (wait === undefined) {
           this.setState("stopped");
@@ -689,10 +728,24 @@ export class Supervisor {
       case "connect": {
         const probe = await probeEngineSocket(this.config.engineSocketPath, this.config.clock);
         if (!probe.answered) {
-          throw new EngineStartError(
-            `no vaultd is listening at ${this.config.engineSocketPath}, and engine: "connect" never spawns one`,
-            null,
-            "",
+          // **At startup this is the end; after a loss it is a rung.** The
+          // spec says "if the socket is absent at startup, exit 3", and the
+          // first probe is everything a mode that never spawns can learn — so
+          // a cold start refuses non-retryably rather than re-asking on four
+          // more rungs and calling each answer a fresh loss. A host that was
+          // *connected* and lost its socket is the other case: the daemon may
+          // be restarting, so it waits on the ladder, which is the only
+          // recovery `connect` has. `reconnecting` is the difference, set in
+          // `restart()` and cleared in `start()` and `adopt()`.
+          if (!this.reconnecting) throw new EngineAbsentError(this.config.engineSocketPath);
+          // A rung spent waiting is not a new loss — the same rule `auto`'s
+          // reconnect window follows, and for the same reason: the outage was
+          // reported once when the connection dropped, and a consumer told
+          // "the engine is gone" on every rung of the wait would count one
+          // outage twenty times.
+          throw new EngineWaitingError(
+            `no vaultd is listening at ${this.config.engineSocketPath} yet; the daemon this ` +
+              'host was connected to may still come back, and engine: "connect" never spawns one',
           );
         }
         return this.connectOnce();
