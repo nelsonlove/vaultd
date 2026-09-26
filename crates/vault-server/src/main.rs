@@ -76,9 +76,18 @@ impl Cli {
     }
 }
 
-/// A server and the notice stream its transport must forward, if it has one.
-/// Health-only mode has no runtime, so there is nothing to forward.
-type ConfiguredServer = (Server, Option<Receiver<RuntimeNotice>>);
+/// A server, the notice stream its transport must forward if it has one, and
+/// the canonical vault root the server was configured with.
+///
+/// Health-only mode has no runtime, so there is nothing to forward — and no
+/// vault, so there is no root. The root is carried out rather than recomputed
+/// because the default socket path is a function of it: deriving a *second*
+/// `IndexConfig` just to read it would import failure modes that have nothing
+/// to do with sockets (the XDG cache lookup, and the refusal of a derived
+/// index path that would land inside the vault), so a daemon given an
+/// explicit `--index` safely outside its vault could be refused `--listen`
+/// over an index path it was never going to use.
+type ConfiguredServer = (Server, Option<Receiver<RuntimeNotice>>, Option<PathBuf>);
 
 fn main() {
     // Before anything can parse a note: a contained parse panic must read as a
@@ -94,25 +103,27 @@ fn main() {
 /// graph, no timer, and no threads beyond the transport's own.
 fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
     let config = match (&cli.vault, &cli.index) {
-        (None, None) => return Ok((Server::health_only(), None)),
+        (None, None) => return Ok((Server::health_only(), None, None)),
         (Some(vault), None) => IndexConfig::derived(vault)?,
         (Some(vault), Some(index)) => IndexConfig::explicit(vault, index)?,
         (None, Some(_)) => unreachable!("clap enforces --index requires --vault"),
     };
+    let canonical_vault_root = config.canonical_vault_root.clone();
     let (server, notices) = Server::start(config, cli.runtime_options())?;
-    Ok((server, Some(notices)))
+    Ok((server, Some(notices), Some(canonical_vault_root)))
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let (mut server, notices) = configured_server(&cli)?;
-    let listen = match (&cli.listen, &cli.vault) {
+    let (mut server, notices, canonical_vault_root) = configured_server(&cli)?;
+    let listen = match (&cli.listen, &canonical_vault_root) {
         (None, _) => None,
         (Some(Some(path)), _) => Some(path.clone()),
-        (Some(None), Some(vault)) => Some(vault_server::listener::default_socket_path(
-            &vault_index::IndexConfig::derived(vault)?.canonical_vault_root,
-        )?),
-        // clap enforces `--listen` requires `--vault`.
+        // The root this daemon is actually serving, not a second derivation
+        // of it. See `ConfiguredServer`.
+        (Some(None), Some(root)) => Some(vault_server::listener::default_socket_path(root)?),
+        // clap enforces `--listen` requires `--vault`, and a `--vault` is
+        // exactly what gives `configured_server` a root to hand back.
         (Some(None), None) => unreachable!("--listen requires --vault"),
     };
     // Answered by `get_vault_info` so a client on stdio can tell others where

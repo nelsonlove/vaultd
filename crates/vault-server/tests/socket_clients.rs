@@ -4,6 +4,8 @@
 
 mod socket;
 
+use std::time::Duration;
+
 use socket::ListeningDaemon;
 use tempfile::TempDir;
 use vault_protocol::{Response, ResponseOutcome, RuntimeEventDto};
@@ -49,6 +51,11 @@ fn two_clients_see_the_same_generation_each_under_its_own_subscription_id() {
         let event = client.wait_for_event(|envelope| {
             matches!(&envelope.event, RuntimeEventDto::GenerationCommitted(committed) if committed.generation == generation)
         });
+        // The fan-out reaching only one connection is what this catches: the
+        // other `wait_for_event` would hang and panic at its bound. The id
+        // check below is the weaker half — both ids are the same string, so
+        // it pins the string and not the attribution; the attribution is
+        // proven at the end, where the unsubscribed client must hear nothing.
         assert_eq!(
             event.subscription_id, id,
             "{label} sees the generation under its own subscription id"
@@ -70,6 +77,25 @@ fn two_clients_see_the_same_generation_each_under_its_own_subscription_id() {
         matches!(&envelope.event, RuntimeEventDto::GenerationCommitted(committed) if committed.generation == later)
     });
     assert_eq!(event.subscription_id, first_id);
+
+    // And the other half, which is what actually proves the events are
+    // attributed per connection: the client that unsubscribed must hear
+    // nothing about that generation. `first` has already received it, so the
+    // fan-out has run and this is not a race against a slow daemon.
+    assert!(
+        second
+            .try_wait_for_event(
+                |envelope| matches!(
+                    &envelope.event,
+                    RuntimeEventDto::GenerationCommitted(committed) if committed.generation == later
+                ),
+                Duration::from_secs(1),
+            )
+            .is_none(),
+        "unsubscribing must stop this connection's events and nobody else's — \
+         an event arriving here means the registries are shared or the \
+         unsubscribe reached the wrong one"
+    );
 }
 
 fn subscription_id(client: &mut socket::Client, request_id: &str) -> String {

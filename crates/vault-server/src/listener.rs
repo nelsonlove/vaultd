@@ -84,6 +84,11 @@ pub enum ListenError {
         #[source]
         source: std::io::Error,
     },
+    /// A stdio-only daemon failed. Nothing was bound and there is no path, so
+    /// the message is carried through unchanged: an operator running without
+    /// `--listen` sees exactly what that daemon has always printed.
+    #[error("{0}")]
+    Stdio(String),
 }
 
 /// The first 16 hex characters of the SHA-256 of the canonical vault root.

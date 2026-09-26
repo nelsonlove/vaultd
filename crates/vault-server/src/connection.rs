@@ -202,6 +202,93 @@ fn write_output(mut sink: impl Write, outputs: Receiver<OutputEnvelope>) -> io::
     Ok(())
 }
 
+/// A thread this connection needs, or the reason the OS would not start it.
+///
+/// One helper for all three of `serve`'s spawns, so the seam below sits in
+/// one place rather than three.
+fn spawn_named<T: Send + 'static>(
+    name: String,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<JoinHandle<T>> {
+    #[cfg(test)]
+    if spawn_refuses() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "a test seam standing in for pthread_create refusing with EAGAIN",
+        ));
+    }
+    std::thread::Builder::new().name(name).spawn(body)
+}
+
+// Make the next `spawn_named` **on this thread** refuse.
+//
+// Thread-local and not global: the lib tests run in parallel in one process,
+// and a global switch would make every other connection in flight fail too.
+// A connection's threads are all spawned from the thread that called `serve`,
+// so this reaches exactly the one connection the test is driving.
+#[cfg(test)]
+thread_local! {
+    static SPAWN_REFUSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn spawn_refuses() -> bool {
+    SPAWN_REFUSES.with(std::cell::Cell::get)
+}
+
+/// Everything a connection owes on its way out, run exactly once and on
+/// **every** exit from [`serve`] — the ordinary one, an early return because a
+/// thread could not be spawned, and an unwind out of the dispatcher.
+///
+/// A straight-line call cannot promise that. `serve` returns early through `?`
+/// three times before the dispatcher is even reached, and a panic inside
+/// `dispatch` leaves the same two debts unpaid: the connection's snapshot
+/// sessions, whose WAL frames nobody else can release, and its broadcaster
+/// inbox, which the fan-out deliberately will not remove for it (removal
+/// belongs to the connection, or it would race one). Both are then held until
+/// the process ends.
+///
+/// The ordinary path calls [`Teardown::run`] explicitly, because the order
+/// matters there — the unregister has to happen before the forwarder is
+/// joined, not at the end of the function — and `run` leaves nothing for
+/// `Drop` to do.
+struct Teardown<'a, F: FnOnce()> {
+    server: &'a Server,
+    connection: ConnectionId,
+    after_dispatch: Option<F>,
+}
+
+impl<'a, F: FnOnce()> Teardown<'a, F> {
+    fn new(server: &'a Server, connection: ConnectionId, after_dispatch: F) -> Self {
+        Self {
+            server,
+            connection,
+            after_dispatch: Some(after_dispatch),
+        }
+    }
+
+    /// Pay both debts, in order, once. A second call does nothing.
+    fn run(&mut self) {
+        let Some(after_dispatch) = self.after_dispatch.take() else {
+            return;
+        };
+        // **Before `after_dispatch`, which unregisters this connection's
+        // notice inbox.** The sessions are this connection's and nobody
+        // else's, and the WAL frames they pin are held until they are
+        // closed — the idle sweep cannot reach them, because it only runs on
+        // some *other* connection's input. So the connection that opened them
+        // closes them on its way out.
+        self.server.close_sessions_of(self.connection);
+        after_dispatch();
+    }
+}
+
+impl<F: FnOnce()> Drop for Teardown<'_, F> {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
 /// Serve one connection until its input ends, its input becomes unparseable,
 /// or its writer fails. Always joins every thread it started before returning.
 ///
@@ -210,6 +297,7 @@ fn write_output(mut sink: impl Write, outputs: Receiver<OutputEnvelope>) -> io::
 /// producers finish: stdio stops the runtime (which drops the coordinator's
 /// notice sender), and a socket connection unregisters its broadcaster inbox.
 /// Without it this function would have to know which of the two it is serving.
+/// It is held in a [`Teardown`], so an early return or an unwind runs it too.
 pub(crate) fn serve(
     server: &Server,
     connection: ConnectionId,
@@ -221,27 +309,24 @@ pub(crate) fn serve(
 ) -> Result<(), String> {
     let (inputs, mailbox) = sync_channel(INPUT_CAPACITY);
     let (outputs, pending) = sync_channel(OUTPUT_CAPACITY);
+    // Armed before the first fallible step, so the three `?`s below cannot
+    // leave this connection's inbox registered or its sessions open.
+    let mut teardown = Teardown::new(server, connection, after_dispatch);
 
-    let reader = std::thread::Builder::new()
-        .name(labels.reader)
-        .spawn({
-            let inputs = inputs.clone();
-            move || read_input(reader, inputs)
-        })
-        .map_err(|error| format!("failed to start the input thread: {error}"))?;
-    let writer = std::thread::Builder::new()
-        .name(labels.writer)
-        .spawn(move || write_output(writer, pending))
+    let reader = spawn_named(labels.reader, {
+        let inputs = inputs.clone();
+        move || read_input(reader, inputs)
+    })
+    .map_err(|error| format!("failed to start the input thread: {error}"))?;
+    let writer = spawn_named(labels.writer, move || write_output(writer, pending))
         .map_err(|error| format!("failed to start the output thread: {error}"))?;
     let forwarder = notices
         .map(|notices| {
-            std::thread::Builder::new()
-                .name(labels.notices)
-                .spawn({
-                    let inputs = inputs.clone();
-                    move || forward_notices(notices, inputs)
-                })
-                .map_err(|error| format!("failed to start the notice thread: {error}"))
+            spawn_named(labels.notices, {
+                let inputs = inputs.clone();
+                move || forward_notices(notices, inputs)
+            })
+            .map_err(|error| format!("failed to start the notice thread: {error}"))
         })
         .transpose()?;
     // The dispatcher's own copy is the last one that must go, or the reader
@@ -254,13 +339,10 @@ pub(crate) fn serve(
     // finish; `after_dispatch` is what lets the forwarder finish; and this
     // connection's input having ended is what lets the reader finish.
     drop(outputs);
-    // **Before `after_dispatch`, which unregisters this connection's notice
-    // inbox.** The sessions are this connection's and nobody else's, and the
-    // WAL frames they pin are held until they are closed — the idle sweep
-    // cannot reach them, because it only runs on some *other* connection's
-    // input. So the connection that opened them closes them on its way out.
-    server.close_sessions_of(connection);
-    after_dispatch();
+    // Here rather than at the end of the function: the unregister inside it
+    // is what lets the forwarder's `recv` return, so it has to happen before
+    // the join below and not when the guard falls out of scope.
+    teardown.run();
     let writer = join(writer, "output");
     if let Some(forwarder) = forwarder {
         let _ = forwarder.join();
@@ -383,10 +465,21 @@ mod tests {
     /// the watcher and the periodic tick off so nothing but this test moves
     /// the index.
     fn server(vault: &tempfile::TempDir, index: &tempfile::TempDir) -> Server {
+        server_idle_after(vault, index, Duration::from_millis(50))
+    }
+
+    /// The same server, with the idle timeout the caller needs. A test about
+    /// anything **other** than the sweep must set this long enough that the
+    /// sweep cannot be what closed a session — otherwise it proves nothing.
+    fn server_idle_after(
+        vault: &tempfile::TempDir,
+        index: &tempfile::TempDir,
+        idle: Duration,
+    ) -> Server {
         std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
         let mut config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
             .expect("sweep config");
-        config.snapshot_idle_timeout = Duration::from_millis(50);
+        config.snapshot_idle_timeout = idle;
         let (server, notices) = Server::start(
             config,
             RuntimeOptions {
@@ -452,6 +545,144 @@ mod tests {
             server.snapshot_session_count(),
             0,
             "an idle session must be reclaimed on the notice path too, not only on requests"
+        );
+        server.shutdown();
+    }
+
+    /// A sink the test still holds after `serve` has moved a writer into its
+    /// output thread, so the test can read what the connection actually
+    /// answered. Without it this test could pass on a session that never
+    /// opened, which would prove nothing about closing one.
+    #[derive(Clone)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Ending a connection closes the snapshot sessions it opened, releasing
+    /// the WAL frames they pinned — and it is **`serve`** that does it, not
+    /// some later caller. The two `session_ownership` tests drive
+    /// `Server::close_sessions_of` directly, so they pin the method and not
+    /// the call; delete the call from `serve`'s teardown and they stay green.
+    ///
+    /// The idle timeout is ten minutes here on purpose: with the sweep's own
+    /// 50 ms it would close the session anyway and this test would pass with
+    /// the teardown gone.
+    #[test]
+    fn serve_closes_the_sessions_its_own_connection_opened() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server_idle_after(&vault, &index, Duration::from_secs(600));
+        let connection = ConnectionId::for_test(1);
+
+        let requests = concat!(
+            r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#,
+            "\n",
+            r#"{"version":1,"id":"o","request":{"method":"open_snapshot","params":{}}}"#,
+            "\n",
+        );
+        let answered = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        // End of the cursor is end of input, so `serve` runs its whole
+        // teardown and returns — no socket and no second thread needed.
+        serve(
+            &server,
+            connection,
+            io::BufReader::new(io::Cursor::new(requests.as_bytes().to_vec())),
+            answered.clone(),
+            None,
+            ThreadLabels::for_connection("test"),
+            || {},
+        )
+        .expect("the connection ends cleanly at end of input");
+
+        let written = answered.0.lock().unwrap_or_else(|error| error.into_inner());
+        let written = String::from_utf8(written.clone()).expect("utf-8 answers");
+        assert!(
+            written.contains("\"snapshot_id\""),
+            "the session must really have opened, or this test proves nothing: {written}"
+        );
+        assert_eq!(
+            server.snapshot_session_count(),
+            0,
+            "the connection that opened the session is gone, so the session \
+             and the WAL frames it pinned must be gone with it"
+        );
+        assert_eq!(
+            server.sessions_owned_by(connection),
+            0,
+            "and nothing is left claiming an owner that no longer exists"
+        );
+        server.shutdown();
+    }
+
+    /// `serve` returns early, through `?`, if the OS will not start one of
+    /// its three threads — before the dispatcher, and so before the line that
+    /// used to pay this connection's debts. Both must still be paid: the
+    /// sessions it opened (nobody else can release their WAL frames) and its
+    /// broadcaster inbox (the fan-out deliberately will not remove it, since
+    /// doing so would race the connection's own removal). That is what the
+    /// `Teardown` guard is for, and this is the path that proves it.
+    #[test]
+    fn a_connection_whose_threads_cannot_start_still_pays_its_debts() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server_idle_after(&vault, &index, Duration::from_secs(600));
+        let broadcaster = crate::broadcast::Broadcaster::new();
+        let (connection, inbox) = broadcaster.register();
+
+        // A session this connection owns, opened before it ever serves.
+        let mut subscriptions = SubscriptionRegistry::new();
+        server.handle(
+            connection,
+            envelope("r", Request::RefreshIndex(RefreshIndexParams::default())),
+            &mut subscriptions,
+        );
+        server.handle(
+            connection,
+            envelope("o", Request::OpenSnapshot(OpenSnapshotParams::default())),
+            &mut subscriptions,
+        );
+        assert_eq!(server.snapshot_session_count(), 1, "the session opened");
+        assert_eq!(broadcaster.connection_count(), 1, "and the inbox is live");
+
+        SPAWN_REFUSES.with(|refuses| refuses.set(true));
+        let outcome = serve(
+            &server,
+            connection,
+            io::BufReader::new(io::Cursor::new(Vec::new())),
+            Vec::new(),
+            Some(inbox),
+            ThreadLabels::for_connection("unstartable"),
+            || broadcaster.unregister(connection),
+        );
+        SPAWN_REFUSES.with(|refuses| refuses.set(false));
+
+        assert!(
+            outcome.is_err(),
+            "a connection that cannot start its threads is not a served one: {outcome:?}"
+        );
+        assert_eq!(
+            broadcaster.connection_count(),
+            0,
+            "the inbox must be unregistered on this exit too, or the fan-out \
+             offers forever to a connection that never existed"
+        );
+        assert_eq!(
+            server.snapshot_session_count(),
+            0,
+            "and the sessions it owned must be closed, or their WAL frames \
+             are pinned for the life of the process"
         );
         server.shutdown();
     }

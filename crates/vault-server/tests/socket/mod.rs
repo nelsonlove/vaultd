@@ -4,6 +4,13 @@
 //! `wait_for_event` — because the conformance test in Task 7 runs one fixture
 //! set through both and any difference in the harnesses would show up as a
 //! difference in the transports.
+//!
+//! One harness, several test binaries, and each one compiles the whole module
+//! and uses part of it — so `dead_code` here means "no binary needs this
+//! yet", not "nothing needs this". Allowed once at the top rather than
+//! item by item, which would otherwise have to be edited on both sides of
+//! every test added in Tasks 5, 7 and 8.
+#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -39,22 +46,59 @@ impl ListeningDaemon {
     }
 
     pub fn start_at(vault: &TempDir, index: &TempDir, socket: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_vaultd"))
-            .args([
-                "--vault",
-                vault.path().to_str().expect("utf-8 vault path"),
-                "--index",
-                index
-                    .path()
-                    .join("index.sqlite3")
-                    .to_str()
-                    .expect("utf-8 index path"),
-                "--no-watch",
-                "--reconcile-interval-seconds",
-                "0",
-                "--listen",
-                socket.to_str().expect("utf-8 socket path"),
-            ])
+        Self::spawn_daemon(vault, index, Some(socket), None, socket.to_path_buf())
+    }
+
+    /// A daemon given `--listen` with **no value**, which is the branch that
+    /// decides the default path for itself. `runtime_dir` becomes its
+    /// `XDG_RUNTIME_DIR`, so the path it lands on is
+    /// `<runtime_dir>/vaultd/<digest>.sock` and the caller can say where that
+    /// is without the daemon telling it.
+    ///
+    /// Keep `runtime_dir` short. A Unix socket address is 103 bytes on this
+    /// platform and this path spends 29 of them after the directory, so a
+    /// deep scratch directory is refused by `PathTooLong` before anything
+    /// binds — which is the listener working, not the test failing.
+    pub fn start_on_its_default_socket(
+        vault: &TempDir,
+        index: &TempDir,
+        runtime_dir: &Path,
+        expected: PathBuf,
+    ) -> Self {
+        Self::spawn_daemon(vault, index, None, Some(runtime_dir), expected)
+    }
+
+    fn spawn_daemon(
+        vault: &TempDir,
+        index: &TempDir,
+        socket: Option<&Path>,
+        runtime_dir: Option<&Path>,
+        expected: PathBuf,
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vaultd"));
+        command.args([
+            "--vault",
+            vault.path().to_str().expect("utf-8 vault path"),
+            "--index",
+            index
+                .path()
+                .join("index.sqlite3")
+                .to_str()
+                .expect("utf-8 index path"),
+            "--no-watch",
+            "--reconcile-interval-seconds",
+            "0",
+            "--listen",
+        ]);
+        // `--listen` takes 0 or 1 values: with a path it binds that, and with
+        // none it works the path out itself.
+        if let Some(socket) = socket {
+            command.arg(socket.to_str().expect("utf-8 socket path"));
+        }
+        if let Some(runtime_dir) = runtime_dir {
+            command.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -62,7 +106,7 @@ impl ListeningDaemon {
             .expect("start vaultd --listen");
         let daemon = Self {
             child,
-            socket: socket.to_path_buf(),
+            socket: expected,
         };
         daemon.await_ready();
         daemon
@@ -92,13 +136,11 @@ impl ListeningDaemon {
     }
 
     /// Unused until the shutdown tests, which assert the socket file is gone.
-    #[allow(dead_code)]
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }
 
     /// Unused until the shutdown tests, which signal the daemon by pid.
-    #[allow(dead_code)]
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -180,7 +222,6 @@ impl Client {
 
     /// Wait for the first event satisfying `wanted`, including events already
     /// stepped over by an earlier [`Client::response`].
-    #[allow(dead_code)]
     pub fn wait_for_event(&mut self, wanted: impl Fn(&EventEnvelope) -> bool) -> EventEnvelope {
         let mut kept = Vec::new();
         let mut found = None;
@@ -219,15 +260,64 @@ impl Client {
         }
     }
 
+    /// The same search, bounded, and `None` when nothing matching arrived.
+    ///
+    /// For asserting an event does **not** come. The bound is one-sided on
+    /// purpose: a slow machine can only make an absent event stay absent, so
+    /// this cannot flake into a failure — only into a weaker pass, which is
+    /// the right way round for a negative.
+    pub fn try_wait_for_event(
+        &mut self,
+        wanted: impl Fn(&EventEnvelope) -> bool,
+        within: Duration,
+    ) -> Option<EventEnvelope> {
+        let mut kept = Vec::new();
+        let mut found = None;
+        for raw in std::mem::take(&mut self.events) {
+            let event: EventEnvelope = serde_json::from_str(&raw).expect("decode an event");
+            if found.is_none() && wanted(&event) {
+                found = Some(event);
+            } else {
+                kept.push(raw);
+            }
+        }
+        self.events = kept;
+        if found.is_some() {
+            return found;
+        }
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let raw = match self.lines.recv_timeout(left) {
+                Ok(raw) => raw,
+                Err(_) => return None,
+            };
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("a JSON line");
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"))
+            {
+                self.events.push(raw);
+                continue;
+            }
+            let event: EventEnvelope = serde_json::from_str(&raw).expect("decode an event");
+            if wanted(&event) {
+                return Some(event);
+            }
+            self.events.push(raw);
+        }
+    }
+
     /// Stop reading, without closing the connection. The slow-client case in
     /// Task 8 needs exactly this: a peer that is alive and not draining.
-    #[allow(dead_code)]
     pub fn stop_reading(&mut self) -> Receiver<String> {
         std::mem::replace(&mut self.lines, channel().1)
     }
 
     /// Close this connection and let the daemon reap it.
-    #[allow(dead_code)]
     pub fn disconnect(self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
