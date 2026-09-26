@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { DispatchQueue } from "../src/runtime/queue";
+import { HostErrors } from "../src/shim/errors";
 import { ShimEventBus } from "../src/shim/events";
 import { Vault } from "../src/shim/vault";
 import { forwardingWriteGate } from "../src/testing/assemble";
@@ -302,6 +303,7 @@ describe("Vault writes", () => {
       events: new ShimEventBus(),
       writes: forwardingWriteGate(harness.client),
       queue: new DispatchQueue(),
+      errors: new HostErrors(),
     });
     expect(cold.getConfig("attachmentFolderPath")).toBeUndefined();
     // A cold cache is this host's state, not a fact about the plugin, so it is

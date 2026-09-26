@@ -441,10 +441,14 @@ export class MetadataCache extends Events {
  * What this surface claims about itself, for Task 11b's compatibility report.
  *
  * The three `CachedMetadata.*` rows are the fields `vaultd` does not parse:
- * `absent` rather than missing from the table, so the report can say the gap
- * exists instead of being silent about it. The rest are the surface this file
- * really implements, listed whether or not a plugin ever calls one — the report
- * is a claim about the host, not a trace of one session.
+ * declared rather than missing from the table, so the report can say the gap
+ * exists instead of being silent about it. They are `absent_field`, not
+ * `absent`: nothing here is callable, so a plugin reading one gets `undefined`
+ * and no throw, and a row spelled `absent` would have told a reader of the
+ * compatibility report that this host refuses a call it is never asked to make.
+ * The rest are the surface this file really implements, listed whether or not a
+ * plugin ever calls one — the report is a claim about the host, not a trace of
+ * one session.
  *
  * **Declared at import, not in the constructor.** The table is the host's
  * statement about its own surface, so it must not be a function of what has
@@ -463,6 +467,6 @@ declarePolicy("MetadataCache.fileToLinktext", "implemented");
 declarePolicy("MetadataCache.resolvedLinks", "implemented");
 declarePolicy("MetadataCache.unresolvedLinks", "implemented");
 declarePolicy("MetadataCache.getBacklinksForFile", "implemented");
-declarePolicy("CachedMetadata.footnotes", "absent");
-declarePolicy("CachedMetadata.footnoteRefs", "absent");
-declarePolicy("CachedMetadata.referenceLinks", "absent");
+declarePolicy("CachedMetadata.footnotes", "absent_field");
+declarePolicy("CachedMetadata.footnoteRefs", "absent_field");
+declarePolicy("CachedMetadata.referenceLinks", "absent_field");

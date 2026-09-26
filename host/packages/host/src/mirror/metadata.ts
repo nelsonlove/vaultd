@@ -90,7 +90,8 @@
  * fields (since 1.6.6 and 1.8.7) that `vaultd` does not parse. The keys are
  * **omitted entirely**, which is exactly what Obsidian does for a note that has
  * none — so a plugin reading them cannot tell "no footnotes" from "not served".
- * They are declared `absent` in the policy table by `shim/metadata-cache.ts`,
+ * They are declared `absent_field` in the policy table by `shim/metadata-cache.ts`
+ * — the kind for a symbol that is read rather than called, so nothing throws —
  * they appear in the compatibility report, and `parity-footnotes` measures the
  * gap rather than assuming it is empty.
  */
@@ -149,7 +150,8 @@ export interface CachedMetadata {
   // and 1.8.7). vaultd does not parse them, so `buildCachedMetadata` omits the
   // keys entirely — which is also what Obsidian does for a note that has none,
   // so a plugin reading them cannot tell "no footnotes" from "not served".
-  // They are registered `absent` in the policy table, they appear in the
+  // They are registered `absent_field` in the policy table — the kind that
+  // says a read answers `undefined` rather than throwing — they appear in the
   // compatibility report, and `parity-footnotes` measures the gap.
 }
 

@@ -190,6 +190,26 @@ import type {
 } from "./types";
 
 /**
+ * The write could not be read back because the host is shutting down.
+ *
+ * **A subclass of {@link EngineLostError}, not a sibling.** The two say the
+ * same thing to every layer that catches one — the engine behind this mirror is
+ * not reachable, it is not the caller's fault, and there is nothing to retry —
+ * and a subclass means no catch site had to learn a second name to keep
+ * behaving correctly. What it adds is the distinction a human reading a log
+ * wants: an engine being *replaced* is a recovery in progress, and a teardown
+ * is not. A caller that needs to tell them apart asks `instanceof`.
+ *
+ * `exit` is `null`: nothing died. The host asked its mirror to stop.
+ */
+export class MirrorStoppedError extends EngineLostError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MirrorStoppedError";
+  }
+}
+
+/**
  * The facets a refetch asks `get_note` for.
  *
  * Exactly the two that are optional on `NoteDto`. Everything else the mirror
@@ -1230,6 +1250,33 @@ export class Mirror implements MirrorQuery {
     // `dryrun/dry-run.ts` says so in its header, because it is the one thing a
     // dry run cannot pretend.
     if (this.config.dryRun) return Promise.resolve();
+    // **A stopped mirror can read nothing back, so it must not say it did.**
+    // {@link enqueue} closes the queue at teardown and answers a task enqueued
+    // after it with a resolved promise that never ran — right for an event,
+    // which is a fan-out nobody is waiting on, and wrong here for the reason
+    // the assertion below exists. Before this check the shutdown window gave
+    // two roads a *wrong* rejection and the rest silence: `Vault.create` and
+    // `copy` asked for a row that was never installed and threw `the daemon
+    // accepted a write to X but the mirror has no row for it`, the exact
+    // sentence this round removed, while `modify`, `delete` and `rename`
+    // resolved as though the mirror had caught up.
+    //
+    // A subclass of {@link EngineLostError} rather than a sibling, deliberately:
+    // every layer that already knows "the engine is not there, this is not the
+    // caller's fault and there is nothing to retry" does the right thing with
+    // it unchanged, and a caller that wants to tell a teardown from a
+    // replacement can still ask `instanceof MirrorStoppedError`. It is raised
+    // before the enqueue, so it cannot be mistaken for a refetch failure inside
+    // an apply.
+    if (this.stopped) {
+      return Promise.reject(
+        new MirrorStoppedError(
+          `the host is shutting down, so the mirror could not read back the write at generation ${String(
+            generation,
+          )}: ${paths.join(", ")}`,
+        ),
+      );
+    }
     return this.enqueue(async () => {
       // `event: null` — a mutation is this host's own write, not a generation
       // somebody told it about, so a warm failure here is attributable to no
@@ -1238,6 +1285,44 @@ export class Mirror implements MirrorQuery {
         guarded: false,
         event: null,
       });
+      // **The contract, asserted, because two roads out of the apply return
+      // without having applied anything.** Both read an `EngineLostError` as a
+      // background condition and stop quietly: `applyChangeSet` catches one out
+      // of its refetch ("a `runtime_recovered` marker is on its way, nothing
+      // here is worth failing a subscription fan-out over"), and `runResync`
+      // catches one out of a re-hydration ("the previous view keeps serving,
+      // stale but coherent"). Both are right for an **event**, whose caller is
+      // a fan-out nobody is holding. Both are wrong for a **mutation**, whose
+      // caller is a shim write still in progress and whose whole promise is
+      // that these paths have been read back.
+      //
+      // Measured, not reasoned: this is the `Vault.create` race the final
+      // review left open. `create` took the quiet return for a success, asked
+      // the mirror for the row that was never installed, and threw `the daemon
+      // accepted a write to X but the mirror has no row for it` — a sentence
+      // that describes the symptom and blames the wrong component, since the
+      // daemon really did accept the write. Reproduced deterministically in
+      // `test/mirror-engine-lost.test.ts` by replacing the engine between the
+      // write's request and its response.
+      //
+      // `appliedThrough` is the exact witness and needs no flag threaded
+      // through the apply: every road that really applied this generation
+      // advances it — the delta install and a re-hydration alike — and no road
+      // that abandoned the work does. An event that applied the same generation
+      // first also advances it, which is correct: the row is installed either
+      // way, and the mutation's refetch was then belt and braces.
+      //
+      // Typed, and not a retry: the write landed, this host could not read it
+      // back, and the supervisor's replacement engine will re-hydrate the
+      // mirror. That is exactly what `EngineLostError` means everywhere else,
+      // so a plugin meets one refusal for one event on every road.
+      if (this.appliedThroughValue < generation) {
+        throw new EngineLostError(
+          `the engine was replaced before the mirror could read back the write at generation ${String(
+            generation,
+          )}: ${paths.join(", ")}`,
+        );
+      }
     });
   }
 
@@ -1292,17 +1377,21 @@ export class Mirror implements MirrorQuery {
    * The current engine's client — **and an engine that is not there is the
    * resync road, not a rejection nobody can act on.**
    *
-   * `Supervisor.client()` throws a bare `Error("no engine is running")` in the
-   * window between an engine dying and its replacement being ready. That
-   * window is real and ordinary: the supervisor is already bringing another
-   * engine up, and its synthesized `runtime_recovered` will re-hydrate
-   * everything. Letting the bare error out of here made it a *different* kind
-   * of failure from {@link EngineLostError}, which every other layer already
-   * treats as "wait for the recovery" — so a refetch that happened to be in
-   * flight rejected with something nothing recognised, and on a promise the
-   * caller had dropped it took the whole process down. Measured: it is one of
-   * the two unhandled rejections that made the golden suite exit non-zero in
-   * half its runs.
+   * `Supervisor.client()` refuses in the window between an engine dying and its
+   * replacement being ready. That window is real and ordinary: the supervisor
+   * is already bringing another engine up, and its synthesized
+   * `runtime_recovered` will re-hydrate everything. It used to refuse with a
+   * bare `Error("no engine is running")`, and letting that out of here made it
+   * a *different* kind of failure from {@link EngineLostError}, which every
+   * other layer already treats as "wait for the recovery" — so a refetch that
+   * happened to be in flight rejected with something nothing recognised, and on
+   * a promise the caller had dropped it took the whole process down. Measured:
+   * it is one of the two unhandled rejections that made the golden suite exit
+   * non-zero in half its runs. **Since 2026-09-24 the supervisor raises
+   * `EngineLostError` itself**, so the shim's road is typed too; this catch
+   * stays because the conversion is not the only thing it does — the resync
+   * mark below is the mirror's own, and a supplier that is not a supervisor is
+   * still free to throw anything.
    *
    * So the conversion happens once, here, at the one place the mirror reaches
    * for a client: mark the resync (the road this generation's paths now have

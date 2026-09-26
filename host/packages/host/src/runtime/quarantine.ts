@@ -44,6 +44,7 @@
  * {@link UNCOUNTED_PHASES}.
  */
 
+import { EngineLostError } from "../supervisor";
 import { HOST_PLUGIN_ID } from "../shim/errors";
 import type { HostConfig } from "../config";
 import type { HostErrorEntry, HostErrorPhase } from "../shim/errors";
@@ -51,15 +52,21 @@ import type { HostErrorEntry, HostErrorPhase } from "../shim/errors";
 /**
  * The phases that are a plugin's failure and are still never counted.
  *
- * One member today: `interaction`. A brokered prompt fails when the *client*
- * end goes — a detach, a disconnect, a human who never answered — and counting
- * that against the plugin that asked would quarantine a working plugin for
- * something it has no control over. `config` is not here because it is not the
- * plugin's at all: {@link failureFromReport} drops it on the phase, and nothing
- * about it is worth recording as any plugin's last error.
+ * Two members. `interaction`: a brokered prompt fails when the *client* end
+ * goes — a detach, a disconnect, a human who never answered — and counting that
+ * against the plugin that asked would quarantine a working plugin for something
+ * it has no control over. `write`: a shim write whose promise the plugin
+ * dropped, reported by `guardDroppedWrites` rather than left to float, and it
+ * fails for the same kind of reason — the engine was replaced under it, or the
+ * host is tearing down. Neither is evidence that a plugin is broken, and one
+ * engine restart under a plugin that writes in a loop would otherwise disable
+ * it. `config` is not here because it is not the plugin's at all:
+ * {@link failureFromReport} drops it on the phase, and nothing about it is
+ * worth recording as any plugin's last error.
  */
 export const UNCOUNTED_PHASES: ReadonlySet<HostErrorPhase> = new Set<HostErrorPhase>([
   "interaction",
+  "write",
 ]);
 
 /**
@@ -291,6 +298,17 @@ export function failureFromReport(
 ): HandlerFailure | null {
   if (report.phase === "config" || report.pluginId === HOST_PLUGIN_ID) return null;
   if (UNCOUNTED_PHASES.has(report.phase)) return null;
+  // **An absent engine is never a plugin's fault, whatever phase it reached.**
+  // A replacement or a teardown fails every call in flight at once — a burst,
+  // not a pattern — so one engine restart under a plugin whose handlers write
+  // could spend its whole quarantine window in a second and disable a plugin
+  // that did nothing wrong. This is the phase-independent twin of `write`
+  // sitting in `UNCOUNTED_PHASES`: that one covers the road, this one covers
+  // the cause, and the cause can arrive on the `event` road too — an `async`
+  // listener whose write refuses rejects, and `ShimEventBus.tryTrigger` reports
+  // that like any other handler failure. `MirrorStoppedError` is a subclass, so
+  // the shutdown case is covered by the same line.
+  if (report.error instanceof EngineLostError) return null;
   const label = detail === undefined || detail === "" ? report.phase : `${report.phase}:${detail}`;
   return { pluginId: report.pluginId, label, error: asError(report.error), atUnixMs };
 }
