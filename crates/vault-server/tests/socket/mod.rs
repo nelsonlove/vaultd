@@ -72,6 +72,16 @@ pub const LINE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a daemon is given to create its socket file and answer on it.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The ceiling on [`Client::drain_events`] — what it spends on a stream that
+/// keeps writing and never goes quiet.
+const DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// How long a silence ends a [`Client::drain_events`]. Five times the 50 ms a
+/// single `recv` used to wait, so a writer pausing between two lines cannot
+/// end the drain early, and short enough that an idle connection costs a
+/// quarter of a second instead of the whole budget.
+const DRAIN_QUIET: Duration = Duration::from_millis(250);
+
 /// The whole of [`Client::resume_reading`]'s settle. Generous on purpose:
 /// it turns a daemon that never pours into a failing assertion rather than a
 /// hang, and asserts nothing about timing.
@@ -247,6 +257,35 @@ impl ListeningDaemon {
     /// One new connection to this daemon.
     pub fn connect(&self) -> Client {
         Client::over(UnixStream::connect(&self.socket).expect("connect to the daemon"))
+    }
+
+    /// One new connection whose kernel receive buffer is `bytes` rather than
+    /// this host's default.
+    ///
+    /// For a test that has to fill the daemon's queues: the socket buffers sit
+    /// in front of them, and on this platform a stream send blocks on the
+    /// **receiver's** buffer, so shrinking it here is what makes the depth of
+    /// the road a number the test sets instead of a number the host's defaults
+    /// decide. `socket_lifecycle`'s wedge test does the same thing inline; this
+    /// is that, in the harness, so both suites state the same intent.
+    pub fn connect_with_receive_buffer(&self, bytes: libc::c_int) -> Client {
+        let stream = UnixStream::connect(&self.socket).expect("connect to the daemon");
+        // SAFETY: a plain `setsockopt` on a descriptor this test owns, with
+        // the size of the value it points at.
+        let set = unsafe {
+            libc::setsockopt(
+                std::os::unix::io::AsRawFd::as_raw_fd(&stream),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(bytes).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            set, 0,
+            "shrink this client's receive buffer to {bytes} bytes"
+        );
+        Client::over(stream)
     }
 }
 
@@ -424,14 +463,25 @@ impl Client {
     /// plus whatever is still in flight after a short settle. The twin of
     /// `daemon::Daemon::drain_events`, with the same bound and the same
     /// reasoning: a slow writer can only make this transcript short, and a
-    /// short transcript fails the length assertion loudly. A closed connection
-    /// ends the drain at once rather than spinning out the budget.
+    /// short transcript fails the length assertion loudly.
+    ///
+    /// **Three ways out, and only the last spends the whole budget:** a
+    /// closed connection, a stream that has gone quiet for
+    /// [`DRAIN_QUIET`], or [`DRAIN_BUDGET`] of a stream that never does. The
+    /// quiet window is the same idea [`Client::resume_reading`] uses, and it
+    /// is what stops every call costing the full budget on an idle
+    /// connection — three calls in one test was 1.5 s of waiting for nothing.
+    /// It is deliberately five times the poll slice, so a writer pausing
+    /// between two lines cannot end the drain early; `daemon::Daemon` carries
+    /// the identical rule, because Task 7's conformance transcript compares
+    /// the two harnesses line for line and a difference here would read as a
+    /// difference between the transports.
     pub fn drain_events(&mut self) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_millis(500);
+        let deadline = Instant::now() + DRAIN_BUDGET;
         while Instant::now() < deadline {
-            match self.lines.recv_timeout(Duration::from_millis(50)) {
+            match self.lines.recv_timeout(DRAIN_QUIET) {
                 Ok(raw) => self.events.push(raw),
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }

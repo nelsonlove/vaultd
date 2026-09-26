@@ -20,6 +20,15 @@ use vault_protocol::{EventEnvelope, ResponseEnvelope};
 /// not to assert anything about timing.
 pub const LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The ceiling on [`Daemon::drain_events`] — what it spends on a stream that
+/// keeps writing and never goes quiet. The same value `socket::Client` uses.
+const DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// How long a silence ends a [`Daemon::drain_events`]. The same value
+/// `socket::Client` uses; the two must agree, because the conformance
+/// transcript compares them line for line.
+const DRAIN_QUIET: Duration = Duration::from_millis(250);
+
 /// Which door a run goes through. Lives here rather than in `socket/mod.rs`
 /// because the conformance test names one enum and picks a harness from it.
 ///
@@ -268,16 +277,22 @@ impl Daemon {
     /// only produce a **short** transcript, never a wrong one, and a short
     /// transcript fails the length assertion loudly.
     ///
-    /// A closed stream ends the drain immediately rather than spinning out the
-    /// budget on a channel that can never deliver again: `Disconnected` is a
-    /// final answer, `Timeout` only a quiet moment.
+    /// Three ways out, and only the last spends the whole budget: a closed
+    /// stream, a stream that has gone quiet for [`DRAIN_QUIET`], or
+    /// [`DRAIN_BUDGET`] of a stream that never does. `Disconnected` is a final
+    /// answer; a quarter-second silence is a practical one, five times the
+    /// poll slice this used to take one at a time, so a writer pausing between
+    /// two lines cannot end the drain early. `socket::Client` carries the
+    /// identical rule, because the conformance transcript compares the two
+    /// harnesses line for line and a difference here would read as a
+    /// difference between the transports.
     #[allow(dead_code)]
     pub fn drain_events(&mut self) -> Vec<String> {
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + DRAIN_BUDGET;
         while std::time::Instant::now() < deadline {
-            match self.lines.recv_timeout(Duration::from_millis(50)) {
+            match self.lines.recv_timeout(DRAIN_QUIET) {
                 Ok(raw) => self.events.push(raw),
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }

@@ -52,10 +52,17 @@ use crate::subscriptions::SubscriptionRegistry;
 /// How many inputs may wait for one dispatcher. Deep enough that an ordinary
 /// request burst never blocks a producer, shallow enough that a wedged
 /// dispatcher is felt rather than buffered indefinitely.
-pub(crate) const INPUT_CAPACITY: usize = 256;
+///
+/// `pub` because it is one of the three published depths on the road between
+/// the fan-out and a client's socket — the other two being
+/// [`OUTPUT_CAPACITY`] and [`crate::broadcast::CONNECTION_NOTICE_CAPACITY`] —
+/// and a test that has to fill that road needs to compute its length rather
+/// than guess a margin.
+pub const INPUT_CAPACITY: usize = 256;
 
-/// How many finished envelopes may wait for one writer.
-pub(crate) const OUTPUT_CAPACITY: usize = 256;
+/// How many finished envelopes may wait for one writer. `pub` for the same
+/// reason as [`INPUT_CAPACITY`].
+pub const OUTPUT_CAPACITY: usize = 256;
 
 /// First parse stage: the envelope with the request left undecoded, so the
 /// version can be validated before the version-specific method enum is
@@ -638,9 +645,14 @@ mod tests {
 
     /// Ending a connection closes the snapshot sessions it opened, releasing
     /// the WAL frames they pinned — and it is **`serve`** that does it, not
-    /// some later caller. The two `session_ownership` tests drive
+    /// some later caller. The two `session_ownership` tests in `lib.rs` drive
     /// `Server::close_sessions_of` directly, so they pin the method and not
-    /// the call; delete the call from `serve`'s teardown and they stay green.
+    /// the call. **This** test is the pin on the call: delete it from
+    /// `serve`'s teardown and this test goes red (as does
+    /// `a_connection_whose_threads_cannot_start_still_pays_its_debts`, which
+    /// runs through the same guard, and
+    /// `socket_clients::a_snapshot_session_belongs_to_the_connection_that_opened_it`,
+    /// which is the pin over a real socket).
     ///
     /// The idle timeout is ten minutes here on purpose: with the sweep's own
     /// 50 ms it would close the session anyway and this test would pass with
