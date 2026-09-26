@@ -1,14 +1,42 @@
 //! One notice stream, many connections.
 //!
-//! The runtime has exactly one notice channel and `--listen` gives it many readers, so one thread owns the receiving end and clones each notice into every connection's own bounded inbox. Three properties, each the reason for the one before it:
+//! The runtime has exactly one notice channel and `--listen` gives it many
+//! readers, so one thread owns the receiving end and clones each notice into
+//! every connection's own bounded inbox. Three properties, each the reason
+//! for the one before it:
 //!
-//! * **The broadcaster never blocks.** Not on a full inbox — it drops — and not on the coordinator, which it only receives from. So no client, however slow or however dead, can stall indexing. That is the invariant the stdio design states, preserved across any number of clients.
-//! * **A drop is latched, never silent.** The connection whose inbox was full has its gap recorded with the newest generation seen, and the next notice that connection could be given is **replaced** by `RuntimeNotice::ResyncRequired { reason: RuntimeRecovered }` naming that generation. This is the coordinator's own drop-and-latch, one hop out: see "What a slow stdio client actually meets is backpressure" in `docs/protocol.md`.
-//! * **A gap that cannot be named waits.** While nothing has ever been committed there is no generation to re-read at, so the marker is owed and is emitted by the first notice that does name one — the same withholding [`crate::subscriptions`] applies, for the same reason.
+//! * **The broadcaster never blocks.** Not on a full inbox — it drops — and
+//!   not on the coordinator, which it only receives from. So no client,
+//!   however slow or however dead, can stall indexing. That is the invariant
+//!   the stdio design states, preserved across any number of clients.
+//! * **A drop is latched, never silent.** The connection whose inbox was full
+//!   has its gap recorded with the newest generation seen, and the next
+//!   notice that connection could be given is **replaced** by
+//!   `RuntimeNotice::ResyncRequired { reason: RuntimeRecovered }` naming
+//!   that generation. This is the coordinator's own drop-and-latch, one hop
+//!   out: see "What a slow stdio client actually meets is backpressure" in
+//!   `docs/protocol.md`.
+//! * **A gap that cannot be named waits.** While nothing has ever been
+//!   committed there is no generation to re-read at, so the marker is owed
+//!   and is emitted by the first notice that does name one — the same
+//!   withholding [`crate::subscriptions`] applies, for the same reason.
 //!
-//! What this module deliberately does **not** do: convert anything to the wire. A `RuntimeNotice` goes in and a `RuntimeNotice` comes out, and the per-connection [`crate::subscriptions::SubscriptionRegistry`] is still the only place a notice becomes an event. The 64-event per-subscription bound and the 1024-path per-generation bound are therefore untouched.
+//! What this module deliberately does **not** do: convert anything to the
+//! wire. A `RuntimeNotice` goes in and a `RuntimeNotice` comes out, and the
+//! per-connection [`crate::subscriptions::SubscriptionRegistry`] is still the
+//! only place a notice becomes an event. The 64-event per-subscription bound
+//! and the 1024-path per-generation bound are therefore untouched.
 //!
-//! **It does not make the dispatcher's pre-drain reachable either.** A notice this broadcaster delivers arrives as a `ServerInput::Notice` like any other, through the same forwarder, and is drained inside the same arm — including the synthetic `resync_required` that replaces a dropped one. So the Request arm's pre-drain stays defensive: what actually keeps "already-queued events reach the client before the response that ends the subscription" true is drain-to-completion inside the Notice arm. The pre-drain becomes load-bearing the day something enqueues outside that arm, or the day `drain` can return with a queue still non-empty — and that day it is owed a test of its own.
+//! **It does not make the dispatcher's pre-drain reachable either.** A
+//! notice this broadcaster delivers arrives as a `ServerInput::Notice` like
+//! any other, through the same forwarder, and is drained inside the same
+//! arm — including the synthetic `resync_required` that replaces a dropped
+//! one. So the Request arm's pre-drain stays defensive: what actually keeps
+//! "already-queued events reach the client before the response that ends the
+//! subscription" true is drain-to-completion inside the Notice arm. The
+//! pre-drain becomes load-bearing the day something enqueues outside that
+//! arm, or the day `drain` can return with a queue still non-empty — and
+//! that day it is owed a test of its own.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +50,10 @@ use crate::runtime::{ResyncReason, RuntimeNotice};
 
 /// How many notices may wait for one connection's dispatcher.
 ///
-/// The same depth as the coordinator's own notice channel and as the dispatcher's input queue, and for the same reason: deep enough that an ordinary burst never costs anyone a resync, shallow enough that a connection which has stopped reading is felt rather than buffered.
+/// The same depth as the coordinator's own notice channel and as the
+/// dispatcher's input queue, and for the same reason: deep enough that an
+/// ordinary burst never costs anyone a resync, shallow enough that a
+/// connection which has stopped reading is felt rather than buffered.
 pub const CONNECTION_NOTICE_CAPACITY: usize = 256;
 
 /// One registered connection. Opaque, process-scoped, and never reused.
@@ -40,7 +71,8 @@ struct Registered {
     sink: SyncSender<RuntimeNotice>,
     /// The newest generation seen while a drop was outstanding.
     gap: Option<Generation>,
-    /// Whether a drop is outstanding at all. Separate from `gap` because a drop before the first commit has no generation and must still be owed.
+    /// Whether a drop is outstanding at all. Separate from `gap` because a
+    /// drop before the first commit has no generation and must still be owed.
     gap_owed: bool,
 }
 
@@ -53,7 +85,8 @@ struct Registry {
 /// The fan-out. One per daemon, shared by `Arc`.
 pub struct Broadcaster {
     registry: Mutex<Registry>,
-    /// Read without taking the lock by the accept loop's diagnostics, and kept in step inside it.
+    /// Read without taking the lock by the accept loop's diagnostics, and
+    /// kept in step inside it.
     count: AtomicU64,
 }
 
@@ -63,7 +96,9 @@ impl Default for Broadcaster {
     }
 }
 
-/// The generation a notice names, if it names one. `ConfigChanged` names none by design: the configuration zone is not indexed, so no generation contains it.
+/// The generation a notice names, if it names one. `ConfigChanged` names none
+/// by design: the configuration zone is not indexed, so no generation
+/// contains it.
 fn notice_generation(notice: &RuntimeNotice) -> Option<Generation> {
     match notice {
         RuntimeNotice::Generation(report) => Some(report.generation),
@@ -92,7 +127,8 @@ impl Broadcaster {
         }
     }
 
-    /// A fresh inbox for one connection. The receiver is handed straight to [`crate::connection::serve`].
+    /// A fresh inbox for one connection. The receiver is handed straight to
+    /// [`crate::connection::serve`].
     pub fn register(&self) -> (ConnectionId, Receiver<RuntimeNotice>) {
         let (sink, inbox) = sync_channel(CONNECTION_NOTICE_CAPACITY);
         let mut registry = self.lock();
@@ -125,7 +161,10 @@ impl Broadcaster {
 
     /// Offer one notice to every registered connection, without ever blocking.
     ///
-    /// A connection whose inbox is closed — its dispatcher has ended but its `after_dispatch` has not run yet — is left registered rather than removed here: removal belongs to the connection itself, and doing it from the fan-out would race that.
+    /// A connection whose inbox is closed — its dispatcher has ended but its
+    /// `after_dispatch` has not run yet — is left registered rather than
+    /// removed here: removal belongs to the connection itself, and doing it
+    /// from the fan-out would race that.
     pub fn offer(&self, notice: &RuntimeNotice) {
         let mut registry = self.lock();
         let incoming = notice_generation(notice);
@@ -166,7 +205,9 @@ impl Broadcaster {
         }
     }
 
-    /// How many notices this connection has had dropped since it was last told, as a generation. Test-only: nothing on the wire distinguishes a latched gap from no gap until the resync is delivered.
+    /// How many notices this connection has had dropped since it was last
+    /// told, as a generation. Test-only: nothing on the wire distinguishes a
+    /// latched gap from no gap until the resync is delivered.
     #[cfg(test)]
     pub fn gap_of(&self, id: ConnectionId) -> Option<Option<u64>> {
         let registry = self.lock();
@@ -183,7 +224,8 @@ impl Broadcaster {
     }
 }
 
-/// Feed `broadcaster` from the runtime's notice channel until the coordinator drops its sender. Returns the thread, which the service joins at shutdown.
+/// Feed `broadcaster` from the runtime's notice channel until the coordinator
+/// drops its sender. Returns the thread, which the service joins at shutdown.
 pub fn spawn_fanout(
     broadcaster: Arc<Broadcaster>,
     notices: Receiver<RuntimeNotice>,
@@ -214,7 +256,10 @@ mod tests {
         }
     }
 
-    /// Two connections, one of which has stopped draining. The one that reads must be unaffected — that is the whole point of per-connection queues — and the one that did not must learn it has a gap rather than silently missing generations.
+    /// Two connections, one of which has stopped draining. The one that reads
+    /// must be unaffected — that is the whole point of per-connection
+    /// queues — and the one that did not must learn it has a gap rather than
+    /// silently missing generations.
     #[test]
     fn a_full_inbox_costs_its_own_connection_a_resync_and_costs_its_peer_nothing() {
         let broadcaster = Arc::new(Broadcaster::new());
@@ -303,7 +348,10 @@ mod tests {
         assert_eq!(broadcaster.connection_count(), 0);
     }
 
-    /// A drop with nothing committed yet cannot name a generation, so the resync is owed rather than emitted — the same withholding the subscription registry does, and for the same reason: an event naming no generation to re-read at tells a client nothing.
+    /// A drop with nothing committed yet cannot name a generation, so the
+    /// resync is owed rather than emitted — the same withholding the
+    /// subscription registry does, and for the same reason: an event naming
+    /// no generation to re-read at tells a client nothing.
     #[test]
     fn a_gap_with_no_generation_yet_waits_for_one_that_has() {
         let broadcaster = Arc::new(Broadcaster::new());
@@ -330,9 +378,15 @@ mod tests {
         }
     }
 
-    /// The invariant the pre-drain is *said* to defend, asserted where it actually holds: a notice that reaches a connection through the broadcaster is drained to completion inside the arm that took it, so the registry is empty again before the next input is considered.
+    /// The invariant the pre-drain is *said* to defend, asserted where it
+    /// actually holds: a notice that reaches a connection through the
+    /// broadcaster is drained to completion inside the arm that took it, so
+    /// the registry is empty again before the next input is considered.
     ///
-    /// This is what makes the Request arm's pre-drain defensive rather than load-bearing, and it is the test that goes red if a future change queues an event and does not drain it — at which point the pre-drain's comment becomes true and its own test is owed.
+    /// This is what makes the Request arm's pre-drain defensive rather than
+    /// load-bearing, and it is the test that goes red if a future change
+    /// queues an event and does not drain it — at which point the
+    /// pre-drain's comment becomes true and its own test is owed.
     #[test]
     fn a_broadcast_notice_is_drained_to_completion_inside_the_arm_that_took_it() {
         use vault_index::PublishedStatus;
