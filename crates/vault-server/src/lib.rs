@@ -1,4 +1,5 @@
 mod convert;
+pub mod connection;
 pub mod fixture_row;
 pub mod runtime;
 pub mod stdio;
@@ -1247,5 +1248,21 @@ mod tests {
         );
 
         server.shutdown();
+    }
+}
+
+/// Every connection holds the same `Server` behind an `Arc`, so the compiler
+/// must agree it can be shared. Stated as a test rather than a comment: the
+/// design says "the phase adds a check that `Server` is `Sync`, and no
+/// rewrite", and a field added later that is not `Sync` should fail here
+/// rather than at the first accepted connection.
+#[cfg(test)]
+mod shareable {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn a_server_may_be_shared_between_connections() {
+        assert_send_sync::<crate::Server>();
+        assert_send_sync::<std::sync::Arc<crate::Server>>();
     }
 }
