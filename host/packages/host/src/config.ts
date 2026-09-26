@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { realpathSync } from "./runtime/fs-access";
+
 /**
  * The one time source.
  *
@@ -342,11 +344,15 @@ export function socketPathFor(dataDir: string, vaultRoot: string): string {
  * `~/Library/Caches`. The daemon's own `tests/socket_info.rs` and this module's
  * test pin the two halves against the same fixed vector.
  *
- * The root is hashed as given. Every caller's is already canonical —
- * `vault_index::canonical_root` is what the daemon hashes, and the host's
- * `vaultRoot` comes from the same resolution — so a caller that passes a
- * symlinked or relative root gets a path no daemon will ever bind, which is the
- * same contract the Rust side documents.
+ * **The root is hashed as given, and it must already be canonical.** The
+ * daemon hashes `vault_index::canonical_root`, which is a `realpath`, so a
+ * caller that passes a symlinked or relative root gets a path no daemon will
+ * ever bind — and under `engine: "auto"` that is not a quiet miss, it is a
+ * second daemon spawned beside a healthy one on every start. {@link
+ * canonicalVaultRoot} is the one place that rule is applied, and
+ * {@link defaultHostConfig} applies it to every config this host builds, so a
+ * caller reaches this function with a canonical root without having to know
+ * that it must.
  */
 export function vaultdSocketPathFor(vaultRoot: string): string {
   const digest = createHash("sha256").update(vaultRoot).digest("hex").slice(0, 16);
@@ -377,8 +383,35 @@ export type EngineMode = "auto" | "connect" | "spawn";
  * release binary beside the workspace) overrides it. Every calibration value
  * below comes from the phase plan's Global Constraints list.
  */
-export function defaultHostConfig(vaultRoot: string): HostConfig {
+/**
+ * A vault root with every symlink resolved — the same string the daemon hashes.
+ *
+ * **Here rather than in the binary**, because the digest is derived from
+ * whatever root {@link defaultHostConfig} is handed and *every* caller derives
+ * it: the CLI, `LiveHost`, an embedder calling `startHost`, and every test
+ * factory. Canonicalizing in `parseArgs` alone left all of those able to hash a
+ * root the daemon never will, which is the production failure the rule exists
+ * to prevent.
+ *
+ * Through `runtime/fs-access`, the one seam allowed to reach the file system,
+ * so this module still names no fs function. A root that does not exist is
+ * returned unchanged: `realpath` has nothing to resolve, and a missing
+ * directory is the daemon's refusal to make, not this function's.
+ */
+export function canonicalVaultRoot(vaultRoot: string): string {
+  try {
+    return realpathSync(vaultRoot);
+  } catch {
+    return vaultRoot;
+  }
+}
+
+export function defaultHostConfig(given: string): HostConfig {
   const dataDir = hostDataDir();
+  // Once, here, so `vaultRoot`, `--vault`, the host socket's digest and the
+  // daemon socket's digest are all derived from the one string the daemon
+  // itself will hash.
+  const vaultRoot = canonicalVaultRoot(given);
   return {
     vaultRoot,
     vaultdBinary: "vaultd",

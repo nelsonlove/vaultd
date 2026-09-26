@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultHostConfig, systemClock } from "../src/config";
-import { EngineLostError } from "../src/supervisor";
+import { EngineLostError, EngineVaultMismatchError } from "../src/supervisor";
 import { probeEngineSocket } from "../src/engine-probe";
 import {
   BINARY,
@@ -30,7 +30,7 @@ import {
   startedOn,
   superviseOn,
 } from "./real-daemon";
-import type { GetVaultInfoResponse } from "../src/client/protocol";
+import type { GetVaultInfoResponse, RuntimeEventDto } from "../src/client/protocol";
 import type { HostConfig } from "../src/config";
 
 afterEach(async () => {
@@ -103,6 +103,55 @@ describe.skipIf(!BINARY_EXISTS)("engine modes", () => {
     ).toBeGreaterThanOrEqual(0);
   });
 
+  it("refuses a daemon serving another vault, and spawns nothing beside it", async () => {
+    // The socket path is a digest of the vault root, so a daemon answering
+    // there is *presumed* to be this vault's — and `health`, which the probe
+    // asks, is answered identically by a daemon over any vault at all. An
+    // operator pointing two vaults at one socket, a daemon restarted over
+    // another root, a stale path reused after a move: each of them ends with a
+    // host mirroring the wrong vault and writing every plugin's changes into
+    // it. The identity is checked before the engine is adopted.
+    const owner = configFor("auto");
+    const first = await startedOn(owner);
+    const other = configFor("auto");
+    const pointed: HostConfig = { ...other, engineSocketPath: owner.engineSocketPath };
+    const second = superviseOn(pointed);
+
+    let thrown: unknown;
+    try {
+      await second.start();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(EngineVaultMismatchError);
+    // Both roots, side by side: an operator error deserves the two strings it
+    // is a disagreement between.
+    expect((thrown as Error).message).toContain(owner.vaultRoot);
+    expect((thrown as Error).message).toContain(other.vaultRoot);
+    expect(second.engineSource()).toBeNull();
+    // **And no fallback to spawning.** A daemon of vault B's own would have
+    // created vault B's index on its way up; nothing did.
+    expect(existsSync(other.indexPath as string)).toBe(false);
+    // The daemon that was there is untouched, and still vault A's.
+    const info = await first.client().request<GetVaultInfoResponse>("get_vault_info");
+    expect(info.canonical_root).toBe(owner.vaultRoot);
+  });
+
+  it("sends SIGTERM at once when it spawned a listening daemon", async () => {
+    // A daemon with `--listen` does not end on stdin EOF, so without the
+    // immediate signal the shutdown waits for the 2 s escalation rung to send
+    // it — same outcome, two seconds later. That makes this a test of which of
+    // two *configured* budgets the shutdown takes, not of how fast the machine
+    // is, which is what makes a duration assertion legitimate here.
+    const config = configFor("auto");
+    const supervisor = await startedOn(config);
+    const pid = supervisor.pid() as number;
+    const startedAt = Date.now();
+    await supervisor.stop();
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+    await expectEventually(() => !alive(pid), "the daemon to stop");
+  });
+
   it("auto leaves a daemon it spawned running when told to", async () => {
     // The flag's whole promise: the next client's start is cheap because this
     // host left the daemon where the probe will find it. A shutdown that
@@ -154,7 +203,44 @@ describe.skipIf(!BINARY_EXISTS)("engine modes", () => {
     // supervisor distinguishes the two, and the Mirror's resync road is built
     // on this class alone.
     expect(lost[0]).toBeInstanceOf(EngineLostError);
-    expect(resyncs.length).toBeLessThanOrEqual(1);
+    // Under `connect` no rung can bring an engine back, so there is nothing to
+    // resync onto and the count stays at zero. The "exactly one of each" case
+    // is the `auto` one below, where the ladder actually recovers.
+    expect(resyncs.length).toBe(0);
+  });
+
+  it("auto recovers from a killed daemon with exactly one loss and exactly one resync", async () => {
+    // The dispatch's rule, counted rather than bounded: a killed daemon under
+    // a host that had an engine produces **one** `EngineLostError` and **one**
+    // `resync_required`. Two of either would mean a consumer rebuilding its
+    // whole view twice for one outage — and the rungs the supervisor spends
+    // waiting out the reconnect window are the same outage, not new ones.
+    const config = configFor("auto");
+    const lost: Error[] = [];
+    const supervisor = await startedOn(config, {
+      onClientReady: (): void => {},
+      onEngineLost: (error): void => {
+        lost.push(error);
+      },
+      onStateChange: (): void => {},
+    });
+    expect(supervisor.engineSource()).toBe("spawned");
+
+    const resyncs: RuntimeEventDto[] = [];
+    await supervisor.subscribe((event) => {
+      if (event.type === "resync_required") resyncs.push(event);
+    });
+
+    process.kill(supervisor.pid() as number, "SIGKILL");
+    await expectEventually(
+      () => supervisor.engineSource() !== null && resyncs.length > 0,
+      "the ladder to bring an engine back and pay the resync debt",
+    );
+
+    expect(lost.length).toBe(1);
+    expect(lost[0]).toBeInstanceOf(EngineLostError);
+    expect(resyncs.length).toBe(1);
+    expect(resyncs[0]?.value).toMatchObject({ reason: "runtime_recovered" });
   });
 });
 

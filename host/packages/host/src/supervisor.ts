@@ -95,6 +95,51 @@ export class EngineStartError extends Error {
 }
 
 /**
+ * The daemon at the engine socket serves a **different vault**.
+ *
+ * Its own class because it is the one start failure that is not worth
+ * retrying: a daemon over another root will still be over another root on the
+ * next rung, so the ladder would spend its whole window re-reading the same
+ * operator error. {@link Supervisor} stops on it at once, and under `auto` it
+ * never falls back to spawning — see {@link Supervisor.connectOnce}.
+ */
+export class EngineVaultMismatchError extends EngineStartError {
+  /** The root the daemon at the socket is actually serving. */
+  readonly servingRoot: string;
+  /** The root this host was configured for. */
+  readonly expectedRoot: string;
+
+  constructor(socketPath: string, servingRoot: string, expectedRoot: string) {
+    super(
+      `the vaultd listening at ${socketPath} serves ${servingRoot}, not ${expectedRoot}; ` +
+        "that path is derived from the vault root, so two vaults are pointed at one socket. " +
+        "This host will neither adopt that daemon nor spawn a second one there",
+      null,
+      "",
+    );
+    this.name = "EngineVaultMismatchError";
+    this.servingRoot = servingRoot;
+    this.expectedRoot = expectedRoot;
+  }
+}
+
+/**
+ * A rung spent waiting for a daemon that may still come back.
+ *
+ * Not a loss and not reported as one: under `auto`, a connected engine whose
+ * socket went away gets the whole restart window to reappear before this host
+ * spawns its own, and telling the consumer "the engine is gone" once per rung
+ * of that wait would turn one loss into five. The spec's window is why it
+ * exists; {@link Supervisor.climb} is the only place it is caught.
+ */
+class EngineWaitingError extends EngineStartError {
+  constructor(message: string) {
+    super(message, null, "");
+    this.name = "EngineWaitingError";
+  }
+}
+
+/**
  * The engine behind a request went away.
  *
  * One class from **both** doors — the stream ending and the process exiting —
@@ -323,6 +368,15 @@ export class Supervisor {
   private readonly durable = new Set<DurableSubscriber>();
   private subscriptionWanted = false;
   private resyncOwed = false;
+  /**
+   * True while the ladder is waiting out the reconnect window.
+   *
+   * Set when a **connected** engine is lost and cleared the moment any engine
+   * is adopted, so it says exactly "the daemon this host was using went away
+   * and may be coming back" — which is the only situation in which `auto`
+   * declines to spawn on an unanswered probe.
+   */
+  private reconnecting = false;
   private backoffTimer: NodeJS.Timeout | null = null;
   private resumeBackoff: (() => void) | null = null;
   private warned = false;
@@ -353,6 +407,8 @@ export class Supervisor {
     if (this.climbing) return this.climbing;
     this.stopping = false;
     this.restartTimes = [];
+    // An explicit start is a cold start: there is no connection to wait for.
+    this.reconnecting = false;
     this.setState("starting");
     return this.runClimb();
   }
@@ -545,7 +601,7 @@ export class Supervisor {
     for (let attempt = 0; ; attempt += 1) {
       if (this.stopping) return;
       try {
-        await this.engineOnce();
+        await this.engineOnce(attempt);
         return;
       } catch (thrown) {
         const error = asError(thrown);
@@ -553,8 +609,22 @@ export class Supervisor {
         // asked for it to go away.
         if (this.stopping) return;
         this.lastErrorValue = error;
-        await this.safely(() => this.events.onEngineLost(error), "onEngineLost");
+        // **Nor is a rung spent waiting out the reconnect window.** The loss
+        // was reported once when the connection dropped; the window is this
+        // supervisor being patient about it, and a consumer told "the engine
+        // is gone" on every rung of that patience would count one outage five
+        // times. See {@link EngineWaitingError}.
+        if (!(error instanceof EngineWaitingError)) {
+          await this.safely(() => this.events.onEngineLost(error), "onEngineLost");
+        }
         if (this.stopping) return;
+        // **A daemon over another vault is an operator error, not a flake.**
+        // Every remaining rung would re-read the same answer, so the ladder is
+        // abandoned and the typed refusal travels to whoever called `start()`.
+        if (error instanceof EngineVaultMismatchError) {
+          this.setState("stopped");
+          throw error;
+        }
         const wait = attempt + 1 < ladder.length ? ladder[attempt] : undefined;
         if (wait === undefined) {
           this.setState("stopped");
@@ -586,7 +656,7 @@ export class Supervisor {
    * `DaemonUnreachable` and the binary into its documented exit code 3, so the
    * mode's promise is a code a script can branch on rather than a sentence.
    */
-  private async engineOnce(): Promise<void> {
+  private async engineOnce(attempt: number): Promise<void> {
     switch (this.config.engine) {
       case "spawn":
         return this.spawnOnce();
@@ -603,9 +673,33 @@ export class Supervisor {
       }
       case "auto": {
         const probe = await probeEngineSocket(this.config.engineSocketPath, this.config.clock);
-        return probe.answered ? this.connectOnce() : this.spawnOnce();
+        if (probe.answered) return this.connectOnce();
+        // **The reconnect window.** A host that was *connected* a moment ago
+        // has one more thing to consider than a host starting cold: the daemon
+        // it was using may be restarting. Spawning on the first unanswered
+        // probe is how every connected host races the owner's unlink, races
+        // each other, and races the index's writer lease — all to bind the one
+        // path the daemon is about to bind again. So the probe is retried on
+        // the restart ladder and the spawn waits for the last rung, which is
+        // the spec's "spawn only if the socket stays absent for the whole
+        // window".
+        //
+        // A cold start never waits: there is no daemon coming back, and the
+        // point of `auto` is that the first host pays the start.
+        if (this.reconnecting && !this.lastRung(attempt)) {
+          throw new EngineWaitingError(
+            `no vaultd is listening at ${this.config.engineSocketPath} yet; the daemon this ` +
+              "host was connected to has the rest of the restart window to come back",
+          );
+        }
+        return this.spawnOnce();
       }
     }
+  }
+
+  /** Is this the last attempt the ladder allows? Then the window has passed. */
+  private lastRung(attempt: number): boolean {
+    return attempt + 1 >= this.config.restartBackoffMs.length;
   }
 
   /**
@@ -772,11 +866,27 @@ export class Supervisor {
    */
   private async connectOnce(): Promise<void> {
     const socket = connect(this.config.engineSocketPath);
+    // **Both racers are removed when the race is over**, whichever way it went.
+    // Left attached, the loser is a one-shot handler on a live socket: the
+    // first post-connect error would call `fail` on a settled promise before
+    // reaching the real error handler below. Harmless, and exactly the kind of
+    // stray listener this file is otherwise careful about.
+    let settleConnect!: () => void;
+    let failConnect!: (error: Error) => void;
+    const connected = new Promise<void>((settle, fail) => {
+      settleConnect = settle;
+      failConnect = fail;
+    });
+    const onConnected = (): void => {
+      settleConnect();
+    };
+    const onConnectFailed = (error: Error): void => {
+      failConnect(error);
+    };
+    socket.once("connect", onConnected);
+    socket.once("error", onConnectFailed);
     try {
-      await new Promise<void>((settle, fail) => {
-        socket.once("connect", settle);
-        socket.once("error", fail);
-      });
+      await connected;
     } catch (thrown) {
       socket.destroy();
       throw new EngineStartError(
@@ -785,6 +895,9 @@ export class Supervisor {
         "",
         thrown,
       );
+    } finally {
+      socket.removeListener("connect", onConnected);
+      socket.removeListener("error", onConnectFailed);
     }
     // The same rule as the spawned engine's stdin: a write into a socket that
     // has gone away is expected, and the request it belonged to is already
@@ -872,6 +985,44 @@ export class Supervisor {
         thrown,
       );
     }
+    // **Answering is not the same as serving this vault.** `health` is a
+    // question every vaultd answers, and the socket path is only a digest of a
+    // root — so a daemon restarted over another vault at this path, a path an
+    // operator passed explicitly, or a stale path reused after a vault moved
+    // all answer exactly as a correct daemon would. Adopting one silently
+    // would point every plugin write at the wrong vault, which is why the
+    // identity is read before the engine is adopted and never after.
+    //
+    // **And a mismatch does not fall back to spawning, under `auto` either.**
+    // Something is already listening at the one path this vault's daemon
+    // binds: a spawn would meet the daemon's own exit 2 there, and if it
+    // somehow did not, it would leave two daemons contending for one address.
+    // A later refactor must not "helpfully" add the fallback — the right
+    // answer to an operator error is to say so and stop.
+    let info: GetVaultInfoResponse;
+    try {
+      info = await client.request<GetVaultInfoResponse>("get_vault_info");
+    } catch (thrown) {
+      this.spawning = null;
+      client.close();
+      socket.destroy();
+      throw new EngineStartError(
+        `the daemon at ${this.config.engineSocketPath} did not answer get_vault_info`,
+        null,
+        "",
+        thrown,
+      );
+    }
+    if (info.canonical_root !== this.config.vaultRoot) {
+      this.spawning = null;
+      client.close();
+      socket.destroy();
+      throw new EngineVaultMismatchError(
+        this.config.engineSocketPath,
+        info.canonical_root,
+        this.config.vaultRoot,
+      );
+    }
     // From here the adoption is byte for byte the spawned path's, so the two
     // roads converge rather than diverging into two lifecycles.
     await this.adopt(engine, client);
@@ -901,6 +1052,8 @@ export class Supervisor {
     engine.failStartup = null;
     engine.everReady = true;
     this.spawning = null;
+    // Whichever road got here, the window is over.
+    this.reconnecting = false;
     // From here the engine is the current one, and that identity — not a flag —
     // is what tells a later exit apart from a failed start attempt.
     this.engine = engine;
@@ -1041,13 +1194,32 @@ export class Supervisor {
     else engine.socket?.destroy();
   }
 
+  /**
+   * How this engine ended, in words an operator can act on.
+   *
+   * **A dropped connection is not an exit**, and saying "vaultd exited for
+   * reasons the supervisor never saw" about one is the most misleading
+   * sentence phase 7 could produce: nothing exited, nothing was unseen, and
+   * the path the connection was to is the single most useful fact about it.
+   */
+  private describeLoss(engine: Engine): string {
+    if (engine.source === "connected") {
+      return `the engine connection to ${this.config.engineSocketPath} closed`;
+    }
+    return `vaultd exited ${describeExit(engine.exit)}`;
+  }
+
   private onChildExit(engine: Engine): void {
     // Never left hanging, and typed: a request whose engine is gone must fail,
     // because a shim write that never settles is indistinguishable from a
     // wedged plugin.
     engine.client.failAllPending(
       new EngineLostError(
-        engine.everReady ? "vaultd restarted" : "the engine ended before it was ready",
+        engine.everReady
+          ? engine.source === "connected"
+            ? "the engine connection closed"
+            : "vaultd restarted"
+          : "the engine ended before it was ready",
         () => engine.exit,
       ),
     );
@@ -1059,7 +1231,7 @@ export class Supervisor {
     if (engine !== this.engine) {
       engine.failStartup?.(
         new EngineStartError(
-          `the engine exited ${describeExit(engine.exit)} before it was ready`,
+          `${this.describeLoss(engine)} before it was ready`,
           engine.exit,
           engine.stderrTail,
         ),
@@ -1068,7 +1240,7 @@ export class Supervisor {
     }
     this.engine = null;
     this.liveStateValue = null;
-    engine.watching.reject(new EngineLostError(`the engine exited ${describeExit(engine.exit)}`));
+    engine.watching.reject(new EngineLostError(this.describeLoss(engine)));
     if (this.stopping) return;
     this.restarts += 1;
     void this.restart(engine);
@@ -1076,7 +1248,10 @@ export class Supervisor {
 
   /** A running engine died. Report it, check the ceiling, then climb the ladder. */
   private async restart(lost: Engine): Promise<void> {
-    const error = new EngineLostError(`vaultd exited ${describeExit(lost.exit)}`, lost.exit);
+    // **Only a lost connection opens the window.** A spawned engine that died
+    // left nothing to reconnect to, so its ladder behaves as it always has.
+    this.reconnecting = lost.source === "connected";
+    const error = new EngineLostError(this.describeLoss(lost), lost.exit);
     this.lastErrorValue = error;
     await this.safely(() => this.events.onEngineLost(error), "onEngineLost");
     if (this.stopping) return;

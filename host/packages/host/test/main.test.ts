@@ -7,12 +7,13 @@
  * clean `SIGTERM` — is `test/main-real-daemon.test.ts`.
  */
 
-import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { defaultHostConfig, socketPathFor } from "../src/config";
-import { scratchRoot } from "./scratch";
+import { defaultHostConfig, socketPathFor, vaultdSocketPathFor } from "../src/config";
+import { SCRATCH_BASE, scratchRoot } from "./scratch";
 import type { HostConfig } from "../src/config";
 
 import {
@@ -27,12 +28,24 @@ import {
   runHost,
 } from "../src/main";
 
+/**
+ * An absolute path that cannot exist, so `realpath` has nothing to resolve.
+ *
+ * It used to be the literal `/tmp/vault`, and that was a dependence on the
+ * developer's own machine: `parseArgs` canonicalizes, `/tmp` is a symlink to
+ * `/private/tmp` on Darwin, and the day somebody actually had a `/tmp/vault`
+ * these cases would fail with a confusing `/private/tmp/vault` diff and
+ * nothing pointing at the cause.
+ */
+const ABSENT = join(SCRATCH_BASE, `no-such-vault-${randomUUID()}`);
+
 describe("vaultd-host argument parsing", () => {
   it("builds a config from --vault alone", () => {
-    const { config, help } = parseArgs(["--vault", "/tmp/vault"]);
+    const { config, help } = parseArgs(["--vault", ABSENT]);
     expect(help).toBe(false);
-    expect(config.vaultRoot).toBe("/tmp/vault");
-    // An absolute path is left alone; the relative case is below.
+    expect(config.vaultRoot).toBe(ABSENT);
+    // An absolute path that resolves to itself is left alone; the relative
+    // case is below and the symlink case is beside it.
     expect(config.configDirName).toBe(".obsidian-headless");
     expect(config.dryRun).toBe(false);
     // The socket defaults under the state directory, never beside the vault.
@@ -48,9 +61,46 @@ describe("vaultd-host argument parsing", () => {
     expect(config.socketPath).toBe(socketPathFor(config.dataDir, resolve("some/vault")));
   });
 
+  it("hashes the daemon's own canonical root, through a symlinked --vault", () => {
+    // **The digest is a join key between two processes.** The daemon hashes
+    // `vault_index::canonical_root`, which is a realpath; a host that hashed
+    // the string an operator typed would derive a path no daemon ever binds,
+    // and under the default `auto` that is not a quiet miss — it is a second
+    // daemon spawned beside a healthy one on every single start.
+    const root = scratchRoot("canon-");
+    const real = join(root, "real");
+    mkdirSync(real, { recursive: true });
+    const link = join(root, "link");
+    symlinkSync(real, link);
+    const canonical = realpathSync(real);
+
+    const { config } = parseArgs(["--vault", link]);
+    expect(config.vaultRoot).toBe(canonical);
+    expect(config.engineSocketPath).toBe(vaultdSocketPathFor(canonical));
+    // And the daemon is told the same root the digest was taken from.
+    expect(config.vaultdArgs).toContain(canonical);
+  });
+
+  it("canonicalizes for a programmatic config too, not only for the binary", () => {
+    // `LiveHost`, an embedder calling `startHost`, and every test factory all
+    // build their config through `defaultHostConfig` and never touch
+    // `parseArgs`. Canonicalizing in the CLI alone would leave every one of
+    // them hashing a root the daemon will not.
+    const root = scratchRoot("canon-prog-");
+    const real = join(root, "real");
+    mkdirSync(real, { recursive: true });
+    const link = join(root, "link");
+    symlinkSync(real, link);
+    const canonical = realpathSync(real);
+
+    const config = defaultHostConfig(link);
+    expect(config.vaultRoot).toBe(canonical);
+    expect(config.engineSocketPath).toBe(vaultdSocketPathFor(canonical));
+  });
+
   it("carries every flag the help text advertises", () => {
     const { config } = parseArgs([
-      "--vault", "/tmp/vault",
+      "--vault", ABSENT,
       "--config-dir", ".headless",
       "--socket", "/tmp/s.sock",
       "--vaultd", "/opt/vaultd",
@@ -75,7 +125,7 @@ describe("vaultd-host argument parsing", () => {
   });
 
   it("defaults the engine to auto and keeps the daemon this host spawns", () => {
-    const { config } = parseArgs(["--vault", "/tmp/vault"]);
+    const { config } = parseArgs(["--vault", ABSENT]);
     expect(config.engine).toBe("auto");
     expect(config.leaveEngineRunning).toBe(false);
   });
@@ -83,7 +133,7 @@ describe("vaultd-host argument parsing", () => {
   it("refuses an --engine mode it does not have", () => {
     let thrown: unknown;
     try {
-      parseArgs(["--vault", "/tmp/vault", "--engine", "adopt"]);
+      parseArgs(["--vault", ABSENT, "--engine", "adopt"]);
     } catch (error) {
       thrown = error;
     }
@@ -140,7 +190,7 @@ describe("vaultd-host argument parsing", () => {
     // files; the whole coexistence design rests on the two being different.
     let thrown: unknown;
     try {
-      parseArgs(["--vault", "/tmp/vault", "--config-dir", ".obsidian"]);
+      parseArgs(["--vault", ABSENT, "--config-dir", ".obsidian"]);
     } catch (error) {
       thrown = error;
     }

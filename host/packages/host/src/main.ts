@@ -14,14 +14,13 @@
  *
  * **It names no fs function.** The state directory is reached through
  * {@link DataDir}, the one module allowed to write outside the vault, and the
- * one read it does of its own — canonicalising the vault root — goes through
- * `runtime/fs-access`, the seam the write guard watches.
+ * vault root is canonicalised by `defaultHostConfig`, which reaches the file
+ * system through `runtime/fs-access` — the seam the write guard watches.
  */
 
 import { resolve } from "node:path";
 
 import { DaemonUnreachable, startHost } from "./host";
-import { realpathSync } from "./runtime/fs-access";
 import { OBSIDIAN_CONFIG_DIR } from "./pluginset/config-dir";
 import { defaultHostConfig, socketPathFor, systemClock } from "./config";
 import type { EngineMode, HostConfig } from "./config";
@@ -196,15 +195,13 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   // `--vault` names, and `vaultdSocketPathFor` hashes the string it is given:
   // a host that passed `/tmp/vault` where the daemon canonicalised
   // `/private/tmp/vault` would probe a path no daemon ever binds and so would
-  // spawn a second daemon beside a perfectly good one, every time. So the host
-  // applies the same realpath the daemon does, before any digest is taken.
+  // spawn a second daemon beside a perfectly good one, every time.
   //
-  // A root that does not exist yet is left as the absolute path: `realpath`
-  // has nothing to resolve, the daemon will refuse the vault in a moment for
-  // its own reasons, and a usage error about a missing directory is not this
-  // function's to raise.
-  const vaultRoot = canonical(resolve(vault));
-  const base = defaultHostConfig(vaultRoot);
+  // `defaultHostConfig` applies that realpath — for this binary and for every
+  // programmatic caller alike — so what this function owes it is only an
+  // absolute path, and `base.vaultRoot` is the canonical answer to read back.
+  const base = defaultHostConfig(resolve(vault));
+  const vaultRoot = base.vaultRoot;
   const config: HostConfig = {
     ...base,
     clock: systemClock(),
@@ -218,20 +215,6 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     forceShared,
   };
   return { config, help: false };
-}
-
-/**
- * `path` with every symlink resolved, or `path` itself when it cannot be.
- *
- * Through the fs seam, which is the one door the write guard watches — this
- * module still names no fs function of its own.
- */
-function canonical(path: string): string {
-  try {
-    return realpathSync(path);
-  } catch {
-    return path;
-  }
 }
 
 /**
