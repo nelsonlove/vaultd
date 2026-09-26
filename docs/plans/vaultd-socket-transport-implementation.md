@@ -52,7 +52,7 @@ Expected: a clean tree on `feat/socket-transport`, `cargo` at 1.85 or above, `no
 ### `crates/vault-server` (Rust)
 
 - Create `src/connection.rs` — the per-connection loop over any `BufRead` + `Write` pair. Owns `RawRequestEnvelope`, `ServerInput`, `OutputEnvelope`, `respond`, `read_input`, `forward_notices`, `write_output`, `dispatch`, `drain`, and the public `serve`. One responsibility: turn one byte stream into one dispatcher with one registry.
-- Modify `src/stdio.rs` — shrinks to `run`, over `io::stdin().lock()` and `io::stdout().lock()`, delegating to `connection::serve`. Keeps its module documentation and its one test.
+- Modify `src/stdio.rs` — shrinks to `run`, over `io::BufReader::new(io::stdin())` and `io::stdout()`, delegating to `connection::serve`. Its module documentation is replaced (it now says what makes connection zero's *ownership* of the runtime special, rather than restating the loop), and its one test moves to `connection.rs` with the loop it exercises. **Not the locked handles:** `serve` moves both streams into spawned threads, so both must be `Send`, and `StdinLock`/`StdoutLock` are not — see Task 1 Step 4.
 - Create `src/broadcast.rs` — `Broadcaster`, `ConnectionId`, the per-connection bounded inbox, and the drop-and-latch rule.
 - Create `src/listener.rs` — the socket path rule (`socket_digest`, `run_dir`, `default_socket_path`), `ListenError`, and `SocketListener` (bind with the stale/live/non-socket decision, directory `0700`, socket `0600`, backlog 16, unlink on drop).
 - Create `src/service.rs` — the multi-connection service: the accept loop, the connection registry, connection zero, the signal handlers, and the bounded shutdown drain.
@@ -539,11 +539,21 @@ use crate::runtime::RuntimeNotice;
 /// Serve the stdio loop until stdin closes, input becomes unparseable, or the
 /// writer fails. Always shuts the runtime down and joins every thread before
 /// returning.
+///
+/// **The unlocked handles are deliberate.** `serve` moves both streams into
+/// spawned threads, so both must be `Send`, and `StdinLock`/`StdoutLock` are
+/// not — a lock guard cannot cross a thread boundary. `Stdin`/`Stdout` take the
+/// same static mutex per call and read or write through the same buffer behind
+/// it, so this is the same lock held per call rather than for the connection's
+/// life; and in this process exactly one thread touches each, because `serve`
+/// spawns one reader and one writer and nothing else in the daemon writes to
+/// standard output. So nothing can interleave and nothing can tear, which is
+/// the property the old `.lock()` was there for.
 pub fn run(server: Server, notices: Option<Receiver<RuntimeNotice>>) -> Result<(), String> {
     connection::serve(
         &server,
-        io::stdin().lock(),
-        io::stdout().lock(),
+        io::BufReader::new(io::stdin()),
+        io::stdout(),
         notices,
         ThreadLabels {
             reader: "vaultd-stdin".into(),
@@ -1010,13 +1020,83 @@ Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/targe
 
 Expected: `a_full_inbox_costs_its_own_connection_a_resync_and_costs_its_peer_nothing ... ok`, `a_gap_with_no_generation_yet_waits_for_one_that_has ... ok`, `exit=0`.
 
-- [ ] **Step 5: Clippy and the whole crate**
+- [ ] **Step 5: Say what the broadcaster does and does not change about the Request arm's pre-drain**
+
+Task 1's review (finding L3) traced the Request arm's pre-drain in `connection::dispatch` and found it **unreachable**: the only producer of queued events is `SubscriptionRegistry::enqueue_notice`, reached only from the Notice arm, which calls `drain` immediately after — and `drain` blocks on `send`, so it always empties the queue completely. Removing the pre-drain left all 173 tests green.
+
+**The broadcaster does not change that, and no comment may claim it does.** A notice the broadcaster delivers still arrives as a `ServerInput::Notice` through the same forwarder and is still drained inside the same arm; so is the synthetic `resync_required` that replaces a dropped one. What *would* make the pre-drain load-bearing is exactly one of two things, and neither exists yet: an `enqueue_notice` reached from somewhere other than the Notice arm, or a `drain` that can return with the queue non-empty. Add that to `broadcast.rs`'s module documentation, after the "What this module deliberately does **not** do" paragraph:
+
+```rust
+//! **It does not make the dispatcher's pre-drain reachable either.** A notice
+//! this broadcaster delivers arrives as a `ServerInput::Notice` like any other,
+//! through the same forwarder, and is drained inside the same arm — including
+//! the synthetic `resync_required` that replaces a dropped one. So the Request
+//! arm's pre-drain stays defensive: what actually keeps "already-queued events
+//! reach the client before the response that ends the subscription" true is
+//! drain-to-completion inside the Notice arm. The pre-drain becomes
+//! load-bearing the day something enqueues outside that arm, or the day
+//! `drain` can return with a queue still non-empty — and that day it is owed a
+//! test of its own.
+```
+
+and pin the half that is true with a unit test, appended to the test module from Step 1:
+
+```rust
+    /// The invariant the pre-drain is *said* to defend, asserted where it
+    /// actually holds: a notice that reaches a connection through the
+    /// broadcaster is drained to completion inside the arm that took it, so the
+    /// registry is empty again before the next input is considered.
+    ///
+    /// This is what makes the Request arm's pre-drain defensive rather than
+    /// load-bearing, and it is the test that goes red if a future change queues
+    /// an event and does not drain it — at which point the pre-drain's comment
+    /// becomes true and its own test is owed.
+    #[test]
+    fn a_broadcast_notice_is_drained_to_completion_inside_the_arm_that_took_it() {
+        use vault_index::PublishedStatus;
+
+        use crate::subscriptions::SubscriptionRegistry;
+
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (_id, inbox) = broadcaster.register();
+        let mut registry = SubscriptionRegistry::new();
+        // The same four fields `tests/subscriptions.rs`'s own `status` helper
+        // fills in, with a generation so the registry has something to name.
+        let subscribed = registry.subscribe(&PublishedStatus {
+            generation: Some(Generation::new(2)),
+            graph_generation: Some(Generation::new(2)),
+            live_state: LiveState::Watching,
+            runtime_error: None,
+        });
+        registry.activate_new();
+
+        broadcaster.offer(&state_at(3));
+        let notice = inbox.recv().expect("the notice reached the inbox");
+
+        // The Notice arm's two statements, in order, with nothing between them.
+        registry.enqueue_notice(notice);
+        let mut drained = 0;
+        while registry.pop_event().is_some() {
+            drained += 1;
+        }
+
+        assert!(drained > 0, "the notice produced at least one event");
+        assert_eq!(
+            registry.queue_len(&subscribed.subscription_id),
+            Some(0),
+            "the queue is empty again before the next input, which is why the \
+             Request arm's pre-drain has nothing to find"
+        );
+    }
+```
+
+- [ ] **Step 6: Clippy and the whole crate**
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && cargo clippy -p vault-server --all-targets -- -D warnings && TMPDIR="$PWD/target/tmp" cargo test -p vault-server; echo "exit=$?"`
 
 Expected: no warnings, every test green, `exit=0`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 cd ~/repos/system/vaultd/.claude/worktrees/live-impl
@@ -1623,19 +1703,24 @@ COMMIT
 
 ### Task 4: `--listen`, the accept loop, and the connection lifecycle
 
-The flag, the service that owns the listener and the broadcaster, and one connection per accepted stream — each with its own registry and its own snapshot sessions, both of which die with it. Shutdown is Task 5; this task ends with a daemon that serves two clients at once and is killed by the test harness.
+The flag, the service that owns the listener and the broadcaster, and one connection per accepted stream — each with its own subscription registry, and each owning the snapshot sessions it opened. Shutdown is Task 5; this task ends with a daemon that serves two clients at once and is killed by the test harness.
+
+**Snapshot sessions: one registry, per-connection ownership (controller ruling, binding).** Task 1's review found that `Server::snapshots` is one process-wide `Mutex<SnapshotSessions>` and that no task scoped it, while the spec requires `snapshot_not_found` across connections and sessions closed when a connection ends. **The registry stays where it is** — it holds SQLite reader connections opened against the `IndexConfig`, and one registry per connection would multiply those per client. Ownership is added beside it instead: a map `snapshot_id → ConnectionId`, checked on every `snapshot_*` request, with a stranger answered `snapshot_not_found` as though the session did not exist. That decision is why `Server::handle` gains a `ConnectionId` parameter in this task and why `connection::serve` gains one to pass it.
 
 **Files:**
 
 - Create: `crates/vault-server/src/service.rs`
+- Modify: `crates/vault-server/src/lib.rs` (the module list; the session-ownership map, `Server::handle`'s new first parameter, the four `snapshot_*` arms, and `Server::close_sessions_of`)
+- Modify: `crates/vault-server/src/connection.rs` (`serve` and `dispatch` and `respond` carry the connection's id; `serve` closes that connection's sessions after dispatch; delete the `#[allow(dead_code, reason = …)]` on `ThreadLabels::for_connection`, which now has callers, and the two-line comment above it)
+- Modify: `crates/vault-server/src/broadcast.rs` (one `ConnectionId` constant for the connection that has no broadcaster)
+- Modify: `crates/vault-server/src/stdio.rs` (`run` passes that constant)
 - Modify: `crates/vault-server/src/main.rs`
-- Modify: `crates/vault-server/src/lib.rs` (module list)
 - Create: `crates/vault-server/tests/socket/mod.rs`
 - Create: `crates/vault-server/tests/socket_clients.rs` (the two-client case only; the slow client and the sessions arrive in Task 8)
 
 **Interfaces:**
 
-- Consumes: `connection::serve` and `connection::ThreadLabels` (Task 1), `broadcast::{Broadcaster, spawn_fanout, ConnectionId}` (Task 2), `listener::{SocketListener, ListenError, default_socket_path}` (Task 3), `Server::shutdown`.
+- Consumes: `connection::serve` and `connection::ThreadLabels` (Task 1), `broadcast::{Broadcaster, spawn_fanout, ConnectionId}` (Task 2), `listener::{SocketListener, ListenError, default_socket_path}` (Task 3), `Server::shutdown`, `vault_index::SnapshotSessions::{close, len}`.
 - Produces:
 
 ```rust
@@ -1655,6 +1740,55 @@ pub fn run(
     options: ServiceOptions,
 ) -> Result<(), ListenError>;
 ```
+
+**Three signatures change in this task, and every later task reads the changed form:**
+
+```rust
+// crates/vault-server/src/broadcast.rs — the id for a connection with no
+// broadcaster behind it. Never issued by `register`, whose counter increments
+// before it is used and so starts at 1.
+impl ConnectionId {
+    pub const STANDALONE: Self = ConnectionId(0);
+}
+
+// crates/vault-server/src/lib.rs
+impl Server {
+    /// Answer one request on behalf of `connection`.
+    ///
+    /// The identifier is what makes a snapshot session belong to somebody: the
+    /// sessions live in one process-wide registry, and this is the only thing
+    /// that tells the owner's `snapshot_id` from a stranger's.
+    pub fn handle(
+        &self,
+        connection: crate::broadcast::ConnectionId,
+        request: RequestEnvelope,
+        subscriptions: &mut SubscriptionRegistry,
+    ) -> ResponseEnvelope;
+
+    /// Close every session `connection` opened, and forget it owned them.
+    /// Idempotent, and safe for a connection that opened none.
+    pub(crate) fn close_sessions_of(&self, connection: crate::broadcast::ConnectionId);
+
+    /// How many sessions `connection` owns. Test-only, and the only honest
+    /// instrument: a stranger's refusal is indistinguishable on the wire from
+    /// a session that was never opened.
+    #[cfg(test)]
+    pub(crate) fn sessions_owned_by(&self, connection: crate::broadcast::ConnectionId) -> usize;
+}
+
+// crates/vault-server/src/connection.rs
+pub(crate) fn serve(
+    server: &Server,
+    connection: crate::broadcast::ConnectionId,
+    reader: impl std::io::BufRead + Send + 'static,
+    writer: impl std::io::Write + Send + 'static,
+    notices: Option<std::sync::mpsc::Receiver<RuntimeNotice>>,
+    labels: ThreadLabels,
+    after_dispatch: impl FnOnce(),
+) -> Result<(), String>;
+```
+
+`dispatch` and `respond` take the same `ConnectionId` and pass it to `Server::handle`; they are `pub(crate)` and `private` respectively, so nothing outside the crate sees the change. `stdio::run` passes `ConnectionId::STANDALONE`.
 
 and, in `main.rs`:
 
@@ -1992,7 +2126,433 @@ Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/targe
 
 Expected: the daemon refuses to start with `error: unexpected argument '--listen' found`, and the harness panics with `vaultd never answered health at …`; `exit=101`.
 
-- [ ] **Step 3: Write `crates/vault-server/src/service.rs`**
+- [ ] **Step 3: Write the failing session-ownership unit test**
+
+Append to `crates/vault-server/src/lib.rs`, beside the `shareable` module Task 1 added. It drives `Server::handle` directly, which is the level the ownership check lives at — the end-to-end pin over two real connections is Task 8's.
+
+```rust
+/// Snapshot sessions live in one process-wide registry and belong to one
+/// connection each. These are the two halves of that: a stranger cannot name
+/// somebody else's session, and a connection that ends takes its own with it.
+#[cfg(test)]
+mod session_ownership {
+    use std::time::Duration;
+
+    use vault_index::IndexConfig;
+    use vault_protocol::{
+        CloseSnapshotParams, ErrorCode, OpenSnapshotParams, RefreshIndexParams, Request,
+        RequestEnvelope, Response, ResponseOutcome, SnapshotTreeParams,
+    };
+
+    use crate::broadcast::ConnectionId;
+    use crate::runtime::RuntimeOptions;
+    use crate::subscriptions::SubscriptionRegistry;
+    use crate::Server;
+
+    fn envelope(id: &str, request: Request) -> RequestEnvelope {
+        RequestEnvelope {
+            version: 1,
+            id: id.to_string(),
+            request,
+        }
+    }
+
+    /// A server over a one-note vault, watcher and periodic tick off, with a
+    /// long idle timeout so nothing is reclaimed by the sweep mid-test.
+    fn server(vault: &tempfile::TempDir, index: &tempfile::TempDir) -> Server {
+        std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
+        let mut config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
+            .expect("an explicit config");
+        config.snapshot_idle_timeout = Duration::from_secs(600);
+        let (server, notices) = Server::start(
+            config,
+            RuntimeOptions {
+                watch: false,
+                reconcile_interval: None,
+                ..RuntimeOptions::default()
+            },
+        )
+        .expect("start a runtime");
+        drop(notices);
+        server
+    }
+
+    /// Two connection identifiers that are not each other. `STANDALONE` is
+    /// deliberately not one of them: it is the id stdio uses when no
+    /// broadcaster issued one, and a test that used it would prove nothing
+    /// about two peers.
+    const OWNER: ConnectionId = ConnectionId::for_test(1);
+    const STRANGER: ConnectionId = ConnectionId::for_test(2);
+
+    fn open_a_session(server: &Server, connection: ConnectionId) -> String {
+        let mut subscriptions = SubscriptionRegistry::new();
+        server.handle(
+            connection,
+            envelope("r", Request::RefreshIndex(RefreshIndexParams::default())),
+            &mut subscriptions,
+        );
+        let opened = server.handle(
+            connection,
+            envelope("o", Request::OpenSnapshot(OpenSnapshotParams::default())),
+            &mut subscriptions,
+        );
+        match opened.outcome {
+            ResponseOutcome::Ok(Response::OpenSnapshot(session)) => session.snapshot_id,
+            other => panic!("open_snapshot was refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stranger_cannot_page_or_close_a_session_it_does_not_own() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let snapshot = open_a_session(&server, OWNER);
+        assert_eq!(server.sessions_owned_by(OWNER), 1);
+        assert_eq!(server.sessions_owned_by(STRANGER), 0);
+
+        let mut subscriptions = SubscriptionRegistry::new();
+        for (label, request) in [
+            (
+                "snapshot_tree",
+                Request::SnapshotTree(SnapshotTreeParams {
+                    snapshot_id: snapshot.clone(),
+                    cursor: None,
+                    limit: None,
+                }),
+            ),
+            (
+                "close_snapshot",
+                Request::CloseSnapshot(CloseSnapshotParams {
+                    snapshot_id: snapshot.clone(),
+                }),
+            ),
+        ] {
+            let refused = server.handle(STRANGER, envelope("s", request), &mut subscriptions);
+            match refused.outcome {
+                ResponseOutcome::Err(error) => assert_eq!(
+                    error.code,
+                    ErrorCode::SnapshotNotFound,
+                    "{label} from a stranger must read exactly as a session that \
+                     never existed — never as a permission refusal, which would \
+                     tell one client that another client is there"
+                ),
+                other => panic!("{label} from a stranger was answered: {other:?}"),
+            }
+        }
+
+        // And the owner still has it: a refused stranger changes nothing.
+        assert_eq!(server.sessions_owned_by(OWNER), 1);
+        let paged = server.handle(
+            OWNER,
+            envelope(
+                "p",
+                Request::SnapshotTree(SnapshotTreeParams {
+                    snapshot_id: snapshot,
+                    cursor: None,
+                    limit: None,
+                }),
+            ),
+            &mut subscriptions,
+        );
+        assert!(
+            matches!(paged.outcome, ResponseOutcome::Ok(Response::SnapshotTree(_))),
+            "the owner pages its own session: {paged:?}"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn a_connection_ending_closes_the_sessions_it_owned_and_no_others() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let leaving = open_a_session(&server, OWNER);
+        let staying = open_a_session(&server, STRANGER);
+        assert_ne!(leaving, staying, "two sessions, two identifiers");
+        assert_eq!(server.snapshot_session_count(), 2);
+
+        server.close_sessions_of(OWNER);
+
+        assert_eq!(server.sessions_owned_by(OWNER), 0, "its sessions are gone");
+        assert_eq!(
+            server.sessions_owned_by(STRANGER),
+            1,
+            "and its peer's are untouched"
+        );
+        assert_eq!(
+            server.snapshot_session_count(),
+            1,
+            "the WAL frames the departing connection pinned are released, and \
+             only those"
+        );
+
+        // The departed session's identifier is now nobody's.
+        let mut subscriptions = SubscriptionRegistry::new();
+        let refused = server.handle(
+            OWNER,
+            envelope(
+                "p",
+                Request::SnapshotTree(SnapshotTreeParams {
+                    snapshot_id: leaving,
+                    cursor: None,
+                    limit: None,
+                }),
+            ),
+            &mut subscriptions,
+        );
+        assert!(
+            matches!(refused.outcome, ResponseOutcome::Err(_)),
+            "a closed session is not found: {refused:?}"
+        );
+        server.shutdown();
+    }
+}
+```
+
+`ConnectionId::for_test(n)` is a `#[cfg(test)] const fn` the next step adds beside `STANDALONE`; the ids a test needs cannot come from `Broadcaster::register`, which hands back a receiver the test has no use for.
+
+- [ ] **Step 4: Run it to verify it fails**
+
+Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/target/tmp" cargo test -p vault-server --lib session_ownership; echo "exit=$?"`
+
+Expected: compilation fails — `this method takes 2 arguments but 3 arguments were supplied` on every `server.handle(…)` call, and `no function or associated item named \`for_test\``, `no method named \`sessions_owned_by\``, `no method named \`close_sessions_of\``. `exit=101`.
+
+- [ ] **Step 5: Add the ownership map and thread the connection id**
+
+Three files, in this order, because each one's compile error names the next.
+
+In `crates/vault-server/src/broadcast.rs`, beside `ConnectionId`:
+
+```rust
+impl ConnectionId {
+    /// The identifier a connection uses when no broadcaster issued one: the
+    /// stdio-only daemon, which has a single connection and takes the
+    /// runtime's notice receiver directly.
+    ///
+    /// Zero is safe to reserve because [`Broadcaster::register`] increments its
+    /// counter **before** using it, so the first identifier it ever issues is
+    /// 1 and no live connection can collide with this.
+    pub const STANDALONE: Self = Self(0);
+
+    /// An arbitrary identifier, for a test that needs two peers without
+    /// needing two inboxes.
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+```
+
+In `crates/vault-server/src/lib.rs`, one field beside `snapshots`:
+
+```rust
+    /// Which connection opened each live snapshot session.
+    ///
+    /// **The registry is shared and the ownership is not.** One
+    /// `SnapshotSessions` holds one SQLite reader connection per session,
+    /// opened against the `IndexConfig`; a registry per client would multiply
+    /// those by the number of clients for no gain, since the sessions are
+    /// already independent pinned transactions. So the sessions stay in one
+    /// place and this map is what makes each of them somebody's: a
+    /// `snapshot_id` from a connection that does not own it is answered
+    /// `snapshot_not_found`, exactly as an identifier this process never
+    /// issued would be — a client learns nothing about any other client.
+    ///
+    /// `None` in health-only mode, beside `snapshots`, for the same reason.
+    session_owners: Option<std::sync::Mutex<std::collections::BTreeMap<String, broadcast::ConnectionId>>>,
+```
+
+initialized `Some(Default::default())` in `for_runtime` and `None` in `health_only`, beside `snapshots` in both.
+
+Then the check, the recording, and the release:
+
+```rust
+impl Server {
+    /// Does `connection` own `snapshot_id`?
+    ///
+    /// A session nobody owns answers `false` too, which is why the caller's
+    /// refusal is `snapshot_not_found` rather than anything narrower: the two
+    /// cases are indistinguishable to a client, and must stay so.
+    fn owns_session(&self, connection: broadcast::ConnectionId, snapshot_id: &str) -> bool {
+        match self.session_owners.as_ref() {
+            None => false,
+            Some(owners) => {
+                owners
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(snapshot_id)
+                    == Some(&connection)
+            }
+        }
+    }
+
+    fn record_session(&self, connection: broadcast::ConnectionId, snapshot_id: &str) {
+        if let Some(owners) = self.session_owners.as_ref() {
+            owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(snapshot_id.to_string(), connection);
+        }
+    }
+
+    fn forget_session(&self, snapshot_id: &str) {
+        if let Some(owners) = self.session_owners.as_ref() {
+            owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(snapshot_id);
+        }
+    }
+
+    /// Close every session `connection` opened, and forget it owned them.
+    ///
+    /// Called by [`crate::connection::serve`] when a connection's dispatcher
+    /// ends, which is what fulfils "ending a connection closes its snapshot
+    /// sessions, releasing the WAL frames they pinned". Idempotent, and a
+    /// connection that opened none does no work.
+    pub(crate) fn close_sessions_of(&self, connection: broadcast::ConnectionId) {
+        let owners = match self.session_owners.as_ref() {
+            None => return,
+            Some(owners) => owners,
+        };
+        let mine: Vec<String> = {
+            let mut owners = owners.lock().unwrap_or_else(|error| error.into_inner());
+            let mine: Vec<String> = owners
+                .iter()
+                .filter(|(_, owner)| **owner == connection)
+                .map(|(snapshot_id, _)| snapshot_id.clone())
+                .collect();
+            for snapshot_id in &mine {
+                owners.remove(snapshot_id);
+            }
+            mine
+        };
+        if mine.is_empty() {
+            return;
+        }
+        if let Some(sessions) = self.snapshots.as_ref() {
+            let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+            for snapshot_id in &mine {
+                // A session the sweep already reclaimed is not an error here:
+                // the owner is leaving either way.
+                let _ = sessions.close(snapshot_id);
+            }
+        }
+    }
+
+    /// How many sessions `connection` owns. Test-only, and the only honest
+    /// instrument: on the wire a stranger's refusal and a session that was
+    /// never opened are the same answer.
+    #[cfg(test)]
+    pub(crate) fn sessions_owned_by(&self, connection: broadcast::ConnectionId) -> usize {
+        self.session_owners.as_ref().map_or(0, |owners| {
+            owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .filter(|owner| **owner == connection)
+                .count()
+        })
+    }
+}
+```
+
+`Server::handle` gains the parameter as its **first** argument, before `request`, and the four `snapshot_*` arms change as follows. `Request::OpenSnapshot` records the new session immediately after a successful open, inside the arm and while it still holds `opened.snapshot_id`:
+
+```rust
+                        Ok(opened) => {
+                            // Recorded before the response is built, so there
+                            // is no window in which a session exists and
+                            // belongs to nobody.
+                            self.record_session(connection, &opened.snapshot_id);
+                            ResponseEnvelope::success(
+                                id,
+                                Response::OpenSnapshot(OpenSnapshotResponse {
+                                    snapshot_id: opened.snapshot_id,
+                                    generation: opened.generation.get(),
+                                    note_count: opened.note_count,
+                                    entry_count: opened.entry_count,
+                                }),
+                            )
+                        }
+```
+
+`Request::SnapshotTree`, `Request::SnapshotNotes` and `Request::CloseSnapshot` each gain the same guard as the **first** thing in the arm, before the registry is locked, so a stranger never touches it:
+
+```rust
+            Request::SnapshotTree(params) => {
+                if !self.owns_session(connection, &params.snapshot_id) {
+                    return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));
+                }
+                match self.snapshots.as_ref() {
+                    // …the existing body, unchanged…
+                }
+            }
+```
+
+and `Request::CloseSnapshot`'s success path additionally forgets the ownership, so closing and reopening cannot leave a stale entry behind:
+
+```rust
+                        Ok(()) => {
+                            self.forget_session(&params.snapshot_id);
+                            ResponseEnvelope::success(
+                                id,
+                                Response::CloseSnapshot(CloseSnapshotResponse {
+                                    snapshot_id: params.snapshot_id,
+                                }),
+                            )
+                        }
+```
+
+with one free function beside `index_unavailable`, so the three guards word their refusal identically to the registry's own:
+
+```rust
+/// The refusal a stranger meets, worded exactly as the refusal for an
+/// identifier this process never issued. The two must be indistinguishable: a
+/// client that could tell them apart could detect the presence of another
+/// client.
+fn snapshot_not_found(snapshot_id: &str) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::SnapshotNotFound,
+        message: format!("no such snapshot session: {snapshot_id}"),
+        supported_version: None,
+        current_generation: None,
+        current_revision: None,
+    }
+}
+```
+
+Check the message against what `convert::index_error` produces for `IndexError`'s own snapshot-not-found today and use that wording if it differs, so the two are byte-identical on the wire — Task 7's conformance transcript compares `c22`, a double `close_snapshot`, through both transports.
+
+In `crates/vault-server/src/connection.rs`: `serve` takes `connection: ConnectionId` as its second parameter and passes it to `dispatch`, which passes it to `respond`, which passes it to `Server::handle`. And `serve` closes that connection's sessions in the teardown, between dropping the output sender and `after_dispatch`:
+
+```rust
+    drop(outputs);
+    // **Before `after_dispatch`, which unregisters this connection's notice
+    // inbox.** The sessions are this connection's and nobody else's, and the
+    // WAL frames they pin are held until they are closed — the idle sweep
+    // cannot reach them, because it only runs on some *other* connection's
+    // input. So the connection that opened them closes them on its way out.
+    server.close_sessions_of(connection);
+    after_dispatch();
+```
+
+Finally, delete the `#[allow(dead_code, reason = …)]` on `ThreadLabels::for_connection` and the two-line comment above it: this task is the caller it was waiting for.
+
+- [ ] **Step 6: Run the ownership tests**
+
+Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/target/tmp" cargo test -p vault-server --lib session_ownership; echo "exit=$?"`
+
+Expected: `a_stranger_cannot_page_or_close_a_session_it_does_not_own ... ok`, `a_connection_ending_closes_the_sessions_it_owned_and_no_others ... ok`, `exit=0`.
+
+Then the whole crate, because `Server::handle`'s signature changed and every caller must be updated: `stdio::run` passes `ConnectionId::STANDALONE`, `connection.rs`'s moved test calls `server.handle(ConnectionId::STANDALONE, …)`, and every integration test under `crates/vault-server/tests/` that calls `handle` directly gains the same first argument.
+
+Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/target/tmp" cargo test -p vault-server; echo "exit=$?"`
+
+Expected: every test green, `exit=0`. The suites that drive the daemon over real stdio (`tests/stdio.rs`, `tests/live_stdio.rs`, `tests/snapshots.rs`) are the ones that prove a single-connection daemon is unchanged: one connection owns every session it opens, so every existing session assertion holds with no edit beyond the new argument.
+
+- [ ] **Step 7: Write `crates/vault-server/src/service.rs`**
 
 ```rust
 //! One daemon, many doors.
@@ -2134,6 +2694,7 @@ impl Service {
                 let broadcaster = Arc::clone(&service.broadcaster);
                 let outcome = connection::serve(
                     &service.server,
+                    id,
                     std::io::BufReader::new(std::io::stdin()),
                     std::io::stdout(),
                     Some(inbox),
@@ -2177,6 +2738,7 @@ impl Service {
                 let broadcaster = Arc::clone(&service.broadcaster);
                 let outcome = connection::serve(
                     &service.server,
+                    id,
                     std::io::BufReader::new(reading),
                     writing,
                     Some(inbox),
@@ -2238,7 +2800,7 @@ fn report(outcome: Result<(), String>, label: &str) {
 }
 ```
 
-- [ ] **Step 4: Wire `--listen` into `main.rs`**
+- [ ] **Step 8: Wire `--listen` into `main.rs`**
 
 Add the flag to `Cli`, after `read_only`:
 
@@ -2302,7 +2864,7 @@ impl Server {
 
 with `socket_path: Option<String>` added to the struct and to all three constructors (`health_only`, `for_runtime`, and through it `start`), defaulting to `None`.
 
-- [ ] **Step 5: Declare the module and run the test**
+- [ ] **Step 9: Declare the module and run the test**
 
 Add `pub mod service;` to `crates/vault-server/src/lib.rs`'s module list.
 
@@ -2310,26 +2872,38 @@ Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/targe
 
 Expected: `two_clients_see_the_same_generation_each_under_its_own_subscription_id ... ok`, `exit=0`.
 
-- [ ] **Step 6: Prove the old daemon is unchanged**
+- [ ] **Step 10: Prove the old daemon is unchanged**
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && cargo clippy -p vault-server --all-targets -- -D warnings && TMPDIR="$PWD/target/tmp" cargo test -p vault-server; echo "exit=$?"`
 
 Expected: no clippy warnings; every pre-existing test green, `tests/stdio.rs` and `tests/live_stdio.rs` included, because without `--listen` `service::run` is a straight delegation to `stdio::run`; `exit=0`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 cd ~/repos/system/vaultd/.claude/worktrees/live-impl
-git add crates/vault-server/src/service.rs crates/vault-server/src/main.rs crates/vault-server/src/lib.rs crates/vault-server/tests/socket crates/vault-server/tests/socket_clients.rs
+git add crates/vault-server/src/service.rs crates/vault-server/src/main.rs crates/vault-server/src/lib.rs crates/vault-server/src/connection.rs crates/vault-server/src/broadcast.rs crates/vault-server/src/stdio.rs crates/vault-server/tests/socket crates/vault-server/tests/socket_clients.rs
+# Plus every integration test whose `handle` call gained the ConnectionId
+# argument — `git add -u crates/vault-server/tests` after checking `git status`.
 git commit -F - <<'COMMIT'
 feat(server): --listen, the accept loop, and one connection per stream
 
 Each accepted stream becomes its own serve loop with its own subscription
-registry and its own snapshot sessions, so ending a connection drops every
-subscription it held and releases every WAL frame its sessions pinned. stdio
-is served as one more connection while stdin is open. Without --listen the
-service is a straight delegation to the stdio transport, so the daemon that
-always shipped is unchanged.
+registry, and owns the snapshot sessions it opened: the sessions stay in the
+one process-wide registry, because that registry holds a SQLite reader
+connection per session, and a map of snapshot_id to ConnectionId beside it is
+what makes each of them somebody's. A stranger naming another connection's
+snapshot_id gets snapshot_not_found, worded exactly as an identifier this
+process never issued, so no client can detect another. A connection ending
+closes what it owned, in serve between dropping the output sender and
+unregistering the notice inbox, which is what releases the WAL frames those
+sessions pinned — the idle sweep cannot reach them, since it only runs on some
+other connection's input.
+
+stdio is served as one more connection while stdin is open, under the reserved
+identifier ConnectionId::STANDALONE. Without --listen the service is a
+straight delegation to the stdio transport, so the daemon that always shipped
+is unchanged.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 COMMIT
@@ -2346,11 +2920,12 @@ SIGTERM or SIGINT stops accepting, tells every connection the runtime stopped, d
 - Create: `crates/vault-server/src/signals.rs`
 - Modify: `crates/vault-server/src/service.rs` (`Service::stop`, `run`)
 - Modify: `crates/vault-server/src/lib.rs` (module list)
+- Modify: `crates/vault-server/src/connection.rs` (two tests defending `serve`'s teardown order — Step 7)
 - Create: `crates/vault-server/tests/socket_lifecycle.rs`
 
 **Interfaces:**
 
-- Consumes: `Broadcaster::offer`, `SocketListener::wake`, `Server::shutdown`, `RuntimeNotice::State`.
+- Consumes: `Broadcaster::offer`, `SocketListener::wake`, `Server::shutdown`, `RuntimeNotice::State`, `connection::serve` with the `ConnectionId` parameter Task 4 added, and `Server::close_sessions_of` — which `serve` calls, so this task's shutdown does not have to: a connection whose read half is closed ends its own dispatcher, and its own teardown releases its sessions.
 - Produces:
 
 ```rust
@@ -2882,17 +3457,174 @@ Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/targe
 
 Expected: all seven tests `ok`, `exit=0`. `sigterm_tells_every_connection_the_runtime_stopped_then_unlinks_the_socket` is the one that was red.
 
-- [ ] **Step 7: Clippy and the whole crate**
+- [ ] **Step 7: Defend `serve`'s teardown order, which this task just made load-bearing**
+
+Task 1's review mutated `connection::serve`'s teardown twice and **both mutations survived all 173 tests**: removing `drop(inputs)` before the dispatch call, and swapping `drop(outputs)` with `after_dispatch()`. Neither was a live bug for a stdio-only daemon, because `after_dispatch` was `server.shutdown()` and that waits on nothing the writer must finish. This task changes that: the shutdown now **drains** each connection's writer within a bounded five seconds, and a teardown that runs `after_dispatch` before the writer can finish is a deadlock the budget merely hides. So the ordering gets tests, here, where it became a rule rather than a habit.
+
+Append both to `crates/vault-server/src/connection.rs`'s test module. Each fails by **hanging until its own deadline and then panicking with a diagnosis**, never by timing out silently.
+
+```rust
+    /// `drop(outputs)` must precede `after_dispatch()`.
+    ///
+    /// Dropping the sender is what ends the writer's `for envelope in outputs`
+    /// loop, which is what lets `write_output` return, which is what drops the
+    /// sink. So a sink whose `Drop` signals, plus an `after_dispatch` that
+    /// waits for that signal, is exactly the shape that distinguishes the two
+    /// orders: in the right one the signal has already arrived, and in the
+    /// wrong one it can never arrive, because the drop is queued behind the
+    /// closure that is waiting for it.
+    ///
+    /// This became load-bearing with the bounded shutdown drain: an
+    /// `after_dispatch` that waits on anything the writer must finish first is
+    /// a deadlock, and the five-second budget would report it as a slow client.
+    #[test]
+    fn the_output_sender_is_dropped_before_after_dispatch_runs() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        /// A sink that says when it is dropped — which is when `write_output`
+        /// returned, which is when the output channel closed.
+        struct SignallingSink(Arc<(Mutex<bool>, Condvar)>);
+        impl Write for SignallingSink {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for SignallingSink {
+            fn drop(&mut self) {
+                let (finished, waiters) = &*self.0;
+                *finished.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                waiters.notify_all();
+            }
+        }
+
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let signal = Arc::new((Mutex::new(false), Condvar::new()));
+        let waited = Arc::new(Mutex::new(false));
+
+        let outcome = serve(
+            &server,
+            crate::broadcast::ConnectionId::STANDALONE,
+            // One request line, then end of input, so the dispatcher has
+            // something to hand the writer and then returns.
+            io::Cursor::new(
+                br#"{"version":1,"id":"h","request":{"method":"health"}}
+"#
+                .to_vec(),
+            ),
+            SignallingSink(Arc::clone(&signal)),
+            None,
+            ThreadLabels::for_connection("teardown-order"),
+            {
+                let signal = Arc::clone(&signal);
+                let waited = Arc::clone(&waited);
+                move || {
+                    let (finished, waiters) = &*signal;
+                    let mut done = finished.lock().unwrap_or_else(|error| error.into_inner());
+                    let deadline = std::time::Duration::from_secs(5);
+                    while !*done {
+                        let (guard, timed_out) = waiters
+                            .wait_timeout(done, deadline)
+                            .unwrap_or_else(|error| error.into_inner());
+                        done = guard;
+                        assert!(
+                            !timed_out.timed_out() || *done,
+                            "after_dispatch ran before the output sender was dropped, so the \
+                             writer can never finish: this teardown order deadlocks under the \
+                             bounded shutdown drain"
+                        );
+                    }
+                    *waited.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                }
+            },
+        );
+
+        assert!(outcome.is_ok(), "the connection ended cleanly: {outcome:?}");
+        assert!(
+            *waited.lock().unwrap_or_else(|error| error.into_inner()),
+            "the closure ran at all, so the assertion inside it was reached"
+        );
+        server.shutdown();
+    }
+
+    /// `drop(inputs)` must precede the dispatch call.
+    ///
+    /// The dispatcher normally exits through an explicit `return` on
+    /// `InputClosed` or `FatalInput`, so its own live sender is never observed
+    /// — which is why Task 1's review could remove the drop and see 173 green
+    /// tests. The one shape that observes it is a reader that ends **without**
+    /// announcing it: a panicking reader thread drops its sender on the unwind
+    /// and sends nothing, so with no notice forwarder the dispatcher's own
+    /// clone is the only sender left. Dropped, the mailbox closes and `serve`
+    /// returns; kept, `mailbox.recv()` blocks for ever and the daemon hangs on
+    /// a connection that is already gone.
+    #[test]
+    fn the_input_sender_is_dropped_so_a_reader_that_dies_silently_still_ends_the_connection() {
+        /// A reader whose first `fill_buf` panics, standing in for any reader
+        /// that stops without sending `InputClosed`.
+        struct PanickingReader;
+        impl io::Read for PanickingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                panic!("this reader dies without announcing end of input");
+            }
+        }
+
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        // Behind an `Arc` so the call can run on a thread this test does not
+        // join: `serve` takes `&Server`, and `Arc<Server>` derefs to it. A
+        // scoped thread would not do — its scope's exit is itself a join, and
+        // joining is the thing that hangs when the drop is missing.
+        let server = std::sync::Arc::new(server(&vault, &index));
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("teardown-input-drop".into())
+            .spawn({
+                let server = std::sync::Arc::clone(&server);
+                move || {
+                    let outcome = serve(
+                        &server,
+                        crate::broadcast::ConnectionId::STANDALONE,
+                        io::BufReader::new(PanickingReader),
+                        io::sink(),
+                        None,
+                        ThreadLabels::for_connection("silent-reader"),
+                        || {},
+                    );
+                    let _ = done.send(outcome.is_ok());
+                }
+            })
+            .expect("start the worker thread");
+
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "serve never returned after its reader died silently: the dispatcher's own input \
+             sender was not dropped, so its mailbox can never close"
+        );
+        server.shutdown();
+    }
+```
+
+Both tests need `server` — the helper the moved stdio test already defines in this module — and `io::Write`, which the module imports. The panicking reader prints a panic line from its own thread; that is expected output, not a failure, and the daemon's own panic hook is not installed in a unit test.
+
+- [ ] **Step 8: Clippy and the whole crate**
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && cargo clippy -p vault-server --all-targets -- -D warnings && TMPDIR="$PWD/target/tmp" cargo test -p vault-server; echo "exit=$?"`
 
 Expected: no warnings, every test green, `exit=0`.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 cd ~/repos/system/vaultd/.claude/worktrees/live-impl
-git add crates/vault-server/src/signals.rs crates/vault-server/src/service.rs crates/vault-server/src/lib.rs crates/vault-server/Cargo.toml crates/vault-server/tests/socket_lifecycle.rs
+git add crates/vault-server/src/signals.rs crates/vault-server/src/service.rs crates/vault-server/src/lib.rs crates/vault-server/src/connection.rs crates/vault-server/Cargo.toml crates/vault-server/tests/socket_lifecycle.rs
 git commit -F - <<'COMMIT'
 feat(server): drain every connection on SIGTERM, then unlink the socket
 
@@ -2904,6 +3636,12 @@ into a writer that is still open, join within a five-second budget, close
 anything past it hard, stop the runtime, unlink. Exit stays 0. Without
 --listen, end of stdin still ends the daemon; with one, it ends connection
 zero alone.
+
+The bounded drain is also what makes serve's teardown order a rule rather
+than a habit, so it arrives with the two tests that were missing: an
+after_dispatch that waits on the writer proves drop(outputs) comes first, and
+a reader that dies without announcing end of input proves the dispatcher's own
+input sender is dropped. Both mutations survived the whole suite before this.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 COMMIT
@@ -3569,7 +4307,7 @@ The two isolation properties the socket exists for: a client that stops reading 
 
 **Interfaces:**
 
-- Consumes: `socket::{ListeningDaemon, Client}` (Task 4), `Client::stop_reading` (Task 4), `broadcast::CONNECTION_NOTICE_CAPACITY` (Task 2).
+- Consumes: `socket::{ListeningDaemon, Client}` (Task 4), `Client::stop_reading` (Task 4), `broadcast::CONNECTION_NOTICE_CAPACITY` (Task 2), and the session ownership Task 4 built — `a_snapshot_session_belongs_to_the_connection_that_opened_it` is the **end-to-end** pin on the `snapshot_id → ConnectionId` map and on `Server::close_sessions_of`, both of which Task 4 already unit-tested through `Server::handle`. If this case fails while Task 4's `session_ownership` tests pass, the defect is in the wiring between `serve` and `handle`, not in the ownership rule.
 - Produces:
 
 ```rust
@@ -5263,19 +6001,20 @@ COMMIT
 
 ### Task 13: Documentation — the Transports section and the two amendments
 
-Four documents, and one test that will not let three of them drift.
+Four documents, one source comment the phase made false, and one test that will not let three of them drift.
 
 **Files:**
 
 - Modify: `docs/protocol.md` (the opening line, a new **Transports** section, and two paragraphs in **Bounds**)
 - Modify: `docs/design/headless-plugin-host.md` (the Sync sentence, and the amended host-death sentence)
 - Modify: `README.md`
+- Modify: `crates/vault-server/src/lib.rs` (`Server::shutdown`'s doc comment — Step 5)
 - Modify: `crates/vault-server/tests/docs.rs`
 
 **Interfaces:**
 
 - Consumes: every behaviour Tasks 1 to 12 built. This task states it and adds nothing.
-- Produces: the phrases `tests/docs.rs` asserts, listed in Step 5.
+- Produces: the phrases `tests/docs.rs` asserts, listed in Step 6.
 
 - [ ] **Step 1: `docs/protocol.md`**
 
@@ -5354,7 +6093,30 @@ In the `vaultd-host` flag block, add the two flags from Task 11's usage text, an
 
 **`--engine` decides where the host's engine comes from.** `auto`, the default, connects to a `vaultd` already listening for this vault and spawns one with `--listen` when none is, so the daemon it starts is shareable and the next client's start is cheap. `connect` never spawns and exits 3 when nothing answers. `spawn` is the phase-6 behaviour exactly: always spawn, never probe, and own the daemon's life through its stdin. A daemon the host spawned under `auto` is sent `SIGTERM` at shutdown unless `--leave-engine-running` is passed. The ready line and `host.info` both report which road was taken.
 
-- [ ] **Step 5: Pin the three documents against drift**
+- [ ] **Step 5: Correct the one source comment this phase made false**
+
+`Server::shutdown`'s comment (`crates/vault-server/src/lib.rs:252-257`) says why sessions are closed first, and its reason stops being true the day `--listen` ships:
+
+> Sessions first: each one pins WAL frames until its transaction is rolled back, and a disconnect is what reaches this on the ordinary path — **the daemon is single-peer, so end of input means every session that client held is abandoned.**
+
+The daemon is no longer single-peer, and end of input on one connection abandons only *that* connection's sessions — which is now `Server::close_sessions_of`'s job, called by `connection::serve`, not this function's. Replace the comment with what is true of both shapes:
+
+```rust
+        // Sessions first: each one pins WAL frames until its transaction is
+        // rolled back, and nothing else in this teardown releases them.
+        //
+        // `close_all` rather than per connection, because this is the
+        // **process** stopping. A single connection leaving is the other path
+        // and belongs to `close_sessions_of`, which `connection::serve` calls
+        // on its way out; by the time the last connection has gone this is
+        // usually a no-op, and it stays here for the shapes where it is not —
+        // a connection whose thread was closed hard past the drain budget, and
+        // health-only mode, which has no connections at all.
+```
+
+Nothing else changes here, and no behaviour changes: `close_all` is already what it calls.
+
+- [ ] **Step 6: Pin the three documents against drift**
 
 In `crates/vault-server/tests/docs.rs`, add one test:
 
@@ -5391,13 +6153,13 @@ fn the_socket_transport_is_documented_where_its_users_look() {
 }
 ```
 
-- [ ] **Step 6: Run the documentation gates**
+- [ ] **Step 7: Run the documentation gates**
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test docs --test protocol_doc_examples; echo "exit=$?"`
 
 Expected: both green, `exit=0`. `protocol_doc_examples` is the one that matters most here: every fenced `json` block in the amended `docs/protocol.md` must still deserialize as a real envelope, and the **Transports** section's fenced blocks are `markdown`, `ini`, `bash` and `text` rather than `json`, so they are not examined — which is correct, because none of them is a protocol example.
 
-- [ ] **Step 7: The whole workspace, both sides**
+- [ ] **Step 8: The whole workspace, both sides**
 
 ```bash
 cd ~/repos/system/vaultd/.claude/worktrees/live-impl
@@ -5410,11 +6172,11 @@ npm --prefix host test; echo "host test exit=$?"
 
 Expected: five lines, all `exit=0`.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 cd ~/repos/system/vaultd/.claude/worktrees/live-impl
-git add docs/protocol.md docs/design/headless-plugin-host.md README.md crates/vault-server/tests/docs.rs
+git add docs/protocol.md docs/design/headless-plugin-host.md README.md crates/vault-server/src/lib.rs crates/vault-server/tests/docs.rs
 git commit -F - <<'COMMIT'
 docs: the Transports section and two amendments
 
@@ -5423,7 +6185,9 @@ occupied-path decision, connection scoping of subscriptions and sessions, the
 fan-out rule, the drain bound and socket_path — and its opening line stops
 calling stdio a proof transport. The phase 6 design document is amended where
 it said host death ends vaultd, and gains the one-line Sync statement.
-tests/docs.rs pins the phrases that are contract.
+tests/docs.rs pins the phrases that are contract. And
+Server::shutdown's comment stops saying the daemon is single-peer, which is
+the one source comment this phase made false.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 COMMIT
@@ -5447,7 +6211,7 @@ Every section of `docs/design/vaultd-socket-transport.md`, and the task that imp
 | Connection lifecycle — Default path | `socket_path` on `get_vault_info` | 6 |
 | Connection lifecycle — Bind | Directory 0700, socket 0600; live/stale/non-socket; exit 2 | 3, 5 |
 | Connection lifecycle — Accept | One accept thread, backlog 16, no connection cap, fd limit reported | 3, 4 |
-| Connection lifecycle — Close | Registry and sessions die with the connection; peers not told | 4, 8 |
+| Connection lifecycle — Close | Subscription registry dies with the connection; the sessions it owns are closed by `serve`; peers not told | 4, 8 |
 | Connection lifecycle — Shutdown | Signals, `stopped` to every connection, 5 s drain, unlink, exit 0 | 5 |
 | Connection lifecycle — Readiness | Nothing new on stdout; the probe is the socket plus `health` | 4 (harness), 13 (documented) |
 | The host supervisor | `engine: auto \| connect \| spawn`, the probe, `--listen` on spawn | 10, 11 |
@@ -5467,7 +6231,7 @@ Every section of `docs/design/vaultd-socket-transport.md`, and the task that imp
 | Testing — Two clients | Same generation, own subscription ids, unsubscribe is local | 4 |
 | Testing — Slow client | Peer unaffected; `runtime_recovered` on return; queue bound held | 8 |
 | Testing — Lifecycle | Stale, live, non-socket, SIGTERM drain, socket gone, stdin closed | 5 |
-| Testing — Sessions | `snapshot_not_found` across connections; close on disconnect | 8 |
+| Testing — Sessions | `snapshot_not_found` across connections; close on disconnect | 4 (unit, through `Server::handle`), 8 (end to end, two real connections) |
 | Testing — Host | All three modes, exit 3, engine-lost, the report | 11, 12 |
 | Testing — Gates | Exit codes reported; `TMPDIR`; scratch base; no live vault | Global Constraints, every task |
 | Documentation | `docs/protocol.md` Transports section | 13 |
@@ -5482,7 +6246,7 @@ Every section of `docs/design/vaultd-socket-transport.md`, and the task that imp
 
 **2. Placeholder scan.** No `TBD`, `TODO`, "implement later", "add error handling", "add validation", "handle edge cases", "write tests for the above", or "similar to Task N" appears. Every test step carries runnable code; every implementation step carries the code it asks for; every run step names its command and the exit code it expects. One helper is genuinely written twice, in two tasks, and the code is given in full both times rather than cross-referenced, because a task's implementer sees only their own task: `call_raw`, for `Daemon` in Task 6 and for `Client` in Task 7. `drain_events` is written twice inside Task 7 alone, for the same two structs. `answer_one_health` is defined exactly once, in Task 3's `listener.rs` test module, and is used only there.
 
-**3. Type consistency.** The names that cross task boundaries, checked in each place they appear: `connection::serve` (Tasks 1, 4) keeps its six parameters and its `after_dispatch` seam; `ThreadLabels::for_connection` (1, 4); `Broadcaster::{new, register, unregister, offer, connection_count}` and `CONNECTION_NOTICE_CAPACITY` (2, 4, 5, 8); `ConnectionId` is `Copy + Display` because Task 4 formats it into a thread name; `SocketListener::{bind, path, accept, wake}` and `ListenError`'s five variants (3, 4, 5); `Server::{set_socket_path, socket_path}` (4, 6) with the field added in Task 4 and read in Task 6; `convert::vault_info`'s third parameter (6); `GetVaultInfoResponse.socket_path` exists on **both** sides of the wire and both land in Task 6 — `Option<String>` with `skip_serializing_if` in `crates/vault-protocol/src/operations.rs`, and the optional `socket_path?: string` in `host/packages/host/src/client/protocol.ts` that Task 11's engine-mode tests read; `Transport` lives in `tests/daemon/mod.rs` and is used by `tests/conformance.rs` (7); `Client::{stop_reading, resume_reading}` are exact inverses (4, 8); on the host, `EngineMode` and `EngineSource` are two distinct types and are never interchanged — the config field is `engine: EngineMode`, the report field is `engineSource: EngineSource`, and `Supervisor.engineSource()` returns `EngineSource | null`; `vaultdSocketPathFor` (10, 11, 13) is never confused with `socketPathFor`, which keeps its own meaning and its own test; `probeEngineSocket`'s `ProbeResult` is consumed only by `Supervisor.engineOnce` (10, 11). The wire keys added to `host.info` are `snake_case` throughout (`socket_path`, `live_state`), matching the Global Constraint the phase-6 plan set and `test/server-wire.test.ts` enforces.
+**3. Type consistency.** The names that cross task boundaries, checked in each place they appear: `connection::serve` is defined in Task 1 with six parameters and **widened in Task 4 to seven**, the new `connection: ConnectionId` sitting second, immediately after `&Server` — Task 4's two call sites in `service.rs`, `stdio::run`'s one, and Task 5's two teardown tests all pass it in that position, and no task uses the six-parameter form after Task 4; `ThreadLabels::for_connection` (1, 4, 5), whose `#[allow(dead_code)]` Task 4 deletes because Task 4 is the caller it waited for; `Broadcaster::{new, register, unregister, offer, connection_count}` and `CONNECTION_NOTICE_CAPACITY` (2, 4, 5, 8); `ConnectionId` is `Copy + Display` because Task 4 formats it into a thread name, and gains `ConnectionId::STANDALONE` plus a `#[cfg(test)] for_test` in Task 4 — `STANDALONE` is `ConnectionId(0)`, which `Broadcaster::register` can never issue because its counter increments before use; `Server::handle` gains the same `ConnectionId` as its **first** parameter in Task 4, and Tasks 5, 7 and 8 reach it only through `serve`, so no later task spells the old three-argument form; `Server::{close_sessions_of, sessions_owned_by}` are Task 4's, called by `connection::serve` and by Task 4's own unit tests respectively, and Task 5 calls neither — a connection's own teardown is what releases its sessions; `SocketListener::{bind, path, accept, wake}` and `ListenError`'s five variants (3, 4, 5); `Server::{set_socket_path, socket_path}` (4, 6) with the field added in Task 4 and read in Task 6; `convert::vault_info`'s third parameter (6); `GetVaultInfoResponse.socket_path` exists on **both** sides of the wire and both land in Task 6 — `Option<String>` with `skip_serializing_if` in `crates/vault-protocol/src/operations.rs`, and the optional `socket_path?: string` in `host/packages/host/src/client/protocol.ts` that Task 11's engine-mode tests read; `Transport` lives in `tests/daemon/mod.rs` and is used by `tests/conformance.rs` (7); `Client::{stop_reading, resume_reading}` are exact inverses (4, 8); on the host, `EngineMode` and `EngineSource` are two distinct types and are never interchanged — the config field is `engine: EngineMode`, the report field is `engineSource: EngineSource`, and `Supervisor.engineSource()` returns `EngineSource | null`; `vaultdSocketPathFor` (10, 11, 13) is never confused with `socketPathFor`, which keeps its own meaning and its own test; `probeEngineSocket`'s `ProbeResult` is consumed only by `Supervisor.engineOnce` (10, 11). The wire keys added to `host.info` are `snake_case` throughout (`socket_path`, `live_state`), matching the Global Constraint the phase-6 plan set and `test/server-wire.test.ts` enforces.
 
 ## Execution handoff
 
