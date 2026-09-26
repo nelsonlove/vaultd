@@ -16,11 +16,53 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use vault_protocol::{EventEnvelope, ResponseEnvelope};
+
+/// The scratch root for a test that must keep a Unix socket path short:
+/// `<this crate>/../../target/tmp`, canonicalized and created if it does not
+/// exist yet.
+///
+/// Deliberately **not** `std::env::temp_dir()`. That resolves `$TMPDIR`, and
+/// a bare `cargo test` — one of the invocations these tests must also pass
+/// under — leaves it unset, which would then bind a test's socket under the
+/// real OS temp directory rather than this repo's own scratch tree. This
+/// path is fixed and in-repo regardless of the environment a test runs in.
+pub fn tmp_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&root).expect("create the scratch root");
+    root.canonicalize().expect("canonicalize the scratch root")
+}
+
+/// Counts calls to [`short_runtime_dir`]. Only ever a per-process counter —
+/// each test binary that links this module is its own process — so it gives
+/// no guarantee across binaries, only within one.
+static RUN_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// A short, freshly-created subdirectory of [`tmp_root`], for a test that
+/// binds its own socket beneath it.
+///
+/// One base-36 digit and nothing more: a `TempDir`'s random `.tmpXXXXXX`
+/// suffix is exactly what pushes a default socket path over the ~103-byte
+/// `sockaddr_un` limit on a checkout nested this deep, so the subdirectory
+/// name has to spend as little of that budget as the daemon's own path
+/// still leaves room for. It is a counter rather than a strong unique id for
+/// the same reason two different tests can already share a vault-scratch
+/// tempdir's parent without colliding: every socket this directory ever
+/// holds is also named for its own vault's digest, so two runs landing on
+/// the same one-character subdirectory — even two different test binaries,
+/// whose counters both start at zero — never collide on a filename.
+pub fn short_runtime_dir() -> PathBuf {
+    let n = RUN_COUNTER.fetch_add(1, Ordering::Relaxed) % 36;
+    let digit = char::from_digit(n, 36).expect("n % 36 is a single base-36 digit");
+    let dir = tmp_root().join(digit.to_string());
+    std::fs::create_dir_all(&dir).expect("create the run subdirectory");
+    dir
+}
 
 /// Generous on purpose: this bound turns a hang into a failing test, and
 /// asserts nothing about timing.

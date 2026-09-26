@@ -71,16 +71,18 @@ fn a_stdio_only_daemon_omits_the_field_entirely() {
 #[test]
 fn listen_with_no_value_binds_the_documented_default_path() {
     let (vault, index, _run) = scratch();
-    // `XDG_RUNTIME_DIR` is honoured first, so this exercises the real rule
-    // without touching the developer's own `~/.cache`. Pointed at the bare
-    // process temp directory rather than a fresh `TempDir` under it — the
-    // default path spends 29 bytes after this directory (`/vaultd/` + 16 hex
-    // + `.sock`) against a 103-byte `sockaddr_un` limit, and a `.tmpXXXXXX`
-    // component would push a checkout at this depth over it (see
-    // `socket_default_path.rs`, which hits the same ceiling). Set on the
-    // child alone — this process's environment is never mutated, because
-    // `cargo test` runs cases in threads.
-    let runtime_dir = std::env::temp_dir();
+    // `XDG_RUNTIME_DIR` is honoured first, so this exercises the real rule.
+    // Never `std::env::temp_dir()` — that reads `$TMPDIR`, unset under a bare
+    // `cargo test`, which would bind this socket under the real OS temp
+    // directory instead of this repo's own scratch tree. `short_runtime_dir`
+    // gives a short, deterministic subdirectory of this crate's own
+    // `target/tmp` instead: the default path spends 29 bytes after it
+    // (`/vaultd/` + 16 hex + `.sock`) against a 103-byte `sockaddr_un` limit,
+    // and a `TempDir`'s random `.tmpXXXXXX` component would push a checkout
+    // at this depth over it (see `socket_default_path.rs`, which hits the
+    // same ceiling). Set on the child alone — this process's environment is
+    // never mutated, because `cargo test` runs cases in threads.
+    let runtime_dir = socket::short_runtime_dir();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vaultd"))
         .args([
             "--vault",
@@ -104,6 +106,20 @@ fn listen_with_no_value_binds_the_documented_default_path() {
         "{}.sock",
         vault_server::listener::socket_digest(&canonical)
     ));
+    // Pin the constraint rather than assume it: the runtime dir must stay
+    // inside this crate's own `target/tmp`, never the OS temp directory, and
+    // the resulting path must still fit a `sockaddr_un`.
+    assert!(
+        expected.starts_with(socket::tmp_root()),
+        "the runtime dir must stay inside target/tmp, not the OS temp dir: {}",
+        expected.display()
+    );
+    assert!(
+        expected.as_os_str().len() <= 103,
+        "a Unix socket address is capped at ~103 bytes on this platform: {} ({} bytes)",
+        expected.display(),
+        expected.as_os_str().len()
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while !expected.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
