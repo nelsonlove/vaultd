@@ -70,6 +70,21 @@ impl AcceptPacing {
 /// seconds to a shutdown.
 const PAUSE_SLICE: Duration = Duration::from_millis(50);
 
+/// What the stop spends, at most, on each of the two things that must happen
+/// before a read half may be closed: offering `stopped` again to a connection
+/// whose inbox was full, and waiting for every forwarder to have handed its
+/// inbox over. **Carved out of [`DRAIN_BUDGET`], never added to it** — both
+/// waits are also capped by the drain deadline, so the spec's "bounded at 5
+/// seconds, then a hard close, then a second 5 seconds" still describes the
+/// whole stop.
+///
+/// A second is generous for both. The forwarder has one `recv` and one `send`
+/// to do, and the retry only has to outlast a client that is reading again.
+const NOTICE_GRACE: Duration = Duration::from_secs(1);
+
+/// How often the `stopped` retry tries again while the drain makes room.
+const RETRY_SLICE: Duration = Duration::from_millis(20);
+
 /// What the service serves, and where.
 pub struct ServiceOptions {
     /// Serve the process's own stdio as connection zero.
@@ -87,6 +102,12 @@ struct Running {
     /// connection zero, whose reader is parked in `read(0)` and cannot be
     /// interrupted — see [`Service::stop`].
     stream: Option<std::os::unix::net::UnixStream>,
+    /// Raised by this connection's notice forwarder when it has handed over
+    /// everything its inbox held. [`Service::stop`] waits for it before it
+    /// closes the read half, which is what puts the `stopped` notice ahead of
+    /// the reader's `InputClosed` in the dispatcher's queue. See
+    /// [`crate::connection::Notices`].
+    notices_ended: std::sync::Arc<AtomicBool>,
 }
 
 /// The shared state the accept loop, the connections and the signal watcher
@@ -121,10 +142,18 @@ struct Seams {
 
 /// Serve `server` over stdio, a socket, or both, until every door has closed
 /// or a signal arrives. Always stops the runtime and joins every thread.
+///
+/// `watch` is the installed signal handlers' end of the self-pipe, and it is
+/// installed by `main` **before** the runtime is built and before this binds,
+/// so a stop arriving during cold hydration or in the bind window is a clean
+/// stop rather than the default disposition. `None` is the stdio-only daemon,
+/// which installs nothing: there would be nobody to read the flag, and a
+/// swallowed SIGTERM would leave it stoppable only by SIGKILL.
 pub fn run(
     server: Server,
     notices: Option<Receiver<RuntimeNotice>>,
     options: ServiceOptions,
+    watch: Option<crate::signals::SignalWatch>,
 ) -> Result<(), ListenError> {
     // Without a listener this is the daemon that always shipped, and its one
     // connection owns the runtime's notice receiver directly — no broadcaster,
@@ -151,37 +180,41 @@ pub fn run(
     }
 
     // A signal cannot be waited for on this thread, which is about to block
-    // in `accept`, and it cannot do any of the stopping itself: a handler may
+    // in `accept`, and the handler itself can do none of the stopping: it may
     // call nothing that locks or allocates. So it writes one byte, and this
-    // thread turns that byte into a flag the accept loop is already reading.
-    let watch = crate::signals::install().map_err(|error| ListenError::Bind {
-        path: path.clone(),
-        source: std::io::Error::other(error.to_string()),
-    })?;
-    let watcher = std::thread::Builder::new()
-        .name("vaultd-signals".into())
-        .spawn({
-            let service = Arc::clone(&service);
-            // **Weak, and not a clone.** The listener unlinks its socket when
-            // the last strong reference to it goes, and this thread can still
-            // be parked in `read` when the daemon is otherwise done. A strong
-            // reference here would leave the socket file on disk for a daemon
-            // that had already exited.
-            let listener = Arc::downgrade(&listener);
-            move || {
-                watch.wait();
-                service.stopping.store(true, Ordering::Release);
-                // Only a nudge: the accept loop's own bounded wait is what
-                // guarantees it notices the flag. See `SocketListener::wake`.
-                if let Some(listener) = listener.upgrade() {
-                    listener.wake();
-                }
-            }
+    // thread turns that byte into the flag the accept loop is already
+    // reading. A signal that arrived before this thread exists is not lost —
+    // the byte is in the pipe, and `wait` returns at once.
+    let watcher = watch
+        .map(|watch| {
+            std::thread::Builder::new()
+                .name("vaultd-signals".into())
+                .spawn({
+                    let service = Arc::clone(&service);
+                    // **Weak, and not a clone.** The listener unlinks its
+                    // socket when the last strong reference to it goes, and
+                    // this thread can still be parked in `read` when the
+                    // daemon is otherwise done. A strong reference here would
+                    // leave the socket file on disk for a daemon that had
+                    // already exited.
+                    let listener = Arc::downgrade(&listener);
+                    move || {
+                        watch.wait();
+                        service.stopping.store(true, Ordering::Release);
+                        // Only a nudge: the accept loop's own bounded wait is
+                        // what guarantees it notices the flag. See
+                        // `SocketListener::wake`.
+                        if let Some(listener) = listener.upgrade() {
+                            listener.wake();
+                        }
+                    }
+                })
+                .map_err(|source| ListenError::Bind {
+                    path: path.clone(),
+                    source,
+                })
         })
-        .map_err(|source| ListenError::Bind {
-            path: path.clone(),
-            source,
-        })?;
+        .transpose()?;
 
     accept_loop(
         &service,
@@ -189,7 +222,7 @@ pub fn run(
         AcceptPacing::DEFAULT,
     );
 
-    service.stop(&listener);
+    service.stop();
     // The watcher is either already finished (a signal arrived) or parked in
     // `read`; either way the process is on its way out and the descriptor
     // goes with it, so the handle is dropped rather than joined.
@@ -230,8 +263,17 @@ fn accept_loop(
     let mut backoff = pacing.first_backoff;
     while !service.stopping.load(Ordering::Acquire) {
         match accept(pacing.poll) {
-            // Nobody yet. Round the loop and look at the flag again.
-            Ok(None) => {}
+            // Nobody yet, which is a *successful* accept and the commonest
+            // answer an idle daemon gets. It resets the count for the same
+            // reason an accepted connection does: the rule is failures **in a
+            // row**, and a listener that answered at all is a listener that
+            // works. Without this reset, errors scattered over hours — the
+            // descriptor limit coming and going — would accumulate to the
+            // give-up threshold and cost a healthy daemon its only door.
+            Ok(None) => {
+                consecutive = 0;
+                backoff = pacing.first_backoff;
+            }
             Ok(Some(stream)) => {
                 consecutive = 0;
                 backoff = pacing.first_backoff;
@@ -322,6 +364,8 @@ impl Service {
     fn start_stdio(self: &Arc<Self>) {
         let service = Arc::clone(self);
         let (id, inbox) = self.broadcaster.register();
+        let notices = connection::Notices::new(inbox);
+        let notices_ended = std::sync::Arc::clone(&notices.ended);
         // Held across the spawn and the push, for the reason `start_socket`
         // gives.
         let mut connections = self.lock();
@@ -332,7 +376,7 @@ impl Service {
                 id,
                 std::io::BufReader::new(std::io::stdin()),
                 std::io::stdout(),
-                Some(inbox),
+                Some(notices),
                 ThreadLabels::for_connection("stdio"),
                 || broadcaster.unregister(id),
             );
@@ -358,6 +402,7 @@ impl Service {
             id,
             thread,
             stream: None,
+            notices_ended,
         });
     }
 
@@ -381,6 +426,8 @@ impl Service {
                 return;
             }
         };
+        let notices = connection::Notices::new(inbox);
+        let notices_ended = std::sync::Arc::clone(&notices.ended);
         let label = id.to_string();
         // **Taken before the spawn and held across the push.** The thread
         // ends with `forget(id)`, which wants this same lock; a connection
@@ -398,7 +445,7 @@ impl Service {
                 id,
                 std::io::BufReader::new(reading),
                 writing,
-                Some(inbox),
+                Some(notices),
                 ThreadLabels::for_connection(&label),
                 || broadcaster.unregister(id),
             );
@@ -419,6 +466,7 @@ impl Service {
             id,
             thread,
             stream: Some(stream),
+            notices_ended,
         });
     }
 
@@ -450,34 +498,59 @@ impl Service {
 
     /// Stop accepting, tell every connection, drain, stop the runtime, join.
     ///
-    /// The order is the content. The `stopped` notice goes out **before** the
-    /// runtime stops, because the broadcaster's fan-out thread ends with the
-    /// coordinator's sender and a notice offered after that reaches nobody.
-    /// Each connection's read half is then closed, which is what ends its
-    /// reader and lets its dispatcher reach `InputClosed`, drain its queued
-    /// events and hand them to a writer that is still open.
-    fn stop(&self, listener: &Arc<SocketListener>) {
+    /// **The order is the content**, and it is the whole of what makes the
+    /// last notice arrive:
+    ///
+    /// 1. `stopped` is offered to every live connection, before the runtime
+    ///    stops, because the fan-out thread ends with the coordinator's sender
+    ///    and a notice offered after that reaches nobody.
+    /// 2. A connection whose inbox was **full** at that moment is offered it
+    ///    again, for as long as the retry window lasts, because the drain is
+    ///    making room in exactly that inbox as its client reads. Without this
+    ///    the one client that was behind is the one client told nothing.
+    /// 3. Every inbox is closed, which makes each forwarder hand over what it
+    ///    holds and end.
+    /// 4. **Every forwarder's end is waited for** before any read half is
+    ///    closed. This is the ordering. The reader and the forwarder are two
+    ///    senders on one mailbox and `mpsc` cannot order across senders, so
+    ///    "offered first" means nothing on its own; "the forwarder has already
+    ///    handed everything over" means the notice is in the queue, ahead of
+    ///    the `InputClosed` that no reader has been told to send yet.
+    /// 5. Then the read halves close, which ends each reader and lets each
+    ///    dispatcher reach `InputClosed`, write what it was handed, and go.
+    ///
+    /// Steps 2 and 4 are bounded, and their bounds are **carved out of** the
+    /// drain budget rather than added to it, so the whole stop is still the
+    /// spec's two budgets: at most [`DRAIN_BUDGET`] to here, then a hard close,
+    /// then at most [`DRAIN_BUDGET`] more.
+    fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
-        listener.wake();
+
+        // One deadline for everything up to the hard close.
+        let deadline = Instant::now() + DRAIN_BUDGET;
 
         // The last thing every live connection is told. `generation: None` is
         // honest: this says the runtime stopped, not that a generation moved,
         // and `subscriptions::events_for` carries the state through with no
         // generation attached.
-        self.broadcaster.offer(&RuntimeNotice::State {
+        let stopped = RuntimeNotice::State {
             generation: None,
             state: vault_index::LiveState::Stopped,
             error: None,
-        });
-        // Closed straight after the offer, and this is what makes the notice
-        // above land rather than race. Dropping every inbox sender leaves the
-        // buffered notice still deliverable — an `mpsc` receiver hands over
-        // what it holds before it reports the disconnection — so each
-        // connection's forwarder delivers the `stopped` notice and then ends,
-        // which is precisely the end of notices the dispatcher's settle is
-        // waiting for. Without it the dispatcher would wait out its whole
-        // settle on every connection, and every forwarder would still be
-        // parked in `recv` on an inbox nobody was going to close.
+        };
+        let mut owed = self.broadcaster.offer_reporting(&stopped);
+        let retry_until = (Instant::now() + NOTICE_GRACE).min(deadline);
+        while !owed.is_empty() && Instant::now() < retry_until {
+            std::thread::sleep(RETRY_SLICE);
+            owed = self.broadcaster.offer_to(&owed, &stopped);
+        }
+        if !owed.is_empty() {
+            eprintln!(
+                "vaultd: {} connection(s) could not be told the runtime stopped: \
+                 their queues were still full after {NOTICE_GRACE:?}",
+                owed.len()
+            );
+        }
         self.broadcaster.close();
 
         // Taken out of the mutex **before** anything is joined. A connection
@@ -485,6 +558,9 @@ impl Service {
         // joining while holding it would deadlock against the very thread
         // being joined.
         let running: Vec<Running> = std::mem::take(&mut *self.lock());
+
+        await_forwarders(&running, (Instant::now() + NOTICE_GRACE).min(deadline));
+
         for connection in &running {
             if let Some(stream) = connection.stream.as_ref() {
                 // Ends this connection's reader without waiting for the peer,
@@ -496,7 +572,6 @@ impl Service {
         // `join` is the drain: a connection's thread returns once its writer
         // has emptied its queue. One deadline for all of them, not one each,
         // so the whole stop is bounded rather than the count times the budget.
-        let deadline = Instant::now() + DRAIN_BUDGET;
         let mut parked = Vec::new();
         for connection in running {
             // A connection with no stream is connection zero, whose reader is
@@ -526,7 +601,17 @@ impl Service {
                 // Past the budget the writer is closed hard, which fails its
                 // next write and ends the thread.
                 Some(stream) => {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    // **`Write`, not `Both`.** The read half was shut down at
+                    // the top of the drain, and on Darwin a second `shutdown`
+                    // naming a direction that is already shut answers
+                    // `ENOTCONN` and does nothing at all — so `Both` here left
+                    // the blocked writer exactly as it was, and the stop spent
+                    // the second budget too before abandoning the thread.
+                    // Measured, not guessed: `Both` returned
+                    // `Err(ENOTCONN)` and the connection took 10 s to go,
+                    // where `Write` returns `Ok` and the writer's blocked
+                    // `write` fails with `EPIPE` in milliseconds.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
                     if wait_until(&connection.thread, hard) {
                         let _ = connection.thread.join();
                     }
@@ -538,6 +623,27 @@ impl Service {
         }
 
         self.server.shutdown();
+    }
+}
+
+/// Wait for every connection's notice forwarder to have handed its inbox
+/// over, but never past `deadline`.
+///
+/// This is the shutdown's ordering, and it is why no dispatcher needs a grace
+/// period of its own: once a forwarder's flag is up, everything that inbox
+/// held — the `stopped` notice included — is already in the dispatcher's
+/// mailbox, so closing the read half afterwards puts `InputClosed` strictly
+/// behind it. A forwarder wedged on a dispatcher that is not consuming costs
+/// this bound and nothing more; that connection is about to be drained and,
+/// if it cannot be, closed hard.
+fn await_forwarders(running: &[Running], deadline: Instant) {
+    for connection in running {
+        while !connection.notices_ended.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -834,33 +940,228 @@ mod tests {
     #[test]
     fn an_accept_error_that_clears_costs_a_pause_and_not_the_listener() {
         let service = service();
-        // One fewer failure than the threshold, then a listener that works
-        // again — which here means "nobody is connecting", the ordinary
-        // answer from a bounded accept.
-        let left = std::sync::Mutex::new(BRISK.give_up_after - 1);
+        // One fewer failure than the threshold, one idle poll to clear them,
+        // and then the same burst again — and again, for ever. The count has
+        // to be *reset* by that idle poll for this to survive: if a recovery
+        // only stopped the count rising, the second burst would carry it past
+        // the threshold and the loop would give up.
+        let seen = std::sync::Mutex::new(0u32);
+        let burst = BRISK.give_up_after - 1;
         let (thread, attempts) = accept_loop_on_a_thread(&service, move |_| {
-            let mut left = left.lock().unwrap_or_else(|error| error.into_inner());
-            if *left == 0 {
-                return Ok(None);
+            let mut seen = seen.lock().unwrap_or_else(|error| error.into_inner());
+            *seen += 1;
+            if *seen % (burst + 1) == 0 {
+                // The listener answering: nobody there, which is a success.
+                Ok(None)
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
             }
-            *left -= 1;
-            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
         });
 
-        await_at_least(&attempts, u64::from(BRISK.give_up_after) + 20);
+        // Four bursts of four failures, separated by a working accept.
+        await_at_least(&attempts, u64::from(burst + 1) * 4);
         assert!(
             !thread.is_finished(),
-            "a cleared error leaves the loop accepting"
+            "errors that clear must never reach the give-up threshold, however \
+             many bursts of them there are: the rule is failures in a row"
         );
         let after = attempts.load(Ordering::Acquire);
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             attempts.load(Ordering::Acquire) > after,
-            "and the consecutive count was reset by the recovery, so the \
-             threshold is never reached by failures that are not in a row"
+            "and the loop is still accepting rather than parked"
         );
 
         await_stopped(&service, thread);
+    }
+
+    /// Errors that are not **in a row** must never add up to a dead listener.
+    ///
+    /// The review's probe, landed as a test. `Ok(None)` is what a bounded
+    /// accept answers when nobody connected — a successful call, and the
+    /// commonest one an idle daemon makes. If it did not clear the count,
+    /// then 32 descriptor-limit errors spread over hours would close a
+    /// healthy daemon's only door for the life of the process, which is the
+    /// opposite of what the give-up rule is for.
+    #[test]
+    fn errors_separated_by_idle_polls_are_not_failures_in_a_row() {
+        let service = service();
+        let failing = std::sync::Mutex::new(true);
+        let (thread, attempts) = accept_loop_on_a_thread(&service, move |_| {
+            let mut failing = failing.lock().unwrap_or_else(|error| error.into_inner());
+            *failing = !*failing;
+            if *failing {
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+            } else {
+                Ok(None)
+            }
+        });
+
+        // Far past the threshold in errors, none of them consecutive. A loop
+        // that had given up would have parked instead — it does not return —
+        // so what says it is still trying is that the attempts keep coming,
+        // and `await_at_least` is what fails if they stop.
+        await_at_least(&attempts, u64::from(BRISK.give_up_after) * 6);
+        let after = attempts.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            attempts.load(Ordering::Acquire) > after,
+            "the loop stopped accepting from a listener that answered between \
+             every error: errors that are not in a row must never add up to a \
+             dead listener"
+        );
+
+        await_stopped(&service, thread);
+    }
+
+    /// One connection's worth of the shutdown's notice path, without a
+    /// listener or a second process: a registered inbox, the forwarder
+    /// `serve` would run on it, and a connection record whose thread has
+    /// already finished so the drain is instant and what is measured is the
+    /// notice path alone.
+    fn one_connection_on(
+        service: &Arc<Service>,
+        label: &str,
+    ) -> (
+        std::sync::mpsc::Receiver<crate::connection::ServerInput>,
+        UnixStream,
+    ) {
+        let (id, inbox) = service.broadcaster.register();
+        let notices = crate::connection::Notices::new(inbox);
+        let notices_ended = Arc::clone(&notices.ended);
+        let (inputs, mailbox) = std::sync::mpsc::sync_channel(crate::connection::INPUT_CAPACITY);
+        std::thread::Builder::new()
+            .name(format!("forwarder-{label}"))
+            .spawn(move || crate::connection::run_forwarder(notices.inbox, inputs, notices.ended))
+            .expect("start the forwarder");
+        let (peer, accepted) = UnixStream::pair().expect("a socket pair");
+        let thread = std::thread::Builder::new()
+            .name(format!("connection-{label}"))
+            .spawn(|| {})
+            .expect("start the connection thread");
+        service.lock().push(Running {
+            id,
+            thread,
+            stream: Some(accepted),
+            notices_ended,
+        });
+        (mailbox, peer)
+    }
+
+    /// `stop` closes every inbox, and that is what lets it wait on the
+    /// forwarders at all.
+    ///
+    /// The wait before the read halves close is the shutdown's whole ordering
+    /// argument, and it only terminates because the inbox it is waiting on
+    /// has been closed: a forwarder parked in `recv` on an inbox nobody will
+    /// close never ends, so the wait would cost its full bound on every
+    /// connection and the `stopped` notice would be back to racing end of
+    /// input. Remove the `close` and this test says so.
+    #[test]
+    fn stop_closes_every_inbox_so_every_forwarder_ends_before_the_read_halves_do() {
+        let service = service();
+        let (mailbox, _peer) = one_connection_on(&service, "closed-inbox");
+
+        let started = Instant::now();
+        service.stop();
+        let spent = started.elapsed();
+
+        assert!(
+            spent < NOTICE_GRACE,
+            "the stop spent {spent:?} waiting for a forwarder that was never \
+             going to end: nothing closed its inbox, so the ordering the \
+             shutdown depends on is bought with a timeout instead of a fact"
+        );
+        assert!(
+            matches!(
+                mailbox.try_recv(),
+                Ok(crate::connection::ServerInput::Notice(_))
+            ),
+            "and the stopped notice is in the dispatcher's mailbox before any \
+             read half was closed"
+        );
+    }
+
+    /// A connection whose inbox was full when `stopped` was offered is
+    /// offered it again while the drain makes room.
+    ///
+    /// The spec's amended Shutdown bullet. A client that was behind is
+    /// exactly the client that most needs to hear the daemon is going away,
+    /// and `try_send` into a full queue is the one way the first offer can be
+    /// silently lost — the gap latch that normally carries it is no use when
+    /// there is no later notice to carry it on.
+    #[test]
+    fn a_connection_whose_inbox_was_full_is_told_again_once_the_drain_makes_room() {
+        let service = service();
+        let (id, inbox) = service.broadcaster.register();
+        // Fill it to the brim, so the stop's first offer cannot land.
+        for _ in 0..crate::broadcast::CONNECTION_NOTICE_CAPACITY {
+            service.broadcaster.offer(&RuntimeNotice::ConfigChanged {
+                path: vault_core::VaultPath::new("Filler.md").expect("a vault path"),
+            });
+        }
+        let (peer, accepted) = UnixStream::pair().expect("a socket pair");
+        let thread = std::thread::Builder::new()
+            .name("full-inbox-connection".into())
+            .spawn(|| {})
+            .expect("start the connection thread");
+        service.lock().push(Running {
+            id,
+            thread,
+            stream: Some(accepted),
+            // Nothing forwards here: the inbox is read by the test, which
+            // stands in for the client that starts reading again.
+            notices_ended: Arc::new(AtomicBool::new(true)),
+        });
+
+        // The stop runs on its own thread so the test can be the client: the
+        // first offer has to meet a full inbox, and the room has to appear
+        // afterwards, which is the order a real drain produces.
+        let stopping = std::thread::Builder::new()
+            .name("stop-under-test".into())
+            .spawn({
+                let service = Arc::clone(&service);
+                move || service.stop()
+            })
+            .expect("start the stop");
+
+        // Long enough for the first offer, which is the first thing `stop`
+        // does. One-sided: if this machine were slow enough that the offer
+        // had not happened yet, the inbox would simply have room for it and
+        // the test would pass without exercising the retry — never fail.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + PATIENCE;
+        while let Ok(notice) = inbox.recv_timeout(Duration::from_millis(50)) {
+            let stopped = matches!(
+                notice,
+                RuntimeNotice::State {
+                    state: vault_index::LiveState::Stopped,
+                    ..
+                }
+            );
+            seen.push(notice);
+            if stopped {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the reader ran out of patience");
+        }
+
+        stopping.join().expect("the stop finished");
+        drop(peer);
+        assert!(
+            seen.iter().any(|notice| matches!(
+                notice,
+                RuntimeNotice::State {
+                    state: vault_index::LiveState::Stopped,
+                    ..
+                }
+            )),
+            "a connection whose inbox was full at the offer must be offered \
+             `stopped` again once the drain has made room; this one read {} \
+             notices and never saw it",
+            seen.len()
+        );
     }
 
     /// The stdio-only daemon's failure reaches the operator unchanged. `main`

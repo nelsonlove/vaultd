@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use socket::ListeningDaemon;
 use tempfile::TempDir;
 use vault_protocol::{LiveStateDto, RuntimeEventDto};
+use vault_server::service::DRAIN_BUDGET;
 
 fn scratch_vault() -> (TempDir, TempDir, TempDir) {
     let vault = TempDir::new().expect("vault tempdir");
@@ -175,6 +176,152 @@ fn a_daemon_whose_socket_was_replaced_under_it_still_stops_on_a_signal() {
         "the stranger's socket survives: a daemon unlinks its own and nobody else's"
     );
     drop(stranger);
+}
+
+/// A client that has stopped reading is closed hard, and the stop is still
+/// bounded.
+///
+/// The one path in the shutdown no ordinary test reaches: a connection whose
+/// writer is blocked on a socket nobody is draining cannot finish its drain,
+/// so the first budget has to expire, the socket has to be closed hard, and
+/// the thread has to end inside the second budget. The spec names all three
+/// ("bounded at 5 seconds, after which writers are closed hard, and the join
+/// after the hard close is bounded by a second 5 seconds"), and before this
+/// test the whole suite stayed green with the hard close deleted.
+///
+/// It costs the real budget — a little over five seconds — because the daemon
+/// under test is a separate process and no `cfg(test)` constant can reach it.
+/// One test paying five seconds inside a suite that runs in parallel is
+/// cheaper than the alternative, which is an untested hard close.
+#[test]
+fn a_client_that_stopped_reading_is_closed_hard_and_the_stop_is_still_bounded() {
+    let (vault, index, run) = scratch_vault();
+    let socket = run.path().join("vaultd.sock");
+    let mut daemon = ListeningDaemon::start_at(&vault, &index, &socket);
+
+    // A tiny receive buffer, so the daemon's writer blocks after a few
+    // events rather than after tens of kilobytes. The wedge is the point;
+    // how much it takes to wedge is not.
+    let wedged = UnixStream::connect(&socket).expect("connect the slow client");
+    let tiny: libc::c_int = 1024;
+    // SAFETY: a plain `setsockopt` on a descriptor this test owns, with the
+    // size of the value it points at.
+    let set = unsafe {
+        libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(&wedged),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(tiny).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "shrink the client's receive buffer");
+    let mut wedged = socket::Client::over(wedged);
+    wedged.call(r#"{"version":1,"id":"s","request":{"method":"subscribe_events","params":{}}}"#);
+    // Alive, and not draining: the harness's reader thread ends on its next
+    // line, and nothing reads the socket after that.
+    drop(wedged.stop_reading());
+
+    // A second client makes the events the first one will not read.
+    let mut busy = daemon.connect();
+    for nth in 0..40 {
+        busy.call(&format!(
+            r##"{{"version":1,"id":"w{nth}","request":{{"method":"write_note","params":{{"path":"Note{nth}.md","content":"# Note {nth}\n","expected":{{"absent":true}}}}}}}}"##
+        ));
+    }
+
+    let pid = daemon.pid();
+    let signalled = Instant::now();
+    // SAFETY: a plain `kill(2)` on a child this process spawned.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    let status = daemon
+        .wait_for_exit(DRAIN_BUDGET * 4)
+        .expect("the daemon stopped despite a client that stopped reading");
+    let spent = signalled.elapsed();
+
+    assert_eq!(status.code(), Some(0), "and stopped cleanly");
+    assert!(
+        spent >= DRAIN_BUDGET,
+        "the stop took {spent:?}: a connection whose writer is blocked cannot \
+         drain, so the budget must actually be spent waiting for it — if this \
+         is fast, the wedge never happened and the test proves nothing"
+    );
+    assert!(
+        spent < DRAIN_BUDGET * 2,
+        "the stop took {spent:?}, which is past the drain budget and the \
+         second budget together: the hard close is not ending the blocked \
+         writer, so the daemon is leaving on the second bound rather than on \
+         the close"
+    );
+    drop(wedged);
+}
+
+/// A stop that arrives before the daemon has answered anything is still a
+/// clean stop, and leaves no socket file.
+///
+/// `main` installs the handlers before it builds the runtime and before
+/// anything is bound, so every moment after the daemon's own code starts is
+/// covered — cold hydration included. What a test outside the process can
+/// observe is the window this one takes: the socket file exists, so the bind
+/// has happened and the install certainly preceded it, but nothing has asked
+/// the daemon anything yet. A SIGTERM there used to be the default
+/// disposition killing the process with its socket already on disk and no
+/// `Drop` to unlink it.
+///
+/// The wait is for the socket file rather than a fixed delay on purpose. The
+/// window before the daemon's own code runs at all belongs to `exec` and the
+/// dynamic loader — half a second for a cold binary on this machine, ten
+/// milliseconds once it is warm — and no handler can cover it. A test that
+/// guessed a delay would be measuring the page cache.
+#[test]
+fn a_signal_that_arrives_before_the_daemon_is_ready_is_still_a_clean_stop() {
+    let (vault, index, run) = scratch_vault();
+    let socket = run.path().join("vaultd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vaultd"))
+        .args(arguments(&vault, &index, &socket))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start vaultd --listen");
+
+    let bound = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < bound,
+            "the daemon never bound its socket, so there is no window to signal in"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // SAFETY: a plain `kill(2)` on a child this process spawned.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("poll the child") {
+            Some(status) => break status,
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the daemon did not stop within 20s of a signal sent before it was ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stop during startup is a stop, not a kill: exit 0, not a signal's \
+         default disposition"
+    );
+    assert!(
+        !socket.exists(),
+        "and it left no socket file behind, whether it had bound one yet or not"
+    );
 }
 
 #[test]

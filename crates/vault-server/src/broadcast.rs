@@ -182,7 +182,13 @@ fn newest(left: Option<Generation>, right: Option<Generation>) -> Option<Generat
 impl Registered {
     /// Deliver one notice, mirroring the coordinator's `emit` arm for arm:
     /// the marker first when a gap is owed, then the notice in hand.
-    fn deliver(&mut self, notice: &RuntimeNotice, incoming: Option<Generation>) {
+    ///
+    /// Answers whether **this** notice reached the inbox. `false` is a full
+    /// queue or an ended dispatcher, and the shutdown uses it: a connection
+    /// whose inbox was full at the moment `stopped` was offered is offered it
+    /// again once the drain has made room, rather than being the one client
+    /// told nothing about the daemon going away.
+    fn deliver(&mut self, notice: &RuntimeNotice, incoming: Option<Generation>) -> bool {
         if self.gap.is_owed() {
             let generation = newest(self.gap.generation(), incoming);
             match self.sink.try_send(RuntimeNotice::ResyncRequired {
@@ -205,23 +211,24 @@ impl Registered {
                 // with it, and the debt grows to name it.
                 Err(TrySendError::Full(_)) => {
                     self.gap = owing(generation);
-                    return;
+                    return false;
                 }
                 // The dispatcher has ended. Nothing to announce to it.
                 Err(TrySendError::Disconnected(_)) => {
                     self.gap = Gap::None;
-                    return;
+                    return false;
                 }
             }
         }
         match self.sink.try_send(notice.clone()) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 self.gap = owing(newest(self.gap.generation(), incoming));
+                false
             }
             // The dispatcher has ended. Nothing to latch for a connection
             // that is already closing.
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Disconnected(_)) => false,
         }
     }
 }
@@ -282,11 +289,50 @@ impl Broadcaster {
     /// removed here: removal belongs to the connection itself, and doing it
     /// from the fan-out would race that.
     pub fn offer(&self, notice: &RuntimeNotice) {
+        let _ = self.offer_reporting(notice);
+    }
+
+    /// The same offer, naming the connections the notice did **not** reach.
+    ///
+    /// Only the shutdown cares. A full inbox is an ordinary event on the
+    /// runtime's own notices — that is what the gap latch is for — but at the
+    /// stop there is no later notice to carry the gap, so `Service::stop`
+    /// takes this list and tries those connections again while the drain is
+    /// making room for them.
+    pub(crate) fn offer_reporting(&self, notice: &RuntimeNotice) -> Vec<ConnectionId> {
         let mut registry = self.lock();
         let incoming = notice_generation(notice);
-        for registered in registry.connections.values_mut() {
-            registered.deliver(notice, incoming);
+        let mut missed = Vec::new();
+        for (id, registered) in registry.connections.iter_mut() {
+            if !registered.deliver(notice, incoming) {
+                missed.push(ConnectionId(*id));
+            }
         }
+        missed
+    }
+
+    /// Offer `notice` to these connections alone, naming the ones it still
+    /// could not reach. The shutdown's retry: the list shrinks as the drain
+    /// makes room, and an empty answer is every connection told.
+    pub(crate) fn offer_to(
+        &self,
+        ids: &[ConnectionId],
+        notice: &RuntimeNotice,
+    ) -> Vec<ConnectionId> {
+        let mut registry = self.lock();
+        let incoming = notice_generation(notice);
+        let mut missed = Vec::new();
+        for id in ids {
+            // A connection gone since the first offer ended on its own, which
+            // is the one way it can be owed nothing.
+            let Some(registered) = registry.connections.get_mut(&id.0) else {
+                continue;
+            };
+            if !registered.deliver(notice, incoming) {
+                missed.push(*id);
+            }
+        }
+        missed
     }
 
     /// Close every inbox by dropping every sender.
@@ -300,10 +346,14 @@ impl Broadcaster {
     /// inbox that is already closed rather than one nothing will ever close.
     ///
     /// Called by the fan-out when the runtime's notices end, and by
-    /// `Service::stop` straight after it has offered the `stopped` notice: a
-    /// buffered notice is still delivered after its sender goes, so closing
-    /// there is what turns "a notice is somewhere on its way" into "this
-    /// notice, and then the end".
+    /// `Service::stop` once it has finished offering `stopped`. **What it
+    /// buys the stop is that every forwarder ends promptly**: a buffered
+    /// notice is still delivered after its sender goes, so each forwarder
+    /// hands over what it holds and then returns, which is the end
+    /// `Service::stop` then waits for before it closes any read half. Without
+    /// it every forwarder would stay parked in `recv` on an inbox nobody was
+    /// going to close, and that wait would cost its whole bound on every
+    /// connection.
     pub(crate) fn close(&self) {
         let mut registry = self.lock();
         registry.closed = true;

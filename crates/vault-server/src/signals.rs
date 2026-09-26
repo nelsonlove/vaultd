@@ -8,9 +8,25 @@
 //! draining, unlinking — then happens on that ordinary thread with the whole
 //! language available.
 //!
-//! [`SignalWatch::cancel`] writes the same byte from ordinary code, so the
-//! service can stop for its own reasons (its last connection closed, say) and
-//! still join the waiting thread rather than leaking it.
+//! **A second signal during the stop is inert, and that is the policy.** The
+//! watcher reads one byte and is done: the read end of the self-pipe is
+//! dropped the moment [`SignalWatch::wait`] returns, so a second SIGTERM or
+//! SIGINT arriving while the daemon is draining writes to a pipe nobody is
+//! reading and is discarded. An operator's second Ctrl-C therefore does not
+//! hurry the exit. It does not need to: the stop is bounded at two drain
+//! budgets, ten seconds, and nothing in it can hang. The escalation for a
+//! daemon that must go *now* is SIGKILL, which no handler can intercept and
+//! which the bounded stop makes unnecessary in every case but a kernel-level
+//! wedge.
+//!
+//! **Handlers are installed before the runtime is built and before the socket
+//! is bound** (see `main::run`), so a stop arriving during cold hydration or
+//! in the window between binding and serving is still a clean stop rather
+//! than the default disposition killing the process with its socket file
+//! already on disk. They are installed **only** when the daemon is going to
+//! listen: without `--listen` there is nothing to wait on the flag, and
+//! swallowing SIGTERM there would leave a stdio-only daemon that cannot be
+//! stopped by anything but SIGKILL.
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -63,6 +79,10 @@ pub fn install() -> Result<SignalWatch, SignalError> {
     let mut ends = [0 as libc::c_int; 2];
     // SAFETY: `pipe` fills the two-element array it is given.
     if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        // The latch is released on every failure, or a caller that retried
+        // would be told "already installed" for ever and never learn what
+        // actually went wrong.
+        INSTALLED.store(false, Ordering::Release);
         return Err(SignalError::Install(std::io::Error::last_os_error()));
     }
     // SAFETY: both descriptors were just created by `pipe` and are unowned.
@@ -75,6 +95,7 @@ pub fn install() -> Result<SignalWatch, SignalError> {
         let handler = handle as *const () as libc::sighandler_t;
         // SAFETY: `handle` touches only the two atomics above and `write`.
         if unsafe { libc::signal(signal, handler) } == libc::SIG_ERR {
+            INSTALLED.store(false, Ordering::Release);
             return Err(SignalError::Install(std::io::Error::last_os_error()));
         }
     }
@@ -82,8 +103,17 @@ pub fn install() -> Result<SignalWatch, SignalError> {
 }
 
 impl SignalWatch {
-    /// Block until a signal arrives or [`SignalWatch::cancel`] is called.
-    /// `None` means it was cancelled; `Some(signal)` names what arrived.
+    /// Block until a signal arrives. `Some(signal)` names what arrived;
+    /// `None` means the self-pipe could not be read, which is not a case any
+    /// caller can do anything about beyond stopping, and is treated as a stop.
+    ///
+    /// The brief's interface also had a `cancel`, for a service that stopped
+    /// for its own reasons and wanted to join this thread rather than leak
+    /// it. Nothing stops for its own reasons: the accept loop's return is the
+    /// only way out, and `run` drops the watcher handle rather than joining
+    /// it. It is left out rather than left uncalled — an unused waking
+    /// mechanism that writes to a process-wide descriptor and does not clear
+    /// [`SIGNAL`] is a thing to get wrong later, not an asset.
     pub fn wait(&self) -> Option<i32> {
         let mut byte = [0u8; 1];
         loop {
@@ -105,19 +135,6 @@ impl SignalWatch {
         match SIGNAL.load(Ordering::Relaxed) {
             0 => None,
             signal => Some(signal),
-        }
-    }
-
-    /// Unblock a waiter without a signal, so the service can stop for its own
-    /// reasons and still join the watcher thread.
-    pub fn cancel(&self) {
-        let descriptor = PIPE_WRITE.load(Ordering::Acquire);
-        if descriptor >= 0 {
-            let byte: u8 = 0;
-            // SAFETY: the same one-byte write the handler performs.
-            unsafe {
-                libc::write(descriptor, std::ptr::addr_of!(byte).cast(), 1);
-            }
         }
     }
 }

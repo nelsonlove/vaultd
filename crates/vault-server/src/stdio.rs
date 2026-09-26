@@ -42,7 +42,11 @@ pub fn run(server: Server, notices: Option<Receiver<RuntimeNotice>>) -> Result<(
         ConnectionId::STANDALONE,
         io::BufReader::new(io::stdin()),
         io::stdout(),
-        notices,
+        // `Notices::new`: nothing waits for this forwarder's end,
+        // because nothing here shuts a read half. The daemon's own stop is
+        // end of stdin, which ends the reader first and the connection with
+        // it.
+        notices.map(connection::Notices::new),
         ThreadLabels {
             reader: "vaultd-stdin".into(),
             writer: "vaultd-stdout".into(),

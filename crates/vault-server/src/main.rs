@@ -115,6 +115,25 @@ fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    // **Before the runtime is built and before anything is bound.** Cold
+    // hydration of a large vault takes seconds, and a SIGTERM arriving in
+    // them would otherwise take the default disposition: the process dies on
+    // the signal, exit 143, no `stopped` notice — and if it lands in the
+    // window just after the bind, it dies with the socket file already
+    // created and no `Drop` to unlink it. The handlers only write a byte to a
+    // pipe, so installing them this early costs nothing and no one reads the
+    // flag until `service::run` spawns its watcher, which finds the byte
+    // waiting for it.
+    //
+    // **Only when this daemon is going to listen.** Without `--listen` there
+    // is no watcher and nobody would ever read the flag, so installing a
+    // handler would swallow SIGTERM and leave a stdio-only daemon stoppable
+    // by nothing but SIGKILL — a regression on the daemon that always
+    // shipped.
+    let watch = match cli.listen {
+        Some(_) => Some(vault_server::signals::install()?),
+        None => None,
+    };
     let (mut server, notices, canonical_vault_root) = configured_server(&cli)?;
     let listen = match (&cli.listen, &canonical_vault_root) {
         (None, _) => None,
@@ -140,6 +159,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             stdio: true,
             listen,
         },
+        watch,
     )
     .map_err(Into::into)
 }

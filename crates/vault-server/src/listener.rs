@@ -264,6 +264,14 @@ impl SocketListener {
         }
         self.listener.set_nonblocking(true)?;
         let accepted = self.listener.accept();
+        // The restore is behind `?`, so a `set_nonblocking(false)` that failed
+        // would leave the listener non-blocking and return `Err`. It
+        // self-heals: the next call sets the mode it wants before accepting
+        // anything, and `Ok(None)` from a would-block accept is already a case
+        // this method handles. Left as it is rather than wrapped in a drop
+        // guard, because `fcntl` failing on a live descriptor this process
+        // owns is the same class of event as the descriptor being gone — which
+        // the accept loop's give-up rule is there for.
         self.listener.set_nonblocking(false)?;
         match accepted {
             Ok((stream, _address)) => {
