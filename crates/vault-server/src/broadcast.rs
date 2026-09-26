@@ -134,6 +134,24 @@ struct Registered {
     gap: Gap,
 }
 
+/// What one offer did to one inbox.
+///
+/// Three states rather than two, because the shutdown's retry turns on the
+/// difference between the failures. A **full** inbox will have room the
+/// moment its client reads again, and retrying it is the whole point of the
+/// retry; an inbox whose dispatcher has **ended** never will, and treating it
+/// as full spends the stop's drain budget on a connection that is owed
+/// nothing and then tells the operator its queue was full when it was gone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Delivery {
+    /// The notice is in the inbox.
+    Landed,
+    /// No room for it. The gap is latched; worth offering again.
+    NoRoom,
+    /// The dispatcher on the other end has ended. Never worth offering again.
+    Gone,
+}
+
 #[derive(Default)]
 struct Registry {
     next: u64,
@@ -183,12 +201,13 @@ impl Registered {
     /// Deliver one notice, mirroring the coordinator's `emit` arm for arm:
     /// the marker first when a gap is owed, then the notice in hand.
     ///
-    /// Answers whether **this** notice reached the inbox. `false` is a full
-    /// queue or an ended dispatcher, and the shutdown uses it: a connection
-    /// whose inbox was full at the moment `stopped` was offered is offered it
-    /// again once the drain has made room, rather than being the one client
-    /// told nothing about the daemon going away.
-    fn deliver(&mut self, notice: &RuntimeNotice, incoming: Option<Generation>) -> bool {
+    /// Answers what happened to **this** notice, and the shutdown uses it: a
+    /// connection whose inbox was full at the moment `stopped` was offered is
+    /// offered it again once the drain has made room, rather than being the
+    /// one client told nothing about the daemon going away. A connection
+    /// whose dispatcher has ended is told apart from that one, because
+    /// nothing will ever make room in an inbox nobody is holding.
+    fn deliver(&mut self, notice: &RuntimeNotice, incoming: Option<Generation>) -> Delivery {
         if self.gap.is_owed() {
             let generation = newest(self.gap.generation(), incoming);
             match self.sink.try_send(RuntimeNotice::ResyncRequired {
@@ -211,24 +230,24 @@ impl Registered {
                 // with it, and the debt grows to name it.
                 Err(TrySendError::Full(_)) => {
                     self.gap = owing(generation);
-                    return false;
+                    return Delivery::NoRoom;
                 }
                 // The dispatcher has ended. Nothing to announce to it.
                 Err(TrySendError::Disconnected(_)) => {
                     self.gap = Gap::None;
-                    return false;
+                    return Delivery::Gone;
                 }
             }
         }
         match self.sink.try_send(notice.clone()) {
-            Ok(()) => true,
+            Ok(()) => Delivery::Landed,
             Err(TrySendError::Full(_)) => {
                 self.gap = owing(newest(self.gap.generation(), incoming));
-                false
+                Delivery::NoRoom
             }
             // The dispatcher has ended. Nothing to latch for a connection
             // that is already closing.
-            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Disconnected(_)) => Delivery::Gone,
         }
     }
 }
@@ -292,28 +311,38 @@ impl Broadcaster {
         let _ = self.offer_reporting(notice);
     }
 
-    /// The same offer, naming the connections the notice did **not** reach.
+    /// The same offer, naming the connections whose inbox had **no room**
+    /// for it.
     ///
     /// Only the shutdown cares. A full inbox is an ordinary event on the
     /// runtime's own notices — that is what the gap latch is for — but at the
     /// stop there is no later notice to carry the gap, so `Service::stop`
     /// takes this list and tries those connections again while the drain is
     /// making room for them.
+    ///
+    /// A connection whose dispatcher has **ended** is not in the list. It is
+    /// not a client that was behind; it is a client that has gone, its
+    /// `after_dispatch` has simply not unregistered it yet, and no amount of
+    /// draining will make room in an inbox nobody holds. Retrying it would
+    /// cost the stop the whole retry window and end in an operator-facing
+    /// line saying its queue was full, which would not be true.
     pub(crate) fn offer_reporting(&self, notice: &RuntimeNotice) -> Vec<ConnectionId> {
         let mut registry = self.lock();
         let incoming = notice_generation(notice);
         let mut missed = Vec::new();
         for (id, registered) in registry.connections.iter_mut() {
-            if !registered.deliver(notice, incoming) {
+            if registered.deliver(notice, incoming) == Delivery::NoRoom {
                 missed.push(ConnectionId(*id));
             }
         }
         missed
     }
 
-    /// Offer `notice` to these connections alone, naming the ones it still
-    /// could not reach. The shutdown's retry: the list shrinks as the drain
-    /// makes room, and an empty answer is every connection told.
+    /// Offer `notice` to these connections alone, naming the ones that still
+    /// had no room for it. The shutdown's retry: the list shrinks as the
+    /// drain makes room, and an empty answer is every connection told. A
+    /// connection that has ended since the last pass leaves the list for the
+    /// same reason it never joined it.
     pub(crate) fn offer_to(
         &self,
         ids: &[ConnectionId],
@@ -328,7 +357,7 @@ impl Broadcaster {
             let Some(registered) = registry.connections.get_mut(&id.0) else {
                 continue;
             };
-            if !registered.deliver(notice, incoming) {
+            if registered.deliver(notice, incoming) == Delivery::NoRoom {
                 missed.push(*id);
             }
         }
@@ -916,6 +945,42 @@ mod tests {
             Some(Gap::None),
             "there is nobody left to announce a gap to"
         );
+    }
+
+    /// The retry list is the connections that had no **room**, never the
+    /// ones that have **gone**.
+    ///
+    /// Both answer "the notice did not land", and the shutdown does very
+    /// different things with them: a full inbox is retried every 20 ms for
+    /// the whole retry window, because its client reading again is exactly
+    /// what makes room. An inbox whose dispatcher has ended can never make
+    /// room, so retrying it spends the stop's budget on a connection that is
+    /// owed nothing and then prints a line claiming its queue was full. One
+    /// offer, two connections in those two states, and only one of them is
+    /// named.
+    #[test]
+    fn a_connection_that_has_gone_is_not_named_for_retry_the_way_a_full_one_is() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (full, full_inbox) = broadcaster.register();
+        let (_gone, gone_inbox) = broadcaster.register();
+
+        // One inbox brim full, the other's dispatcher ended. The filling
+        // offers reach both, which is why the gone one is dropped only now.
+        for generation in 1..=CONNECTION_NOTICE_CAPACITY as u64 {
+            broadcaster.offer(&state_at(generation));
+        }
+        drop(gone_inbox);
+
+        let missed = broadcaster.offer_reporting(&state_at(CONNECTION_NOTICE_CAPACITY as u64 + 1));
+
+        assert_eq!(
+            missed,
+            vec![full],
+            "the full inbox is worth another offer and the ended one is not; \
+             naming the ended one costs the stop its whole retry window and \
+             misreports why"
+        );
+        drop(full_inbox);
     }
 
     /// "Never blocks" is this module's first claim, and a blocking send would

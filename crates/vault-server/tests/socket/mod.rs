@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -70,6 +71,16 @@ pub const LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long a daemon is given to create its socket file and answer on it.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The whole of [`Client::resume_reading`]'s settle. Generous on purpose:
+/// it turns a daemon that never pours into a failing assertion rather than a
+/// hang, and asserts nothing about timing.
+const RESUME_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long a quiet line-receiver ends the settle. A daemon emptying a chain
+/// of queues that are all full writes without pausing, so a gap this long is
+/// the end of the pour and not a lull in it.
+const RESUME_QUIET: Duration = Duration::from_millis(250);
 
 /// How long one readiness probe waits for its answer before trying again.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -246,12 +257,56 @@ impl Drop for ListeningDaemon {
     }
 }
 
+/// The handbrake on a [`Client`]'s reading thread.
+///
+/// **A slow client is one that stops taking bytes off its socket**, and that
+/// is the only model of it worth testing: the daemon can only be stalled by
+/// backpressure it can actually feel. A reading thread that went on reading
+/// into an unbounded channel while the test ignored the channel would drain
+/// the socket just as fast as a healthy client and stall nothing — the test
+/// would then be measuring its own harness, and every queue on the daemon's
+/// side would stay empty.
+///
+/// So the brake stops the thread itself. Held between the read and the
+/// hand-over, it leaves the line already in hand undelivered and reads
+/// nothing more, at which point the kernel's receive buffer fills, then the
+/// daemon's writer blocks, then its output queue, its mailbox and its notice
+/// inbox fill in turn, and the fan-out's non-blocking send starts failing.
+/// That chain is the subject of the slow-client tests.
+struct Brake {
+    parked: Mutex<bool>,
+    change: Condvar,
+}
+
+impl Brake {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parked: Mutex::new(false),
+            change: Condvar::new(),
+        })
+    }
+
+    fn set(&self, parked: bool) {
+        *self.parked.lock().expect("the brake is not poisoned") = parked;
+        self.change.notify_all();
+    }
+
+    /// Called by the reading thread, with a line in hand.
+    fn wait_while_parked(&self) {
+        let mut parked = self.parked.lock().expect("the brake is not poisoned");
+        while *parked {
+            parked = self.change.wait(parked).expect("the brake is not poisoned");
+        }
+    }
+}
+
 /// One connection, with the same two questions `tests/daemon` answers: what
 /// was the response, and did an event I asked about arrive.
 pub struct Client {
     stream: UnixStream,
     lines: Receiver<String>,
     events: Vec<String>,
+    brake: Arc<Brake>,
 }
 
 impl Client {
@@ -260,10 +315,16 @@ impl Client {
             .try_clone()
             .expect("clone the connection for reading");
         let (sender, lines) = channel();
+        let brake = Brake::new();
+        let held = Arc::clone(&brake);
         std::thread::spawn(move || {
             for line in BufReader::new(reading).lines() {
                 match line {
                     Ok(line) => {
+                        // Before the hand-over, not after: a parked thread
+                        // holds this line and reads no further, which is what
+                        // makes the socket stop draining.
+                        held.wait_while_parked();
                         if sender.send(line).is_err() {
                             return;
                         }
@@ -276,6 +337,7 @@ impl Client {
             stream,
             lines,
             events: Vec::new(),
+            brake,
         }
     }
 
@@ -467,14 +529,61 @@ impl Client {
         }
     }
 
-    /// Stop reading, without closing the connection. The slow-client case in
-    /// Task 8 needs exactly this: a peer that is alive and not draining.
+    /// Stop reading, without closing the connection. The slow-client cases
+    /// need exactly this: a peer that is alive and not draining.
+    ///
+    /// The receiver handed back is the live one, so a caller that only wants
+    /// the wedge can drop it; a caller that wants the client back gives it to
+    /// [`Client::resume_reading`]. Either way the reading thread is parked on
+    /// the [`Brake`] from here, so nothing takes bytes off the socket.
     pub fn stop_reading(&mut self) -> Receiver<String> {
+        self.brake.set(true);
         std::mem::replace(&mut self.lines, channel().1)
+    }
+
+    /// Start reading again, returning every line that arrived meanwhile.
+    ///
+    /// The peer never stopped being connected — the kernel's socket buffer and
+    /// then the daemon's own queues absorbed what it did not take — so this is
+    /// "resume", not "reconnect", which is exactly the client the slow-client
+    /// rule is about.
+    ///
+    /// `parked` is the receiver [`Client::stop_reading`] handed back. Whatever
+    /// the reading thread had already delivered is taken out of it first, then
+    /// it becomes the live receiver again and the brake comes off; the settle
+    /// after that is how the lines released by the unblocking are collected.
+    /// The settle ends on the first quiet [`RESUME_QUIET`], because a daemon
+    /// pouring out a full chain of queues never pauses that long mid-pour.
+    pub fn resume_reading(&mut self, parked: Receiver<String>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = parked.try_recv() {
+            lines.push(line);
+        }
+        // Put the live receiver back, then let what was blocked flow.
+        self.lines = parked;
+        self.brake.set(false);
+        let deadline = Instant::now() + RESUME_BUDGET;
+        while Instant::now() < deadline {
+            match self.lines.recv_timeout(RESUME_QUIET) {
+                Ok(line) => lines.push(line),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        lines
     }
 
     /// Close this connection and let the daemon reap it.
     pub fn disconnect(self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Drop for Client {
+    /// Release the brake, so a client parked by [`Client::stop_reading`] and
+    /// never resumed leaves no thread blocked on a condvar for the life of
+    /// the test binary. The thread wakes, finds its receiver gone, and ends.
+    fn drop(&mut self) {
+        self.brake.set(false);
     }
 }

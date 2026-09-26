@@ -1164,6 +1164,202 @@ mod tests {
         );
     }
 
+    /// A connection whose dispatcher has already ended costs the stop
+    /// nothing, and is never counted as one that could not be told.
+    ///
+    /// The window is real and its own doc describes it: `after_dispatch`
+    /// unregisters the inbox, and until that runs the fan-out still holds a
+    /// sender whose receiver is gone. Treating that as a full queue makes the
+    /// stop retry it every [`RETRY_SLICE`] for the whole of [`NOTICE_GRACE`],
+    /// which can never succeed, and then print `their queues were still full`
+    /// about a queue that was not full but gone. Two costs, and this pins
+    /// both: the budget by measuring the stop, and the wording by there being
+    /// nothing left in the owed list to report.
+    #[test]
+    fn a_connection_whose_dispatcher_ended_does_not_cost_the_stop_its_retry_window() {
+        let service = service();
+        let (id, inbox) = service.broadcaster.register();
+        // The dispatcher ended; nothing has unregistered its inbox yet.
+        drop(inbox);
+        let (peer, accepted) = UnixStream::pair().expect("a socket pair");
+        let thread = std::thread::Builder::new()
+            .name("ended-dispatcher".into())
+            .spawn(|| {})
+            .expect("start the connection thread");
+        service.lock().push(Running {
+            id,
+            thread,
+            stream: Some(accepted),
+            // Nothing forwards here, and a connection whose dispatcher has
+            // ended has no forwarder left to wait for either.
+            notices_ended: Arc::new(AtomicBool::new(true)),
+        });
+
+        let started = Instant::now();
+        service.stop();
+        let spent = started.elapsed();
+        drop(peer);
+
+        assert!(
+            spent < NOTICE_GRACE,
+            "the stop spent {spent:?} offering `stopped` again to a connection \
+             whose inbox was gone rather than full: nothing will ever make \
+             room in an inbox nobody holds, so the whole retry window goes on \
+             a connection that is owed nothing"
+        );
+    }
+
+    /// One connection whose forwarder is **mid hand-over**, so the stop's
+    /// wait for it is the only thing keeping the read half open.
+    ///
+    /// `one_connection_on` is no use here: its forwarder ends the instant the
+    /// inbox closes, so the wait costs nothing and its absence costs nothing
+    /// either — which is exactly how a bound shortened to zero passed the
+    /// whole suite. This one gives the forwarder more notices than the
+    /// mailbox can hold and nobody to take them, so its flag cannot rise
+    /// until the test itself drains, and the stop is obliged to wait.
+    fn one_slow_connection_on(
+        service: &Arc<Service>,
+    ) -> (
+        std::sync::mpsc::Receiver<crate::connection::ServerInput>,
+        UnixStream,
+        Arc<AtomicBool>,
+    ) {
+        let (id, inbox) = service.broadcaster.register();
+        // More than the mailbox below can hold, so the forwarder is blocked
+        // in `send` rather than parked in `recv` when the stop arrives.
+        for _ in 0..4 {
+            service.broadcaster.offer(&RuntimeNotice::ConfigChanged {
+                path: vault_core::VaultPath::new("Filler.md").expect("a vault path"),
+            });
+        }
+        let notices = crate::connection::Notices::new(inbox);
+        let notices_ended = Arc::clone(&notices.ended);
+        let (inputs, mailbox) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("forwarder-mid-hand-over".into())
+            .spawn(move || crate::connection::run_forwarder(notices.inbox, inputs, notices.ended))
+            .expect("start the forwarder");
+        let (peer, accepted) = UnixStream::pair().expect("a socket pair");
+        // A dup of the accepted end, so the test can watch for the moment
+        // `stop` shuts its read half: a read blocked on it returns `Ok(0)`
+        // then, and at no other time.
+        let watched = accepted.try_clone().expect("dup the accepted end");
+        let closed = Arc::new(AtomicBool::new(false));
+        let raised = Arc::clone(&closed);
+        std::thread::Builder::new()
+            .name("read-half-watcher".into())
+            .spawn(move || {
+                let mut watched = watched;
+                let mut byte = [0u8; 1];
+                let _ = watched.read(&mut byte);
+                raised.store(true, Ordering::Release);
+            })
+            .expect("start the watcher");
+        let thread = std::thread::Builder::new()
+            .name("connection-mid-hand-over".into())
+            .spawn(|| {})
+            .expect("start the connection thread");
+        service.lock().push(Running {
+            id,
+            thread,
+            stream: Some(accepted),
+            notices_ended,
+        });
+        (mailbox, peer, closed)
+    }
+
+    /// The bound on the forwarder wait is load-bearing: no read half closes
+    /// while a forwarder is still handing its inbox over.
+    ///
+    /// This is the shutdown's whole ordering argument, and it was the one
+    /// part of it nothing checked — a bound shortened to zero left the entire
+    /// crate green, because the two tests that look as if they cover it
+    /// cover something else: one asserts the stop is *fast*, which a wait
+    /// that never waits only makes faster, and the other pins what the flag
+    /// means without anybody reading it. What must be true is a **relation**
+    /// between two events, so both are observed: the forwarder's flag, and a
+    /// read blocked on a dup of the accepted end, which returns `Ok(0)` when
+    /// and only when `stop` shuts the read half.
+    ///
+    /// Nothing here is a sleep standing in for a condition. The forwarder
+    /// cannot finish while the test holds the mailbox full, so the pause
+    /// below is one-sided: on a machine slow enough that `stop` had not
+    /// reached the wait yet, the read half would simply still be open and the
+    /// case would pass without having proved anything — never fail. The
+    /// second assertion is what stops it being vacuous: the read half must
+    /// close afterwards, so the stop demonstrably did reach that step.
+    #[test]
+    fn stop_waits_for_a_forwarder_mid_hand_over_before_it_closes_any_read_half() {
+        let service = service();
+        let (mailbox, _peer, closed) = one_slow_connection_on(&service);
+
+        let stopping = std::thread::Builder::new()
+            .name("stop-under-test".into())
+            .spawn({
+                let service = Arc::clone(&service);
+                move || service.stop()
+            })
+            .expect("start the stop");
+
+        // Long enough for `stop` to have offered, closed the broadcaster and
+        // reached the wait — which is microseconds of work — and far inside
+        // NOTICE_GRACE, so a healthy stop is still waiting here.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !closed.load(Ordering::Acquire),
+            "a read half was closed while this connection's forwarder was \
+             still handing its inbox over: the `stopped` notice is then \
+             racing the reader's `InputClosed`, which is the ordering the \
+             whole shutdown is built to avoid"
+        );
+        assert!(
+            !stopping.is_finished(),
+            "and the stop has not run past the wait either"
+        );
+
+        // Now be the dispatcher. The forwarder unblocks, hands over the rest,
+        // and only then may the read half close.
+        let mut handed = Vec::new();
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match mailbox.recv_timeout(Duration::from_millis(50)) {
+                Ok(crate::connection::ServerInput::Notice(notice)) => {
+                    let stopped = matches!(
+                        *notice,
+                        RuntimeNotice::State {
+                            state: vault_index::LiveState::Stopped,
+                            ..
+                        }
+                    );
+                    handed.push(*notice);
+                    if stopped {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) if Instant::now() >= deadline => {
+                    panic!("the forwarder never handed over {} notices", handed.len())
+                }
+                Err(_) => {}
+            }
+        }
+        stopping.join().expect("the stop finished");
+
+        // Polled, because the watcher's read waking and its flag rising are
+        // two steps and the join only orders the first.
+        let deadline = Instant::now() + PATIENCE;
+        while !closed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "and the read half is closed once the hand-over is done — if \
+                 it never closes, the assertion above proved nothing because \
+                 the stop never got that far"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The stdio-only daemon's failure reaches the operator unchanged. `main`
     /// prints `vaultd: {error}`, so this is the whole of what it says — no
     /// bind, and no `<stdio>` standing in for a path.
