@@ -514,12 +514,12 @@ fn a_state_change_arriving_at_capacity_survives_the_collapse() {
 // The registry driven against a live runtime
 // ---------------------------------------------------------------------------
 //
-// `stdio::dispatch` is private and `stdio::run` owns real stdin and stdout,
-// so these drive the same loop in process from the same public pieces the
-// dispatcher uses: pre-drain, `Server::handle`, `activate_new`, then
+// `connection::dispatch` is crate-visible and `stdio::run` owns real stdin and
+// stdout, so these drive the same loop in process from the same public pieces
+// the dispatcher uses: pre-drain, `Server::handle`, `activate_new`, then
 // `enqueue_notice` + drain for every notice. That is the sanctioned route to
-// `subscriber_lag`, which the shipped stdio transport cannot reach because it
-// drains after every single notice.
+// `subscriber_lag`, which the shipped transports cannot reach because that
+// dispatcher drains after every single notice.
 
 /// A vault plus its cache directory, kept alive for the whole test.
 struct LiveFixture {

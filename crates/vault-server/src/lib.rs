@@ -1,5 +1,5 @@
-mod convert;
 pub mod connection;
+mod convert;
 pub mod fixture_row;
 pub mod runtime;
 pub mod stdio;

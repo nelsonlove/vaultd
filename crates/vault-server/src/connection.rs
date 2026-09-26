@@ -1,8 +1,7 @@
 //! One connection: one reader, one dispatcher, one writer, one registry.
 //!
 //! This is the loop the stdio transport shipped with, made transport-neutral.
-//! Everything the module documentation of [`crate::stdio`] argues still holds,
-//! **per connection**:
+//! Everything that loop argued still holds, **per connection**:
 //!
 //! * **Nothing tears.** Exactly one thread ever serializes an envelope or
 //!   writes a byte to this connection's stream, so a response line can never
@@ -15,16 +14,23 @@
 //!   written after that subscription's queue is drained.
 //!
 //! What is now per connection rather than per process: the
-//! [`SubscriptionRegistry`], the snapshot sessions the dispatcher sweeps, and
-//! the three threads. What stays shared: the [`Server`], behind an `Arc`, and
-//! through it the runtime's single coordinator — so two connections cannot
-//! interleave a mutation.
+//! [`SubscriptionRegistry`] the dispatcher owns, and the three threads. What
+//! stays shared: the [`Server`], behind an `Arc`, and through it the runtime's
+//! single coordinator — so two connections cannot interleave a mutation — and
+//! the snapshot sessions, which are still one process-wide registry on
+//! `Server` that any dispatcher's sweep reaches. Scoping those sessions to the
+//! connection that opened them is the socket transport's business, not this
+//! module's.
 //!
 //! Backpressure still never reaches the runtime. A connection's notice
 //! producer (the coordinator's own channel for stdio, the broadcaster's inbox
 //! for a socket) is fed with a non-blocking send by whoever owns it, so a
 //! dispatcher busy inside `refresh_index` cannot deadlock the coordinator: the
-//! notice is dropped, the gap latched, and announced later as a resync.
+//! notice is dropped, the gap latched, and announced later as a resync. Inside
+//! the connection both remaining legs may block, deliberately: the forwarder
+//! may block feeding the dispatcher, and the dispatcher may block feeding the
+//! writer if a client has stopped reading its own end of the stream. Neither
+//! can stall indexing.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -55,9 +61,10 @@ pub(crate) const OUTPUT_CAPACITY: usize = 256;
 /// `request` is the raw, unparsed JSON text for the `request` field rather
 /// than a `serde_json::Value`: `serde_json::Map` is a `BTreeMap` in this
 /// build, so routing through `Value` would alphabetize every nested JSON
-/// object before the method-specific params ever see it. Decoding straight
-/// from `request.get()`'s bytes (see [`respond`]) preserves document order end
-/// to end.
+/// object before the method-specific params ever see it — silently reordering,
+/// for example, a frontmatter patch's `Mapping` keys. Decoding straight from
+/// `request.get()`'s bytes (see [`respond`]) preserves document order end to
+/// end.
 #[derive(Debug, Deserialize)]
 pub struct RawRequestEnvelope {
     pub version: u16,
@@ -95,7 +102,10 @@ impl ThreadLabels {
     /// The three labels for one connection, suffixed with `suffix`.
     // Unused until the socket transport's accept loop calls it; kept here because
     // the label shape is this module's to own, not the listener's.
-    #[allow(dead_code, reason = "the socket transport's accept loop is its first caller")]
+    #[allow(
+        dead_code,
+        reason = "the socket transport's accept loop is its first caller"
+    )]
     pub fn for_connection(suffix: &str) -> Self {
         Self {
             reader: format!("vaultd-read-{suffix}"),
@@ -287,10 +297,14 @@ pub(crate) fn dispatch(
         server.sweep_snapshots();
         match input {
             ServerInput::Request(raw) => {
-                // Pre-drain. For `unsubscribe` this is what fulfils
-                // "already-queued events reach the client before the response
-                // that ends the subscription"; for every other request it
-                // simply keeps the stream current.
+                // Pre-drain, defensive. What actually fulfils "already-queued
+                // events reach the client before the response that ends the
+                // subscription" is the Notice arm below draining to
+                // completion: the only code that enqueues an event is reached
+                // from there, so the queue is already empty every time this
+                // line runs. It stays because it is cheap and it is what keeps
+                // the invariant true the moment anything enqueues outside that
+                // arm.
                 if !drain(&mut subscriptions, outputs) {
                     return Ok(());
                 }
