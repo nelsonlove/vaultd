@@ -75,7 +75,7 @@ The host's own socket (`host.sock`, nonce-gated, 24 operations) is unchanged. It
 
 ## Error handling
 
-- Malformed JSON, an unknown protocol version, an oversized line: the same errors as stdio produces today, on that connection only, and the connection stays open. Only end of stream, a write failure, or shutdown closes a connection.
+- An unknown protocol version or an oversized line: the same error as stdio produces today, on that connection only, and the connection stays open. A line that is not JSON at all has no request id to answer under, so it ends that connection with no response line, exactly as it ends the stdio loop today (`FatalInput`); the code is shared, so both doors behave identically, and the conformance suite pins it. Otherwise only end of stream, a write failure, or shutdown closes a connection. (Amended 2026-09-26 after Task 7: the first wording said a malformed line leaves the connection open, which stdio never did.)
 - A write failure on one connection's stream ends that connection. The daemon logs one line on stderr and keeps serving the others. Stdio's rule that "a write failure outranks a clean end of input" applies per connection: the reason is recorded, and it is the connection's, not the daemon's.
 - A silent connection is never timed out. Idle snapshot sessions are swept on every input on their own connection, as today. A connection that opens a session and then sends nothing pins WAL frames until it closes. This is a documented limit, unchanged from stdio, and the socket file's mode is the guard against strangers doing it. Cross-connection sweeping is deferred with a pointer here.
 - The 16 MiB payload cap is per line per connection, unchanged.
