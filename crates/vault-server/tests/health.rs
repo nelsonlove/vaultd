@@ -2,6 +2,7 @@ use vault_protocol::{
     ErrorCode, PROTOCOL_VERSION, Request, RequestEnvelope, Response, ResponseOutcome,
 };
 use vault_server::Server;
+use vault_server::broadcast::ConnectionId;
 use vault_server::subscriptions::SubscriptionRegistry;
 
 #[test]
@@ -9,6 +10,7 @@ fn server_dispatches_health_requests() {
     let server = Server::health_only();
     let mut subscriptions = SubscriptionRegistry::new();
     let response = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope::new("health-1", Request::Health),
         &mut subscriptions,
     );
@@ -30,7 +32,7 @@ fn server_rejects_incompatible_versions_before_dispatch() {
 
     let server = Server::health_only();
     let mut subscriptions = SubscriptionRegistry::new();
-    let response = server.handle(request, &mut subscriptions);
+    let response = server.handle(ConnectionId::STANDALONE, request, &mut subscriptions);
     match response.outcome {
         ResponseOutcome::Err(error) => {
             assert_eq!(error.code, ErrorCode::IncompatibleVersion);

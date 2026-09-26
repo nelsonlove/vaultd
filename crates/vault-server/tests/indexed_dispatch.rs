@@ -16,6 +16,7 @@ use vault_protocol::{
     RequestEnvelope, ResolveLinkParams, Response, ResponseEnvelope, ResponseOutcome, SeverityDto,
 };
 use vault_server::Server;
+use vault_server::broadcast::ConnectionId;
 use vault_server::runtime::{Runtime, RuntimeNotice, RuntimeOptions, RuntimeTestHooks};
 use vault_server::subscriptions::SubscriptionRegistry;
 
@@ -37,7 +38,8 @@ struct Fixture {
 
 impl Fixture {
     fn handle(&mut self, envelope: RequestEnvelope) -> ResponseEnvelope {
-        self.server.handle(envelope, &mut self.subscriptions)
+        self.server
+            .handle(ConnectionId::STANDALONE, envelope, &mut self.subscriptions)
     }
 }
 
@@ -118,6 +120,7 @@ fn health_only_server_keeps_health_and_refuses_indexed_reads() {
     let server = Server::health_only();
     let mut subscriptions = SubscriptionRegistry::new();
     let response = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope::new(
             "note-2",
             Request::GetNote(NotePathParams {
@@ -139,6 +142,7 @@ fn health_only_server_keeps_health_and_refuses_indexed_reads() {
     // empty answer, because "nothing is there" and "I cannot tell you" are
     // different statements and only one of them is safe to act on.
     let response = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope::new(
             "tree-2",
             Request::GetTreeEntries(GetTreeEntriesParams {

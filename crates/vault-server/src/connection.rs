@@ -18,9 +18,11 @@
 //! stays shared: the [`Server`], behind an `Arc`, and through it the runtime's
 //! single coordinator — so two connections cannot interleave a mutation — and
 //! the snapshot sessions, which are still one process-wide registry on
-//! `Server` that any dispatcher's sweep reaches. Scoping those sessions to the
-//! connection that opened them is the socket transport's business, not this
-//! module's.
+//! `Server` that any dispatcher's sweep reaches. Those sessions are scoped by
+//! ownership rather than by storage: each is recorded against the
+//! [`ConnectionId`] that opened it, a stranger naming one is answered
+//! `snapshot_not_found`, and [`serve`] closes what this connection owned on
+//! its way out.
 //!
 //! Backpressure still never reaches the runtime. A connection's notice
 //! producer (the coordinator's own channel for stdio, the broadcaster's inbox
@@ -43,6 +45,7 @@ use vault_protocol::{
 };
 
 use crate::Server;
+use crate::broadcast::ConnectionId;
 use crate::runtime::RuntimeNotice;
 use crate::subscriptions::SubscriptionRegistry;
 
@@ -100,12 +103,6 @@ pub(crate) struct ThreadLabels {
 
 impl ThreadLabels {
     /// The three labels for one connection, suffixed with `suffix`.
-    // Unused until the socket transport's accept loop calls it; kept here because
-    // the label shape is this module's to own, not the listener's.
-    #[allow(
-        dead_code,
-        reason = "the socket transport's accept loop is its first caller"
-    )]
     pub fn for_connection(suffix: &str) -> Self {
         Self {
             reader: format!("vaultd-read-{suffix}"),
@@ -120,6 +117,7 @@ impl ThreadLabels {
 /// a method this server has never heard of.
 fn respond(
     server: &Server,
+    connection: ConnectionId,
     subscriptions: &mut SubscriptionRegistry,
     raw: RawRequestEnvelope,
 ) -> ResponseEnvelope {
@@ -128,6 +126,7 @@ fn respond(
     }
     match serde_json::from_str::<Request>(raw.request.get()) {
         Ok(request) => server.handle(
+            connection,
             RequestEnvelope {
                 version: raw.version,
                 id: raw.id,
@@ -213,6 +212,7 @@ fn write_output(mut sink: impl Write, outputs: Receiver<OutputEnvelope>) -> io::
 /// Without it this function would have to know which of the two it is serving.
 pub(crate) fn serve(
     server: &Server,
+    connection: ConnectionId,
     reader: impl BufRead + Send + 'static,
     writer: impl Write + Send + 'static,
     notices: Option<Receiver<RuntimeNotice>>,
@@ -248,12 +248,18 @@ pub(crate) fn serve(
     // and forwarder could not be joined after the loop ends.
     drop(inputs);
 
-    let outcome = dispatch(server, mailbox, &outputs);
+    let outcome = dispatch(server, connection, mailbox, &outputs);
 
     // Order matters. Dropping the output sender is what lets the writer
     // finish; `after_dispatch` is what lets the forwarder finish; and this
     // connection's input having ended is what lets the reader finish.
     drop(outputs);
+    // **Before `after_dispatch`, which unregisters this connection's notice
+    // inbox.** The sessions are this connection's and nobody else's, and the
+    // WAL frames they pin are held until they are closed — the idle sweep
+    // cannot reach them, because it only runs on some *other* connection's
+    // input. So the connection that opened them closes them on its way out.
+    server.close_sessions_of(connection);
     after_dispatch();
     let writer = join(writer, "output");
     if let Some(forwarder) = forwarder {
@@ -284,6 +290,7 @@ fn join(handle: JoinHandle<io::Result<()>>, label: &str) -> Result<(), String> {
 /// requests and notices are interleaved by the channel, not by chance.
 pub(crate) fn dispatch(
     server: &Server,
+    connection: ConnectionId,
     mailbox: Receiver<ServerInput>,
     outputs: &SyncSender<OutputEnvelope>,
 ) -> Result<(), String> {
@@ -308,7 +315,7 @@ pub(crate) fn dispatch(
                 if !drain(&mut subscriptions, outputs) {
                     return Ok(());
                 }
-                let response = respond(server, &mut subscriptions, *raw);
+                let response = respond(server, connection, &mut subscriptions, *raw);
                 if outputs
                     .send(OutputEnvelope::Response(Box::new(response)))
                     .is_err()
@@ -409,10 +416,12 @@ mod tests {
         let mut subscriptions = SubscriptionRegistry::new();
 
         server.handle(
+            ConnectionId::STANDALONE,
             envelope("r", Request::RefreshIndex(RefreshIndexParams::default())),
             &mut subscriptions,
         );
         server.handle(
+            ConnectionId::STANDALONE,
             envelope("o", Request::OpenSnapshot(OpenSnapshotParams::default())),
             &mut subscriptions,
         );
@@ -436,7 +445,8 @@ mod tests {
             })))
             .expect("queue one notice");
         drop(inputs);
-        dispatch(&server, mailbox, &outputs).expect("the loop ends when its mailbox closes");
+        dispatch(&server, ConnectionId::STANDALONE, mailbox, &outputs)
+            .expect("the loop ends when its mailbox closes");
 
         assert_eq!(
             server.snapshot_session_count(),

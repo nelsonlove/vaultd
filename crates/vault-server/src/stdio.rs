@@ -17,6 +17,7 @@ use std::io;
 use std::sync::mpsc::Receiver;
 
 use crate::Server;
+use crate::broadcast::ConnectionId;
 use crate::connection::{self, ThreadLabels};
 use crate::runtime::RuntimeNotice;
 
@@ -36,6 +37,9 @@ use crate::runtime::RuntimeNotice;
 pub fn run(server: Server, notices: Option<Receiver<RuntimeNotice>>) -> Result<(), String> {
     connection::serve(
         &server,
+        // No broadcaster issued an identifier here: this daemon has one
+        // connection and takes the runtime's notice receiver directly.
+        ConnectionId::STANDALONE,
         io::BufReader::new(io::stdin()),
         io::stdout(),
         notices,

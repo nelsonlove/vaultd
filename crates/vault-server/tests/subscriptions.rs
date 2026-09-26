@@ -22,6 +22,7 @@ use vault_protocol::{
     SubscribeEventsParams, SubscribeEventsResponse,
 };
 use vault_server::Server;
+use vault_server::broadcast::ConnectionId;
 use vault_server::runtime::{
     ResyncReason, Runtime, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
 };
@@ -601,6 +602,7 @@ fn subscribe_through_dispatcher(
         "these tests subscribe before any event is queued"
     );
     let envelope = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope::new(
             "req-subscribe",
             Request::SubscribeEvents(SubscribeEventsParams {}),

@@ -7,7 +7,6 @@ use clap::Parser;
 use vault_index::IndexConfig;
 use vault_server::Server;
 use vault_server::runtime::{RuntimeNotice, RuntimeOptions};
-use vault_server::stdio;
 
 #[derive(Debug, Parser)]
 #[command(name = "vaultd", version, about)]
@@ -43,6 +42,15 @@ struct Cli {
     /// snapshot sessions, and reconciliation are unaffected.
     #[arg(long, default_value_t = false, requires = "vault")]
     read_only: bool,
+    /// Also serve a Unix domain socket, so clients other than this process's
+    /// parent can reach the daemon and the daemon can outlive them.
+    ///
+    /// With no value, the default path: `<run dir>/<digest>.sock`, where the
+    /// digest is the first 16 hex characters of the SHA-256 of the canonical
+    /// vault root and the run directory is `$XDG_RUNTIME_DIR/vaultd` when that
+    /// is set, else `<XDG cache dir>/vaultd/run`.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, requires = "vault")]
+    listen: Option<Option<PathBuf>>,
 }
 
 impl Cli {
@@ -97,6 +105,30 @@ fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let (server, notices) = configured_server(&cli)?;
-    stdio::run(server, notices).map_err(Into::into)
+    let (mut server, notices) = configured_server(&cli)?;
+    let listen = match (&cli.listen, &cli.vault) {
+        (None, _) => None,
+        (Some(Some(path)), _) => Some(path.clone()),
+        (Some(None), Some(vault)) => Some(vault_server::listener::default_socket_path(
+            &vault_index::IndexConfig::derived(vault)?.canonical_vault_root,
+        )?),
+        // clap enforces `--listen` requires `--vault`.
+        (Some(None), None) => unreachable!("--listen requires --vault"),
+    };
+    // Answered by `get_vault_info` so a client on stdio can tell others where
+    // to knock. Task 6 makes the field reach the wire; setting it here keeps
+    // the one place that knows the path the one place that decides it.
+    server.set_socket_path(listen.as_ref().map(|path| path.display().to_string()));
+    vault_server::service::run(
+        server,
+        notices,
+        vault_server::service::ServiceOptions {
+            // Stdin is a door like any other and is served while it is open.
+            // A daemon started with stdin closed (systemd) simply reaches end
+            // of file at once, which ends connection zero and nothing else.
+            stdio: true,
+            listen,
+        },
+    )
+    .map_err(Into::into)
 }

@@ -67,6 +67,24 @@ pub const CONNECTION_NOTICE_CAPACITY: usize = 256;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(u64);
 
+impl ConnectionId {
+    /// The identifier a connection uses when no broadcaster issued one: the
+    /// stdio-only daemon, which has a single connection and takes the
+    /// runtime's notice receiver directly.
+    ///
+    /// Zero is safe to reserve because [`Broadcaster::register`] increments its
+    /// counter **before** using it, so the first identifier it ever issues is
+    /// 1 and no live connection can collide with this.
+    pub const STANDALONE: Self = Self(0);
+
+    /// An arbitrary identifier, for a test that needs two peers without
+    /// needing two inboxes.
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 impl std::fmt::Display for ConnectionId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "conn-{}", self.0)
@@ -120,6 +138,16 @@ struct Registered {
 struct Registry {
     next: u64,
     connections: BTreeMap<u64, Registered>,
+    /// Has the fan-out loop ended and closed every inbox?
+    ///
+    /// Without this, a connection accepted in the window between the runtime's
+    /// notice channel ending and the daemon stopping would be registered into
+    /// a registry nothing will ever clear again — and its forwarder thread
+    /// blocks in `recv` on an inbox whose sender no longer has an owner that
+    /// will drop it, so that connection could never be joined. Latched rather
+    /// than inferred from an empty map, because a registry with no connections
+    /// in it is also the state of a daemon that has simply had no clients yet.
+    closed: bool,
 }
 
 /// The fan-out. One per daemon, shared by `Arc`.
@@ -206,12 +234,27 @@ impl Broadcaster {
     }
 
     /// A fresh inbox for one connection. The receiver is handed straight to
-    /// [`crate::connection::serve`].
+    /// the connection's own serve loop (`crate::connection::serve`, which is
+    /// crate-private and so is not linked here).
+    ///
+    /// **After the fan-out has ended the inbox comes back already closed.**
+    /// A connection accepted in that window is still served — it can answer
+    /// every request — but there are no more notices to give it, and handing
+    /// it a live inbox nothing would ever close would leave its notice
+    /// forwarder blocked in `recv` for the life of the process, so the
+    /// connection could never be joined. Closing it up front makes that
+    /// connection's forwarder see end of notices immediately, exactly as
+    /// every other connection's does when the runtime stops.
     pub fn register(&self) -> (ConnectionId, Receiver<RuntimeNotice>) {
         let (sink, inbox) = sync_channel(CONNECTION_NOTICE_CAPACITY);
         let mut registry = self.lock();
         registry.next += 1;
         let id = registry.next;
+        if registry.closed {
+            // `sink` is dropped here, with nothing inserted: the receiver is
+            // already disconnected when the caller gets it.
+            return (ConnectionId(id), inbox);
+        }
         registry.connections.insert(
             id,
             Registered {
@@ -252,8 +295,13 @@ impl Broadcaster {
     /// `forward_notices` returns only when its receiver's senders are gone,
     /// so without this the broadcaster would absorb the signal that the
     /// runtime's channel has closed and every forwarder would block forever.
+    ///
+    /// Latched, so a connection registering after this point is handed an
+    /// inbox that is already closed rather than one nothing will ever close.
     fn close(&self) {
-        self.lock().connections.clear();
+        let mut registry = self.lock();
+        registry.closed = true;
+        registry.connections.clear();
     }
 
     /// What this connection is owed, or `None` if no such connection is
@@ -704,6 +752,113 @@ mod tests {
             broadcaster.connection_count(),
             0,
             "and nothing is left registered"
+        );
+    }
+
+    /// The accept loop outlives the fan-out: the runtime's notice channel can
+    /// end while the listener is still answering, so a client may connect
+    /// after the last notice has been handed out. That connection must be
+    /// given an inbox that is **already** closed. A live one would leave its
+    /// notice forwarder parked in `recv` forever, because nothing clears the
+    /// registry a second time, and the service could then never join that
+    /// connection's threads.
+    #[test]
+    fn a_connection_registering_after_the_fan_out_ended_is_given_a_closed_inbox() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (notices, receiver) = sync_channel(1);
+        let fanout =
+            spawn_fanout(Arc::clone(&broadcaster), receiver).expect("the fan-out thread starts");
+        drop(notices);
+        fanout
+            .join()
+            .expect("the fan-out thread ends with its channel");
+
+        let (late, inbox) = broadcaster.register();
+
+        assert!(
+            matches!(
+                inbox.recv_timeout(PATIENCE),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "a connection registered after the fan-out ended must see end of \
+             notices at once, not wait for a close that will never come"
+        );
+        assert_eq!(
+            broadcaster.connection_count(),
+            0,
+            "and it was never put in the registry, so no later offer can \
+             reach a sender nobody owns"
+        );
+        assert_eq!(
+            broadcaster.gap_of(late),
+            None,
+            "an unregistered connection owes nothing and is owed nothing"
+        );
+    }
+
+    /// The marker's own `Full` arm. A connection that is already owed a
+    /// resync, and whose inbox is *still* full, cannot even be told about the
+    /// debt — so the debt must survive the attempt and grow to name the
+    /// newest generation. Losing it here would silently downgrade a client
+    /// from "you missed something" to "you are current".
+    #[test]
+    fn a_debt_survives_an_offer_that_cannot_even_fit_the_marker() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (id, inbox) = broadcaster.register();
+        let overflow = overflow_with_states(&broadcaster);
+        assert_eq!(
+            broadcaster.gap_of(id),
+            Some(Gap::Named(Generation::new(overflow))),
+            "the overflow latched a gap"
+        );
+
+        // Nothing has been read, so the inbox is still brim full and the
+        // marker has nowhere to go either.
+        let later = overflow + 1;
+        broadcaster.offer(&state_at(later));
+
+        assert_eq!(
+            broadcaster.gap_of(id),
+            Some(Gap::Named(Generation::new(later))),
+            "the debt survives, and names the newest generation it has seen"
+        );
+        let waiting = drain_inbox(&inbox);
+        assert_eq!(
+            waiting.len(),
+            CONNECTION_NOTICE_CAPACITY,
+            "nothing was delivered: not the notice, and not the marker either"
+        );
+        assert!(
+            !waiting
+                .iter()
+                .any(|notice| matches!(notice, RuntimeNotice::ResyncRequired { .. })),
+            "a marker that could not be sent was not sent"
+        );
+    }
+
+    /// The marker's `Disconnected` arm. A dispatcher that has ended cannot be
+    /// told anything, so the debt is dropped rather than carried — and the
+    /// offer must return normally rather than panicking on a dead sender.
+    #[test]
+    fn a_debt_owed_to_a_dispatcher_that_ended_is_forgotten_rather_than_carried() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (id, inbox) = broadcaster.register();
+        let overflow = overflow_with_states(&broadcaster);
+        assert_eq!(
+            broadcaster.gap_of(id),
+            Some(Gap::Named(Generation::new(overflow))),
+            "the overflow latched a gap"
+        );
+
+        // The connection ends. Its `after_dispatch` has not unregistered it
+        // yet, which is exactly the window this arm exists for.
+        drop(inbox);
+        broadcaster.offer(&state_at(overflow + 1));
+
+        assert_eq!(
+            broadcaster.gap_of(id),
+            Some(Gap::None),
+            "there is nobody left to announce a gap to"
         );
     }
 

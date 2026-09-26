@@ -16,6 +16,7 @@ use vault_protocol::{
     ErrorCode, ExpectedDto, Request, RequestEnvelope, Response, ResponseOutcome, WriteNoteParams,
 };
 use vault_server::Server;
+use vault_server::broadcast::ConnectionId;
 use vault_server::runtime::{
     MutationFailure, Runtime, RuntimeHandle, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
 };
@@ -596,6 +597,7 @@ fn a_write_that_lands_but_cannot_publish(
     let mut subscriptions = SubscriptionRegistry::new();
     stage.store(1, Ordering::Release);
     let response = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope {
             version: 1,
             id: "w".into(),
