@@ -46,7 +46,12 @@
  *   --notes N        fixture size when it has to be built (default 1000)
  *   --out PATH       where the report lands
  *   --binary PATH    the vaultd to measure (default target/release/vaultd)
- *   --keep-vault     use an existing non-empty --vault outside target/ as it is
+ *   --keep-vault     measure an existing non-empty --vault outside target/ instead
+ *                    of refusing it. **Not read-only**: the `write_note` case
+ *                    creates `--samples` notes named `Bench-<label>-<run>-NNNNNN.md`
+ *                    (plus 20 warm-up notes) in that directory and removes them
+ *                    again when the run ends, so a run that is killed between the
+ *                    two leaves them behind.
  *   --json           print the summary as JSON instead of a table
  */
 
@@ -56,6 +61,7 @@ const {
   existsSync,
   mkdirSync,
   readdirSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } = require("node:fs");
@@ -134,22 +140,50 @@ function parseArgs(argv) {
 // --- The fixture -------------------------------------------------------------
 
 /**
+ * The path with every symlink resolved, for a path that may not exist yet.
+ *
+ * `realpathSync` throws on a path that is not there, and the guard below has to
+ * judge paths the harness is about to create. So: resolve the deepest existing
+ * ancestor and re-attach the names below it, which is the same technique
+ * `IndexConfig::explicit` uses on the Rust side for exactly this reason.
+ */
+function realPathish(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    // `dirname("/")` is `"/"`, so this is the recursion's floor.
+    if (parent === path) return path;
+    return join(realPathish(parent), basename(path));
+  }
+}
+
+/**
  * Refuse to build the fixture over anything that is not obviously scratch.
  *
  * `--vault` is a path a human types, and the standing rule in this repository
  * is that a harness never touches a real vault. A path under `target/` is this
  * harness's own scratch; anywhere else, an existing non-empty directory is
  * refused and the caller is told the two ways forward.
+ *
+ * **Both sides are resolved through their symlinks before the prefix test**,
+ * because `resolve()` is purely lexical: a symlink at
+ * `target/tmp/anything` pointing at a real vault would otherwise read as "under
+ * `target/`, therefore scratch, therefore safe to fill with a thousand notes".
+ * Measured, not imagined — the review that asked for this built that symlink and
+ * the lexical guard allowed it. `socket-transport-guard-selftest.js` pins the
+ * fixed behaviour.
  */
 function assertSafeToBuild(root) {
-  const scratch = join(REPO, "target");
-  if (root === scratch || root.startsWith(`${scratch}/`)) return;
-  if (!existsSync(root)) return;
-  if (readdirSync(root).length === 0) return;
+  const scratch = realPathish(join(REPO, "target"));
+  const real = realPathish(root);
+  if (real === scratch || real.startsWith(`${scratch}/`)) return;
+  if (!existsSync(real)) return;
+  if (readdirSync(real).length === 0) return;
   throw new Error(
-    `refusing to build the fixture at ${root}: it exists, it is not empty, and it is not under ` +
-      `${scratch}. Pass --keep-vault to measure it as it is, or point --vault at a new or empty ` +
-      `directory.`,
+    `refusing to build the fixture at ${root} (${real}): it exists, it is not empty, and it is ` +
+      `not under ${scratch}. Pass --keep-vault to measure it as it is, or point --vault at a new ` +
+      `or empty directory.`,
   );
 }
 
@@ -172,6 +206,61 @@ function buildVault(root, count) {
 
 // --- The daemon --------------------------------------------------------------
 
+/**
+ * Every daemon this process has started and not yet reaped.
+ *
+ * It exists for one reason: a signal. Node's default disposition for SIGINT,
+ * SIGTERM and SIGHUP is to die without running a `finally`, and `spawn` on
+ * POSIX does not take a child with its parent — so a Ctrl-C twenty seconds into
+ * a run leaves a `vaultd` alive holding the writer lease on `--index` and the
+ * socket file bound, and the next run fails on the lease with nobody to blame.
+ * Measured, not imagined: the review that asked for this SIGTERMed a run and
+ * found the daemon still alive four seconds later.
+ */
+const liveDaemons = new Set();
+
+/**
+ * True once a signal has been taken and the daemons are being stopped.
+ *
+ * Stopping a daemon fails every request in flight, so a run that is interrupted
+ * ends with a rejected promise — which is correct and is not news. The harness's
+ * top-level handler consults this so an interrupted run dies of its signal with
+ * one line, rather than of an uncaught "client closed" with a stack trace that
+ * suggests something went wrong.
+ */
+let stopping = false;
+
+/** Whether this process is on its way out because of a signal. */
+const stoppingForSignal = () => stopping;
+
+/**
+ * Install the handler that stops those daemons and then lets the signal do what
+ * it was going to do.
+ *
+ * Re-raising rather than `process.exit`ing is the part worth stating: a shell
+ * that sent SIGINT is entitled to see the process die of SIGINT, and a wrapper
+ * counting exit codes must not be told a killed run exited 0. The handler is
+ * removed first so the re-raise takes the default disposition.
+ */
+function stopDaemonsOnSignal(label) {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => {
+      if (stopping) return;
+      stopping = true;
+      process.stderr.write(
+        `${label}: ${signal} — stopping ${String(liveDaemons.size)} daemon(s) before exiting\n`,
+      );
+      void (async () => {
+        // `stopDaemon` is SIGTERM, then a 15 s deadline, then SIGKILL, so this
+        // waits exactly as long as an orderly shutdown is allowed to take.
+        await Promise.all([...liveDaemons].map((child) => stopDaemon(child)));
+        for (const other of ["SIGINT", "SIGTERM", "SIGHUP"]) process.removeAllListeners(other);
+        process.kill(process.pid, signal);
+      })();
+    });
+  }
+}
+
 /** Spawn the daemon, with a listener when the run needs one. */
 function spawnDaemon(options, socketPath, indexPath) {
   const args = [
@@ -181,7 +270,14 @@ function spawnDaemon(options, socketPath, indexPath) {
     "--reconcile-interval-seconds", "0",
   ];
   if (options.transport === "socket") args.push("--listen", socketPath);
-  return spawn(options.binary, args, { stdio: ["pipe", "pipe", "inherit"] });
+  return track(spawn(options.binary, args, { stdio: ["pipe", "pipe", "inherit"] }));
+}
+
+/** Remember a daemon until it exits, so a signal can stop it. */
+function track(child) {
+  liveDaemons.add(child);
+  child.once("exit", () => liveDaemons.delete(child));
+  return child;
 }
 
 /**
@@ -277,12 +373,22 @@ async function measureRun(options, run) {
   rmSync(socketPath, { force: true });
 
   const loadBefore = loadavg();
-  const child = spawnDaemon(options, socketPath, indexPath);
-  const { client, socket, connectMs } = await openClient(options, child, socketPath);
   // Every path this run writes, so the fixture is the same bytes for the next
   // run and for the other transport.
   const written = [];
+  // **The spawn is inside the `try`.** Every way `openClient` can fail — its
+  // hydration deadline, a `health` that connects and never answers, a client
+  // that rejects — must still reach the `finally` that stops the daemon, or the
+  // harness exits 1 leaving a `vaultd` holding the lease on `--index`.
+  let child = null;
+  let client = null;
+  let socket = null;
   try {
+    child = spawnDaemon(options, socketPath, indexPath);
+    const opened = await openClient(options, child, socketPath);
+    client = opened.client;
+    socket = opened.socket;
+    const connectMs = opened.connectMs;
     await client.request("refresh_index", {});
     const info = await client.request("get_vault_info");
     const first = (await client.request("list_notes", { cursor: null, limit: 1 })).items[0];
@@ -298,8 +404,20 @@ async function measureRun(options, run) {
       getNoteMs.push(ms(started));
     }
 
-    const writeNoteMs = [];
+    // **Warmed the same way the reads are**, because the first write of a run
+    // pays the index's first-write cost on a freshly built index and it would
+    // otherwise sit inside the sample set. The warm-up notes are removed with
+    // the measured ones.
     const prefix = `Bench-${options.label}-${String(run)}`;
+    for (let at = 0; at < 20; at += 1) {
+      const path = `${prefix}-warm-${String(at).padStart(6, "0")}.md`;
+      await client.request("write_note", {
+        path, content: `# Warm ${String(at)}\n`, expected: { absent: true },
+      });
+      written.push(path);
+    }
+
+    const writeNoteMs = [];
     for (let at = 0; at < options.samples; at += 1) {
       const path = `${prefix}-${String(at).padStart(6, "0")}.md`;
       const started = hrtime.bigint();
@@ -328,16 +446,18 @@ async function measureRun(options, run) {
       },
     };
   } finally {
-    client.close();
+    if (client) client.close();
     if (socket) socket.destroy();
-    if (child.stdin.writable) child.stdin.end();
-    const exit = await stopDaemon(child);
+    if (child) {
+      if (child.stdin.writable) child.stdin.end();
+      const exit = await stopDaemon(child);
+      if (exit.signal === "SIGKILL") {
+        process.stderr.write(`baseline: run ${String(run)} had to SIGKILL the daemon\n`);
+      }
+    }
     // After the daemon is gone, so nothing reconciles a half-removed vault.
     for (const path of written) rmSync(join(options.vault, path), { force: true });
     rmSync(socketPath, { force: true });
-    if (exit.signal === "SIGKILL") {
-      process.stderr.write(`baseline: run ${String(run)} had to SIGKILL the daemon\n`);
-    }
   }
 }
 
@@ -352,6 +472,7 @@ const median = (values) => {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  stopDaemonsOnSignal("baseline");
   if (options.help) {
     process.stdout.write(`${require("node:fs").readFileSync(__filename, "utf8").split("*/")[0]}\n`);
     return;
@@ -453,11 +574,19 @@ module.exports = {
   median,
   ms,
   openSocketClient,
+  realPathish,
   stopDaemon,
+  stopDaemonsOnSignal,
+  stoppingForSignal,
+  track,
 };
 
 if (require.main === module) {
   main().catch((error) => {
+    if (stoppingForSignal()) {
+      process.stderr.write("baseline: interrupted; the signal handler is stopping the daemon\n");
+      return;
+    }
     process.stderr.write(
       `baseline: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
     );

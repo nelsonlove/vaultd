@@ -132,7 +132,9 @@ if (skipWarm) {
   note("dist is current; fixture warm-up skipped");
   process.exit(0);
 }
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+// The require is deliberately here rather than at the top: `compiled` only
+// exists after the build above ran, and the `existsSync` guard is what makes the
+// failure legible.
 const { warmFixtureCache, fixtureCacheDir } = require(compiled);
 
 const cases = readdirSync(fixturesDir)

@@ -44,10 +44,37 @@
  * generations means the stall engaged, and the report says so either way —
  * a measurement taken behind a peer that was never actually stalled measures
  * nothing, and must not be read as a pass.
+ *
+ * **A third client covers the case the parked peer does not.** `beside` is taken
+ * after the worker's own event stream has gone quiet, so no notice is in flight
+ * while it is measured and the per-notice `try_send` into the stalled
+ * connection's inbox — the mechanism the design worried about — costs nothing
+ * then. So a third client reads *while* the generations are being driven, once
+ * during the control writes and once during the stalled writes, and the two are
+ * reported as `during_writes`. That pair is the fan-out cost; `beside` over
+ * `control` is the parked-peer cost the spec's words ask for.
+ *
+ * Flags:
+ *   --vault DIR        the fixture (default target/tmp/socket-baseline/vault)
+ *   --index PATH       the engine index file (default …/iso.sqlite3)
+ *   --socket PATH      the socket to bind (default beside the index)
+ *   --samples N        samples per phase (default 200)
+ *   --repeat N         measured runs, one daemon each (default 1)
+ *   --label NAME       names the per-run files (default "run")
+ *   --notes N          fixture size when it has to be built (default 1000)
+ *   --stall-writes N   generations driven per phase (default 1200)
+ *   --out PATH         where the report lands
+ *   --binary PATH      the vaultd to measure (default target/release/vaultd)
+ *   --keep-vault       measure an existing non-empty --vault outside target/
+ *                      instead of refusing it. **Not read-only**: each run
+ *                      creates 2×`--stall-writes` + 1 notes in that directory
+ *                      and removes them when it ends.
+ *   --json             print the summary as JSON as well as the table
+ *   --help             print this header
  */
 
 const { spawn } = require("node:child_process");
-const { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
+const { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
 const { loadavg } = require("node:os");
 const { basename, dirname, extname, join, resolve } = require("node:path");
 const { hrtime } = require("node:process");
@@ -61,12 +88,24 @@ const {
   ms,
   openSocketClient,
   stopDaemon,
+  stopDaemonsOnSignal,
+  stoppingForSignal,
+  track,
 } = require("./socket-transport-baseline.js");
 
 const DEFAULT_ROOT = join(REPO, "target", "tmp", "socket-baseline");
 
 function parseArgs(argv) {
-  const out = { samples: 200, repeat: 1, label: "run", notes: 1_000, stallWrites: 1_200, json: false, keepVault: false };
+  const out = {
+    samples: 200,
+    repeat: 1,
+    label: "run",
+    notes: 1_000,
+    stallWrites: 1_200,
+    json: false,
+    keepVault: false,
+    help: false,
+  };
   const numeric = (raw, flag) => {
     const value = Number(raw);
     if (!Number.isFinite(value) || value < 1) throw new Error(`${flag} wants a positive number, got ${String(raw)}`);
@@ -92,9 +131,11 @@ function parseArgs(argv) {
       case "--binary": out.binary = resolve(next()); break;
       case "--keep-vault": out.keepVault = true; break;
       case "--json": out.json = true; break;
+      case "--help": case "-h": out.help = true; break;
       default: throw new Error(`unknown flag ${String(flag)}`);
     }
   }
+  if (out.help) return out;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(out.label)) {
     throw new Error(`--label must be a plain file-name fragment, got ${out.label}`);
   }
@@ -105,6 +146,15 @@ function parseArgs(argv) {
   out.socket ??= join(dirname(out.index), "i.sock");
   return out;
 }
+
+/**
+ * Reads discarded before each timing window, to let the daemon settle.
+ *
+ * 100 because that is where the post-write decay measured on this machine has
+ * flattened: the first read after a thousand generations costs about 2 ms and
+ * the hundredth costs the floor.
+ */
+const SETTLE_READS = 100;
 
 /** Wait until nothing has arrived for `quiet` ms, or give up at `bound`. */
 async function settleQuiet(counter, quiet, bound) {
@@ -131,17 +181,18 @@ async function measureRun(options, run) {
   rmSync(socketPath, { force: true });
 
   const loadBefore = loadavg();
-  const child = spawn(options.binary, [
+  const child = track(spawn(options.binary, [
     "--vault", options.vault,
     "--index", indexPath,
     "--no-watch",
     "--reconcile-interval-seconds", "0",
     "--listen", socketPath,
-  ], { stdio: ["pipe", "pipe", "inherit"] });
+  ], { stdio: ["pipe", "pipe", "inherit"] }));
 
   const written = [];
   let worker = null;
   let peer = null;
+  let prober = null;
   try {
     const workerSeen = { seen: 0 };
     const deadline = Date.now() + 120_000;
@@ -163,7 +214,22 @@ async function measureRun(options, run) {
     // that differs between them is the stalled peer.
     await worker.client.request("subscribe_events", {});
 
+    /**
+     * Read until the daemon has settled, then take the samples.
+     *
+     * **The warm-up is not decoration.** Every one of these windows opens right
+     * after a phase that committed a thousand generations or handed a stalled
+     * peer its backlog, and the first hundred-odd reads after that decay from
+     * about 2 ms to the floor — SQLite's WAL state, not the transport. Measured
+     * without it, one phase's p50 lands wherever its decay had reached, and a
+     * single run of this case could read anywhere from 0.66 to 1.6 on a
+     * quantity whose true value is 1.0. Discarding `SETTLE_READS` first costs
+     * a tenth of a second and makes the four windows comparable.
+     */
     const time = async (samples) => {
+      for (let at = 0; at < SETTLE_READS; at += 1) {
+        await worker.client.request("get_note", { path: first.path });
+      }
       const out = [];
       for (let at = 0; at < samples; at += 1) {
         const started = hrtime.bigint();
@@ -181,7 +247,45 @@ async function measureRun(options, run) {
       }
     };
 
-    for (let at = 0; at < 20; at += 1) await worker.client.request("get_note", { path: first.path });
+    /**
+     * Drive those generations while a third client reads, and time the reads.
+     *
+     * This is the fan-out window: every generation is one notice offered to
+     * every registered connection, so while this is running the broadcaster is
+     * cloning and `try_send`ing per notice — including into a stalled
+     * connection's inbox when there is one. The prober is deliberately **not**
+     * subscribed: a subscriber's round trip would also be carrying its own
+     * event traffic, and the question is what a *reader* pays while other
+     * people's events are being fanned out.
+     */
+    const driveWhileReading = async (tag, count, prober) => {
+      const samples = [];
+      const state = { done: false };
+      // The catch is attached at construction, not at the `await` below: a
+      // daemon that goes away mid-phase — an interrupted run, a crash — rejects
+      // this loop's request while nobody is awaiting it yet, and a floating
+      // rejection takes the whole process down with an uncaught error instead of
+      // the error that actually happened.
+      let failure = null;
+      const reading = (async () => {
+        while (!state.done) {
+          const started = hrtime.bigint();
+          await prober.client.request("get_note", { path: first.path });
+          samples.push(ms(started));
+        }
+      })().catch((error) => {
+        failure = error;
+        state.done = true;
+      });
+      await drive(tag, count);
+      state.done = true;
+      await reading;
+      if (failure) throw failure;
+      return samples;
+    };
+
+    prober = await openSocketClient(socketPath);
+    for (let at = 0; at < 20; at += 1) await prober.client.request("get_note", { path: first.path });
     const alone = await time(options.samples);
 
     // **The control, and why there is one.** The stall is produced by driving
@@ -192,7 +296,7 @@ async function measureRun(options, run) {
     // peer at all, and *that* is the single-client value the stalled case is
     // compared against; the alone-to-control ratio below is the size-and-churn
     // effect, reported separately rather than folded in.
-    await drive("Warm", options.stallWrites);
+    const duringControlWrites = await driveWhileReading("Warm", options.stallWrites, prober);
     const controlQuiet = await settleQuiet(workerSeen, 250, 60_000);
     const control = await time(options.samples);
 
@@ -214,7 +318,7 @@ async function measureRun(options, run) {
     peer.socket.pause();
 
     const before = await worker.client.request("get_vault_info");
-    await drive("Stall", options.stallWrites);
+    const duringStalledWrites = await driveWhileReading("Stall", options.stallWrites, prober);
     const after = await worker.client.request("get_vault_info");
     // The worker's own fan-out must have drained before the second sample, or
     // it would time the tail of the run's own events rather than `get_note`.
@@ -251,6 +355,12 @@ async function measureRun(options, run) {
       control_p50_ms: median(control),
       beside_stalled_peer_p50_ms: median(beside),
       recovered_p50_ms: median(recovered),
+      // The fan-out window: a third, unsubscribed client reading while the
+      // generations are driven, once with nobody stalled and once with the peer
+      // stalled. This is the pair that exercises the per-notice `try_send`.
+      during_writes_control_p50_ms: median(duringControlWrites),
+      during_writes_stalled_peer_p50_ms: median(duringStalledWrites),
+      during_writes_ratio: median(duringStalledWrites) / median(duringControlWrites),
       // The isolation number: the stalled case against a settled daemon after
       // the same write volume with nobody stalled. See the header for why the
       // same-vault-size pair is the secondary one and not this.
@@ -262,6 +372,8 @@ async function measureRun(options, run) {
       control_ms: control,
       beside_stalled_peer_ms: beside,
       recovered_ms: recovered,
+      during_writes_control_ms: duringControlWrites,
+      during_writes_stalled_peer_ms: duringStalledWrites,
       stall: {
         generations_committed: generations,
         peer_lines_seen_after_resume: peerSeen.seen,
@@ -289,9 +401,10 @@ async function measureRun(options, run) {
       peer.client.close();
       peer.socket.destroy();
     }
-    if (worker) {
-      worker.client.close();
-      worker.socket.destroy();
+    for (const held of [prober, worker]) {
+      if (!held) continue;
+      held.client.close();
+      held.socket.destroy();
     }
     if (child.stdin.writable) child.stdin.end();
     const exit = await stopDaemon(child);
@@ -305,6 +418,11 @@ async function measureRun(options, run) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.help) {
+    process.stdout.write(`${readFileSync(__filename, "utf8").split("*/")[0]}\n`);
+    return;
+  }
+  stopDaemonsOnSignal("isolation");
   if (!existsSync(join(DIST, "client", "client.js"))) {
     throw new Error(`the host is not built: no ${join(DIST, "client", "client.js")} — npm --prefix host run build`);
   }
@@ -332,6 +450,9 @@ async function main() {
         `  beside a stalled peer ${report.beside_stalled_peer_p50_ms.toFixed(3)} ms` +
         `  recovered p50 ${report.recovered_p50_ms.toFixed(3)} ms` +
         `  ratio ${report.ratio.toFixed(3)} (against recovered ${report.ratio_against_recovered.toFixed(3)})` +
+        `\n  during the writes: control ${report.during_writes_control_p50_ms.toFixed(3)} ms` +
+        `  with the peer stalled ${report.during_writes_stalled_peer_p50_ms.toFixed(3)} ms` +
+        `  ratio ${report.during_writes_ratio.toFixed(3)}` +
         `  stall ${report.stall.engaged ? "engaged" : "DID NOT ENGAGE"}` +
         ` (${String(report.stall.peer_lines_seen_after_resume)} of ${String(report.stall.generations_committed)} events kept)` +
         `  load ${report.environment.load_average_after[0].toFixed(2)}\n`,
@@ -347,6 +468,11 @@ async function main() {
     median_recovered_p50_ms: median(runs.map((run) => run.recovered_p50_ms)),
     median_ratio: median(runs.map((run) => run.ratio)),
     median_ratio_against_recovered: median(runs.map((run) => run.ratio_against_recovered)),
+    median_during_writes_control_p50_ms: median(runs.map((run) => run.during_writes_control_p50_ms)),
+    median_during_writes_stalled_peer_p50_ms: median(
+      runs.map((run) => run.during_writes_stalled_peer_p50_ms),
+    ),
+    median_during_writes_ratio: median(runs.map((run) => run.during_writes_ratio)),
     median_churn_ratio: median(runs.map((run) => run.churn_ratio)),
     every_run_stalled: runs.every((run) => run.stall.engaged),
     runs,
@@ -357,6 +483,10 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (stoppingForSignal()) {
+    process.stderr.write("isolation: interrupted; the signal handler is stopping the daemon\n");
+    return;
+  }
   process.stderr.write(
     `isolation: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
   );
