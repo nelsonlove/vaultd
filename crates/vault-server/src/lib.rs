@@ -5,6 +5,7 @@ pub mod fixture_row;
 pub mod listener;
 pub mod runtime;
 pub mod service;
+pub mod signals;
 pub mod stdio;
 pub mod subscriptions;
 

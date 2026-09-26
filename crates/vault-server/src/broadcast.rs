@@ -298,7 +298,13 @@ impl Broadcaster {
     ///
     /// Latched, so a connection registering after this point is handed an
     /// inbox that is already closed rather than one nothing will ever close.
-    fn close(&self) {
+    ///
+    /// Called by the fan-out when the runtime's notices end, and by
+    /// `Service::stop` straight after it has offered the `stopped` notice: a
+    /// buffered notice is still delivered after its sender goes, so closing
+    /// there is what turns "a notice is somewhere on its way" into "this
+    /// notice, and then the end".
+    pub(crate) fn close(&self) {
         let mut registry = self.lock();
         registry.closed = true;
         registry.connections.clear();

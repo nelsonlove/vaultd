@@ -29,6 +29,41 @@ pub const LINE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a daemon is given to create its socket file and answer on it.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long one readiness probe waits for its answer before trying again.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// One bounded question at `socket`: is a daemon answering `health` there?
+///
+/// **A socket file that accepts is not a daemon.** A stale listener left
+/// behind by some other process accepts the connection and then never
+/// answers, and the daemon under test replaces such a file only after its own
+/// liveness probe has timed out — so a readiness check that blocked on the
+/// first connection that succeeded would spend its whole budget talking to
+/// the wrong socket while the daemon was still binding. Every probe is
+/// therefore bounded and a silent one is simply retried.
+fn answers(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err() {
+        return false;
+    }
+    if writeln!(
+        stream,
+        r#"{{"version":1,"id":"ready","request":{{"method":"health"}}}}"#
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .is_ok_and(|read| {
+            read > 0 && line.contains(r#""id":"ready""#) && line.contains(r#""outcome""#)
+        })
+}
+
 /// A listening daemon. Its clients are [`Client`]s; it has no stdio client of
 /// its own here, because `stdin` is inherited as a pipe and left unwritten.
 pub struct ListeningDaemon {
@@ -118,14 +153,8 @@ impl ListeningDaemon {
     fn await_ready(&self) {
         let deadline = Instant::now() + READY_TIMEOUT;
         while Instant::now() < deadline {
-            if self.socket.exists() {
-                if let Ok(stream) = UnixStream::connect(&self.socket) {
-                    let mut client = Client::over(stream);
-                    let answer =
-                        client.call(r#"{"version":1,"id":"ready","request":{"method":"health"}}"#);
-                    assert_eq!(answer.id, "ready");
-                    return;
-                }
+            if answers(&self.socket) {
+                return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -143,6 +172,23 @@ impl ListeningDaemon {
     /// Unused until the shutdown tests, which signal the daemon by pid.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Poll for the daemon's exit, bounded. `None` means it was still running
+    /// when `within` had passed.
+    ///
+    /// Never a bare `wait`: the failure this is written to catch is a daemon
+    /// that does not stop, and a bare `wait` would hang the whole suite on it
+    /// rather than fail one test.
+    pub fn wait_for_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.try_wait().expect("poll the daemon") {
+                Some(status) => return Some(status),
+                None if Instant::now() >= deadline => return None,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 
     /// One new connection to this daemon.

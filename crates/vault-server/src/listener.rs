@@ -225,6 +225,60 @@ impl SocketListener {
         self.listener.accept().map(|(stream, _address)| stream)
     }
 
+    /// Accept one connection, or give up after `timeout` so the caller can
+    /// look at its own stopping flag. `Ok(None)` is "nobody yet", which is
+    /// not a failure and must not count towards an accept-error backoff.
+    ///
+    /// **This is the accept loop's second exit, and the one that needs
+    /// nothing from the path.** [`SocketListener::wake`] is best-effort by
+    /// construction: it connects only while the file at the path is still
+    /// this listener's socket, so a socket replaced under a running daemon
+    /// leaves nothing to nudge the loop with. A daemon whose only exit was
+    /// that nudge would sit in `accept` for ever and have to be killed.
+    ///
+    /// `poll` first and a **non-blocking** `accept` after it, rather than a
+    /// blocking `accept` on a readable descriptor: readability is not a
+    /// promise that the queued connection is still there, and a peer that
+    /// aborts in between leaves a blocking `accept` parked until the next
+    /// client arrives — which is the hang this method exists to prevent.
+    pub fn accept_within(&self, timeout: Duration) -> std::io::Result<Option<UnixStream>> {
+        let mut watched = libc::pollfd {
+            fd: self.listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: one `pollfd` over a descriptor this struct owns, and the
+        // count matches the array behind the pointer.
+        let ready = unsafe { libc::poll(&mut watched, 1, milliseconds) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            // A signal arriving during the wait is not an accept failure.
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        self.listener.set_nonblocking(true)?;
+        let accepted = self.listener.accept();
+        self.listener.set_nonblocking(false)?;
+        match accepted {
+            Ok((stream, _address)) => {
+                // Darwin's `accept` gives the new socket the listener's
+                // non-blocking flag where Linux's does not, so it is cleared
+                // here rather than left to the platform: every connection
+                // this daemon serves is a blocking one.
+                stream.set_nonblocking(false)?;
+                Ok(Some(stream))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Wake a thread blocked in [`SocketListener::accept`] by connecting once
     /// and closing. Unlinking the path does **not** wake an `accept`, and
     /// there is no portable interrupt for one, so the shutdown path connects

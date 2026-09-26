@@ -415,11 +415,68 @@ pub(crate) fn dispatch(
                     return Ok(());
                 }
             }
-            ServerInput::InputClosed => return Ok(()),
+            ServerInput::InputClosed => {
+                return settle(server, &mut subscriptions, &mailbox, outputs);
+            }
             ServerInput::FatalInput(message) => return Err(message),
         }
     }
     Ok(())
+}
+
+/// How long a dispatcher whose input has ended goes on taking notices before
+/// it leaves. It ends sooner than this whenever the notice path has closed,
+/// which is what a shutdown makes happen, so this bound is only ever paid by
+/// a single connection closing under a daemon that runs on.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// End of input is not quite the end of the connection.
+///
+/// The reader and the notice forwarder are two senders on one queue, so
+/// nothing orders the reader's `InputClosed` against a notice that is already
+/// on its way. The shutdown's `runtime_state_changed { stopped }` is exactly
+/// such a notice — offered to every inbox a moment before every read half is
+/// closed — so returning the instant `InputClosed` arrives drops it on
+/// whichever connection lost that race, and a client is told nothing about a
+/// daemon that is going away. It is a race a loaded machine loses in earnest:
+/// it was observed under a full parallel test run, not reasoned about.
+///
+/// So the dispatcher settles. It keeps taking notices until the queue closes
+/// — which the shutdown causes, by closing every inbox, so each forwarder
+/// hands over what it holds and then ends — or until [`SETTLE`] has passed
+/// with nothing further, which is the ordinary case of one client
+/// disconnecting while the daemon runs on. The bound is on the whole settle
+/// and not on each wait, so a vault committing generations in a tight loop
+/// cannot keep a closed connection alive by feeding it.
+fn settle(
+    server: &Server,
+    subscriptions: &mut SubscriptionRegistry,
+    mailbox: &Receiver<ServerInput>,
+    outputs: &SyncSender<OutputEnvelope>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + SETTLE;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        match mailbox.recv_timeout(left) {
+            Ok(ServerInput::Notice(notice)) => {
+                server.sweep_snapshots();
+                subscriptions.enqueue_notice(*notice);
+                if !drain(subscriptions, outputs) {
+                    return Ok(());
+                }
+            }
+            Ok(ServerInput::FatalInput(message)) => return Err(message),
+            // A request cannot follow `InputClosed` — they share one sender,
+            // which is FIFO — and `InputClosed` is the reader's last word, so
+            // neither arm has anything left to answer.
+            Ok(_) => {}
+            // Timed out, or every sender is gone. Both are the end.
+            Err(_) => return Ok(()),
+        }
+    }
 }
 
 /// Hand every queued event to the writer. `false` means the writer is gone,
@@ -683,6 +740,244 @@ mod tests {
             0,
             "and the sessions it owned must be closed, or their WAL frames \
              are pinned for the life of the process"
+        );
+        server.shutdown();
+    }
+
+    /// A notice that arrives **after** end of input is still delivered.
+    ///
+    /// This is the rule the shutdown rests on. `Service::stop` offers
+    /// `runtime_state_changed { stopped }` to every connection and then closes
+    /// every read half, and those two reach the dispatcher on different
+    /// senders of one queue — so on a loaded machine the end of input can
+    /// arrive first. A dispatcher that returned there would leave the client
+    /// with no word at all about the daemon going away, which is exactly what
+    /// a full parallel test run produced before the settle existed.
+    ///
+    /// The ordering here is structural rather than timed. The reader sends
+    /// its one request and then `InputClosed`, back to back on the same
+    /// sender, so by the time the *response* has been written the
+    /// `InputClosed` is certainly already queued. The notice is sent only
+    /// after the test has seen that response, so it is certainly behind the
+    /// `InputClosed` in the queue — and only a dispatcher that keeps taking
+    /// notices past end of input can ever see it.
+    #[test]
+    fn a_notice_that_arrives_after_end_of_input_is_still_delivered() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = std::sync::Arc::new(server(&vault, &index));
+        let answered = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let (notices, inbox) = std::sync::mpsc::channel();
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("settle-under-test".into())
+            .spawn({
+                let server = std::sync::Arc::clone(&server);
+                let answered = answered.clone();
+                move || {
+                    let outcome = serve(
+                        &server,
+                        ConnectionId::for_test(7),
+                        io::BufReader::new(io::Cursor::new(
+                            br#"{"version":1,"id":"s","request":{"method":"subscribe_events","params":{}}}
+"#
+                            .to_vec(),
+                        )),
+                        answered,
+                        Some(inbox),
+                        ThreadLabels::for_connection("settle"),
+                        || {},
+                    );
+                    let _ = done.send(outcome);
+                }
+            })
+            .expect("start the connection");
+
+        let written = |sink: &SharedSink| {
+            String::from_utf8(sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("utf-8 answers")
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !written(&answered).contains(r#""id":"s""#) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the subscription was never answered: {}",
+                written(&answered)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Behind `InputClosed` in the queue, for the reason above.
+        notices
+            .send(RuntimeNotice::State {
+                generation: None,
+                state: LiveState::Stopped,
+                error: None,
+            })
+            .expect("the connection is still taking notices");
+        // End of notices, which is what a real shutdown does straight after
+        // its offer, and what lets the settle finish at once rather than wait
+        // its bound out.
+        drop(notices);
+
+        finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("serve returned")
+            .expect("the connection ended cleanly");
+        assert!(
+            written(&answered).contains("runtime_state_changed"),
+            "a notice queued behind end of input must still reach the client: \
+             the shutdown's `stopped` is exactly such a notice, and losing it \
+             tells a client nothing about a daemon that is going away. Written: {}",
+            written(&answered)
+        );
+        server.shutdown();
+    }
+
+    /// `drop(outputs)` must precede `after_dispatch()`.
+    ///
+    /// Dropping the sender is what ends the writer's `for envelope in outputs`
+    /// loop, which is what lets `write_output` return, which is what drops the
+    /// sink. So a sink whose `Drop` signals, plus an `after_dispatch` that
+    /// waits for that signal, is exactly the shape that distinguishes the two
+    /// orders: in the right one the signal has already arrived, and in the
+    /// wrong one it can never arrive, because the drop is queued behind the
+    /// closure that is waiting for it.
+    ///
+    /// This became load-bearing with the bounded shutdown drain: an
+    /// `after_dispatch` that waits on anything the writer must finish first is
+    /// a deadlock, and the five-second budget would report it as a slow client.
+    #[test]
+    fn the_output_sender_is_dropped_before_after_dispatch_runs() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        /// A sink that says when it is dropped — which is when `write_output`
+        /// returned, which is when the output channel closed.
+        struct SignallingSink(Arc<(Mutex<bool>, Condvar)>);
+        impl Write for SignallingSink {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for SignallingSink {
+            fn drop(&mut self) {
+                let (finished, waiters) = &*self.0;
+                *finished.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                waiters.notify_all();
+            }
+        }
+
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let signal = Arc::new((Mutex::new(false), Condvar::new()));
+        let waited = Arc::new(Mutex::new(false));
+
+        let outcome = serve(
+            &server,
+            crate::broadcast::ConnectionId::STANDALONE,
+            // One request line, then end of input, so the dispatcher has
+            // something to hand the writer and then returns.
+            io::Cursor::new(
+                br#"{"version":1,"id":"h","request":{"method":"health"}}
+"#
+                .to_vec(),
+            ),
+            SignallingSink(Arc::clone(&signal)),
+            None,
+            ThreadLabels::for_connection("teardown-order"),
+            {
+                let signal = Arc::clone(&signal);
+                let waited = Arc::clone(&waited);
+                move || {
+                    let (finished, waiters) = &*signal;
+                    let mut done = finished.lock().unwrap_or_else(|error| error.into_inner());
+                    let deadline = std::time::Duration::from_secs(5);
+                    while !*done {
+                        let (guard, timed_out) = waiters
+                            .wait_timeout(done, deadline)
+                            .unwrap_or_else(|error| error.into_inner());
+                        done = guard;
+                        assert!(
+                            !timed_out.timed_out() || *done,
+                            "after_dispatch ran before the output sender was dropped, so the \
+                             writer can never finish: this teardown order deadlocks under the \
+                             bounded shutdown drain"
+                        );
+                    }
+                    *waited.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                }
+            },
+        );
+
+        assert!(outcome.is_ok(), "the connection ended cleanly: {outcome:?}");
+        assert!(
+            *waited.lock().unwrap_or_else(|error| error.into_inner()),
+            "the closure ran at all, so the assertion inside it was reached"
+        );
+        server.shutdown();
+    }
+
+    /// `drop(inputs)` must precede the dispatch call.
+    ///
+    /// The dispatcher normally exits through an explicit `return` on
+    /// `InputClosed` or `FatalInput`, so its own live sender is never observed
+    /// — which is why Task 1's review could remove the drop and see 173 green
+    /// tests. The one shape that observes it is a reader that ends **without**
+    /// announcing it: a panicking reader thread drops its sender on the unwind
+    /// and sends nothing, so with no notice forwarder the dispatcher's own
+    /// clone is the only sender left. Dropped, the mailbox closes and `serve`
+    /// returns; kept, `mailbox.recv()` blocks for ever and the daemon hangs on
+    /// a connection that is already gone.
+    #[test]
+    fn the_input_sender_is_dropped_so_a_reader_that_dies_silently_still_ends_the_connection() {
+        /// A reader whose first `fill_buf` panics, standing in for any reader
+        /// that stops without sending `InputClosed`.
+        struct PanickingReader;
+        impl io::Read for PanickingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                panic!("this reader dies without announcing end of input");
+            }
+        }
+
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        // Behind an `Arc` so the call can run on a thread this test does not
+        // join: `serve` takes `&Server`, and `Arc<Server>` derefs to it. A
+        // scoped thread would not do — its scope's exit is itself a join, and
+        // joining is the thing that hangs when the drop is missing.
+        let server = std::sync::Arc::new(server(&vault, &index));
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("teardown-input-drop".into())
+            .spawn({
+                let server = std::sync::Arc::clone(&server);
+                move || {
+                    let outcome = serve(
+                        &server,
+                        crate::broadcast::ConnectionId::STANDALONE,
+                        io::BufReader::new(PanickingReader),
+                        io::sink(),
+                        None,
+                        ThreadLabels::for_connection("silent-reader"),
+                        || {},
+                    );
+                    let _ = done.send(outcome.is_ok());
+                }
+            })
+            .expect("start the worker thread");
+
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "serve never returned after its reader died silently: the dispatcher's own input \
+             sender was not dropped, so its mailbox can never close"
         );
         server.shutdown();
     }

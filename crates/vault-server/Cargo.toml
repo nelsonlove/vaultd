@@ -44,4 +44,8 @@ vault-watch = { path = "../vault-watch" }
 xdg.workspace = true
 
 [dev-dependencies]
+# An integration test is its own crate, so the normal dependency above does
+# not reach it. `tests/socket_lifecycle.rs` sends SIGTERM to the daemon it
+# spawned.
+libc.workspace = true
 tempfile.workspace = true
