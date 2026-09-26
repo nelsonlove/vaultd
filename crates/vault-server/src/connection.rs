@@ -248,7 +248,30 @@ fn forward_notices(notices: Receiver<RuntimeNotice>, inputs: SyncSender<ServerIn
 
 /// The only code that serializes an envelope or writes a byte to this
 /// connection's stream. Stops at the first write failure and reports it.
-fn write_output(mut sink: impl Write, outputs: Receiver<OutputEnvelope>) -> io::Result<()> {
+///
+/// **The sink is buffered here, for every transport.** `serde_json::to_writer`
+/// writes its output in fragments — a brace, a key, a comma — so an unbuffered
+/// sink turns one response into one `write(2)` per fragment: a 902-byte
+/// `get_note` answer reached a socket client in 15 chunks and cost 0.145 ms
+/// more than the same answer over stdio, which was measured in
+/// `docs/performance/vaultd-socket-transport-baseline.md` and is the whole of
+/// that document's one missed target. Stdio never paid it because
+/// `std::io::stdout()` is internally line-buffered; a socket's `UnixStream`
+/// buffers nothing at all. Wrapping the sink *here* rather than at one caller
+/// is what makes the two doors identical, and what makes a third door correct
+/// by construction.
+///
+/// **The explicit flush is load-bearing and is not the buffer's own.** A
+/// `BufWriter` flushes when it is full or dropped, neither of which is "when a
+/// response is ready", so without the `flush()` below a client would wait on
+/// bytes the daemon considers sent. The guarantee is unchanged from the
+/// unbuffered version — one flush per envelope, one writer thread, so nothing
+/// tears and nothing is held back — and the buffer only changes how many
+/// syscalls that one flush costs. An envelope larger than the buffer still
+/// leaves in more than one write, which is the buffer doing its job rather
+/// than failing at it.
+fn write_output(sink: impl Write, outputs: Receiver<OutputEnvelope>) -> io::Result<()> {
+    let mut sink = io::BufWriter::new(sink);
     for envelope in outputs {
         match envelope {
             OutputEnvelope::Response(response) => serde_json::to_writer(&mut sink, &response)?,
@@ -518,13 +541,101 @@ fn drain(subscriptions: &mut SubscriptionRegistry, outputs: &SyncSender<OutputEn
 /// two arms can be told apart.
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use vault_index::{IndexConfig, LiveState};
-    use vault_protocol::{OpenSnapshotParams, RefreshIndexParams};
+    use vault_protocol::{OpenSnapshotParams, RefreshIndexParams, Response};
 
     use super::*;
     use crate::runtime::RuntimeOptions;
+
+    /// A sink that counts what reaches the operating system.
+    ///
+    /// `write` is one syscall's worth and `flush` is one boundary, so the two
+    /// tallies are exactly the thing
+    /// `docs/performance/vaultd-socket-transport-baseline.md` measured from
+    /// the client's side as chunks per response.
+    #[derive(Clone, Default)]
+    struct Counting(Arc<Mutex<Tally>>);
+
+    #[derive(Default)]
+    struct Tally {
+        writes: usize,
+        flushes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Counting {
+        fn tally(&self) -> std::sync::MutexGuard<'_, Tally> {
+            self.0.lock().expect("the tally is never poisoned")
+        }
+    }
+
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut tally = self.tally();
+            tally.writes += 1;
+            tally.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.tally().flushes += 1;
+            Ok(())
+        }
+    }
+
+    /// One envelope leaves as **one** write and one flush, however many
+    /// fragments `serde_json` serialized it in.
+    ///
+    /// This is the pin for the write buffer in [`write_output`]. A health
+    /// envelope is a dozen or so serde fragments, and without the buffer each
+    /// of them is its own `write` — which is what a socket client measured as
+    /// 15 chunks for one `get_note` answer and 0.145 ms of avoidable latency.
+    /// Remove the `BufWriter` and `writes` goes to the fragment count while
+    /// `bytes` stays identical: the bug was never about the bytes.
+    ///
+    /// The second envelope is here so that "one flush per envelope" cannot be
+    /// satisfied by a writer that batches both lines into one flush at the
+    /// end — a client waiting on the first answer must not wait for the
+    /// second request to produce one.
+    #[test]
+    fn one_envelope_leaves_the_daemon_as_one_write_and_one_flush() {
+        let sink = Counting::default();
+        let (outputs, pending) = sync_channel(4);
+        let first = ResponseEnvelope::success("h-1", Response::health("vaultd"));
+        let second = ResponseEnvelope::success("h-2", Response::health("vaultd"));
+        outputs
+            .send(OutputEnvelope::Response(Box::new(first.clone())))
+            .expect("queue the first envelope");
+        outputs
+            .send(OutputEnvelope::Response(Box::new(second.clone())))
+            .expect("queue the second envelope");
+        drop(outputs);
+
+        write_output(sink.clone(), pending).expect("write both envelopes");
+
+        let tally = sink.tally();
+        assert_eq!(
+            tally.writes, 2,
+            "one write per envelope, not one per fragment"
+        );
+        assert_eq!(
+            tally.flushes, 2,
+            "one flush per envelope, not one at the end"
+        );
+        let expected = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).expect("serialize the first"),
+            serde_json::to_string(&second).expect("serialize the second"),
+        );
+        assert_eq!(
+            String::from_utf8(tally.bytes.clone()).expect("the output is UTF-8"),
+            expected,
+            "the bytes on the wire are unchanged by the buffer",
+        );
+    }
 
     fn envelope(id: &str, request: Request) -> RequestEnvelope {
         RequestEnvelope {

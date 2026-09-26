@@ -15,9 +15,18 @@
  * larger vault to the stalled peer. This run therefore takes four samples:
  * `alone` before anything is written, `control` after the same write volume
  * with nobody stalled, `beside` with the peer stalled, and `recovered` with
- * the peer reading again at the same vault size. `ratio` is `beside` over
- * `recovered` — the pair that differs in the stall alone — and the others are
- * reported beside it rather than folded into it.
+ * the peer reading again at the same vault size.
+ *
+ * **`ratio` is `beside` over `control`.** `recovered` looks like the tighter
+ * control — same vault size, one variable changed — and it is reported as
+ * `ratio_against_recovered`, but it is measured while the daemon is still
+ * settling from handing the peer its whole backlog at once: its samples start
+ * around 2.5 ms and decay for a hundred-odd requests, so its p50 lands wherever
+ * the decay happened to be when the window closed and moves by a factor of 1.6
+ * between runs that are otherwise identical. `control` is taken on a settled
+ * daemon after the same write volume, and it is stable to about 2 percent
+ * across runs, which is what makes it the honest single-client value. Both are
+ * in the output; the run prints both.
  *
  *     node host/scripts/socket-transport-isolation.js \
  *       --vault target/tmp/t7-bench/vault --index target/tmp/t7-bench/iso.sqlite3 \
@@ -242,10 +251,11 @@ async function measureRun(options, run) {
       control_p50_ms: median(control),
       beside_stalled_peer_p50_ms: median(beside),
       recovered_p50_ms: median(recovered),
-      // The isolation number: the stalled case against the same daemon at the
-      // same vault size with the peer reading again.
-      ratio: median(beside) / median(recovered),
-      ratio_against_control: median(beside) / median(control),
+      // The isolation number: the stalled case against a settled daemon after
+      // the same write volume with nobody stalled. See the header for why the
+      // same-vault-size pair is the secondary one and not this.
+      ratio: median(beside) / median(control),
+      ratio_against_recovered: median(beside) / median(recovered),
       ratio_against_first_measurement: median(beside) / median(alone),
       churn_ratio: median(control) / median(alone),
       alone_ms: alone,
@@ -321,7 +331,8 @@ async function main() {
       `  first p50 ${report.alone_p50_ms.toFixed(3)} ms  control p50 ${report.control_p50_ms.toFixed(3)} ms` +
         `  beside a stalled peer ${report.beside_stalled_peer_p50_ms.toFixed(3)} ms` +
         `  recovered p50 ${report.recovered_p50_ms.toFixed(3)} ms` +
-        `  ratio ${report.ratio.toFixed(3)}  stall ${report.stall.engaged ? "engaged" : "DID NOT ENGAGE"}` +
+        `  ratio ${report.ratio.toFixed(3)} (against recovered ${report.ratio_against_recovered.toFixed(3)})` +
+        `  stall ${report.stall.engaged ? "engaged" : "DID NOT ENGAGE"}` +
         ` (${String(report.stall.peer_lines_seen_after_resume)} of ${String(report.stall.generations_committed)} events kept)` +
         `  load ${report.environment.load_average_after[0].toFixed(2)}\n`,
     );
@@ -335,7 +346,7 @@ async function main() {
     median_beside_stalled_peer_p50_ms: median(runs.map((run) => run.beside_stalled_peer_p50_ms)),
     median_recovered_p50_ms: median(runs.map((run) => run.recovered_p50_ms)),
     median_ratio: median(runs.map((run) => run.ratio)),
-    median_ratio_against_control: median(runs.map((run) => run.ratio_against_control)),
+    median_ratio_against_recovered: median(runs.map((run) => run.ratio_against_recovered)),
     median_churn_ratio: median(runs.map((run) => run.churn_ratio)),
     every_run_stalled: runs.every((run) => run.stall.engaged),
     runs,
