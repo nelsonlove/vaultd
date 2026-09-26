@@ -306,7 +306,7 @@ fn the_socket_transport_is_documented_where_its_users_look() {
             "mode `0600`",
             "connection-scoped",
             "bounded at five seconds",
-            "runtime_recovered",
+            "256 deep",
         ],
     );
     assert_document_contains(
