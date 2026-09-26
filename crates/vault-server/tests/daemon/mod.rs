@@ -20,6 +20,19 @@ use vault_protocol::{EventEnvelope, ResponseEnvelope};
 /// not to assert anything about timing.
 pub const LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Which door a run goes through. Lives here rather than in `socket/mod.rs`
+/// because the conformance test names one enum and picks a harness from it.
+///
+/// Allowed dead for the reason every other helper in this file is: the module
+/// compiles into each test binary separately, and only
+/// `tests/conformance.rs` parameterizes itself by transport.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Transport {
+    Stdio,
+    Socket,
+}
+
 pub struct Daemon {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -107,6 +120,11 @@ impl Daemon {
     }
 
     /// The next *response* line, skipping any events that interleave.
+    ///
+    /// Allowed dead for this file's usual reason: `tests/conformance.rs`
+    /// compares raw bytes and so reaches only [`Daemon::call_raw`], which does
+    /// not go through here.
+    #[allow(dead_code)]
     pub fn response(&mut self) -> ResponseEnvelope {
         loop {
             let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
@@ -176,6 +194,9 @@ impl Daemon {
 
     /// Send one request line and return its response — the ordinary shape,
     /// for a test that is not deliberately pipelining.
+    ///
+    /// Allowed dead for the same reason as [`Daemon::response`] above.
+    #[allow(dead_code)]
     pub fn call(&mut self, line: &str) -> ResponseEnvelope {
         self.send(line);
         self.response()
@@ -204,6 +225,27 @@ impl Daemon {
             }
             self.events.push(raw);
         }
+    }
+
+    /// Every event line this daemon has written and no call has claimed, plus
+    /// whatever is still in flight after a short settle.
+    ///
+    /// The settle is a real wait rather than a rendezvous, and it is the one
+    /// in this file: the events being collected are the tail of a mutation
+    /// that has already been answered, so there is no observable state to wait
+    /// on — only "has the writer got to them yet". It is bounded and it can
+    /// only produce a **short** transcript, never a wrong one, and a short
+    /// transcript fails the length assertion loudly.
+    #[allow(dead_code)]
+    pub fn drain_events(&mut self) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            match self.lines.recv_timeout(Duration::from_millis(50)) {
+                Ok(raw) => self.events.push(raw),
+                Err(_) => continue,
+            }
+        }
+        std::mem::take(&mut self.events)
     }
 
     /// Close stdin and wait. The daemon must exit rather than hang.

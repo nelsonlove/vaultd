@@ -308,6 +308,47 @@ impl Client {
         self.response()
     }
 
+    /// The next response line, as the bytes the daemon wrote.
+    ///
+    /// The twin of `daemon::Daemon::call_raw`, duplicated rather than shared
+    /// because the two harnesses are two crates' worth of different plumbing
+    /// around the same two questions, and a shared trait here would couple the
+    /// thing being compared to the thing comparing it.
+    pub fn call_raw(&mut self, line: &str) -> String {
+        self.send(line);
+        loop {
+            let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(raw) => raw,
+                Err(RecvTimeoutError::Timeout) => panic!("no response within {LINE_TIMEOUT:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the daemon closed the connection"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("a JSON line");
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"))
+            {
+                return raw;
+            }
+            self.events.push(raw);
+        }
+    }
+
+    /// Every event line this connection has been sent and no call has claimed,
+    /// plus whatever is still in flight after a short settle. The twin of
+    /// `daemon::Daemon::drain_events`, with the same bound and the same
+    /// reasoning: a slow writer can only make this transcript short, and a
+    /// short transcript fails the length assertion loudly.
+    pub fn drain_events(&mut self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match self.lines.recv_timeout(Duration::from_millis(50)) {
+                Ok(raw) => self.events.push(raw),
+                Err(_) => continue,
+            }
+        }
+        std::mem::take(&mut self.events)
+    }
+
     /// Wait for the first event satisfying `wanted`, including events already
     /// stepped over by an earlier [`Client::response`].
     pub fn wait_for_event(&mut self, wanted: impl Fn(&EventEnvelope) -> bool) -> EventEnvelope {

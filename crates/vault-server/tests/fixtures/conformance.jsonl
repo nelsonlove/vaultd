@@ -1,0 +1,27 @@
+# Envelope and version handling.
+{"version":1,"id":"c01","request":{"method":"health"}}
+{"version":99,"id":"c02","request":{"method":"health"}}
+{"version":1,"id":"c03","request":{"method":"no_such_method"}}
+# Bring the index up, then read the vault's shape.
+{"version":1,"id":"c04","request":{"method":"refresh_index","params":{}}}
+{"version":1,"id":"c05","request":{"method":"get_vault_info"}}
+{"version":1,"id":"c06","request":{"method":"list_notes","params":{"limit":2}}}
+{"version":1,"id":"c07","request":{"method":"get_note","params":{"path":"One.md"}}}
+{"version":1,"id":"c08","request":{"method":"get_tree_entries","params":{"paths":["One.md","Missing.md"]}}}
+{"version":1,"id":"c09","request":{"method":"read_dir","params":{"path":""}}}
+# Refusals, each of which must read identically through either door.
+{"version":1,"id":"c10","request":{"method":"get_note","params":{"path":"Nowhere.md"}}}
+{"version":1,"id":"c11","request":{"method":"get_note","params":{"path":"../escape.md"}}}
+{"version":1,"id":"c12","request":{"method":"list_notes","params":{"limit":0}}}
+# A subscription, a write, and the events the write produces.
+{"version":1,"id":"c13","request":{"method":"subscribe_events","params":{}}}
+{"version":1,"id":"c14","request":{"method":"write_note","params":{"path":"Two.md","content":"# Two\n\n[[One]]\n","expected":{"absent":true}}}}
+{"version":1,"id":"c15","request":{"method":"patch_frontmatter","params":{"path":"Two.md","patch":[{"key_path":"a","value":{"zebra":1,"apple":2}}],"expected":{"any":true}}}}
+{"version":1,"id":"c16","request":{"method":"unsubscribe","params":{"subscription_id":"sub-1"}}}
+{"version":1,"id":"c17","request":{"method":"unsubscribe","params":{"subscription_id":"sub-1"}}}
+# A snapshot session, paged and closed.
+{"version":1,"id":"c18","request":{"method":"open_snapshot","params":{}}}
+{"version":1,"id":"c19","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1","limit":10}}}
+{"version":1,"id":"c20","request":{"method":"snapshot_notes","params":{"snapshot_id":"snap-1","limit":10}}}
+{"version":1,"id":"c21","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}
+{"version":1,"id":"c22","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}
