@@ -7,19 +7,24 @@
  * clean `SIGTERM` — is `test/main-real-daemon.test.ts`.
  */
 
-import { resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { socketPathFor } from "../src/config";
+import { defaultHostConfig, socketPathFor } from "../src/config";
+import { scratchRoot } from "./scratch";
+import type { HostConfig } from "../src/config";
 
 import {
   CliRefusal,
   EXIT_CONFIG_DIR_REFUSED,
+  EXIT_DAEMON_UNREACHABLE,
   EXIT_OK,
   EXIT_USAGE,
   USAGE,
   main,
   parseArgs,
+  runHost,
 } from "../src/main";
 
 describe("vaultd-host argument parsing", () => {
@@ -51,6 +56,8 @@ describe("vaultd-host argument parsing", () => {
       "--vaultd", "/opt/vaultd",
       "--dry-run",
       "--dry-run-allow-network",
+      "--engine", "connect",
+      "--leave-engine-running",
       "--force-shared", "alpha",
       "--force-shared", "beta",
     ]);
@@ -59,7 +66,59 @@ describe("vaultd-host argument parsing", () => {
     expect(config.vaultdBinary).toBe("/opt/vaultd");
     expect(config.dryRun).toBe(true);
     expect(config.dryRunAllowNetwork).toBe(true);
+    expect(config.engine).toBe("connect");
+    expect(config.leaveEngineRunning).toBe(true);
     expect(config.forceShared).toEqual(["alpha", "beta"]);
+    // Every flag asserted above is advertised, which is what makes this case a
+    // test of the interface rather than of the parser alone.
+    for (const flag of ["--engine", "--leave-engine-running"]) expect(USAGE).toContain(flag);
+  });
+
+  it("defaults the engine to auto and keeps the daemon this host spawns", () => {
+    const { config } = parseArgs(["--vault", "/tmp/vault"]);
+    expect(config.engine).toBe("auto");
+    expect(config.leaveEngineRunning).toBe(false);
+  });
+
+  it("refuses an --engine mode it does not have", () => {
+    let thrown: unknown;
+    try {
+      parseArgs(["--vault", "/tmp/vault", "--engine", "adopt"]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CliRefusal);
+    expect((thrown as CliRefusal).code).toBe(EXIT_USAGE);
+    expect((thrown as CliRefusal).message).toContain("auto, connect or spawn");
+  });
+
+  it("answers exit 3 when --engine connect finds nothing listening", async () => {
+    // The mode's whole promise, and the one the config's doc comment makes:
+    // `connect` never spawns, so an absent daemon is *the* failure it has, and
+    // it must arrive as the documented code rather than as a stack trace. No
+    // daemon binary is involved — that is the point.
+    const root = scratchRoot("main-connect-");
+    const vault = join(root, "v");
+    mkdirSync(vault, { recursive: true });
+    const config: HostConfig = {
+      ...defaultHostConfig(vault),
+      dataDir: join(root, "state"),
+      socketPath: join(root, "state", "host.sock"),
+      engine: "connect",
+      engineSocketPath: join(root, "nobody.sock"),
+      // The ladder is climbed and exhausted here on purpose; the real rungs
+      // would be nine seconds of waiting for an answer already known.
+      restartBackoffMs: [1, 1],
+    };
+    let thrown: unknown;
+    try {
+      await runHost(config);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CliRefusal);
+    expect((thrown as CliRefusal).code).toBe(EXIT_DAEMON_UNREACHABLE);
+    expect((thrown as CliRefusal).message).toMatch(/no vaultd is listening/i);
   });
 
   it("refuses a missing --vault, an unknown flag and a flag with no value, all as usage errors", () => {

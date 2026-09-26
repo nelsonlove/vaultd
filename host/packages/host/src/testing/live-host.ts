@@ -134,6 +134,12 @@ export class LiveHost {
     const dataDir = scratchVault("hs-");
     const config: HostConfig = {
       ...defaultHostConfig(spec.vaultRoot),
+      // **A live case owns its daemon.** Under `auto` this host would bind an
+      // engine socket in the developer's own XDG run directory and leave a
+      // shareable daemon behind it; a golden is about a plugin, not about the
+      // engine's provenance. `test/real-daemon.ts` carries the whole note, and
+      // `spec.config` below can still ask for another mode.
+      engine: "spawn",
       dataDir,
       socketPath: join(dataDir, "s"),
       vaultdBinary: liveBinary(),

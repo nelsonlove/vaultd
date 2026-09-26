@@ -62,6 +62,9 @@ function realVaultFor(files: Record<string, string>): HostConfig {
   const index = join(root, "index.db");
   return {
     ...defaultHostConfig(vault),
+    // Phase 6's road, pinned: this case owns its daemon. See the note in
+    // `real-daemon.ts` on why a test never runs under `auto`.
+    engine: "spawn" as const,
     vaultdBinary: BINARY,
     vaultdArgs: ["--vault", vault, "--index", index],
     indexPath: index,

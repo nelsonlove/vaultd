@@ -187,6 +187,9 @@ function configFor(overrides: Partial<HostConfig> = {}): HostConfig {
   const state = scratchRoot("vaultd-wiring-state-");
   return {
     ...defaultHostConfig(vault),
+    // Phase 6's road, pinned: this case owns its daemon. See the note in
+    // `real-daemon.ts` on why a test never runs under `auto`.
+    engine: "spawn" as const,
     vaultdBinary: BINARY,
     dataDir: state,
     socketPath: join(state, "s"),

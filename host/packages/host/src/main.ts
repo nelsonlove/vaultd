@@ -13,15 +13,18 @@
  * {@link DaemonUnreachable} becomes 3, and the GUI overlap report becomes 4.
  *
  * **It names no fs function.** The state directory is reached through
- * {@link DataDir}, the one module allowed to write outside the vault.
+ * {@link DataDir}, the one module allowed to write outside the vault, and the
+ * one read it does of its own — canonicalising the vault root — goes through
+ * `runtime/fs-access`, the seam the write guard watches.
  */
 
 import { resolve } from "node:path";
 
 import { DaemonUnreachable, startHost } from "./host";
+import { realpathSync } from "./runtime/fs-access";
 import { OBSIDIAN_CONFIG_DIR } from "./pluginset/config-dir";
 import { defaultHostConfig, socketPathFor, systemClock } from "./config";
-import type { HostConfig } from "./config";
+import type { EngineMode, HostConfig } from "./config";
 import type { RunningHost } from "./host";
 
 /** What `--help` prints, and the whole of this binary's interface. */
@@ -41,6 +44,12 @@ Options:
                             refuse the file system, process spawning and the
                             network to plugin bundles.
   --dry-run-allow-network   Under --dry-run, let requestUrl through anyway.
+  --engine <mode>           auto (default): connect to a vaultd already listening
+                            for this vault, else spawn one with --listen.
+                            connect: never spawn; exit 3 if none is listening.
+                            spawn: always spawn, never probe, and own its life.
+  --leave-engine-running    Under --engine auto, leave a daemon this host
+                            spawned running when the host shuts down.
   --force-shared <id>       Run <id> even though the GUI has it enabled too.
                             Repeatable.
   -h, --help                Print this and exit 0.
@@ -100,6 +109,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   let vaultdBinary: string | null = null;
   let dryRun = false;
   let dryRunAllowNetwork = false;
+  let engine: EngineMode | null = null;
+  let leaveEngineRunning = false;
   const forceShared: string[] = [];
 
   const valueOf = (flag: string, at: number): string => {
@@ -138,6 +149,18 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       case "--dry-run-allow-network":
         dryRunAllowNetwork = true;
         break;
+      case "--engine": {
+        const value = valueOf(flag, at);
+        if (value !== "auto" && value !== "connect" && value !== "spawn") {
+          throw new CliRefusal(EXIT_USAGE, `--engine must be auto, connect or spawn, not "${value}"`);
+        }
+        engine = value;
+        at += 1;
+        break;
+      }
+      case "--leave-engine-running":
+        leaveEngineRunning = true;
+        break;
       case "--force-shared":
         forceShared.push(valueOf(flag, at));
         at += 1;
@@ -160,13 +183,27 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     );
   }
 
-  // **Absolute, once, here.** The vault root is two things downstream: the
-  // daemon's `--vault` argument and the key the socket digest is derived from.
-  // Left as the operator typed it, one vault reached from two directories is
-  // two different hosts with two different sockets, each believing it is the
+  // **Absolute and canonical, once, here.** The vault root is three things
+  // downstream: the daemon's `--vault` argument, the key the host's own socket
+  // digest is derived from, and the key the *daemon's* socket digest is derived
+  // from. Left as the operator typed it, one vault reached from two directories
+  // is two different hosts with two different sockets, each believing it is the
   // only one — and `./vault` means nothing at all to a daemon spawned with a
   // different working directory.
-  const vaultRoot = resolve(vault);
+  //
+  // **The symlinks matter as much as the relative segments**, and only since
+  // the daemon started listening. `vault_index::canonical_root` realpaths what
+  // `--vault` names, and `vaultdSocketPathFor` hashes the string it is given:
+  // a host that passed `/tmp/vault` where the daemon canonicalised
+  // `/private/tmp/vault` would probe a path no daemon ever binds and so would
+  // spawn a second daemon beside a perfectly good one, every time. So the host
+  // applies the same realpath the daemon does, before any digest is taken.
+  //
+  // A root that does not exist yet is left as the absolute path: `realpath`
+  // has nothing to resolve, the daemon will refuse the vault in a moment for
+  // its own reasons, and a usage error about a missing directory is not this
+  // function's to raise.
+  const vaultRoot = canonical(resolve(vault));
   const base = defaultHostConfig(vaultRoot);
   const config: HostConfig = {
     ...base,
@@ -176,9 +213,25 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     ...(socketPath === null ? { socketPath: socketPathFor(base.dataDir, vaultRoot) } : { socketPath }),
     dryRun,
     dryRunAllowNetwork,
+    ...(engine === null ? {} : { engine }),
+    leaveEngineRunning,
     forceShared,
   };
   return { config, help: false };
+}
+
+/**
+ * `path` with every symlink resolved, or `path` itself when it cannot be.
+ *
+ * Through the fs seam, which is the one door the write guard watches — this
+ * module still names no fs function of its own.
+ */
+function canonical(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
 }
 
 /**

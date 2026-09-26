@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
+import { connect } from "node:net";
 import type { ChildProcess } from "node:child_process";
+import type { Socket } from "node:net";
 
 import { VaultdClient } from "./client/client";
 import { isKnownRuntimeEvent } from "./client/events";
+import { probeEngineSocket } from "./engine-probe";
 import type {
   SubscriptionErrorHandler,
   SubscriptionHandle,
@@ -12,6 +15,15 @@ import type { GetVaultInfoResponse, LiveStateDto, RuntimeEventDto } from "./clie
 import type { HostConfig } from "./config";
 
 export type SupervisorState = "starting" | "running" | "restarting" | "stopped";
+
+/**
+ * Where the current engine came from.
+ *
+ * The two roads differ in **who owns the daemon's life**, and in nothing else
+ * a caller can see: a connected engine answers the same requests, carries the
+ * same subscriptions, and dies through the same {@link EngineLostError} door.
+ */
+export type EngineSource = "spawned" | "connected";
 
 export interface SupervisorEvents {
   /**
@@ -150,8 +162,21 @@ interface Deferred {
 }
 
 interface Engine {
-  readonly child: ChildProcess;
+  /** `null` for an engine this host connected to rather than started. */
+  readonly child: ChildProcess | null;
+  /** The socket, for a connected engine. `null` for a spawned one. */
+  readonly socket: Socket | null;
+  readonly source: EngineSource;
   readonly client: VaultdClient;
+  /**
+   * The door this supervisor closes to end the engine.
+   *
+   * For a spawned engine it is the child's `stdin`, whose closing ends a
+   * daemon that has no listener. For a connected one it is the socket, whose
+   * closing ends **this connection** and leaves the daemon serving everyone
+   * else — which is the whole difference between owning a daemon and using
+   * one.
+   */
   readonly stdin: NodeJS.WritableStream;
   /** Resolves when this engine's runtime announces `watching`. */
   readonly watching: Deferred;
@@ -234,6 +259,19 @@ function describeExit(exit: EngineExit | null): string {
  * only if the child does not take the hint. A `stop()` that lands *inside* a
  * spawn shuts that half-born engine down too, rather than letting the spawn
  * finish and adopt it.
+ *
+ * **There are two roads to an engine, and `config.engine` picks between them.**
+ * `spawn` is the paragraph above, unchanged. `connect` adopts a daemon that is
+ * already listening at `config.engineSocketPath` and never starts one, so its
+ * shutdown closes a connection and leaves the daemon serving everyone else.
+ * `auto` probes that path and takes whichever road answers — connecting when a
+ * daemon is there, and otherwise spawning one **with `--listen`** so the next
+ * client can connect to it in turn. A daemon with a listener no longer ends
+ * when its stdin closes, so an `auto` host that spawned one sends it `SIGTERM`
+ * at shutdown, unless `config.leaveEngineRunning` says to leave it for the
+ * next client. Downstream nothing changes: a connected engine is an
+ * {@link Engine}, its socket ending is the same event a child's exit was, and
+ * {@link engineSource} is the only way to tell which road was taken.
  *
  * **Readiness has two meanings and this class exposes both, because conflating
  * them is how a host starts driving a runtime that is still catching up.**
@@ -356,9 +394,20 @@ export class Supervisor {
     return this.engine.client;
   }
 
-  /** The current engine's pid, for a test that needs to kill it the hard way. */
+  /**
+   * The current engine's pid, for a test that needs to kill it the hard way.
+   *
+   * `null` for a connected engine as well as for no engine at all: the daemon
+   * behind a connection is another process's child, and this host has no
+   * business signalling it.
+   */
   pid(): number | null {
-    return this.engine?.child.pid ?? null;
+    return this.engine?.child?.pid ?? null;
+  }
+
+  /** Where the current engine came from. `null` before there is one. */
+  engineSource(): EngineSource | null {
+    return this.engine?.source ?? null;
   }
 
   /** The last live state the current engine announced, or `null` before any. */
@@ -496,7 +545,7 @@ export class Supervisor {
     for (let attempt = 0; ; attempt += 1) {
       if (this.stopping) return;
       try {
-        await this.spawnOnce();
+        await this.engineOnce();
         return;
       } catch (thrown) {
         const error = asError(thrown);
@@ -525,6 +574,41 @@ export class Supervisor {
   }
 
   /**
+   * One attempt at an engine, by whichever road the mode names.
+   *
+   * `auto` probes first, because the point of the mode is to prefer a daemon
+   * that already exists: spawning beside one would meet the writer lease and
+   * fail, and spawning *instead* of one is the cold start this phase exists to
+   * stop paying.
+   *
+   * `connect` refuses rather than spawning, and it refuses with an
+   * {@link EngineStartError} — which `startHost` turns into a
+   * `DaemonUnreachable` and the binary into its documented exit code 3, so the
+   * mode's promise is a code a script can branch on rather than a sentence.
+   */
+  private async engineOnce(): Promise<void> {
+    switch (this.config.engine) {
+      case "spawn":
+        return this.spawnOnce();
+      case "connect": {
+        const probe = await probeEngineSocket(this.config.engineSocketPath, this.config.clock);
+        if (!probe.answered) {
+          throw new EngineStartError(
+            `no vaultd is listening at ${this.config.engineSocketPath}, and engine: "connect" never spawns one`,
+            null,
+            "",
+          );
+        }
+        return this.connectOnce();
+      }
+      case "auto": {
+        const probe = await probeEngineSocket(this.config.engineSocketPath, this.config.clock);
+        return probe.answered ? this.connectOnce() : this.spawnOnce();
+      }
+    }
+  }
+
+  /**
    * Spawn one engine and prove it answers.
    *
    * The readiness proof is a `health` round trip rather than a timer: a process
@@ -534,7 +618,15 @@ export class Supervisor {
    * the process's `exit` and the exit code is the half a caller can act on.
    */
   private async spawnOnce(): Promise<void> {
-    const child = spawn(this.config.vaultdBinary, [...this.config.vaultdArgs], {
+    // **`--listen` under `auto`, and only under `auto`.** A daemon this host
+    // spawns in that mode is meant to be shared, which is what makes the next
+    // client's start cheap — and it is also why the host must SIGTERM it at
+    // shutdown, because a listening daemon no longer ends when its stdin
+    // closes. Under `spawn` the daemon has no listener and its life is this
+    // host's stdin, exactly as in phase 6.
+    const args = [...this.config.vaultdArgs];
+    if (this.config.engine === "auto") args.push("--listen", this.config.engineSocketPath);
+    const child = spawn(this.config.vaultdBinary, args, {
       env: { ...process.env, ...this.config.env },
       // stderr is piped and forwarded verbatim to the host's own stderr rather
       // than inherited: the diagnostics still reach the operator, and the tail
@@ -594,6 +686,8 @@ export class Supervisor {
     });
     const engine: Engine = {
       child,
+      socket: null,
+      source: "spawned",
       client,
       stdin,
       watching: deferred(),
@@ -663,6 +757,136 @@ export class Supervisor {
         thrown,
       );
     }
+    await this.adopt(engine, client);
+  }
+
+  /**
+   * Adopt a daemon that is already listening.
+   *
+   * There is no child, so there is no exit to wait for and no stderr to tail:
+   * the only door this engine can leave by is its stream ending, which is the
+   * door {@link EngineLostError} was already built around. Everything after
+   * the readiness probe — the durable subscriptions, the resync debt, the
+   * restart ladder — is identical, which is the reason a connected engine is
+   * an `Engine` rather than a second kind of thing.
+   */
+  private async connectOnce(): Promise<void> {
+    const socket = connect(this.config.engineSocketPath);
+    try {
+      await new Promise<void>((settle, fail) => {
+        socket.once("connect", settle);
+        socket.once("error", fail);
+      });
+    } catch (thrown) {
+      socket.destroy();
+      throw new EngineStartError(
+        `cannot connect to vaultd at ${this.config.engineSocketPath}: ${asError(thrown).message}`,
+        null,
+        "",
+        thrown,
+      );
+    }
+    // The same rule as the spawned engine's stdin: a write into a socket that
+    // has gone away is expected, and the request it belonged to is already
+    // failed by the stream door, so EPIPE is not news.
+    socket.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPIPE" || error.code === "ECONNRESET" || error.code === "ERR_STREAM_DESTROYED") {
+        return;
+      }
+      this.warn(`the engine socket failed: ${error.message}`);
+    });
+
+    // Declared before the client for the same reason the spawned road declares
+    // it there: no callback may name `engine` inside its own dead zone.
+    let self: Engine | null = null;
+    socket.once("end", () => {
+      const engine = self;
+      if (!engine) return;
+      engine.lost = true;
+      engine.client.failAllPending(
+        new EngineLostError(
+          engine.everReady ? "vaultd closed the connection" : "the engine ended before it was ready",
+          () => engine.exit,
+        ),
+      );
+    });
+    const client = new VaultdClient({
+      stdout: socket,
+      stdin: socket,
+      onEvent: () => undefined,
+      onHandlerError: (error) => {
+        this.warn(`a vaultd event handler threw: ${error.message}`);
+      },
+      onFatal: (error) => {
+        const engine = self;
+        if (engine) this.onTransportFatal(engine, error);
+      },
+    });
+    const engine: Engine = {
+      child: null,
+      socket,
+      source: "connected",
+      client,
+      stdin: socket,
+      watching: deferred(),
+      ended: deferred(),
+      everReady: false,
+      lost: false,
+      exited: false,
+      exit: null,
+      escalated: "none",
+      stderrTail: "",
+      subscription: null,
+      opening: null,
+      sawLiveEvent: false,
+      queued: [],
+      buffering: false,
+      shuttingDown: null,
+      failStartup: null,
+    };
+    self = engine;
+    // A closed socket is this engine's whole death. There is no exit code, so
+    // `ended` resolves here and `exit` stays null — which `describeExit`
+    // already words as "for reasons the supervisor never saw".
+    socket.once("close", () => {
+      engine.exited = true;
+      engine.lost = true;
+      engine.ended.resolve();
+      this.onChildExit(engine);
+    });
+
+    const failed = new Promise<never>((_resolve, reject) => {
+      engine.failStartup = reject;
+    });
+    this.spawning = engine;
+    try {
+      await Promise.race([client.request("health"), failed]);
+    } catch (thrown) {
+      this.spawning = null;
+      client.close();
+      socket.destroy();
+      throw new EngineStartError(
+        `the daemon at ${this.config.engineSocketPath} did not answer health`,
+        null,
+        "",
+        thrown,
+      );
+    }
+    // From here the adoption is byte for byte the spawned path's, so the two
+    // roads converge rather than diverging into two lifecycles.
+    await this.adopt(engine, client);
+  }
+
+  /**
+   * The half of a start that is the same on both roads: the stop check, the
+   * readiness latch, the state transition, and the subscription re-open.
+   *
+   * It lives in one place because everything in it is about *this supervisor's*
+   * relationship to an engine that answers, and none of it is about how the
+   * engine came to exist. Two copies would be two chances for the connected
+   * road to miss a rung the spawned one gained.
+   */
+  private async adopt(engine: Engine, client: VaultdClient): Promise<void> {
     if (this.stopping) {
       // The host asked to stop while this engine was being born. Nobody else
       // can see it, so nobody else can shut it down.
@@ -810,7 +1034,11 @@ export class Supervisor {
   private onTransportFatal(engine: Engine, error: Error): void {
     if (engine.exited || engine !== this.engine || this.stopping) return;
     this.lastErrorValue = error;
-    engine.child.kill("SIGKILL");
+    // A spawned engine is killed; a connected one is dropped. Both land on the
+    // same door — the child's `exit` or the socket's `close` — so there is
+    // still one restart mechanism and not two.
+    if (engine.child) engine.child.kill("SIGKILL");
+    else engine.socket?.destroy();
   }
 
   private onChildExit(engine: Engine): void {
@@ -900,6 +1128,26 @@ export class Supervisor {
   }
 
   private runShutdown(engine: Engine): Promise<void> {
+    // **A connected engine is not this host's to end.** Closing the socket
+    // ends this connection; the daemon carries on serving everyone else, which
+    // is exactly what `engine: "connect"` promises. There is no escalation
+    // ladder because there is no process to escalate against — only the one
+    // timer that turns a peer which never closes back into a `destroy`, so a
+    // shutdown always ends.
+    if (engine.source === "connected") return this.disconnect(engine);
+    const child = engine.child;
+    if (!child) return Promise.resolve();
+    // **`leaveEngineRunning` has to skip the whole ladder, not just the first
+    // signal.** A listening daemon does not exit on stdin EOF, so a shutdown
+    // that waited for its exit would escalate to `SIGTERM` at 2 s and
+    // `SIGKILL` at 5 s and kill exactly the daemon the flag said to keep. So
+    // the connection is closed and the daemon is left where the next client
+    // will find it.
+    if (this.config.engine === "auto" && this.config.leaveEngineRunning && !engine.exited) {
+      this.lastExitValue = engine.exit;
+      engine.stdin.end();
+      return Promise.resolve();
+    }
     return new Promise<void>((resolve) => {
       const finish = (): void => {
         for (const timer of timers) this.config.clock.clearTimeout(timer);
@@ -914,17 +1162,43 @@ export class Supervisor {
       const timers: NodeJS.Timeout[] = [
         this.config.clock.setTimeout(() => {
           engine.escalated = "sigterm";
-          engine.child.kill("SIGTERM");
+          child.kill("SIGTERM");
         }, 2_000),
         this.config.clock.setTimeout(() => {
           engine.escalated = "sigkill";
-          engine.child.kill("SIGKILL");
+          child.kill("SIGKILL");
         }, 5_000),
       ];
       // Registered after the listener that records the exit, so by the time
       // this runs `engine.exit` is filled in.
-      engine.child.once("exit", finish);
+      child.once("exit", finish);
+      // **The listener changes what closing stdin means.** A daemon spawned
+      // with `--listen` does not end when its stdin closes — that ends its
+      // connection zero and nothing else — so the host that started it must
+      // say so out loud, at once rather than through the 2 s escalation rung,
+      // which exists for a daemon that is *refusing* to go.
+      if (this.config.engine === "auto") child.kill("SIGTERM");
       engine.stdin.end();
+    });
+  }
+
+  /** End one connection, and never the daemon behind it. */
+  private disconnect(engine: Engine): Promise<void> {
+    const socket = engine.socket;
+    if (!socket || socket.destroyed) {
+      this.lastExitValue = engine.exit;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const timer = this.config.clock.setTimeout(() => {
+        socket.destroy();
+      }, 2_000);
+      socket.once("close", () => {
+        this.config.clock.clearTimeout(timer);
+        this.lastExitValue = engine.exit;
+        resolve();
+      });
+      socket.end();
     });
   }
 

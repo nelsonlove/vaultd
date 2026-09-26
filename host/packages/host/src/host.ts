@@ -48,6 +48,7 @@ import { Mirror } from "./mirror/mirror";
 import { QuarantineTracker } from "./runtime/quarantine";
 import { SchemaLadder } from "./settings/ladder";
 import { Supervisor } from "./supervisor";
+import type { EngineSource } from "./supervisor";
 import { assembleShim } from "./testing/assemble";
 import { installModuleInterception } from "./runtime/intercept";
 import type { HostAssembly } from "./testing/assemble";
@@ -71,6 +72,15 @@ export interface RunningHost {
   readonly socketPath: string;
   /** What `lifecycle.start()` reported. */
   readonly startup: StartupReport;
+  /**
+   * Which road this host's engine came by — it spawned a daemon, or it
+   * connected to one that was already listening.
+   *
+   * A snapshot taken at startup, not a live reading: a restart that had to
+   * spawn after connecting is the supervisor's own story, and
+   * `supervisor.engineSource()` is where a caller asks for the current answer.
+   */
+  readonly engineSource: EngineSource;
   /**
    * The GUI overlap reading taken at startup, **typed**.
    *
@@ -250,6 +260,7 @@ export async function startHost(
     errors: assembly.errors,
     policyRecorder: assembly.policyRecorder,
     liveState: () => supervisor.liveState(),
+    engineSource: () => supervisor.engineSource(),
   });
   server.attachWiring({ broker: assembly.broker, pluginConfig, detector });
 
@@ -311,6 +322,7 @@ export async function startHost(
     server,
     socketPath,
     startup,
+    engineSource: supervisor.engineSource() ?? "spawned",
     overlap,
     stopped: () => stopped,
     stop,

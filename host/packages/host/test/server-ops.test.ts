@@ -597,6 +597,7 @@ describe("host.* operations", () => {
         counters: Record<string, unknown>;
         timers: unknown[];
         unsupported: unknown[];
+        engine: Record<string, unknown>;
       }>("host.info", { refresh: true });
       expect(info.overlap).toMatchObject({
         gui_readable: false,
@@ -609,6 +610,18 @@ describe("host.* operations", () => {
       });
       expect(Array.isArray(info.timers)).toBe(true);
       expect(Array.isArray(info.unsupported)).toBe(true);
+      // **The engine object, in the wire's own spelling.** `source` is null
+      // here and that is the honest answer: this harness drives the host off a
+      // client, with no supervisor to have spawned or connected anything. The
+      // keys are asserted by name because `snake_case` on this socket is a
+      // rule rather than a habit — `server-wire.test.ts` walks the same
+      // payload for camelCase at any depth.
+      expect(info.engine).toEqual({
+        mode: harness.config.engine,
+        source: null,
+        socket_path: harness.config.engineSocketPath,
+        live_state: null,
+      });
     } finally {
       await harness.stop();
     }

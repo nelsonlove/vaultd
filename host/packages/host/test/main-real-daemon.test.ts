@@ -54,9 +54,13 @@ describe.skipIf(!BINARY_EXISTS)("the vaultd-host binary", () => {
     const socketDir = shortSocketDir();
     const socketPath = join(socketDir, "s");
 
+    // `--engine spawn` for the reason `test/real-daemon.ts` gives: the default
+    // `auto` would bind an engine socket under the developer's own XDG run
+    // directory and leave a shareable daemon behind, and this case is about
+    // the binary's ready line and its exit code.
     const child = spawn(
       process.execPath,
-      [MAIN, "--vault", vault, "--vaultd", BINARY, "--socket", socketPath],
+      [MAIN, "--vault", vault, "--vaultd", BINARY, "--socket", socketPath, "--engine", "spawn"],
       {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, XDG_STATE_HOME: state },
@@ -141,7 +145,7 @@ describe.skipIf(!BINARY_EXISTS)("the vaultd-host binary", () => {
 
     const child = spawn(
       process.execPath,
-      [MAIN, "--vault", vault, "--vaultd", BINARY, "--socket", socketPath],
+      [MAIN, "--vault", vault, "--vaultd", BINARY, "--socket", socketPath, "--engine", "spawn"],
       { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, XDG_STATE_HOME: state } },
     );
     const stderr: string[] = [];

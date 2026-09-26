@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { cleanupScratchRoots, scratchRoot } from "./scratch";
-import { probeEngineSocket } from "../src/engine-probe";
+import { PROBE_ID, probeEngineSocket } from "../src/engine-probe";
 import { systemClock, vaultdSocketPathFor } from "../src/config";
 
 afterEach(() => {
@@ -28,13 +28,20 @@ afterEach(() => {
  *
  * `status` is a parameter because "answering is the test, not answering well":
  * an `err` outcome is exactly as alive as an `ok` one.
+ *
+ * `id` is a parameter because `isResponseEnvelope` has **two** reasons to say
+ * yes — an `outcome` object, or the echoed correlation id — and a fixture
+ * carrying both proves neither. A line that carries the outcome and no id
+ * isolates the first branch; the case below it isolates the second.
  */
-function responseLine(status: "ok" | "err"): string {
+function responseLine(status: "ok" | "err", id: "echoed" | "absent" = "echoed"): string {
   const outcome =
     status === "ok"
       ? { status: "ok", value: { type: "health", value: { service: "vaultd", status: "ok" } } }
       : { status: "err", value: { code: "incompatible_version", message: "version 2" } };
-  return `${JSON.stringify({ version: 1, id: "vaultd-probe", outcome })}\n`;
+  const envelope: Record<string, unknown> =
+    id === "echoed" ? { version: 1, id: PROBE_ID, outcome } : { version: 1, outcome };
+  return `${JSON.stringify(envelope)}\n`;
 }
 
 /**
@@ -138,8 +145,30 @@ describe("probeEngineSocket", () => {
     // working daemon's socket to whichever process probed it the day
     // `PROTOCOL_VERSION` moves — the daemon's own `something_answers` keeps
     // this rule and so must this.
+    //
+    // **No echoed id on this line**, so the `outcome` branch is the only thing
+    // that can make it true: with both halves present, a mutation deleting the
+    // outcome branch passed this case anyway.
     const server = await listenAt("p-err-", (socket) => {
-      socket.once("data", () => socket.write(responseLine("err")));
+      socket.once("data", () => socket.write(responseLine("err", "absent")));
+    });
+    try {
+      const result = await probeEngineSocket(server.path, systemClock(), 2_000);
+      expect(result.answered).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("answers true for the echoed id alone, whatever shape the rest is", async () => {
+    // The other branch, isolated: a future envelope may rename or nest its
+    // outcome, and the correlation id is the part the protocol can least
+    // afford to change — so a line that echoes it is a daemon answering, and
+    // this case fails if that branch is ever dropped.
+    const server = await listenAt("p-id-", (socket) => {
+      socket.once("data", () =>
+        socket.write(`${JSON.stringify({ version: 2, id: PROBE_ID, reply: "health" })}\n`),
+      );
     });
     try {
       const result = await probeEngineSocket(server.path, systemClock(), 2_000);
