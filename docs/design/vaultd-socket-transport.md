@@ -87,7 +87,7 @@ The host's own socket (`host.sock`, nonce-gated, 24 operations) is unchanged. It
 - Connection setup, from `connect()` to the first `get_health` answer, under 5 ms p50 on the development laptop.
 - Round trip over the socket within 10 percent of the same request over stdio, measured on `get_note` warm and on one `write_note` (the baseline harness gains a `--transport socket|stdio` switch).
 - Slow-client isolation: with one client that has stopped reading, a second client's `get_note` p50 is within 10 percent of its single-client value, and the stalled client receives `runtime_recovered` when it resumes.
-- No new thread per connection beyond the three the stdio loop already has (reader, writer, dispatcher; the forwarder is replaced by the broadcaster's queue).
+- No new thread per connection beyond the four the stdio loop already has (reader, forwarder, writer, dispatcher): the forwarder now feeds the dispatcher from that connection's broadcaster inbox instead of from the runtime directly, and the broadcaster itself is one process-wide thread. (Amended 2026-09-26 after Task 9 measured four per connection on both transports; the first wording said three and claimed the forwarder was replaced, which the design never did.)
 
 ## Testing
 
