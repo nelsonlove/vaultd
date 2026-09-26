@@ -176,7 +176,7 @@ fn bounds_documentation_describes_the_shipped_transport() {
             "backpressure",
             "`resync_required { runtime_recovered }`",
             // Peer delivery is not independent on one connection.
-            "Private queues bound memory, not latency.",
+            "Private queues bound memory, not latency, and the boundary is the connection",
             // The bounds are the registry's, not the transport's.
             "regardless of transport",
             // The tuning flags are enforced, not merely conventional.
@@ -285,5 +285,39 @@ fn the_protocol_documents_its_unknown_variant_tolerance() {
             "MUST treat an unrecognized value",
             "`Unknown` catch-all",
         ],
+    );
+}
+
+/// The socket transport's contract lives in three documents, and a phase that
+/// shipped the behaviour without them would leave an operator guessing at the
+/// path rule and the shutdown bound. Phrases rather than prose, for the same
+/// reason the rest of this file uses them: a required sentence that was
+/// reworded is a doc question, and a required sentence that was **deleted** is
+/// a contract question.
+#[test]
+fn the_socket_transport_is_documented_where_its_users_look() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "## Transports",
+            "<run dir>/<digest>.sock",
+            "$XDG_RUNTIME_DIR/vaultd",
+            "mode `0700`",
+            "mode `0600`",
+            "connection-scoped",
+            "bounded at five seconds",
+            "runtime_recovered",
+        ],
+    );
+    assert_document_contains(
+        "docs/design/headless-plugin-host.md",
+        &[
+            "vaultd` never speaks the Sync protocol",
+            "Amended by the socket transport phase",
+        ],
+    );
+    assert_document_contains(
+        "README.md",
+        &["--listen [PATH]", "--engine", "--leave-engine-running"],
     );
 }

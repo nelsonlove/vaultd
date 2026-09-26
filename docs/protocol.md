@@ -2,7 +2,7 @@
 
 Protocol version: `1`
 
-The protocol is transport-neutral. The daemon's newline-delimited JSON stdio loop is a proof transport, not a production transport commitment.
+The protocol is transport-neutral and is carried over two transports today: the process's own stdio, and a Unix domain socket. The bytes are identical over either, and which one a client came in by is invisible in every request, response, event and error it sees. See **Transports** below.
 
 ## Daemon configuration
 
@@ -504,6 +504,32 @@ Releases the session and its pinned transaction. A session identifier this proce
 {"version":1,"id":"c","outcome":{"status":"ok","value":{"type":"close_snapshot","value":{"snapshot_id":"snap-1"}}}}
 ```
 
+## Transports
+
+The daemon serves the same newline-delimited JSON over two doors.
+
+**stdio** is always served while standard input is open, and is what a parent process that spawned the daemon uses. Without `--listen`, end of file on standard input ends the daemon, which is how a supervising parent owns its whole life.
+
+**A Unix domain socket** is served when the daemon is started with `--listen`. With no value it binds `<run dir>/<digest>.sock`, where the digest is the first sixteen hexadecimal characters of the SHA-256 of the canonical vault root and the run directory is `$XDG_RUNTIME_DIR/vaultd` when that variable is set and non-empty, else `<XDG cache dir>/vaultd/run`. With a value it binds that path. The run directory is created with mode `0700` and the socket with mode `0600`: the socket file's mode is the whole of the access control, and there is no authentication beyond it. The listen backlog is 16, and there is no cap on connections — the operating system's file-descriptor limit is the cap, and reaching it is reported on stderr and does not stop the daemon.
+
+With `--listen`, end of file on standard input ends **stdio alone** and the daemon carries on serving the socket, which is what lets it be started with standard input closed and outlive whatever started it. It is then ended by `SIGTERM` or `SIGINT`.
+
+**Readiness is the socket file existing and `health` answering.** The daemon prints nothing new to standard output when it binds, because standard output is stdio's protocol stream and a non-protocol line would break its client.
+
+**A path that is already occupied is decided rather than guessed.** If a daemon answers `health` there, this one refuses to start, exits 2, and names the path on stderr. If nothing answers, the file is treated as the remains of a crashed daemon and unlinked. A path that exists and is not a socket is refused with exit 2 and left untouched.
+
+**Subscriptions and snapshot sessions are connection-scoped.** Identifiers are issued from each connection's own counter, so two connections may each hold `sub-1` and each hold `snap-1`, and neither can name the other's: a `snapshot_id` from another connection is `snapshot_not_found`, and a `subscription_id` from another connection is `subscription_not_found`. Ending a connection drops every subscription it held and closes every session it opened, releasing the write-ahead-log frames those pinned. The other connections are not told.
+
+**Writes still serialize.** Every mutation goes through the runtime's single coordinator whichever connection asked for it, so two clients cannot interleave one, and read-your-writes holds per connection exactly as it always did. The exclusive writer lease is unchanged: there is one daemon per index, and the socket is a second door to it, never a second writer. `--read-only` applies to every connection.
+
+**A connection's errors are its own.** Malformed JSON, an unsupported version, an oversized line: the same refusals as ever, on that connection, which stays open. Only end of input, a write failure, or shutdown closes a connection, and a write failure ends that connection alone — one line on stderr, every other connection still served.
+
+**Shutdown drains.** On `SIGTERM` or `SIGINT` the daemon stops accepting, sends every live connection a `runtime_state_changed` with `live_state: "stopped"`, closes each writer once its queue has drained, stops the runtime, and unlinks the socket file. The drain is bounded at five seconds, after which writers are closed hard. A clean shutdown exits 0.
+
+**A silent connection is never timed out.** Idle snapshot sessions are swept on every input on their own connection, so a connection that opens a session and then sends nothing pins write-ahead-log frames until it closes. This is a documented limit, unchanged from stdio, and the socket file's mode is the guard against strangers reaching it. Sweeping sessions across connections is deferred.
+
+Reaching the daemon from another machine is done by forwarding the socket over SSH.
+
 ## Events
 
 The stdio transport carries a second top-level envelope shape alongside responses: one JSON object per line, with `version`, `subscription_id`, and `event`, and no `id` or `outcome`. Exactly one writer owns the output stream, so an event line can never split a response line, and a client that never subscribed sees byte-identical output to protocol version 1 without events.
@@ -568,6 +594,8 @@ Every queue is bounded and every overflow degrades into a marker, never into sil
 
 **What a slow stdio client actually meets is backpressure.** The dispatcher drains queued events immediately after every notice, so no subscription queue holds more than one notice's worth. A client that stops reading its stdout instead backs up the output queue, which blocks the dispatcher's shared drain, which fills the input queue, at which point the coordinator's non-blocking notice send starts failing. Those drops are latched and announced, once there is a generation to name, as `resync_required { runtime_recovered }`. So the symptom of a slow stdio client is a `runtime_recovered` resync — not `subscriber_lag`.
 
+**On the socket the same thing happens one hop further out.** One broadcaster thread clones each runtime notice into every connection's own bounded inbox, 256 deep, with a non-blocking send. A connection whose inbox is full has that notice dropped and its gap latched, and the next notice it can be given is replaced by `resync_required { runtime_recovered }` naming the newest generation. So the symptom of a slow socket client is the same `runtime_recovered` resync a slow stdio client meets, it costs that connection alone, and the broadcaster never blocks — which is what keeps "reconciliation is never stalled by a client" true however many clients there are.
+
 **The registry enforces two bounds** regardless of transport. They bind any embedder driving it directly — batching notices, or draining on a schedule — and only the second is reachable through the stdio dispatcher:
 
 - **Per subscription: 64 events.** A subscription whose queue fills has its queued generation detail replaced by one `resync_required { subscriber_lag }` naming the newest generation; the newest `runtime_state_changed` survives, because state is a level rather than an edge. Detail resumes once that marker drains. Not reachable through the stdio dispatcher, for the reason above.
@@ -575,7 +603,7 @@ Every queue is bounded and every overflow degrades into a marker, never into sil
 
 **Reconciliation is never stalled by a client.** The coordinator offers notices without ever waiting and drops what will not fit, so no client — however slow, however dead — can slow indexing or cause a lost change. Only a gap, and the gap is announced.
 
-**Delivery between peers is not independent on one connection.** Subscriptions have private queues, so neither can displace the other's events. But they share a dispatcher and a writer, so a client that stops reading delays every other subscription on that same connection until it resumes or disconnects. Private queues bound memory, not latency.
+**Delivery between peers is not independent on one connection.** Subscriptions have private queues, so neither can displace the other's events. But they share a dispatcher and a writer, so a client that stops reading delays every other subscription on that same connection until it resumes or disconnects. Private queues bound memory, not latency, and the boundary is the connection: two subscriptions on one connection share a dispatcher and a writer, so a client that stops reading delays its own other subscriptions until it resumes or disconnects — and delays nothing on any other connection.
 
 While no generation has ever been committed, `resync_required` is withheld: there would be nothing to re-read at. The first resync that does name a generation — after a cold build, the runtime's own `runtime_recovered` at generation 1 — supersedes every withheld predecessor.
 

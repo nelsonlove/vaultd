@@ -28,7 +28,7 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 
 - `vault-core`: semantic types and runtime ports
 - `vault-protocol`: stable external contract
-- `vault-server`: daemon composition and stdio proof transport
+- `vault-server`: daemon composition and its two transports, stdio and a Unix domain socket
 - `host/`: a Node/TypeScript npm workspace, outside the Cargo workspace — the headless Obsidian plugin host and the `vaultd-host` binary. Built and tested on its own (`npm --prefix host run build`, `npm --prefix host test`); it supervises a `vaultd` child rather than linking against the crates.
 
 ## Current milestone
@@ -54,13 +54,21 @@ vaultd-host --vault <path> [options]
   --dry-run                 Intercept every write instead of performing it, and refuse the
                             file system, process spawning and the network to plugin bundles.
   --dry-run-allow-network   Under --dry-run, let requestUrl through anyway.
+  --engine <mode>           auto (default): connect to a vaultd already listening for this
+                            vault, else spawn one with --listen. connect: never spawn;
+                            exit 3 if none is listening. spawn: always spawn, never
+                            probe, and own its life through this process's stdin.
+  --leave-engine-running    Under --engine auto, leave a daemon this host spawned
+                            running when the host shuts down.
   --force-shared <id>       Run <id> even though the GUI has it enabled too. Repeatable.
   -h, --help                Print the usage and exit 0.
 ```
 
-One machine-readable line goes to stdout when the host is ready — `{"ready":true,"socket":…,"vault":…,"dry_run":…,"loaded":[…],"failed":[…]}` — so whatever started the host knows where to knock without recomputing the digest.
+One machine-readable line goes to stdout when the host is ready — `{"ready":true,"socket":…,"vault":…,"dry_run":…,"engine_source":…,"engine_socket":…,"loaded":[…],"failed":[…]}` — so whatever started the host knows where to knock without recomputing the digest. `engine_source` is a snapshot taken at startup (`"connected"`, `"spawned"`, or the daemon this process owns under `--engine spawn`), and `engine_socket` is the path the engine listens on under `auto` and `connect`, or `null` under `spawn`, where nothing binds there.
 
 **Exit codes are a contract:** `0` a clean shutdown on `SIGINT` or `SIGTERM`; `1` any other unhandled failure outside the shutdown window — a refusal with no typed code of its own, with the message on stderr; `2` a usage error (an unknown flag, a missing value, or no `--vault`); `3` the daemon was unreachable — it did not start, or never reached a watching state; `4` the config directory was refused, either because `--config-dir` named the GUI's own directory or because the GUI has every enabled plugin open too and there was nothing left to run. The overlap case is decided from the coexistence monitor's typed report, never from the text of a failure message.
+
+**`--engine` decides where the host's engine comes from.** `auto`, the default, connects to a `vaultd` already listening for this vault and spawns one with `--listen` when none is, so the daemon it starts is shareable and the next client's start is cheap. `connect` never spawns and exits 3 when nothing answers. `spawn` is the phase-6 behaviour exactly: always spawn, never probe, and own the daemon's life through its stdin. A daemon the host spawned under `auto` is sent `SIGTERM` at shutdown unless `--leave-engine-running` is passed. The ready line and `host.info` both report which road was taken.
 
 **One copy of the wiring.** `host/packages/host/src/host.ts`'s `startHost(config)` is the entry point: it builds and starts the whole host in the one order that works, and returns a `RunningHost` with an ordered `stop()`. `src/main.ts` is the process half alone — parse the flags, start, print the ready line, wait for a signal, stop — and the live-host test seam drives the same function, so every golden test exercises the code the binary runs. There is deliberately no second copy: four separate mutations of an earlier private copy survived the whole suite because the copy under test was the harness's.
 
@@ -107,12 +115,15 @@ See `docs/protocol.md` and `docs/design/live-incremental-runtime.md`.
 `vaultd` now persists the semantic graph in a normalized persistent SQLite cache and serves read operations over protocol version 1:
 
 - normalized SQLite storage outside the vault (XDG cache by default, `--index` to override), with exact source bytes, spans, resolutions, backlinks, and diagnostics as rows;
+- `--listen [PATH]` also serves a Unix domain socket; with no value, `<run dir>/<digest>.sock`;
 - the vault file tree indexed alongside the semantic rows: every non-hidden folder and file with its kind, size, and creation/modification timestamps, kept current on the same watcher path as the notes;
 - atomic, monotonically numbered generations published by compare-and-swap; readers never observe partial state;
 - normal reconciliation that trusts path/size/mtime fingerprints and reads no unchanged bodies, plus verified reconciliation that hashes every file but reparses only changed revisions;
 - change detection through startup and manual reconciliation (`refresh_index`); a filesystem watcher and live events arrived with the milestone above;
 - all eight indexed operations: `get_vault_info`, `list_notes`, `get_note`, `resolve_link`, `get_backlinks`, `list_references`, `get_diagnostics`, and `refresh_index`, plus `health`;
 - generation-bound opaque cursors, bounded pages, and stable error codes.
+
+**`--listen` gives the daemon a second door.** It serves the same protocol to any number of connections at once, each with its own subscriptions and snapshot sessions, and it outlives whatever started it: with a listener, end of stdin ends stdio alone and `SIGTERM` ends the daemon. The default path is derived from the vault root, so a client finds the daemon without being told where it is, and `get_vault_info` reports `socket_path` for one that would rather ask. `docs/protocol.md`'s **Transports** section is the contract.
 
 See `docs/design/persistent-index-and-daemon-read-api.md`, `docs/plans/persistent-index-and-daemon-read-api-implementation.md`, `docs/protocol.md`, and `docs/performance/persistent-index-baseline.md`.
 

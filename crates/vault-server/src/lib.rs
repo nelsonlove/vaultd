@@ -311,9 +311,15 @@ impl Server {
     /// implied by dropping the server.
     pub fn shutdown(&self) {
         // Sessions first: each one pins WAL frames until its transaction is
-        // rolled back, and a disconnect is what reaches this on the ordinary
-        // path — the daemon is single-peer, so end of input means every
-        // session that client held is abandoned.
+        // rolled back, and nothing else in this teardown releases them.
+        //
+        // `close_all` rather than per connection, because this is the
+        // **process** stopping. A single connection leaving is the other path
+        // and belongs to `close_sessions_of`, which `connection::serve` calls
+        // on its way out; by the time the last connection has gone this is
+        // usually a no-op, and it stays here for the shapes where it is not —
+        // a connection whose thread was closed hard past the drain budget, and
+        // health-only mode, which has no connections at all.
         if let Some(sessions) = self.sessions.as_ref() {
             sessions
                 .registry
