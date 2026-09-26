@@ -608,6 +608,14 @@ export interface GetVaultInfoResponse {
   refreshed_at_unix_ms: number | null;
   /** Absent in health-only mode, where there is no runtime to describe. */
   live_state?: LiveStateDto;
+  /**
+   * Where the daemon is listening, absent when it has no socket.
+   *
+   * Optional rather than `string | null` because the daemon **skips** the key
+   * rather than serializing `null` — so a host that tests `info.socket_path`
+   * for undefined is testing what the wire actually does.
+   */
+  socket_path?: string;
 }
 
 export interface GetNoteResponse {

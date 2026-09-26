@@ -372,6 +372,11 @@ impl Server {
         self.socket_path = path;
     }
 
+    /// Where this daemon is listening, or `None` when it has no socket.
+    pub fn socket_path(&self) -> Option<&str> {
+        self.socket_path.as_deref()
+    }
+
     /// May `connection` name `snapshot_id`?
     ///
     /// A session nobody owns answers `false`, which is why the caller's
@@ -743,7 +748,11 @@ impl Server {
                         let state = self.live_state(live).ok().map(subscriptions::live_state);
                         ResponseEnvelope::success(
                             id,
-                            Response::GetVaultInfo(convert::vault_info(info, state)),
+                            Response::GetVaultInfo(convert::vault_info(
+                                info,
+                                state,
+                                self.socket_path.clone(),
+                            )),
                         )
                     }
                     Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),

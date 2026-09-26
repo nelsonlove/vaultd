@@ -221,6 +221,12 @@ pub struct GetVaultInfoResponse {
     pub refreshed_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_state: Option<LiveStateDto>,
+    /// Where this daemon is listening, so a client on one connection can tell
+    /// another where to knock. Absent — the key is skipped, never `null` —
+    /// when the daemon has no socket, which keeps a version 1 client's bytes
+    /// exactly what they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

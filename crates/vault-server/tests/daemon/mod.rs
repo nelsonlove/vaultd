@@ -181,6 +181,31 @@ impl Daemon {
         self.response()
     }
 
+    /// The next response line, as the bytes the daemon wrote.
+    ///
+    /// Deserializing and re-serializing would defeat the one thing an
+    /// additive-field test must prove: that the field is absent from the
+    /// wire, not merely `None` after a decode that defaults it.
+    #[allow(dead_code)]
+    pub fn call_raw(&mut self, line: &str) -> String {
+        self.send(line);
+        loop {
+            let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(raw) => raw,
+                Err(RecvTimeoutError::Timeout) => panic!("no response within {LINE_TIMEOUT:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the daemon closed its stdout"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("a JSON line");
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"))
+            {
+                return raw;
+            }
+            self.events.push(raw);
+        }
+    }
+
     /// Close stdin and wait. The daemon must exit rather than hang.
     ///
     /// Allowed dead because this module is compiled into each test binary

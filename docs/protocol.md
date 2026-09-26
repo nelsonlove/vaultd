@@ -62,8 +62,10 @@ Returns the canonical vault root, vault identity, index state (`ready`, `stale` 
 ```
 
 ```json
-{"version":1,"id":"v","outcome":{"status":"ok","value":{"type":"get_vault_info","value":{"generation":3,"canonical_root":"/vaults/example","vault_identity":"2f9a…","state":{"state":"ready"},"note_count":128,"refreshed_at_unix_ms":1756100000000,"live_state":"watching"}}}}
+{"version":1,"id":"v","outcome":{"status":"ok","value":{"type":"get_vault_info","value":{"generation":3,"canonical_root":"/vaults/example","vault_identity":"2f9a…","state":{"state":"ready"},"note_count":128,"refreshed_at_unix_ms":1756100000000,"live_state":"watching","socket_path":"/run/user/501/vaultd/9f2c1b7a4e5d6083.sock"}}}}
 ```
+
+`socket_path` is present only when the daemon was started with `--listen`, and names the path it actually bound. It is how a client that reached the daemon one way tells another client where to knock; the path can also be computed from the vault root alone, by the rule in **Transports** below.
 
 ### `list_notes`
 

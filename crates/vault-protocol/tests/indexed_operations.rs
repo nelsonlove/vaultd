@@ -108,6 +108,7 @@ fn vault_info_response_round_trips_with_live_state_present() {
         note_count: 12,
         refreshed_at_unix_ms: Some(2000),
         live_state: Some(LiveStateDto::Watching),
+        socket_path: None,
     };
     let json = serde_json::to_string(&response).expect("serialize response");
     assert!(json.contains("\"live_state\":\"watching\""));
