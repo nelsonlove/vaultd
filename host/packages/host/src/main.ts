@@ -282,12 +282,27 @@ export async function main(
     running = await runHost(parsed.config);
     // One machine-readable line on stdout, so whatever started this host knows
     // where its socket is without guessing at the digest.
+    //
+    // **`engine_source` is flat, and deliberately.** `host.info` carries an
+    // `engine` object, so its own spelling is `engine.source`; here there is
+    // no object to hang it off and `engine.engine_source` would be the
+    // redundancy of nesting a one-key group. What it answers is whether this
+    // host is paying for a daemon of its own — a supervisor that reports
+    // `"connected"` adopted one that was already there, and will not take it
+    // down at shutdown.
+    //
+    // It is a **snapshot taken at startup**, not a live reading: a host that
+    // connected and then had to spawn a replacement after a restart still says
+    // `"connected"` on the line it already printed. `host.info`'s
+    // `engine.source` is the live answer.
     out(
       JSON.stringify({
         ready: true,
         socket: running.socketPath,
         vault: running.config.vaultRoot,
         dry_run: running.config.dryRun,
+        engine_source: running.engineSource,
+        engine_socket: running.config.engineSocketPath,
         loaded: running.startup.loaded,
         failed: running.startup.failed,
       }),

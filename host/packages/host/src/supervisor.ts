@@ -60,6 +60,32 @@ const STDERR_TAIL_BYTES = 4096;
 const LEASE_HELD = /already in use by another writer/i;
 
 /**
+ * The daemon's own words when the path it was told to `--listen` on is already
+ * answering: `ListenError::AlreadyListening`, which is
+ * `crates/vault-server/src/listener.rs`'s refusal to bind beside a live peer.
+ *
+ * Read exactly like {@link LEASE_HELD}, and for the same reason: the daemon's
+ * only "refused to start" code is 2, so the code classifies the *kind* of
+ * failure and the line classifies which one. Both halves are required —
+ * {@link isAlreadyListening}.
+ */
+const ALREADY_LISTENING = /another vaultd is listening at/i;
+
+/**
+ * Did this start failure mean "somebody else already has that socket"?
+ *
+ * The one failure `auto` can recover from without a rung: a daemon at the
+ * address is the thing `auto` was trying to obtain.
+ */
+function isAlreadyListening(error: Error): boolean {
+  return (
+    error instanceof EngineStartError &&
+    error.exit?.code === 2 &&
+    ALREADY_LISTENING.test(error.stderrTail)
+  );
+}
+
+/**
  * An engine that could not be started.
  *
  * It carries the **exit**, not the transport symptom. When a child dies during
@@ -692,7 +718,29 @@ export class Supervisor {
               "host was connected to has the rest of the restart window to come back",
           );
         }
-        return this.spawnOnce();
+        // **The end of the window is a TOCTOU, and it gets exactly one second
+        // look.** The window spends rungs `0..n-2` probing, so the spawn lands
+        // on the last rung with no wait left behind it: a daemon that rebinds
+        // between that final probe and the spawn's own `bind` makes the
+        // spawned `vaultd` exit 2 with `another vaultd is listening at <path>`
+        // — and the ladder, being exhausted, would give up fatally *while a
+        // perfectly good daemon sits at the path this host wanted*. So that
+        // one exit is read for what it is: proof that the thing the probe was
+        // looking for arrived. Re-probe once and adopt it.
+        //
+        // Narrow on purpose. Only `auto` (under `spawn` nothing was probing
+        // and nothing is listening by design), only exit 2 with the daemon's
+        // own listening line, and only one extra probe — a daemon that has
+        // gone again by then is the original failure, rethrown unchanged.
+        try {
+          return await this.spawnOnce();
+        } catch (thrown) {
+          const error = asError(thrown);
+          if (!isAlreadyListening(error)) throw error;
+          const again = await probeEngineSocket(this.config.engineSocketPath, this.config.clock);
+          if (!again.answered) throw error;
+          return await this.connectOnce();
+        }
       }
     }
   }

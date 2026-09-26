@@ -172,6 +172,85 @@ describe.skipIf(!BINARY_EXISTS)("the vaultd-host binary", () => {
     const exitCode = await terminate(child);
     expect(exitCode, `stderr:\n${stderr.join("")}`).toBe(0);
   }, 120_000);
+
+  it("exits 3 under --engine connect when nothing is listening", async () => {
+    // **The exit code is read off the process, not off a thrown refusal.**
+    // `test/main.test.ts` already drives `runHost` in-process and asserts the
+    // `CliRefusal`'s `code`; what that cannot show is that the code survives
+    // `main`'s catch, the `finally`, and the entry point's `process.exitCode`
+    // assignment — which is the half a script branches on. So this case runs
+    // `dist/main.js` and waits for the real exit status.
+    //
+    // No daemon is involved and none is spawned, which is the point of the
+    // mode: `connect` probes and refuses. The probe path is derived from the
+    // vault root, and the root is a fresh scratch directory, so nothing else
+    // in the suite can be listening there. `XDG_RUNTIME_DIR` is the scratch
+    // one `test/scratch-setup.ts` installs and the child inherits it.
+    const vault = scratchRoot("vaultd-main-connect-");
+    writeFileSync(join(vault, "One.md"), "# One\n", "utf8");
+    const state = scratchRoot("vaultd-main-connect-state-");
+    const socketPath = join(shortSocketDir(), "s");
+
+    const child = spawn(
+      process.execPath,
+      [MAIN, "--vault", vault, "--vaultd", BINARY, "--engine", "connect", "--socket", socketPath],
+      { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, XDG_STATE_HOME: state } },
+    );
+    const finished = await untilExit(child);
+
+    expect(finished.code, `stderr:\n${finished.stderr}`).toBe(3);
+    expect(finished.stderr).toMatch(/no vaultd is listening/i);
+    expect(finished.stderr).toContain('engine: "connect" never spawns one');
+    // Nothing reached the ready line, so there is no machine-readable line on
+    // stdout to mislead a caller that only reads the first `{`.
+    expect(finished.stdout.split("\n").filter((line) => line.startsWith("{"))).toEqual([]);
+  }, 120_000);
+
+  it("refuses an --engine value that is not one of the three", async () => {
+    const child = spawn(process.execPath, [MAIN, "--vault", ".", "--engine", "borrow"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+    const finished = await untilExit(child);
+
+    expect(finished.code, `stderr:\n${finished.stderr}`).toBe(2);
+    expect(finished.stderr).toContain("--engine must be auto, connect or spawn");
+    // A usage error prints the contract it broke.
+    expect(finished.stderr).toContain("Exit codes:");
+  }, 60_000);
+
+  it("says on its ready line where its engine came from", async () => {
+    const vault = scratchRoot("vaultd-main-ready-");
+    writeFileSync(join(vault, "One.md"), "# One\n", "utf8");
+    const state = scratchRoot("vaultd-main-ready-state-");
+    const socketPath = join(shortSocketDir(), "s");
+
+    // `spawn`, so the answer is `"spawned"` and this case binds no engine
+    // socket — the mode matrix's own file owns that.
+    const child = spawn(
+      process.execPath,
+      [MAIN, "--vault", vault, "--vaultd", BINARY, "--engine", "spawn", "--socket", socketPath],
+      { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, XDG_STATE_HOME: state } },
+    );
+    const stderr: string[] = [];
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk.toString("utf8")));
+
+    // **The terminate is in a `finally`.** Between the ready line and the
+    // signal there are assertions, and an assertion that throws would
+    // otherwise leave a host and its daemon running for the rest of the
+    // session — which is exactly what a deliberate mutation of the ready line
+    // produced while this case was being proved able to fail.
+    let exitCode: number | null = null;
+    try {
+      const ready = await readyLine(child, stderr);
+      expect(ready.ready).toBe(true);
+      expect(ready.engine_source, stderr.join("")).toBe("spawned");
+      expect(typeof ready.engine_socket).toBe("string");
+    } finally {
+      exitCode = await terminate(child);
+    }
+    expect(exitCode, stderr.join("")).toBe(0);
+  }, 120_000);
 });
 
 /** Copy a golden plugin's bundle into the vault's headless config dir, enabled. */
@@ -190,7 +269,48 @@ interface ReadyLine {
   readonly ready: boolean;
   readonly socket: string;
   readonly vault: string;
+  readonly engine_source: string;
+  readonly engine_socket: string;
   readonly loaded: readonly string[];
+}
+
+/** Everything a finished child said, and the status it said it with. */
+interface Finished {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
+ * Wait for a child to exit on its own, with a deadline that kills rather than
+ * hangs.
+ *
+ * Both pipes are drained and the `close` event is awaited rather than `exit`,
+ * so the output is complete before it is asserted on: `exit` can arrive with
+ * the last chunk of stderr still buffered, which would make a message
+ * assertion a race.
+ */
+function untilExit(child: ChildProcess, timeoutMs = 30_000): Promise<Finished> {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));
+  child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+  return new Promise<Finished>((settle, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(
+        new Error(
+          `the binary was still running after ${String(timeoutMs)}ms. ` +
+            `stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`,
+        ),
+      );
+    }, timeoutMs);
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      settle({ code, signal, stdout, stderr });
+    });
+  });
 }
 
 /** Resolve with the binary's one machine-readable ready line. */

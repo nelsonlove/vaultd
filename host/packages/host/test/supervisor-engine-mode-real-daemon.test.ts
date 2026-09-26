@@ -231,16 +231,26 @@ describe.skipIf(!BINARY_EXISTS)("engine modes", () => {
       if (event.type === "resync_required") resyncs.push(event);
     });
 
+    // **Counted from a baseline, and the loss is part of the rendezvous.** The
+    // daemon emits `resync_required` for reasons of its own — a watcher
+    // overflow, an oversized change set, a reconcile escalation — so
+    // `resyncs.length > 0` is not "the outage was paid for", it is "a resync
+    // happened at some point". Measured under load on 2026-09-26: one run in
+    // eleven satisfied that predicate **before the kill was even noticed**,
+    // returned in 52 ms, and failed on `lost.length` being 0. What this case
+    // is about is the cost of *this* outage, so the count is a delta and the
+    // wait requires the loss it is counting.
+    const before = resyncs.length;
     process.kill(supervisor.pid() as number, "SIGKILL");
     await expectEventually(
-      () => supervisor.engineSource() !== null && resyncs.length > 0,
+      () => lost.length > 0 && supervisor.engineSource() !== null && resyncs.length > before,
       "the ladder to bring an engine back and pay the resync debt",
     );
 
     expect(lost.length).toBe(1);
     expect(lost[0]).toBeInstanceOf(EngineLostError);
-    expect(resyncs.length).toBe(1);
-    expect(resyncs[0]?.value).toMatchObject({ reason: "runtime_recovered" });
+    expect(resyncs.length - before).toBe(1);
+    expect(resyncs[before]?.value).toMatchObject({ reason: "runtime_recovered" });
   });
 });
 

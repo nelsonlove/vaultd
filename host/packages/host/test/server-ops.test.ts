@@ -626,4 +626,35 @@ describe("host.* operations", () => {
       await harness.stop();
     }
   });
+
+  it("reports the engine in snake_case, without moving host.hello's live_state", async () => {
+    const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const info = await client.call<{ engine: Record<string, unknown> }>("host.info", {});
+      // **An exact sorted list, not a `toMatchObject`.** The neighbouring case
+      // asserts the four values; this asserts that there are four and no more,
+      // so a fifth key added without a wire decision fails here rather than
+      // reaching a client that will then depend on it.
+      expect(Object.keys(info.engine).sort()).toEqual([
+        "live_state",
+        "mode",
+        "socket_path",
+        "source",
+      ]);
+      expect(info.engine.mode).toBe(harness.config.engine);
+      expect(info.engine.socket_path).toBe(harness.config.engineSocketPath);
+      // **`host.hello` is answered once per connection**, and `connectClient`
+      // already consumed this one's — so the payload is read back off the
+      // client rather than asked for again, which is what the neighbouring
+      // case does and why it asserts a second hello rejects. The point here is
+      // only that `live_state` is still on `hello`: the `engine` object adds a
+      // second place to read the runtime's state, and moving the first would
+      // break every client reading it today.
+      expect(client.helloPayload()).toHaveProperty("live_state");
+    } finally {
+      await harness.stop();
+    }
+  });
 });
