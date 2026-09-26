@@ -1,3 +1,8 @@
+# One request envelope per line, in order. Blank lines and lines beginning
+# with `#` are comments the harness skips. `{{next_cursor}}` anywhere in a
+# line is replaced with the `next_cursor` the previous response carried, and
+# a line asking for it when the previous answer had none fails the run.
+#
 # Envelope and version handling.
 {"version":1,"id":"c01","request":{"method":"health"}}
 {"version":99,"id":"c02","request":{"method":"health"}}
@@ -5,23 +10,40 @@
 # Bring the index up, then read the vault's shape.
 {"version":1,"id":"c04","request":{"method":"refresh_index","params":{}}}
 {"version":1,"id":"c05","request":{"method":"get_vault_info"}}
-{"version":1,"id":"c06","request":{"method":"list_notes","params":{"limit":2}}}
+# A page of one, then the page that follows the cursor it returned.
+{"version":1,"id":"c06","request":{"method":"list_notes","params":{"limit":1}}}
+{"version":1,"id":"c23","request":{"method":"list_notes","params":{"limit":1,"cursor":"{{next_cursor}}"}}}
 {"version":1,"id":"c07","request":{"method":"get_note","params":{"path":"One.md"}}}
+{"version":1,"id":"c24","request":{"method":"get_note","params":{"path":"Folder/Nested.md"}}}
 {"version":1,"id":"c08","request":{"method":"get_tree_entries","params":{"paths":["One.md","Missing.md"]}}}
 {"version":1,"id":"c09","request":{"method":"read_dir","params":{"path":""}}}
+{"version":1,"id":"c25","request":{"method":"read_file","params":{"path":"One.md"}}}
+# The link resolver, asked about the one wikilink in the vault.
+{"version":1,"id":"c26","request":{"method":"resolve_link","params":{"source_path":"Folder/Nested.md","destination":"One"}}}
+{"version":1,"id":"c27","request":{"method":"get_backlinks","params":{"path":"One.md","cursor":null,"limit":100}}}
+{"version":1,"id":"c28","request":{"method":"list_references","params":{"source_path":"Folder/Nested.md","status":null,"cursor":null,"limit":100}}}
+{"version":1,"id":"c29","request":{"method":"get_diagnostics","params":{"path":null,"severity":null,"cursor":null,"limit":100}}}
 # Refusals, each of which must read identically through either door.
 {"version":1,"id":"c10","request":{"method":"get_note","params":{"path":"Nowhere.md"}}}
 {"version":1,"id":"c11","request":{"method":"get_note","params":{"path":"../escape.md"}}}
 {"version":1,"id":"c12","request":{"method":"list_notes","params":{"limit":0}}}
-# A subscription, a write, and the events the write produces.
+# A subscription, every mutation the protocol has, and the events they produce.
 {"version":1,"id":"c13","request":{"method":"subscribe_events","params":{}}}
 {"version":1,"id":"c14","request":{"method":"write_note","params":{"path":"Two.md","content":"# Two\n\n[[One]]\n","expected":{"absent":true}}}}
 {"version":1,"id":"c15","request":{"method":"patch_frontmatter","params":{"path":"Two.md","patch":[{"key_path":"a","value":{"zebra":1,"apple":2}}],"expected":{"any":true}}}}
+{"version":1,"id":"c30","request":{"method":"create_folder","params":{"path":"Made"}}}
+{"version":1,"id":"c31","request":{"method":"write_file","params":{"path":"Made/raw.bin","content_base64":"AAECAw==","expected":{"absent":true}}}}
+{"version":1,"id":"c32","request":{"method":"copy_file","params":{"from":"One.md","to":"Made/Copy.md","expected_source":{"any":true},"if_exists":"error"}}}
+{"version":1,"id":"c33","request":{"method":"rename_note","params":{"from":"Two.md","to":"Three.md","expected":{"any":true},"rewrite_links":true}}}
+{"version":1,"id":"c34","request":{"method":"rename_folder","params":{"from":"Made","to":"Renamed","rewrite_links":true}}}
+{"version":1,"id":"c35","request":{"method":"delete_note","params":{"path":"Three.md","mode":"permanent","expected":{"any":true}}}}
+{"version":1,"id":"c36","request":{"method":"delete_folder","params":{"path":"Renamed","mode":"permanent","recursive":true}}}
 {"version":1,"id":"c16","request":{"method":"unsubscribe","params":{"subscription_id":"sub-1"}}}
 {"version":1,"id":"c17","request":{"method":"unsubscribe","params":{"subscription_id":"sub-1"}}}
 # A snapshot session, paged and closed.
 {"version":1,"id":"c18","request":{"method":"open_snapshot","params":{}}}
-{"version":1,"id":"c19","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1","limit":10}}}
+{"version":1,"id":"c19","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1","limit":2}}}
+{"version":1,"id":"c37","request":{"method":"snapshot_tree","params":{"snapshot_id":"snap-1","limit":2,"cursor":"{{next_cursor}}"}}}
 {"version":1,"id":"c20","request":{"method":"snapshot_notes","params":{"snapshot_id":"snap-1","limit":10}}}
 {"version":1,"id":"c21","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}
 {"version":1,"id":"c22","request":{"method":"close_snapshot","params":{"snapshot_id":"snap-1"}}}

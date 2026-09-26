@@ -333,17 +333,44 @@ impl Client {
         }
     }
 
+    /// Every line the daemon wrote to this connection in answer to `line`, in
+    /// arrival order: the events that landed while the response was
+    /// outstanding, then the response. The twin of `daemon::Daemon::exchange`,
+    /// and the reason the conformance transcript can say *where* an event
+    /// arrived rather than only that it did.
+    pub fn exchange(&mut self, line: &str) -> Vec<String> {
+        let mut written = std::mem::take(&mut self.events);
+        self.send(line);
+        loop {
+            let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(raw) => raw,
+                Err(RecvTimeoutError::Timeout) => panic!("no response within {LINE_TIMEOUT:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the daemon closed the connection"),
+            };
+            let is_response = serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("a JSON line")
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"));
+            written.push(raw);
+            if is_response {
+                return written;
+            }
+        }
+    }
+
     /// Every event line this connection has been sent and no call has claimed,
     /// plus whatever is still in flight after a short settle. The twin of
     /// `daemon::Daemon::drain_events`, with the same bound and the same
     /// reasoning: a slow writer can only make this transcript short, and a
-    /// short transcript fails the length assertion loudly.
+    /// short transcript fails the length assertion loudly. A closed connection
+    /// ends the drain at once rather than spinning out the budget.
     pub fn drain_events(&mut self) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             match self.lines.recv_timeout(Duration::from_millis(50)) {
                 Ok(raw) => self.events.push(raw),
-                Err(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         std::mem::take(&mut self.events)

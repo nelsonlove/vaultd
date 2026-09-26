@@ -227,6 +227,37 @@ impl Daemon {
         }
     }
 
+    /// Every line this daemon wrote in answer to `line`, **in arrival order**:
+    /// the events that landed while the response was outstanding, then the
+    /// response itself.
+    ///
+    /// The difference from [`Daemon::call_raw`] is the whole point: `call_raw`
+    /// buries the events it steps over in a side buffer, which loses where
+    /// they arrived relative to the responses. A transport that held every
+    /// event back to the end of the connection, or delivered one before its
+    /// `subscribe_events` response, is invisible to a transcript assembled
+    /// that way and obvious in one assembled this way.
+    #[allow(dead_code)]
+    pub fn exchange(&mut self, line: &str) -> Vec<String> {
+        let mut written = std::mem::take(&mut self.events);
+        self.send(line);
+        loop {
+            let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(raw) => raw,
+                Err(RecvTimeoutError::Timeout) => panic!("no response within {LINE_TIMEOUT:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the daemon closed its stdout"),
+            };
+            let is_response = serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("a JSON line")
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"));
+            written.push(raw);
+            if is_response {
+                return written;
+            }
+        }
+    }
+
     /// Every event line this daemon has written and no call has claimed, plus
     /// whatever is still in flight after a short settle.
     ///
@@ -236,13 +267,18 @@ impl Daemon {
     /// on — only "has the writer got to them yet". It is bounded and it can
     /// only produce a **short** transcript, never a wrong one, and a short
     /// transcript fails the length assertion loudly.
+    ///
+    /// A closed stream ends the drain immediately rather than spinning out the
+    /// budget on a channel that can never deliver again: `Disconnected` is a
+    /// final answer, `Timeout` only a quiet moment.
     #[allow(dead_code)]
     pub fn drain_events(&mut self) -> Vec<String> {
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
             match self.lines.recv_timeout(Duration::from_millis(50)) {
                 Ok(raw) => self.events.push(raw),
-                Err(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         std::mem::take(&mut self.events)
