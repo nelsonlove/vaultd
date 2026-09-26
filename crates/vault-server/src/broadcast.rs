@@ -9,17 +9,25 @@
 //!   not on the coordinator, which it only receives from. So no client,
 //!   however slow or however dead, can stall indexing. That is the invariant
 //!   the stdio design states, preserved across any number of clients.
-//! * **A drop is latched, never silent.** The connection whose inbox was full
-//!   has its gap recorded with the newest generation seen, and the next
-//!   notice that connection could be given is **replaced** by
-//!   `RuntimeNotice::ResyncRequired { reason: RuntimeRecovered }` naming
-//!   that generation. This is the coordinator's own drop-and-latch, one hop
-//!   out: see "What a slow stdio client actually meets is backpressure" in
-//!   `docs/protocol.md`.
+//! * **A drop is latched, and the marker precedes the notice.** The
+//!   connection whose inbox was full has its gap recorded with the newest
+//!   generation seen. The next time that connection can be delivered to, it
+//!   is sent `RuntimeNotice::ResyncRequired { reason: RuntimeRecovered }`
+//!   naming that generation **and then the notice in hand** — the marker
+//!   never replaces a notice. That matters because a resync only says
+//!   "re-read at generation N": it cannot stand in for a `ConfigChanged`,
+//!   whose zone no generation contains, nor for the final
+//!   `live_state: stopped`, which nothing re-announces. This is the
+//!   coordinator's own drop-and-latch, one hop out: see
+//!   [`crate::runtime`]'s `emit`, whose `Ok`, `Full` and `Disconnected` arms
+//!   this mirrors exactly, and "What a slow stdio client actually meets is
+//!   backpressure" in `docs/protocol.md`.
 //! * **A gap that cannot be named waits.** While nothing has ever been
-//!   committed there is no generation to re-read at, so the marker is owed
-//!   and is emitted by the first notice that does name one — the same
-//!   withholding [`crate::subscriptions`] applies, for the same reason.
+//!   committed there is no generation to re-read at. The marker still goes
+//!   out, naming nothing, and an observer discards it — so it cannot have
+//!   paid the debt, and the latch survives until a marker names a
+//!   generation. The same withholding [`crate::subscriptions`] applies, for
+//!   the same reason.
 //!
 //! What this module deliberately does **not** do: convert anything to the
 //! wire. A `RuntimeNotice` goes in and a `RuntimeNotice` comes out, and the
@@ -30,8 +38,8 @@
 //! **It does not make the dispatcher's pre-drain reachable either.** A
 //! notice this broadcaster delivers arrives as a `ServerInput::Notice` like
 //! any other, through the same forwarder, and is drained inside the same
-//! arm — including the synthetic `resync_required` that replaces a dropped
-//! one. So the Request arm's pre-drain stays defensive: what actually keeps
+//! arm — including the synthetic marker that precedes a dropped one. So the
+//! Request arm's pre-drain stays defensive: what actually keeps
 //! "already-queued events reach the client before the response that ends the
 //! subscription" true is drain-to-completion inside the Notice arm. The
 //! pre-drain becomes load-bearing the day something enqueues outside that
@@ -39,7 +47,6 @@
 //! that day it is owed a test of its own.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -66,14 +73,47 @@ impl std::fmt::Display for ConnectionId {
     }
 }
 
+/// What one connection is owed after a drop.
+///
+/// One type rather than a flag beside an `Option`, so "owed but not yet
+/// nameable" cannot be confused with "nothing owed" — by this module or by a
+/// test reading [`Broadcaster::gap_of`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Gap {
+    /// Nothing was dropped. The connection has seen every notice.
+    None,
+    /// A notice was dropped before anything was ever committed, so there is
+    /// no generation to re-read at yet. The debt stands until one exists.
+    Owed,
+    /// A notice was dropped, and this is the newest generation seen since.
+    Named(Generation),
+}
+
+/// The debt a drop leaves, given the newest generation it can name.
+fn owing(generation: Option<Generation>) -> Gap {
+    match generation {
+        Some(generation) => Gap::Named(generation),
+        None => Gap::Owed,
+    }
+}
+
+impl Gap {
+    fn is_owed(self) -> bool {
+        !matches!(self, Gap::None)
+    }
+
+    fn generation(self) -> Option<Generation> {
+        match self {
+            Gap::Named(generation) => Some(generation),
+            Gap::None | Gap::Owed => None,
+        }
+    }
+}
+
 /// One connection's inbox, and the gap it has not been told about.
 struct Registered {
     sink: SyncSender<RuntimeNotice>,
-    /// The newest generation seen while a drop was outstanding.
-    gap: Option<Generation>,
-    /// Whether a drop is outstanding at all. Separate from `gap` because a
-    /// drop before the first commit has no generation and must still be owed.
-    gap_owed: bool,
+    gap: Gap,
 }
 
 #[derive(Default)]
@@ -85,9 +125,6 @@ struct Registry {
 /// The fan-out. One per daemon, shared by `Arc`.
 pub struct Broadcaster {
     registry: Mutex<Registry>,
-    /// Read without taking the lock by the accept loop's diagnostics, and
-    /// kept in step inside it.
-    count: AtomicU64,
 }
 
 impl Default for Broadcaster {
@@ -108,14 +145,56 @@ fn notice_generation(notice: &RuntimeNotice) -> Option<Generation> {
     }
 }
 
+/// The later of two generations. `Option`'s own ordering does the work:
+/// `None` is below every `Some`, so an absent generation never wins.
 fn newest(left: Option<Generation>, right: Option<Generation>) -> Option<Generation> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(if left.get() >= right.get() {
-            left
-        } else {
-            right
-        }),
-        (value, None) | (None, value) => value,
+    left.max(right)
+}
+
+impl Registered {
+    /// Deliver one notice, mirroring the coordinator's `emit` arm for arm:
+    /// the marker first when a gap is owed, then the notice in hand.
+    fn deliver(&mut self, notice: &RuntimeNotice, incoming: Option<Generation>) {
+        if self.gap.is_owed() {
+            let generation = newest(self.gap.generation(), incoming);
+            match self.sink.try_send(RuntimeNotice::ResyncRequired {
+                generation,
+                reason: ResyncReason::RuntimeRecovered,
+            }) {
+                // The debt is only paid if the announcement can be acted on,
+                // and an observer can only act on one that names a
+                // generation. Clearing the latch on a marker naming nothing
+                // would spend the only record that a gap ever happened on a
+                // notice nobody can use, and nothing else re-arms it.
+                Ok(()) => {
+                    self.gap = if generation.is_none() {
+                        Gap::Owed
+                    } else {
+                        Gap::None
+                    };
+                }
+                // No room even for the marker. The notice in hand is lost
+                // with it, and the debt grows to name it.
+                Err(TrySendError::Full(_)) => {
+                    self.gap = owing(generation);
+                    return;
+                }
+                // The dispatcher has ended. Nothing to announce to it.
+                Err(TrySendError::Disconnected(_)) => {
+                    self.gap = Gap::None;
+                    return;
+                }
+            }
+        }
+        match self.sink.try_send(notice.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.gap = owing(newest(self.gap.generation(), incoming));
+            }
+            // The dispatcher has ended. Nothing to latch for a connection
+            // that is already closing.
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 }
 
@@ -123,7 +202,6 @@ impl Broadcaster {
     pub fn new() -> Self {
         Self {
             registry: Mutex::new(Registry::default()),
-            count: AtomicU64::new(0),
         }
     }
 
@@ -138,28 +216,23 @@ impl Broadcaster {
             id,
             Registered {
                 sink,
-                gap: None,
-                gap_owed: false,
+                gap: Gap::None,
             },
         );
-        self.count
-            .store(registry.connections.len() as u64, Ordering::Release);
         (ConnectionId(id), inbox)
     }
 
     /// Drop one connection's inbox. Idempotent.
     pub fn unregister(&self, id: ConnectionId) {
-        let mut registry = self.lock();
-        registry.connections.remove(&id.0);
-        self.count
-            .store(registry.connections.len() as u64, Ordering::Release);
+        self.lock().connections.remove(&id.0);
     }
 
     pub fn connection_count(&self) -> usize {
-        self.count.load(Ordering::Acquire) as usize
+        self.lock().connections.len()
     }
 
-    /// Offer one notice to every registered connection, without ever blocking.
+    /// Offer one notice to every registered connection, without ever
+    /// blocking.
     ///
     /// A connection whose inbox is closed — its dispatcher has ended but its
     /// `after_dispatch` has not run yet — is left registered rather than
@@ -169,52 +242,30 @@ impl Broadcaster {
         let mut registry = self.lock();
         let incoming = notice_generation(notice);
         for registered in registry.connections.values_mut() {
-            // A gap is outstanding, so the notice this connection would be
-            // given is replaced by the resync that announces it — but only
-            // once a generation exists to re-read at. Until then the notice
-            // goes through unchanged, because a state change is a level a
-            // stale client still needs and it is not the resync.
-            let named = if registered.gap_owed {
-                newest(registered.gap, incoming)
-            } else {
-                None
-            };
-            let announcing = named.is_some();
-            let outgoing = match named {
-                Some(generation) => RuntimeNotice::ResyncRequired {
-                    generation: Some(generation),
-                    reason: ResyncReason::RuntimeRecovered,
-                },
-                None => notice.clone(),
-            };
-            match registered.sink.try_send(outgoing) {
-                Ok(()) => {
-                    if announcing {
-                        registered.gap = None;
-                        registered.gap_owed = false;
-                    }
-                }
-                Err(TrySendError::Full(_)) => {
-                    registered.gap = newest(registered.gap, incoming);
-                    registered.gap_owed = true;
-                }
-                // The dispatcher has ended. Nothing to latch for a connection
-                // that is already closing.
-                Err(TrySendError::Disconnected(_)) => {}
-            }
+            registered.deliver(notice, incoming);
         }
     }
 
-    /// How many notices this connection has had dropped since it was last
-    /// told, as a generation. Test-only: nothing on the wire distinguishes a
-    /// latched gap from no gap until the resync is delivered.
+    /// Close every inbox by dropping every sender.
+    ///
+    /// This is how end of notices reaches each connection: a dispatcher's
+    /// `forward_notices` returns only when its receiver's senders are gone,
+    /// so without this the broadcaster would absorb the signal that the
+    /// runtime's channel has closed and every forwarder would block forever.
+    fn close(&self) {
+        self.lock().connections.clear();
+    }
+
+    /// What this connection is owed, or `None` if no such connection is
+    /// registered. Test-only: nothing on the wire distinguishes a latched gap
+    /// from no gap until the marker is delivered.
     #[cfg(test)]
-    pub fn gap_of(&self, id: ConnectionId) -> Option<Option<u64>> {
+    pub fn gap_of(&self, id: ConnectionId) -> Option<Gap> {
         let registry = self.lock();
         registry
             .connections
             .get(&id.0)
-            .map(|registered| registered.gap.map(Generation::get))
+            .map(|registered| registered.gap)
     }
 
     fn lock(&self) -> MutexGuard<'_, Registry> {
@@ -225,7 +276,8 @@ impl Broadcaster {
 }
 
 /// Feed `broadcaster` from the runtime's notice channel until the coordinator
-/// drops its sender. Returns the thread, which the service joins at shutdown.
+/// drops its sender, then close every inbox. Returns the thread, which the
+/// service joins at shutdown.
 pub fn spawn_fanout(
     broadcaster: Arc<Broadcaster>,
     notices: Receiver<RuntimeNotice>,
@@ -236,23 +288,115 @@ pub fn spawn_fanout(
             while let Ok(notice) = notices.recv() {
                 broadcaster.offer(&notice);
             }
+            broadcaster.close();
         })
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, sync_channel};
+    use std::time::Duration;
 
-    use vault_index::{Generation, LiveState};
+    use vault_core::VaultPath;
+    use vault_index::{
+        ChangeCause, Generation, LiveRefreshReport, LiveState, NoteChangeCounts, PathChanges,
+        ReconcileMetrics,
+    };
+    use vault_protocol::RuntimeEventDto;
 
     use super::*;
     use crate::runtime::{ResyncReason, RuntimeNotice};
+
+    /// How long a test waits for another thread before calling it wedged.
+    /// Generous: it is a failure bound, not a timing assertion.
+    const PATIENCE: Duration = Duration::from_secs(10);
 
     fn state_at(generation: u64) -> RuntimeNotice {
         RuntimeNotice::State {
             generation: Some(Generation::new(generation)),
             state: LiveState::Watching,
             error: None,
+        }
+    }
+
+    /// A notice that names no generation, because nothing has been committed.
+    fn ungenerated() -> RuntimeNotice {
+        RuntimeNotice::State {
+            generation: None,
+            state: LiveState::CatchingUp,
+            error: None,
+        }
+    }
+
+    fn config_changed(path: &str) -> RuntimeNotice {
+        RuntimeNotice::ConfigChanged {
+            path: VaultPath::new(path).expect("vault path"),
+        }
+    }
+
+    /// The notice a published generation actually emits — the common case in
+    /// the field, and the one whose generation the latch must be able to
+    /// name. Shaped like `tests/subscriptions.rs`'s own helper.
+    fn generation_notice(generation: u64) -> RuntimeNotice {
+        RuntimeNotice::Generation(Box::new(LiveRefreshReport {
+            previous_generation: generation.checked_sub(1).map(Generation::new),
+            generation: Generation::new(generation),
+            cause: ChangeCause::Watcher,
+            changes: PathChanges {
+                created: Vec::new(),
+                modified: Vec::new(),
+                deleted: Vec::new(),
+            },
+            note_changes: NoteChangeCounts {
+                created: 0,
+                modified: 0,
+                deleted: 0,
+            },
+            affected_reference_count: 0,
+            complete_resolution: false,
+            metrics: ReconcileMetrics::default(),
+        }))
+    }
+
+    /// Everything waiting in an inbox, in delivery order.
+    fn drain_inbox(inbox: &Receiver<RuntimeNotice>) -> Vec<RuntimeNotice> {
+        let mut seen = Vec::new();
+        while let Ok(notice) = inbox.try_recv() {
+            seen.push(notice);
+        }
+        seen
+    }
+
+    /// Fill one connection's inbox and then overflow it by one, so a gap is
+    /// latched naming `CONNECTION_NOTICE_CAPACITY + 1`.
+    fn overflow_with_states(broadcaster: &Broadcaster) -> u64 {
+        let overflow = CONNECTION_NOTICE_CAPACITY as u64 + 1;
+        for generation in 1..=overflow {
+            broadcaster.offer(&state_at(generation));
+        }
+        overflow
+    }
+
+    fn assert_marker_naming(notice: &RuntimeNotice, generation: u64) {
+        match notice {
+            RuntimeNotice::ResyncRequired {
+                generation: named,
+                reason,
+            } => {
+                assert_eq!(
+                    *reason,
+                    ResyncReason::RuntimeRecovered,
+                    "the drop-and-latch reason"
+                );
+                assert_eq!(
+                    named.map(Generation::get),
+                    Some(generation),
+                    "the marker names the newest generation, not the one that \
+                     was dropped"
+                );
+            }
+            other => panic!("the gap was never announced: {other:?}"),
         }
     }
 
@@ -276,7 +420,11 @@ mod tests {
             broadcaster.offer(&state_at(generation));
             fast_seen.push(fast_inbox.recv().expect("the fast inbox has a notice"));
         }
-        assert_eq!(broadcaster.gap_of(slow), Some(None), "no gap while it fits");
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::None),
+            "no gap while it fits"
+        );
 
         // The next one cannot fit in the slow inbox. It is dropped there and
         // latched; the fast inbox takes it as usual.
@@ -285,7 +433,7 @@ mod tests {
         fast_seen.push(fast_inbox.recv().expect("the fast inbox has a notice"));
         assert_eq!(
             broadcaster.gap_of(slow),
-            Some(Some(overflow)),
+            Some(Gap::Named(Generation::new(overflow))),
             "the gap names the newest generation it has seen"
         );
 
@@ -305,41 +453,35 @@ mod tests {
         }
         assert_eq!(
             broadcaster.gap_of(fast),
-            Some(None),
+            Some(Gap::None),
             "the peer's overflow latched nothing here"
         );
 
-        // The slow connection drains one slot, and the next notice it can be
-        // given is replaced by the resync that announces the gap.
+        // The slow connection drains two slots — one for the marker, one for
+        // the notice it precedes — and the next offer delivers both.
         let drained = slow_inbox.recv().expect("the slow inbox has a notice");
         assert!(
             matches!(drained, RuntimeNotice::State { .. }),
             "queued detail first"
         );
+        slow_inbox
+            .recv()
+            .expect("the slow inbox has a second notice");
         broadcaster.offer(&state_at(overflow + 1));
-        let mut seen = Vec::new();
-        while let Ok(notice) = slow_inbox.try_recv() {
-            seen.push(notice);
-        }
-        let last = seen.last().expect("the slow inbox received something");
-        match last {
-            RuntimeNotice::ResyncRequired { generation, reason } => {
-                assert_eq!(
-                    *reason,
-                    ResyncReason::RuntimeRecovered,
-                    "the drop-and-latch reason"
-                );
-                assert_eq!(
-                    generation.map(Generation::get),
-                    Some(overflow + 1),
-                    "the resync names the newest generation, not the one that was dropped"
-                );
-            }
-            other => panic!("the gap was never announced: {other:?}"),
+        let seen = drain_inbox(&slow_inbox);
+        let tail = &seen[seen.len() - 2..];
+        assert_marker_naming(&tail[0], overflow + 1);
+        match &tail[1] {
+            RuntimeNotice::State { generation, .. } => assert_eq!(
+                generation.map(Generation::get),
+                Some(overflow + 1),
+                "the marker precedes the notice in hand, it never replaces it"
+            ),
+            other => panic!("the notice in hand was swallowed: {other:?}"),
         }
         assert_eq!(
             broadcaster.gap_of(slow),
-            Some(None),
+            Some(Gap::None),
             "the gap is cleared once it has been announced"
         );
 
@@ -349,46 +491,259 @@ mod tests {
     }
 
     /// A drop with nothing committed yet cannot name a generation, so the
-    /// resync is owed rather than emitted — the same withholding the
+    /// debt stands rather than being paid — the same withholding the
     /// subscription registry does, and for the same reason: an event naming
     /// no generation to re-read at tells a client nothing.
     #[test]
     fn a_gap_with_no_generation_yet_waits_for_one_that_has() {
         let broadcaster = Arc::new(Broadcaster::new());
         let (slow, slow_inbox) = broadcaster.register();
-        let ungenerated = RuntimeNotice::State {
-            generation: None,
-            state: LiveState::CatchingUp,
-            error: None,
-        };
         for _ in 0..=CONNECTION_NOTICE_CAPACITY {
-            broadcaster.offer(&ungenerated);
+            broadcaster.offer(&ungenerated());
         }
-        assert_eq!(broadcaster.gap_of(slow), Some(None), "owed, but unnameable");
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::Owed),
+            "owed, but unnameable"
+        );
 
         // Drain everything, then offer one that does name a generation.
-        while slow_inbox.try_recv().is_ok() {}
+        drain_inbox(&slow_inbox);
         broadcaster.offer(&state_at(7));
-        match slow_inbox.recv().expect("a notice reached the slow inbox") {
-            RuntimeNotice::ResyncRequired { generation, reason } => {
-                assert_eq!(reason, ResyncReason::RuntimeRecovered);
-                assert_eq!(generation.map(Generation::get), Some(7));
-            }
-            other => panic!("the owed resync was not emitted: {other:?}"),
+        let seen = drain_inbox(&slow_inbox);
+        assert_marker_naming(&seen[0], 7);
+        assert!(
+            matches!(&seen[1], RuntimeNotice::State { .. }),
+            "the notice in hand follows the marker"
+        );
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::None),
+            "naming it is what pays the debt"
+        );
+    }
+
+    /// The step the two tests above skip: an unnameable notice arriving
+    /// *between* the drop and the first one that can name a generation.
+    ///
+    /// The marker still goes out — the coordinator sends one too — but it
+    /// names nothing, an observer discards it, and so it cannot have paid
+    /// anything. Clearing the latch on any successful send loses the gap
+    /// permanently, because nothing re-arms it.
+    #[test]
+    fn an_unnameable_notice_does_not_pay_a_debt_it_cannot_name() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (slow, slow_inbox) = broadcaster.register();
+        for _ in 0..=CONNECTION_NOTICE_CAPACITY {
+            broadcaster.offer(&ungenerated());
+        }
+        assert_eq!(broadcaster.gap_of(slow), Some(Gap::Owed));
+        drain_inbox(&slow_inbox);
+
+        broadcaster.offer(&ungenerated());
+        let between = drain_inbox(&slow_inbox);
+        assert!(
+            matches!(
+                between[0],
+                RuntimeNotice::ResyncRequired {
+                    generation: None,
+                    ..
+                }
+            ),
+            "a marker that names nothing is still sent, as the coordinator sends it"
+        );
+        assert!(
+            matches!(between[1], RuntimeNotice::State { .. }),
+            "and the notice in hand still follows it"
+        );
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::Owed),
+            "a marker an observer must discard cannot have paid the debt"
+        );
+
+        drain_inbox(&slow_inbox);
+        broadcaster.offer(&state_at(7));
+        let seen = drain_inbox(&slow_inbox);
+        assert_marker_naming(&seen[0], 7);
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::None),
+            "the debt outlived the notice that could not name it"
+        );
+    }
+
+    /// The marker precedes, it never replaces. Two notices prove it, because
+    /// they are the two a resync cannot stand in for: a configuration change
+    /// names a zone no generation contains, and the final `stopped` state is
+    /// the daemon's last word and is never re-announced.
+    #[test]
+    fn the_marker_precedes_a_config_change_and_a_stopped_state() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (slow, slow_inbox) = broadcaster.register();
+
+        let overflow = overflow_with_states(&broadcaster);
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::Named(Generation::new(overflow)))
+        );
+        drain_inbox(&slow_inbox);
+
+        broadcaster.offer(&config_changed("config/vaultd.toml"));
+        let seen = drain_inbox(&slow_inbox);
+        assert_marker_naming(&seen[0], overflow);
+        match &seen[1] {
+            RuntimeNotice::ConfigChanged { path } => assert_eq!(
+                path.as_str(),
+                "config/vaultd.toml",
+                "no later notice re-announces a configuration change"
+            ),
+            other => panic!("the configuration change was swallowed: {other:?}"),
+        }
+
+        // Latch a second gap, then send the one notice a client cannot
+        // afford to lose.
+        let overflow = overflow_with_states(&broadcaster);
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::Named(Generation::new(overflow)))
+        );
+        drain_inbox(&slow_inbox);
+
+        broadcaster.offer(&RuntimeNotice::State {
+            generation: None,
+            state: LiveState::Stopped,
+            error: None,
+        });
+        let seen = drain_inbox(&slow_inbox);
+        assert_marker_naming(&seen[0], overflow);
+        match &seen[1] {
+            RuntimeNotice::State { state, .. } => assert_eq!(
+                *state,
+                LiveState::Stopped,
+                "the daemon's last word survives the gap"
+            ),
+            other => panic!("the stopped state was swallowed: {other:?}"),
         }
     }
 
-    /// The invariant the pre-drain is *said* to defend, asserted where it
-    /// actually holds: a notice that reaches a connection through the
-    /// broadcaster is drained to completion inside the arm that took it, so
-    /// the registry is empty again before the next input is considered.
-    ///
-    /// This is what makes the Request arm's pre-drain defensive rather than
-    /// load-bearing, and it is the test that goes red if a future change
-    /// queues an event and does not drain it — at which point the
-    /// pre-drain's comment becomes true and its own test is owed.
+    /// `RuntimeNotice::Generation` is what a published generation emits, so
+    /// it is the notice whose generation the latch will name in the field.
+    /// The `State` notices the other tests use would not catch a
+    /// `notice_generation` that forgot this arm.
     #[test]
-    fn a_broadcast_notice_is_drained_to_completion_inside_the_arm_that_took_it() {
+    fn the_latch_names_the_generation_of_a_generation_notice() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (slow, _slow_inbox) = broadcaster.register();
+        for generation in 1..=CONNECTION_NOTICE_CAPACITY as u64 {
+            broadcaster.offer(&generation_notice(generation));
+        }
+        assert_eq!(broadcaster.gap_of(slow), Some(Gap::None));
+
+        let overflow = CONNECTION_NOTICE_CAPACITY as u64 + 1;
+        broadcaster.offer(&generation_notice(overflow));
+        assert_eq!(
+            broadcaster.gap_of(slow),
+            Some(Gap::Named(Generation::new(overflow))),
+            "a dropped generation notice must still be nameable"
+        );
+    }
+
+    /// The thread itself, end to end: a notice put into the runtime's channel
+    /// comes out of a registered inbox unchanged.
+    #[test]
+    fn the_fan_out_thread_carries_a_notice_from_the_runtime_channel_to_an_inbox() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (_id, inbox) = broadcaster.register();
+        let (notices, receiver) = sync_channel(4);
+        let fanout =
+            spawn_fanout(Arc::clone(&broadcaster), receiver).expect("the fan-out thread starts");
+
+        notices
+            .send(generation_notice(9))
+            .expect("the runtime channel takes it");
+        match inbox
+            .recv_timeout(PATIENCE)
+            .expect("the notice reached the inbox")
+        {
+            RuntimeNotice::Generation(report) => {
+                assert_eq!(report.generation, Generation::new(9));
+            }
+            other => panic!("something else arrived: {other:?}"),
+        }
+
+        drop(notices);
+        fanout
+            .join()
+            .expect("the fan-out thread ends with its channel");
+    }
+
+    /// End of notices must reach every dispatcher. `forward_notices` returns
+    /// only when its receiver's senders are gone, so the broadcaster has to
+    /// drop them when the runtime's channel closes — otherwise it absorbs the
+    /// signal and every forwarder blocks forever, including after a
+    /// coordinator panic.
+    #[test]
+    fn the_fan_out_closes_every_inbox_when_the_runtime_channel_ends() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (_id, inbox) = broadcaster.register();
+        let (notices, receiver) = sync_channel(1);
+        let fanout =
+            spawn_fanout(Arc::clone(&broadcaster), receiver).expect("the fan-out thread starts");
+
+        drop(notices);
+        fanout
+            .join()
+            .expect("the fan-out thread ends with its channel");
+
+        assert!(
+            inbox.recv().is_err(),
+            "the inbox is closed, so a dispatcher's forwarder sees end of notices"
+        );
+        assert_eq!(
+            broadcaster.connection_count(),
+            0,
+            "and nothing is left registered"
+        );
+    }
+
+    /// "Never blocks" is this module's first claim, and a blocking send would
+    /// otherwise show up as an unbounded hang rather than a failure. Bound it
+    /// so the mutation is red instead of eternal.
+    #[test]
+    fn offer_returns_rather_than_blocking_on_a_full_inbox() {
+        let broadcaster = Arc::new(Broadcaster::new());
+        let (_id, inbox) = broadcaster.register();
+        for generation in 1..=CONNECTION_NOTICE_CAPACITY as u64 {
+            broadcaster.offer(&state_at(generation));
+        }
+
+        let (done, finished) = sync_channel(1);
+        let offering = Arc::clone(&broadcaster);
+        let offerer = std::thread::spawn(move || {
+            offering.offer(&state_at(CONNECTION_NOTICE_CAPACITY as u64 + 1));
+            done.send(()).ok();
+        });
+        finished
+            .recv_timeout(PATIENCE)
+            .expect("offer returned rather than blocking on a full inbox");
+        offerer.join().expect("the offering thread ends");
+        drop(inbox);
+    }
+
+    /// A notice that reaches a connection through the broadcaster becomes
+    /// events in that connection's registry, and draining empties the queue
+    /// however many are waiting.
+    ///
+    /// **What this does not pin:** the Request arm's pre-drain. It cannot —
+    /// it does not call `connection::dispatch`, and the branch that would
+    /// make the pre-drain load-bearing is `drain`'s early return when the
+    /// writer is gone, which lives there. `tests/live_stdio.rs` is what goes
+    /// red if `drain` stops draining to completion. What is pinned here is
+    /// the link the module header claims: broadcaster to registry, more than
+    /// one event, in order, nothing left behind.
+    #[test]
+    fn a_broadcast_notice_becomes_events_a_single_drain_empties() {
         use vault_index::PublishedStatus;
 
         use crate::subscriptions::SubscriptionRegistry;
@@ -406,22 +761,42 @@ mod tests {
         });
         registry.activate_new();
 
-        broadcaster.offer(&state_at(3));
-        let notice = inbox.recv().expect("the notice reached the inbox");
-
-        // The Notice arm's two statements, in order, with nothing between them.
-        registry.enqueue_notice(notice);
-        let mut drained = 0;
-        while registry.pop_event().is_some() {
-            drained += 1;
+        // Configuration changes, because each becomes exactly one event and
+        // none of them collapses into another — so the count and the order
+        // below mean what they say.
+        let paths = ["config/a.toml", "config/b.toml", "config/c.toml"];
+        for path in paths {
+            broadcaster.offer(&config_changed(path));
         }
 
-        assert!(drained > 0, "the notice produced at least one event");
+        // Enqueue all three before draining any, so the queue genuinely holds
+        // more than one event and "to completion" has something to mean.
+        for _ in paths {
+            let notice = inbox.recv_timeout(PATIENCE).expect("the notice arrived");
+            registry.enqueue_notice(notice);
+        }
+        assert_eq!(
+            registry.queue_len(&subscribed.subscription_id),
+            Some(paths.len()),
+            "the queue really held every one of them"
+        );
+
+        let mut drained = Vec::new();
+        while let Some(envelope) = registry.pop_event() {
+            match envelope.event {
+                RuntimeEventDto::ConfigChanged(changed) => drained.push(changed.path),
+                other => panic!("an unexpected event was queued: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            drained, paths,
+            "every queued event was delivered, in order, not just the first"
+        );
         assert_eq!(
             registry.queue_len(&subscribed.subscription_id),
             Some(0),
-            "the queue is empty again before the next input, which is why the \
-             Request arm's pre-drain has nothing to find"
+            "and the queue is empty before the next input is considered"
         );
     }
 }
