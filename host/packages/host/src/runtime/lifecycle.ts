@@ -93,7 +93,7 @@ import type { HostErrorEntry, HostErrors } from "../shim/errors";
 import type { Mirror } from "../mirror/mirror";
 import type { MirrorChangeBatch } from "../mirror/types";
 import type { ShimEventBus } from "../shim/events";
-import type { Supervisor } from "../supervisor";
+import type { EngineSource, Supervisor } from "../supervisor";
 import type { AppliedBatch, TAbstractFile } from "../shim/files";
 
 /**
@@ -217,6 +217,15 @@ export interface StartupReport {
   readonly hydrationMs: number;
   readonly warmMs: number;
   readonly loadMs: number;
+  /**
+   * Where this host's engine came from. Reported because the answer changes
+   * what a reader may conclude from a cold-start number: a connected host
+   * never paid the daemon's start at all.
+   *
+   * `"spawned"` when there is no supervisor to ask — a host driven straight
+   * off a client has no engine of its own to have connected to.
+   */
+  readonly engineSource: EngineSource;
 }
 
 /** The scoped bus name of `metadataCache`'s events, for the labels below. */
@@ -521,6 +530,7 @@ export class LifecycleSequencer {
       hydrationMs,
       warmMs,
       loadMs,
+      engineSource: this.deps.supervisor?.engineSource() ?? "spawned",
     };
   }
 

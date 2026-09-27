@@ -30,12 +30,22 @@ serde.workspace = true
 # does not change how `serde_json::Value`/`Map` order keys anywhere else in
 # the workspace.
 serde_json = { workspace = true, features = ["raw_value"] }
+# The socket path digest. SHA-256 rather than the `blake3` the index identity
+# uses, because the host's `vaultdSocketPathFor` is SHA-256 and the two must
+# name the same file from the same vault root or `--listen` with no value and
+# `engine: auto` would never meet.
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 vault-core = { path = "../vault-core" }
 vault-index = { path = "../vault-index" }
 vault-protocol = { path = "../vault-protocol" }
 vault-watch = { path = "../vault-watch" }
+xdg.workspace = true
 
 [dev-dependencies]
+# An integration test is its own crate, so the normal dependency above does
+# not reach it. `tests/socket_lifecycle.rs` sends SIGTERM to the daemon it
+# spawned.
+libc.workspace = true
 tempfile.workspace = true

@@ -137,6 +137,9 @@ async function liveHost(spec: LiveSpec): Promise<LiveHost> {
   mkdirSync(dataDir, { recursive: true });
   const config: HostConfig = {
     ...defaultHostConfig(root),
+    // Phase 6's road, pinned: this case owns its daemon. See the note in
+    // `real-daemon.ts` on why a test never runs under `auto`.
+    engine: "spawn" as const,
     vaultdBinary: BINARY,
     dataDir,
     socketPath: join(dataDir, "host.sock"),

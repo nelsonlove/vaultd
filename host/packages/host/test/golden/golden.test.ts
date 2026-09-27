@@ -277,9 +277,20 @@ function remapDates(path: string, dates: { today: string; yesterday: string }): 
     .replace(ROLLOVER_CAPTURE.yesterday, dates.yesterday);
 }
 
+function pad(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+// **Local components, not `toISOString()`.** The plugin under test computes
+// "today" from the local date; building this one in UTC instead means the two
+// disagree by a day between 20:00 and midnight Eastern (19:00-midnight under
+// EST), and the golden fails with the two notes' contents swapped. This is a
+// phase-6 defect, fixed here rather than folded into the phase-7 branch that
+// found it.
 function isoDay(offsetDays: number): string {
-  const at = new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000);
-  return at.toISOString().slice(0, 10);
+  const at = new Date();
+  at.setDate(at.getDate() + offsetDays);
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
 }
 
 /** Rename every capture-dated file under `root` onto the replay's dates. */

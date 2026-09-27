@@ -129,6 +129,40 @@ fn live_event_documents_declare_the_subscription_contract() {
     );
 }
 
+/// The per-subscription bound is a **published** number, so the constant and
+/// the documents that publish it must agree.
+///
+/// This is the only pin on the value itself. Every behavioural test is
+/// necessarily written against `SUBSCRIBER_CAPACITY` — a threshold expressed
+/// relative to a constant cannot notice the constant moving — so raising it
+/// from 64 to 65 left the whole crate green until this existed, while
+/// `docs/protocol.md` and the socket-transport design both went on promising
+/// clients 64. A client sizing its own buffers from the protocol document is
+/// entitled to that number being true.
+#[test]
+fn the_documented_per_subscription_bound_matches_the_constant() {
+    let bound = vault_server::subscriptions::SUBSCRIBER_CAPACITY;
+    assert_document_contains(
+        "docs/protocol.md",
+        &[format!("**Per subscription: {bound} events.**").as_str()],
+    );
+    assert_document_contains(
+        "docs/design/vaultd-socket-transport.md",
+        &[format!("per-subscription bound of {bound} events").as_str()],
+    );
+}
+
+/// The per-generation detail limit is published the same way, and drifts the
+/// same way. Same reasoning as the bound above.
+#[test]
+fn the_documented_detailed_path_limit_matches_the_constant() {
+    let limit = vault_server::subscriptions::DETAILED_PATH_LIMIT;
+    assert_document_contains(
+        "docs/protocol.md",
+        &[format!("Per generation: {limit} paths").as_str()],
+    );
+}
+
 /// The bounds documentation drifted once already: it described
 /// `subscriber_lag` as what a slow stdio client experiences, which the
 /// shipped dispatcher makes unreachable. These phrases pin the corrected
@@ -142,7 +176,7 @@ fn bounds_documentation_describes_the_shipped_transport() {
             "backpressure",
             "`resync_required { runtime_recovered }`",
             // Peer delivery is not independent on one connection.
-            "Private queues bound memory, not latency.",
+            "Private queues bound memory, not latency, and the boundary is the connection",
             // The bounds are the registry's, not the transport's.
             "regardless of transport",
             // The tuning flags are enforced, not merely conventional.
@@ -251,5 +285,39 @@ fn the_protocol_documents_its_unknown_variant_tolerance() {
             "MUST treat an unrecognized value",
             "`Unknown` catch-all",
         ],
+    );
+}
+
+/// The socket transport's contract lives in three documents, and a phase that
+/// shipped the behaviour without them would leave an operator guessing at the
+/// path rule and the shutdown bound. Phrases rather than prose, for the same
+/// reason the rest of this file uses them: a required sentence that was
+/// reworded is a doc question, and a required sentence that was **deleted** is
+/// a contract question.
+#[test]
+fn the_socket_transport_is_documented_where_its_users_look() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "## Transports",
+            "<run dir>/<digest>.sock",
+            "$XDG_RUNTIME_DIR/vaultd",
+            "mode `0700`",
+            "mode `0600`",
+            "connection-scoped",
+            "bounded at five seconds",
+            "256 deep",
+        ],
+    );
+    assert_document_contains(
+        "docs/design/headless-plugin-host.md",
+        &[
+            "vaultd` never speaks the Sync protocol",
+            "Amended by the socket transport phase",
+        ],
+    );
+    assert_document_contains(
+        "README.md",
+        &["--listen [PATH]", "--engine", "--leave-engine-running"],
     );
 }

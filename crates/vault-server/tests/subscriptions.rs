@@ -22,6 +22,7 @@ use vault_protocol::{
     SubscribeEventsParams, SubscribeEventsResponse,
 };
 use vault_server::Server;
+use vault_server::broadcast::ConnectionId;
 use vault_server::runtime::{
     ResyncReason, Runtime, RuntimeNotice, RuntimeOptions, RuntimeTestHooks,
 };
@@ -199,6 +200,65 @@ fn a_subscription_opened_before_any_generation_filters_nothing() {
         events[0].event,
         RuntimeEventDto::GenerationCommitted(ref committed) if committed.generation == 1
     ));
+}
+
+/// The queue collapses at **exactly** its documented depth: the bound's last
+/// event is delivered in full, and the one after it is what triggers the
+/// marker.
+///
+/// The neighbouring test enqueues a thousand generations and asserts
+/// `<= SUBSCRIBER_CAPACITY` throughout, which holds for any threshold at or
+/// below the bound and so pins the ceiling without pinning where it bites.
+/// This one brackets it: `SUBSCRIBER_CAPACITY` notices must still be full
+/// detail with nothing collapsed, and the next one must collapse. An
+/// off-by-one in the overflow check — collapsing a notice early, or letting
+/// the queue grow one past its depth — goes red here and nowhere else.
+///
+/// The *value* 64 is pinned separately, in `tests/docs.rs`, against the two
+/// documents that publish it: a threshold expressed relative to the constant
+/// cannot notice the constant moving.
+#[test]
+fn a_subscriber_queue_collapses_at_exactly_its_documented_bound() {
+    let mut registry = SubscriptionRegistry::new();
+    let response = registry.subscribe(&status(Some(1), LiveState::Watching));
+    registry.activate_new();
+    let id = response.subscription_id;
+
+    // Exactly the bound, undrained. Every one of them must still be there,
+    // as itself.
+    for generation in 2..=(SUBSCRIBER_CAPACITY as u64 + 1) {
+        registry.enqueue_notice(generation_notice(generation, paths("Note", 1)));
+    }
+    assert_eq!(
+        registry.queue_len(&id).expect("subscription exists"),
+        SUBSCRIBER_CAPACITY,
+        "exactly the bound's worth of events, and no collapse yet"
+    );
+
+    // One more. This is the notice that cannot fit.
+    registry.enqueue_notice(generation_notice(
+        SUBSCRIBER_CAPACITY as u64 + 2,
+        paths("Over", 1),
+    ));
+    let events = drain(&mut registry);
+    match &events.last().expect("at least the lag marker").event {
+        RuntimeEventDto::ResyncRequired(resync) => {
+            assert_eq!(resync.reason, ResyncReasonDto::SubscriberLag);
+            assert_eq!(
+                resync.current_generation,
+                Some(SUBSCRIBER_CAPACITY as u64 + 2),
+                "the marker names the newest generation"
+            );
+        }
+        other => panic!(
+            "the queue must collapse on the notice past its bound, not before \
+             and not later; got {other:?}"
+        ),
+    }
+    assert!(
+        events.len() <= SUBSCRIBER_CAPACITY,
+        "and the collapsed backlog is bounded"
+    );
 }
 
 /// A subscriber that never drains is coalesced, never grown. The marker that
@@ -514,12 +574,12 @@ fn a_state_change_arriving_at_capacity_survives_the_collapse() {
 // The registry driven against a live runtime
 // ---------------------------------------------------------------------------
 //
-// `stdio::dispatch` is private and `stdio::run` owns real stdin and stdout,
-// so these drive the same loop in process from the same public pieces the
-// dispatcher uses: pre-drain, `Server::handle`, `activate_new`, then
+// `connection::dispatch` is crate-visible and `stdio::run` owns real stdin and
+// stdout, so these drive the same loop in process from the same public pieces
+// the dispatcher uses: pre-drain, `Server::handle`, `activate_new`, then
 // `enqueue_notice` + drain for every notice. That is the sanctioned route to
-// `subscriber_lag`, which the shipped stdio transport cannot reach because it
-// drains after every single notice.
+// `subscriber_lag`, which the shipped transports cannot reach because that
+// dispatcher drains after every single notice.
 
 /// A vault plus its cache directory, kept alive for the whole test.
 struct LiveFixture {
@@ -601,6 +661,7 @@ fn subscribe_through_dispatcher(
         "these tests subscribe before any event is queued"
     );
     let envelope = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope::new(
             "req-subscribe",
             Request::SubscribeEvents(SubscribeEventsParams {}),

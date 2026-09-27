@@ -13,7 +13,9 @@
  * {@link DaemonUnreachable} becomes 3, and the GUI overlap report becomes 4.
  *
  * **It names no fs function.** The state directory is reached through
- * {@link DataDir}, the one module allowed to write outside the vault.
+ * {@link DataDir}, the one module allowed to write outside the vault, and the
+ * vault root is canonicalised by `defaultHostConfig`, which reaches the file
+ * system through `runtime/fs-access` — the seam the write guard watches.
  */
 
 import { resolve } from "node:path";
@@ -21,7 +23,7 @@ import { resolve } from "node:path";
 import { DaemonUnreachable, startHost } from "./host";
 import { OBSIDIAN_CONFIG_DIR } from "./pluginset/config-dir";
 import { defaultHostConfig, socketPathFor, systemClock } from "./config";
-import type { HostConfig } from "./config";
+import type { EngineMode, HostConfig } from "./config";
 import type { RunningHost } from "./host";
 
 /** What `--help` prints, and the whole of this binary's interface. */
@@ -41,6 +43,12 @@ Options:
                             refuse the file system, process spawning and the
                             network to plugin bundles.
   --dry-run-allow-network   Under --dry-run, let requestUrl through anyway.
+  --engine <mode>           auto (default): connect to a vaultd already listening
+                            for this vault, else spawn one with --listen.
+                            connect: never spawn; exit 3 if none is listening.
+                            spawn: always spawn, never probe, and own its life.
+  --leave-engine-running    Under --engine auto, leave a daemon this host
+                            spawned running when the host shuts down.
   --force-shared <id>       Run <id> even though the GUI has it enabled too.
                             Repeatable.
   -h, --help                Print this and exit 0.
@@ -100,6 +108,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   let vaultdBinary: string | null = null;
   let dryRun = false;
   let dryRunAllowNetwork = false;
+  let engine: EngineMode | null = null;
+  let leaveEngineRunning = false;
   const forceShared: string[] = [];
 
   const valueOf = (flag: string, at: number): string => {
@@ -138,6 +148,18 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       case "--dry-run-allow-network":
         dryRunAllowNetwork = true;
         break;
+      case "--engine": {
+        const value = valueOf(flag, at);
+        if (value !== "auto" && value !== "connect" && value !== "spawn") {
+          throw new CliRefusal(EXIT_USAGE, `--engine must be auto, connect or spawn, not "${value}"`);
+        }
+        engine = value;
+        at += 1;
+        break;
+      }
+      case "--leave-engine-running":
+        leaveEngineRunning = true;
+        break;
       case "--force-shared":
         forceShared.push(valueOf(flag, at));
         at += 1;
@@ -160,14 +182,26 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     );
   }
 
-  // **Absolute, once, here.** The vault root is two things downstream: the
-  // daemon's `--vault` argument and the key the socket digest is derived from.
-  // Left as the operator typed it, one vault reached from two directories is
-  // two different hosts with two different sockets, each believing it is the
+  // **Absolute and canonical, once, here.** The vault root is three things
+  // downstream: the daemon's `--vault` argument, the key the host's own socket
+  // digest is derived from, and the key the *daemon's* socket digest is derived
+  // from. Left as the operator typed it, one vault reached from two directories
+  // is two different hosts with two different sockets, each believing it is the
   // only one — and `./vault` means nothing at all to a daemon spawned with a
   // different working directory.
-  const vaultRoot = resolve(vault);
-  const base = defaultHostConfig(vaultRoot);
+  //
+  // **The symlinks matter as much as the relative segments**, and only since
+  // the daemon started listening. `vault_index::canonical_root` realpaths what
+  // `--vault` names, and `vaultdSocketPathFor` hashes the string it is given:
+  // a host that passed `/tmp/vault` where the daemon canonicalised
+  // `/private/tmp/vault` would probe a path no daemon ever binds and so would
+  // spawn a second daemon beside a perfectly good one, every time.
+  //
+  // `defaultHostConfig` applies that realpath — for this binary and for every
+  // programmatic caller alike — so what this function owes it is only an
+  // absolute path, and `base.vaultRoot` is the canonical answer to read back.
+  const base = defaultHostConfig(resolve(vault));
+  const vaultRoot = base.vaultRoot;
   const config: HostConfig = {
     ...base,
     clock: systemClock(),
@@ -176,6 +210,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     ...(socketPath === null ? { socketPath: socketPathFor(base.dataDir, vaultRoot) } : { socketPath }),
     dryRun,
     dryRunAllowNetwork,
+    ...(engine === null ? {} : { engine }),
+    leaveEngineRunning,
     forceShared,
   };
   return { config, help: false };
@@ -246,12 +282,35 @@ export async function main(
     running = await runHost(parsed.config);
     // One machine-readable line on stdout, so whatever started this host knows
     // where its socket is without guessing at the digest.
+    //
+    // **`engine_source` is flat, and deliberately.** `host.info` carries an
+    // `engine` object, so its own spelling is `engine.source`; here there is
+    // no object to hang it off and `engine.engine_source` would be the
+    // redundancy of nesting a one-key group. What it answers is whether this
+    // host is paying for a daemon of its own — a supervisor that reports
+    // `"connected"` adopted one that was already there, and will not take it
+    // down at shutdown.
+    //
+    // It is a **snapshot taken at startup**, not a live reading: a host that
+    // connected and then had to spawn a replacement after a restart still says
+    // `"connected"` on the line it already printed. `host.info`'s
+    // `engine.source` is the live answer.
     out(
       JSON.stringify({
         ready: true,
         socket: running.socketPath,
         vault: running.config.vaultRoot,
         dry_run: running.config.dryRun,
+        engine_source: running.engineSource,
+        // **`null` under `spawn`, and the key stays either way.** The config
+        // always *has* an `engineSocketPath` — `defaultHostConfig` derives one
+        // from the vault root whatever the mode — but `spawnOnce` passes
+        // `--listen` only under `auto`, so under `spawn` that path names a
+        // socket nothing bound and nothing ever will. Printing it there
+        // advertises an address a client would knock on and find empty. The
+        // key is not dropped, because a key that comes and goes is worse to
+        // consume than one whose value says "there is no socket".
+        engine_socket: running.config.engine === "spawn" ? null : running.config.engineSocketPath,
         loaded: running.startup.loaded,
         failed: running.startup.failed,
       }),

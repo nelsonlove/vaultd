@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc --build packages/host",
     "typecheck": "tsc --noEmit -p packages/host && tsc --noEmit -p packages/host/tsconfig.test.json",
-    "lint": "eslint packages",
+    "lint": "eslint packages scripts",
     "pretest": "node scripts/warm-fixtures.js",
     "test": "vitest run"
   },

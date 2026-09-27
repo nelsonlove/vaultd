@@ -41,6 +41,14 @@ function configFor(mode: string, overrides: Partial<HostConfig> = {}): HostConfi
   const root = scratchRoot("vaultd-sup-");
   return {
     ...defaultHostConfig(root),
+    // **Phase 6's road, pinned.** The fake engine is a child process and
+    // nothing here is about the socket transport: under the default `auto`
+    // every start would first spend a probe — a timer on the injected clock,
+    // which is what the ladder cases count — and every stop would send a
+    // SIGTERM the stdin-EOF case exists to prove unnecessary. The mode matrix
+    // is `supervisor-engine-mode-real-daemon.test.ts`, against the real
+    // daemon, because every fact in it is a fact about that daemon.
+    engine: "spawn",
     vaultdBinary: process.execPath,
     vaultdArgs: [fake],
     restartBackoffMs: [1, 1, 1],

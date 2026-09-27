@@ -19,7 +19,8 @@
 //!
 //! **These are component bounds, and only the second is reachable through
 //! the shipped stdio transport.** They bind whoever drives this registry, and
-//! [`crate::stdio`]'s dispatcher drives it in a way that never approaches the
+//! [`crate::connection`]'s dispatcher — the one every transport runs, stdio
+//! included — drives it in a way that never approaches the
 //! first: it drains every queued event immediately after each
 //! `enqueue_notice`, so a subscriber queue holds at most one notice's worth
 //! of events. `subscriber_lag` is therefore not what a slow stdio *client*
@@ -441,9 +442,11 @@ impl SubscriptionRegistry {
         }
     }
 
-    /// Release a subscription. Whatever it had queued has already been
-    /// written by the dispatcher's pre-drain, so this only stops future
-    /// delivery.
+    /// Release a subscription. Whatever it had queued has already been written:
+    /// the dispatcher drains to completion inside the arm that enqueues, so
+    /// nothing is left waiting by the time a request is answered (its
+    /// defensive pre-drain would catch anything that was). So this only stops
+    /// future delivery.
     pub fn unsubscribe(&mut self, id: &str) -> Result<UnsubscribeResponse, ProtocolError> {
         match self.subscriptions.remove(id) {
             Some(_) => Ok(UnsubscribeResponse {

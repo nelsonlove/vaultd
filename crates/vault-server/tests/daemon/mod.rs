@@ -20,6 +20,28 @@ use vault_protocol::{EventEnvelope, ResponseEnvelope};
 /// not to assert anything about timing.
 pub const LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The ceiling on [`Daemon::drain_events`] — what it spends on a stream that
+/// keeps writing and never goes quiet. The same value `socket::Client` uses.
+const DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// How long a silence ends a [`Daemon::drain_events`]. The same value
+/// `socket::Client` uses; the two must agree, because the conformance
+/// transcript compares them line for line.
+const DRAIN_QUIET: Duration = Duration::from_millis(250);
+
+/// Which door a run goes through. Lives here rather than in `socket/mod.rs`
+/// because the conformance test names one enum and picks a harness from it.
+///
+/// Allowed dead for the reason every other helper in this file is: the module
+/// compiles into each test binary separately, and only
+/// `tests/conformance.rs` parameterizes itself by transport.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Transport {
+    Stdio,
+    Socket,
+}
+
 pub struct Daemon {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -107,6 +129,11 @@ impl Daemon {
     }
 
     /// The next *response* line, skipping any events that interleave.
+    ///
+    /// Allowed dead for this file's usual reason: `tests/conformance.rs`
+    /// compares raw bytes and so reaches only [`Daemon::call_raw`], which does
+    /// not go through here.
+    #[allow(dead_code)]
     pub fn response(&mut self) -> ResponseEnvelope {
         loop {
             let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
@@ -176,9 +203,100 @@ impl Daemon {
 
     /// Send one request line and return its response — the ordinary shape,
     /// for a test that is not deliberately pipelining.
+    ///
+    /// Allowed dead for the same reason as [`Daemon::response`] above.
+    #[allow(dead_code)]
     pub fn call(&mut self, line: &str) -> ResponseEnvelope {
         self.send(line);
         self.response()
+    }
+
+    /// The next response line, as the bytes the daemon wrote.
+    ///
+    /// Deserializing and re-serializing would defeat the one thing an
+    /// additive-field test must prove: that the field is absent from the
+    /// wire, not merely `None` after a decode that defaults it.
+    #[allow(dead_code)]
+    pub fn call_raw(&mut self, line: &str) -> String {
+        self.send(line);
+        loop {
+            let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(raw) => raw,
+                Err(RecvTimeoutError::Timeout) => panic!("no response within {LINE_TIMEOUT:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the daemon closed its stdout"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("a JSON line");
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"))
+            {
+                return raw;
+            }
+            self.events.push(raw);
+        }
+    }
+
+    /// Every line this daemon wrote in answer to `line`, **in arrival order**:
+    /// the events that landed while the response was outstanding, then the
+    /// response itself.
+    ///
+    /// The difference from [`Daemon::call_raw`] is the whole point: `call_raw`
+    /// buries the events it steps over in a side buffer, which loses where
+    /// they arrived relative to the responses. A transport that held every
+    /// event back to the end of the connection, or delivered one before its
+    /// `subscribe_events` response, is invisible to a transcript assembled
+    /// that way and obvious in one assembled this way.
+    #[allow(dead_code)]
+    pub fn exchange(&mut self, line: &str) -> Vec<String> {
+        let mut written = std::mem::take(&mut self.events);
+        self.send(line);
+        loop {
+            let raw = match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(raw) => raw,
+                Err(RecvTimeoutError::Timeout) => panic!("no response within {LINE_TIMEOUT:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the daemon closed its stdout"),
+            };
+            let is_response = serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("a JSON line")
+                .as_object()
+                .is_some_and(|object| object.contains_key("outcome"));
+            written.push(raw);
+            if is_response {
+                return written;
+            }
+        }
+    }
+
+    /// Every event line this daemon has written and no call has claimed, plus
+    /// whatever is still in flight after a short settle.
+    ///
+    /// The settle is a real wait rather than a rendezvous, and it is the one
+    /// in this file: the events being collected are the tail of a mutation
+    /// that has already been answered, so there is no observable state to wait
+    /// on — only "has the writer got to them yet". It is bounded and it can
+    /// only produce a **short** transcript, never a wrong one, and a short
+    /// transcript fails the length assertion loudly.
+    ///
+    /// Three ways out, and only the last spends the whole budget: a closed
+    /// stream, a stream that has gone quiet for [`DRAIN_QUIET`], or
+    /// [`DRAIN_BUDGET`] of a stream that never does. `Disconnected` is a final
+    /// answer; a quarter-second silence is a practical one, five times the
+    /// poll slice this used to take one at a time, so a writer pausing between
+    /// two lines cannot end the drain early. `socket::Client` carries the
+    /// identical rule, because the conformance transcript compares the two
+    /// harnesses line for line and a difference here would read as a
+    /// difference between the transports.
+    #[allow(dead_code)]
+    pub fn drain_events(&mut self) -> Vec<String> {
+        let deadline = std::time::Instant::now() + DRAIN_BUDGET;
+        while std::time::Instant::now() < deadline {
+            match self.lines.recv_timeout(DRAIN_QUIET) {
+                Ok(raw) => self.events.push(raw),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        std::mem::take(&mut self.events)
     }
 
     /// Close stdin and wait. The daemon must exit rather than hang.

@@ -290,6 +290,7 @@ fn index_state(value: IndexState) -> IndexStateDto {
 pub(crate) fn vault_info(
     value: VaultInfo,
     live_state: Option<LiveStateDto>,
+    socket_path: Option<String>,
 ) -> GetVaultInfoResponse {
     GetVaultInfoResponse {
         generation: value.generation.get(),
@@ -299,6 +300,7 @@ pub(crate) fn vault_info(
         note_count: value.note_count,
         refreshed_at_unix_ms: value.refreshed_at_unix_ms,
         live_state,
+        socket_path,
     }
 }
 

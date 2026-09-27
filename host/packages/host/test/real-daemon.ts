@@ -34,6 +34,26 @@ import type { SupervisorEvents } from "../src/supervisor";
 export const BINARY = resolve(__dirname, "..", "..", "..", "..", "target", "release", "vaultd");
 export const BINARY_EXISTS = existsSync(BINARY);
 
+/**
+ * **Why every case in this suite but one pins `engine: "spawn"`.**
+ *
+ * `defaultHostConfig` says `engine: "auto"`, which is right for production and
+ * wrong for a test: under `auto` a host probes `config.engineSocketPath` —
+ * whose default is under the developer's own XDG run directory, outside
+ * `target/tmp` — and spawns its daemon with `--listen` there. Three things
+ * follow, and all three are wrong for a case that is about something else.
+ * Sockets accumulate in a directory this suite does not sweep; a daemon with a
+ * listener no longer ends when its stdin closes, which is the fact
+ * `supervisor-real-daemon.test.ts` exists to pin; and two hosts over one vault
+ * would find each other instead of meeting the writer lease, which is the fact
+ * beside it.
+ *
+ * So every real-daemon config factory says `engine: "spawn"` — phase 6's road,
+ * which is what those cases were written against — and the mode matrix lives
+ * in `supervisor-engine-mode-real-daemon.test.ts`, the one file that binds an
+ * engine socket, inside its own scratch root.
+ */
+
 /** A supervisor whose lifecycle callbacks say nothing. */
 export const silentEvents: SupervisorEvents = {
   onClientReady: (): void => {},

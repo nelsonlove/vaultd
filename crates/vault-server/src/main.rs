@@ -7,7 +7,6 @@ use clap::Parser;
 use vault_index::IndexConfig;
 use vault_server::Server;
 use vault_server::runtime::{RuntimeNotice, RuntimeOptions};
-use vault_server::stdio;
 
 #[derive(Debug, Parser)]
 #[command(name = "vaultd", version, about)]
@@ -43,6 +42,15 @@ struct Cli {
     /// snapshot sessions, and reconciliation are unaffected.
     #[arg(long, default_value_t = false, requires = "vault")]
     read_only: bool,
+    /// Also serve a Unix domain socket, so clients other than this process's
+    /// parent can reach the daemon and the daemon can outlive them.
+    ///
+    /// With no value, the default path: `<run dir>/<digest>.sock`, where the
+    /// digest is the first 16 hex characters of the SHA-256 of the canonical
+    /// vault root and the run directory is `$XDG_RUNTIME_DIR/vaultd` when that
+    /// is set, else `<XDG cache dir>/vaultd/run`.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, requires = "vault")]
+    listen: Option<Option<PathBuf>>,
 }
 
 impl Cli {
@@ -68,9 +76,18 @@ impl Cli {
     }
 }
 
-/// A server and the notice stream its transport must forward, if it has one.
-/// Health-only mode has no runtime, so there is nothing to forward.
-type ConfiguredServer = (Server, Option<Receiver<RuntimeNotice>>);
+/// A server, the notice stream its transport must forward if it has one, and
+/// the canonical vault root the server was configured with.
+///
+/// Health-only mode has no runtime, so there is nothing to forward — and no
+/// vault, so there is no root. The root is carried out rather than recomputed
+/// because the default socket path is a function of it: deriving a *second*
+/// `IndexConfig` just to read it would import failure modes that have nothing
+/// to do with sockets (the XDG cache lookup, and the refusal of a derived
+/// index path that would land inside the vault), so a daemon given an
+/// explicit `--index` safely outside its vault could be refused `--listen`
+/// over an index path it was never going to use.
+type ConfiguredServer = (Server, Option<Receiver<RuntimeNotice>>, Option<PathBuf>);
 
 fn main() {
     // Before anything can parse a note: a contained parse panic must read as a
@@ -86,17 +103,63 @@ fn main() {
 /// graph, no timer, and no threads beyond the transport's own.
 fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
     let config = match (&cli.vault, &cli.index) {
-        (None, None) => return Ok((Server::health_only(), None)),
+        (None, None) => return Ok((Server::health_only(), None, None)),
         (Some(vault), None) => IndexConfig::derived(vault)?,
         (Some(vault), Some(index)) => IndexConfig::explicit(vault, index)?,
         (None, Some(_)) => unreachable!("clap enforces --index requires --vault"),
     };
+    let canonical_vault_root = config.canonical_vault_root.clone();
     let (server, notices) = Server::start(config, cli.runtime_options())?;
-    Ok((server, Some(notices)))
+    Ok((server, Some(notices), Some(canonical_vault_root)))
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let (server, notices) = configured_server(&cli)?;
-    stdio::run(server, notices).map_err(Into::into)
+    // **Before the runtime is built and before anything is bound.** Cold
+    // hydration of a large vault takes seconds, and a SIGTERM arriving in
+    // them would otherwise take the default disposition: the process dies on
+    // the signal, exit 143, no `stopped` notice — and if it lands in the
+    // window just after the bind, it dies with the socket file already
+    // created and no `Drop` to unlink it. The handlers only write a byte to a
+    // pipe, so installing them this early costs nothing and no one reads the
+    // flag until `service::run` spawns its watcher, which finds the byte
+    // waiting for it.
+    //
+    // **Only when this daemon is going to listen.** Without `--listen` there
+    // is no watcher and nobody would ever read the flag, so installing a
+    // handler would swallow SIGTERM and leave a stdio-only daemon stoppable
+    // by nothing but SIGKILL — a regression on the daemon that always
+    // shipped.
+    let watch = match cli.listen {
+        Some(_) => Some(vault_server::signals::install()?),
+        None => None,
+    };
+    let (server, notices, canonical_vault_root) = configured_server(&cli)?;
+    let listen = match (&cli.listen, &canonical_vault_root) {
+        (None, _) => None,
+        (Some(Some(path)), _) => Some(path.clone()),
+        // The root this daemon is actually serving, not a second derivation
+        // of it. See `ConfiguredServer`.
+        (Some(None), Some(root)) => Some(vault_server::listener::default_socket_path(root)?),
+        // clap enforces `--listen` requires `--vault`, and a `--vault` is
+        // exactly what gives `configured_server` a root to hand back.
+        (Some(None), None) => unreachable!("--listen requires --vault"),
+    };
+    // Answered by `get_vault_info` so a client on stdio can tell others where
+    // to knock. Set by `service::run` itself, once the bind that path names
+    // has actually succeeded — not here, where `listen` is only the path this
+    // daemon *intends* to bind.
+    vault_server::service::run(
+        server,
+        notices,
+        vault_server::service::ServiceOptions {
+            // Stdin is a door like any other and is served while it is open.
+            // A daemon started with stdin closed (systemd) simply reaches end
+            // of file at once, which ends connection zero and nothing else.
+            stdio: true,
+            listen,
+        },
+        watch,
+    )
+    .map_err(Into::into)
 }

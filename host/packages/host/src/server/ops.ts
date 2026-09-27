@@ -61,6 +61,7 @@ import type { HostConfig } from "../config";
 import type { HostErrors } from "../shim/errors";
 import type { LifecycleSequencer } from "../runtime/lifecycle";
 import type { LiveStateDto } from "../client/protocol";
+import type { EngineSource } from "../supervisor";
 import type { Mirror } from "../mirror/mirror";
 import type { NoticeLog } from "../shim/notice";
 import type { InstalledPlugin } from "../pluginset/config-dir";
@@ -122,6 +123,15 @@ export interface HostServerDeps {
   readonly errors: HostErrors;
   readonly policyRecorder: PolicyRecorder;
   readonly liveState?: () => LiveStateDto | null;
+  /**
+   * Where the current engine came from, for `host.info`'s `engine` object.
+   *
+   * A function for the same reason {@link liveState} is one: the supervisor
+   * owns the answer, it changes when an engine is replaced, and a host driven
+   * straight off a client has no supervisor — so `null` is the honest reading
+   * there rather than an invented `"spawned"`.
+   */
+  readonly engineSource?: () => EngineSource | null;
 }
 
 /**
@@ -406,6 +416,16 @@ export class HostOps {
               // part of the answer.
               { ...toWireOverlap(report), overlap_poll_ms: this.deps.config.overlapPollMs },
         counters: this.counters(),
+        // **Added, not extended.** `host.info` had no engine substructure and
+        // `host.hello.live_state` stays exactly where it is, because a client
+        // reading it today must keep reading it; this object is the mode, the
+        // road taken, and the daemon socket the mode is about.
+        engine: {
+          mode: this.deps.config.engine,
+          source: this.deps.engineSource?.() ?? null,
+          socket_path: this.deps.config.engine === "spawn" ? null : this.deps.config.engineSocketPath,
+          live_state: this.deps.liveState?.() ?? null,
+        },
         unsupported: this.deps.policyRecorder
           .entries()
           .filter((use) => use.policy === "absent")

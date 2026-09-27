@@ -1,6 +1,11 @@
+pub mod broadcast;
+pub mod connection;
 mod convert;
 pub mod fixture_row;
+pub mod listener;
 pub mod runtime;
+pub mod service;
+pub mod signals;
 pub mod stdio;
 pub mod subscriptions;
 
@@ -43,7 +48,13 @@ pub struct Server {
     /// no config — so the absence is modelled rather than faked with an empty
     /// registry that would answer `snapshot_not_found` where it should answer
     /// `index_unavailable`.
-    snapshots: Option<std::sync::Mutex<vault_index::SnapshotSessions>>,
+    sessions: Option<Sessions>,
+    /// Where this daemon is listening, or `None` when it has no socket.
+    ///
+    /// Set by `main` once, from the one place that decides the path, so
+    /// `get_vault_info` cannot report a door the service never opened. Task 6
+    /// is what puts it on the wire.
+    socket_path: Option<String>,
     /// The engine `read_file` answers from, or `None` in health-only mode.
     ///
     /// A raw read touches no index state, takes no lock, and publishes
@@ -65,6 +76,35 @@ pub struct Server {
 struct Live {
     handle: RuntimeHandle,
     reader: Arc<IndexReader>,
+}
+
+/// The snapshot sessions, and which connection opened each of them.
+///
+/// **The registry is shared and the ownership is not.** One
+/// `SnapshotSessions` holds one SQLite reader connection per session, opened
+/// against the `IndexConfig`; a registry per client would multiply those by
+/// the number of clients for no gain, since the sessions are already
+/// independent pinned transactions. So the sessions stay in one place and
+/// `owners` is what makes each of them somebody's: a `snapshot_id` from a
+/// connection that does not own it is answered `snapshot_not_found`, exactly
+/// as an identifier this process never issued would be — a client learns
+/// nothing about any other client.
+///
+/// **One struct and one `Option`, not two.** The ownership guard stands aside
+/// where there is no ownership map, which is right only because there is then
+/// no registry either (health-only mode, which owes `index_unavailable`). Two
+/// `Option`s could drift into a registry with no owner map, and the guard
+/// would silently vanish for every caller. Holding both in one value makes
+/// that unrepresentable rather than merely untrue today.
+///
+/// **Lock order: `registry` then `owners`.** `handle`'s `open_snapshot` and
+/// `close_snapshot` arms hold the registry guard while they record or forget
+/// an owner. Anything that needs both must take them in that order, or
+/// release one before taking the other — see [`Server::close_sessions_of`],
+/// which does the latter.
+struct Sessions {
+    registry: std::sync::Mutex<vault_index::SnapshotSessions>,
+    owners: std::sync::Mutex<std::collections::BTreeMap<String, broadcast::ConnectionId>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +155,21 @@ fn index_unavailable() -> ProtocolError {
     ProtocolError {
         code: ErrorCode::IndexUnavailable,
         message: "no vault is configured".into(),
+        supported_version: None,
+        current_generation: None,
+        current_revision: None,
+    }
+}
+
+/// The refusal a stranger meets, worded exactly as the refusal for an
+/// identifier this process never issued — byte for byte what
+/// `convert::index_error` builds from `IndexError::SnapshotNotFound`. The two
+/// must be indistinguishable: a client that could tell them apart could detect
+/// the presence of another client.
+fn snapshot_not_found(snapshot_id: &str) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::SnapshotNotFound,
+        message: format!("no such snapshot session: {snapshot_id}"),
         supported_version: None,
         current_generation: None,
         current_revision: None,
@@ -201,7 +256,8 @@ impl Server {
     pub fn health_only() -> Self {
         Self {
             live: None,
-            snapshots: None,
+            sessions: None,
+            socket_path: None,
             engine: None,
         }
     }
@@ -212,7 +268,10 @@ impl Server {
     pub fn for_runtime(handle: RuntimeHandle) -> Self {
         let reader = handle.reader();
         let config = handle.config();
-        let snapshots = std::sync::Mutex::new(vault_index::SnapshotSessions::new(&config));
+        let sessions = Sessions {
+            registry: std::sync::Mutex::new(vault_index::SnapshotSessions::new(&config)),
+            owners: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        };
         // The same canonical root the runtime's own engine was built from, so
         // a raw read resolves and contains a path exactly as a write does —
         // and the same read-only flag, so a write attempted straight through
@@ -223,7 +282,8 @@ impl Server {
             .with_read_only(handle.is_read_only());
         Self {
             live: Some(Live { handle, reader }),
-            snapshots: Some(snapshots),
+            sessions: Some(sessions),
+            socket_path: None,
             engine: Some(engine),
         }
     }
@@ -251,11 +311,18 @@ impl Server {
     /// implied by dropping the server.
     pub fn shutdown(&self) {
         // Sessions first: each one pins WAL frames until its transaction is
-        // rolled back, and a disconnect is what reaches this on the ordinary
-        // path — the daemon is single-peer, so end of input means every
-        // session that client held is abandoned.
-        if let Some(sessions) = self.snapshots.as_ref() {
+        // rolled back, and nothing else in this teardown releases them.
+        //
+        // `close_all` rather than per connection, because this is the
+        // **process** stopping. A single connection leaving is the other path
+        // and belongs to `close_sessions_of`, which `connection::serve` calls
+        // on its way out; by the time the last connection has gone this is
+        // usually a no-op, and it stays here for the shapes where it is not —
+        // a connection whose thread was closed hard past the drain budget, and
+        // health-only mode, which has no connections at all.
+        if let Some(sessions) = self.sessions.as_ref() {
             sessions
+                .registry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .close_all();
@@ -278,8 +345,9 @@ impl Server {
     /// Crate-visible: the transport is the only caller, and a sweep is not
     /// something a client can ask for.
     pub(crate) fn sweep_snapshots(&self) {
-        if let Some(sessions) = self.snapshots.as_ref() {
+        if let Some(sessions) = self.sessions.as_ref() {
             sessions
+                .registry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .sweep();
@@ -295,11 +363,133 @@ impl Server {
     /// is what lets a test assert the "not yet" half as well as the "now".
     #[cfg(test)]
     pub(crate) fn snapshot_session_count(&self) -> usize {
-        self.snapshots.as_ref().map_or(0, |sessions| {
+        self.sessions.as_ref().map_or(0, |sessions| {
             sessions
+                .registry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .len()
+        })
+    }
+
+    /// Where this daemon is listening, for `get_vault_info` to report. `None`
+    /// when it has no socket.
+    pub fn set_socket_path(&mut self, path: Option<String>) {
+        self.socket_path = path;
+    }
+
+    /// Where this daemon is listening, or `None` when it has no socket.
+    pub fn socket_path(&self) -> Option<&str> {
+        self.socket_path.as_deref()
+    }
+
+    /// May `connection` name `snapshot_id`?
+    ///
+    /// A session nobody owns answers `false`, which is why the caller's
+    /// refusal is `snapshot_not_found` rather than anything narrower: a
+    /// stranger's identifier and one this process never issued are
+    /// indistinguishable to a client, and must stay so.
+    ///
+    /// **Health-only mode answers `true`**, because there is no ownership map
+    /// there — and no registry either, the two being one `Option` for exactly
+    /// this reason. The arm's own `index_unavailable` is the refusal that mode
+    /// owes ("no vault is configured"), and a guard standing in front of it
+    /// with `snapshot_not_found` would tell a client its identifier was merely
+    /// unknown when in fact nothing is configured to have issued one.
+    fn may_use_session(&self, connection: broadcast::ConnectionId, snapshot_id: &str) -> bool {
+        match self.sessions.as_ref() {
+            None => true,
+            Some(sessions) => {
+                sessions
+                    .owners
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(snapshot_id)
+                    == Some(&connection)
+            }
+        }
+    }
+
+    fn record_session(&self, connection: broadcast::ConnectionId, snapshot_id: &str) {
+        if let Some(sessions) = self.sessions.as_ref() {
+            sessions
+                .owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(snapshot_id.to_string(), connection);
+        }
+    }
+
+    fn forget_session(&self, snapshot_id: &str) {
+        if let Some(sessions) = self.sessions.as_ref() {
+            sessions
+                .owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(snapshot_id);
+        }
+    }
+
+    /// Close every session `connection` opened, and forget it owned them.
+    ///
+    /// Called by [`crate::connection::serve`] when a connection's dispatcher
+    /// ends, which is what fulfils "ending a connection closes its snapshot
+    /// sessions, releasing the WAL frames they pinned". Idempotent, and a
+    /// connection that opened none does no work.
+    pub(crate) fn close_sessions_of(&self, connection: broadcast::ConnectionId) {
+        let sessions = match self.sessions.as_ref() {
+            None => return,
+            Some(sessions) => sessions,
+        };
+        // **The owners guard must die before the registry lock is taken.**
+        // `handle` nests them the other way — `open_snapshot` and
+        // `close_snapshot` record and forget an owner while still holding the
+        // registry guard — so taking them the other way round *at the same
+        // time* is a lock-order cycle, and a closing connection would hang
+        // against a concurrent open. This inner block is what keeps the two
+        // sequential rather than nested; do not flatten it.
+        let mine: Vec<String> = {
+            let mut owners = sessions
+                .owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mine: Vec<String> = owners
+                .iter()
+                .filter(|(_, owner)| **owner == connection)
+                .map(|(snapshot_id, _)| snapshot_id.clone())
+                .collect();
+            for snapshot_id in &mine {
+                owners.remove(snapshot_id);
+            }
+            mine
+        };
+        if mine.is_empty() {
+            return;
+        }
+        let mut registry = sessions
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for snapshot_id in &mine {
+            // A session the sweep already reclaimed is not an error here:
+            // the owner is leaving either way.
+            let _ = registry.close(snapshot_id);
+        }
+    }
+
+    /// How many sessions `connection` owns. Test-only, and the only honest
+    /// instrument: on the wire a stranger's refusal and a session that was
+    /// never opened are the same answer.
+    #[cfg(test)]
+    pub(crate) fn sessions_owned_by(&self, connection: broadcast::ConnectionId) -> usize {
+        self.sessions.as_ref().map_or(0, |sessions| {
+            sessions
+                .owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .filter(|owner| **owner == connection)
+                .count()
         })
     }
 
@@ -534,7 +724,11 @@ impl Server {
         Ok(Response::SubscribeEvents(subscriptions.subscribe(&status)))
     }
 
-    /// Answer one request.
+    /// Answer one request on behalf of `connection`.
+    ///
+    /// The identifier is what makes a snapshot session belong to somebody: the
+    /// sessions live in one process-wide registry, and this is the only thing
+    /// that tells the owner's `snapshot_id` from a stranger's.
     ///
     /// `subscriptions` is passed in rather than owned because the transport,
     /// not the server, decides whether events can be delivered at all: a
@@ -542,6 +736,7 @@ impl Server {
     /// subscriptions it reserves, and nothing is ever queued.
     pub fn handle(
         &self,
+        connection: broadcast::ConnectionId,
         request: RequestEnvelope,
         subscriptions: &mut SubscriptionRegistry,
     ) -> ResponseEnvelope {
@@ -559,7 +754,11 @@ impl Server {
                         let state = self.live_state(live).ok().map(subscriptions::live_state);
                         ResponseEnvelope::success(
                             id,
-                            Response::GetVaultInfo(convert::vault_info(info, state)),
+                            Response::GetVaultInfo(convert::vault_info(
+                                info,
+                                state,
+                                self.socket_path.clone(),
+                            )),
                         )
                     }
                     Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
@@ -1026,84 +1225,124 @@ impl Server {
                     ),
                 },
             },
-            Request::OpenSnapshot(_) => match self.snapshots.as_ref() {
+            Request::OpenSnapshot(_) => match self.sessions.as_ref() {
                 None => ResponseEnvelope::error(id, index_unavailable()),
                 Some(sessions) => {
-                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-                    match sessions.open() {
-                        Ok(opened) => ResponseEnvelope::success(
-                            id,
-                            Response::OpenSnapshot(OpenSnapshotResponse {
-                                snapshot_id: opened.snapshot_id,
-                                generation: opened.generation.get(),
-                                note_count: opened.note_count,
-                                entry_count: opened.entry_count,
-                            }),
-                        ),
+                    let mut registry = sessions
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match registry.open() {
+                        Ok(opened) => {
+                            // Recorded before the response is built, so there
+                            // is no window in which a session exists and
+                            // belongs to nobody.
+                            self.record_session(connection, &opened.snapshot_id);
+                            ResponseEnvelope::success(
+                                id,
+                                Response::OpenSnapshot(OpenSnapshotResponse {
+                                    snapshot_id: opened.snapshot_id,
+                                    generation: opened.generation.get(),
+                                    note_count: opened.note_count,
+                                    entry_count: opened.entry_count,
+                                }),
+                            )
+                        }
                         Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
                     }
                 }
             },
-            Request::SnapshotTree(params) => match self.snapshots.as_ref() {
-                None => ResponseEnvelope::error(id, index_unavailable()),
-                Some(sessions) => {
-                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-                    match sessions.tree_page(
-                        &params.snapshot_id,
-                        params.cursor.as_deref(),
-                        params.limit,
-                    ) {
-                        Ok(page) => ResponseEnvelope::success(
-                            id,
-                            Response::SnapshotTree(SnapshotTreeResponse {
-                                snapshot_id: params.snapshot_id,
-                                generation: page.generation.get(),
-                                entries: page.entries.iter().map(convert::tree_entry).collect(),
-                                next_cursor: page.next_cursor,
-                            }),
-                        ),
-                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+            Request::SnapshotTree(params) => {
+                // Before the registry is locked, so a stranger never touches
+                // it.
+                if !self.may_use_session(connection, &params.snapshot_id) {
+                    return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));
+                }
+                match self.sessions.as_ref() {
+                    None => ResponseEnvelope::error(id, index_unavailable()),
+                    Some(sessions) => {
+                        let mut registry = sessions
+                            .registry
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        match registry.tree_page(
+                            &params.snapshot_id,
+                            params.cursor.as_deref(),
+                            params.limit,
+                        ) {
+                            Ok(page) => ResponseEnvelope::success(
+                                id,
+                                Response::SnapshotTree(SnapshotTreeResponse {
+                                    snapshot_id: params.snapshot_id,
+                                    generation: page.generation.get(),
+                                    entries: page.entries.iter().map(convert::tree_entry).collect(),
+                                    next_cursor: page.next_cursor,
+                                }),
+                            ),
+                            Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                        }
                     }
                 }
-            },
-            Request::CloseSnapshot(params) => match self.snapshots.as_ref() {
-                None => ResponseEnvelope::error(id, index_unavailable()),
-                Some(sessions) => {
-                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-                    match sessions.close(&params.snapshot_id) {
-                        Ok(()) => ResponseEnvelope::success(
-                            id,
-                            Response::CloseSnapshot(CloseSnapshotResponse {
-                                snapshot_id: params.snapshot_id,
-                            }),
-                        ),
-                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+            }
+            Request::CloseSnapshot(params) => {
+                if !self.may_use_session(connection, &params.snapshot_id) {
+                    return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));
+                }
+                match self.sessions.as_ref() {
+                    None => ResponseEnvelope::error(id, index_unavailable()),
+                    Some(sessions) => {
+                        let mut registry = sessions
+                            .registry
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        match registry.close(&params.snapshot_id) {
+                            Ok(()) => {
+                                // Forgotten as well as closed, so a reopened
+                                // identifier cannot inherit a stale owner.
+                                self.forget_session(&params.snapshot_id);
+                                ResponseEnvelope::success(
+                                    id,
+                                    Response::CloseSnapshot(CloseSnapshotResponse {
+                                        snapshot_id: params.snapshot_id,
+                                    }),
+                                )
+                            }
+                            Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                        }
                     }
                 }
-            },
-            Request::SnapshotNotes(params) => match self.snapshots.as_ref() {
-                None => ResponseEnvelope::error(id, index_unavailable()),
-                Some(sessions) => {
-                    let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-                    match sessions.notes_page(
-                        &params.snapshot_id,
-                        params.cursor.as_deref(),
-                        params.limit,
-                        convert::note_facets(&params.include),
-                    ) {
-                        Ok(page) => ResponseEnvelope::success(
-                            id,
-                            Response::SnapshotNotes(SnapshotNotesResponse {
-                                snapshot_id: params.snapshot_id,
-                                generation: page.generation.get(),
-                                notes: page.notes.iter().map(convert::snapshot_note).collect(),
-                                next_cursor: page.next_cursor,
-                            }),
-                        ),
-                        Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+            }
+            Request::SnapshotNotes(params) => {
+                if !self.may_use_session(connection, &params.snapshot_id) {
+                    return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));
+                }
+                match self.sessions.as_ref() {
+                    None => ResponseEnvelope::error(id, index_unavailable()),
+                    Some(sessions) => {
+                        let mut registry = sessions
+                            .registry
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        match registry.notes_page(
+                            &params.snapshot_id,
+                            params.cursor.as_deref(),
+                            params.limit,
+                            convert::note_facets(&params.include),
+                        ) {
+                            Ok(page) => ResponseEnvelope::success(
+                                id,
+                                Response::SnapshotNotes(SnapshotNotesResponse {
+                                    snapshot_id: params.snapshot_id,
+                                    generation: page.generation.get(),
+                                    notes: page.notes.iter().map(convert::snapshot_note).collect(),
+                                    next_cursor: page.next_cursor,
+                                }),
+                            ),
+                            Err(error) => ResponseEnvelope::error(id, convert::index_error(error)),
+                        }
                     }
                 }
-            },
+            }
         }
     }
 }
@@ -1246,6 +1485,203 @@ mod tests {
             "the refused write must leave the vault untouched"
         );
 
+        server.shutdown();
+    }
+}
+
+/// Every connection holds the same `Server` behind an `Arc`, so the compiler
+/// must agree it can be shared. Stated as a test rather than a comment: the
+/// design says "the phase adds a check that `Server` is `Sync`, and no
+/// rewrite", and a field added later that is not `Sync` should fail here
+/// rather than at the first accepted connection.
+#[cfg(test)]
+mod shareable {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn a_server_may_be_shared_between_connections() {
+        assert_send_sync::<crate::Server>();
+        assert_send_sync::<std::sync::Arc<crate::Server>>();
+    }
+}
+
+/// Snapshot sessions live in one process-wide registry and belong to one
+/// connection each. These are the two halves of that: a stranger cannot name
+/// somebody else's session, and a connection that ends takes its own with it.
+#[cfg(test)]
+mod session_ownership {
+    use std::time::Duration;
+
+    use vault_index::IndexConfig;
+    use vault_protocol::{
+        CloseSnapshotParams, ErrorCode, OpenSnapshotParams, RefreshIndexParams, Request,
+        RequestEnvelope, Response, ResponseOutcome, SnapshotTreeParams,
+    };
+
+    use crate::Server;
+    use crate::broadcast::ConnectionId;
+    use crate::runtime::RuntimeOptions;
+    use crate::subscriptions::SubscriptionRegistry;
+
+    fn envelope(id: &str, request: Request) -> RequestEnvelope {
+        RequestEnvelope {
+            version: 1,
+            id: id.to_string(),
+            request,
+        }
+    }
+
+    /// A server over a one-note vault, watcher and periodic tick off, with a
+    /// long idle timeout so nothing is reclaimed by the sweep mid-test.
+    fn server(vault: &tempfile::TempDir, index: &tempfile::TempDir) -> Server {
+        std::fs::write(vault.path().join("One.md"), "# One\n").expect("write One");
+        let mut config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
+            .expect("an explicit config");
+        config.snapshot_idle_timeout = Duration::from_secs(600);
+        let (server, notices) = Server::start(
+            config,
+            RuntimeOptions {
+                watch: false,
+                reconcile_interval: None,
+                ..RuntimeOptions::default()
+            },
+        )
+        .expect("start a runtime");
+        drop(notices);
+        server
+    }
+
+    /// Two connection identifiers that are not each other. `STANDALONE` is
+    /// deliberately not one of them: it is the id stdio uses when no
+    /// broadcaster issued one, and a test that used it would prove nothing
+    /// about two peers.
+    const OWNER: ConnectionId = ConnectionId::for_test(1);
+    const STRANGER: ConnectionId = ConnectionId::for_test(2);
+
+    fn open_a_session(server: &Server, connection: ConnectionId) -> String {
+        let mut subscriptions = SubscriptionRegistry::new();
+        server.handle(
+            connection,
+            envelope("r", Request::RefreshIndex(RefreshIndexParams::default())),
+            &mut subscriptions,
+        );
+        let opened = server.handle(
+            connection,
+            envelope("o", Request::OpenSnapshot(OpenSnapshotParams::default())),
+            &mut subscriptions,
+        );
+        match opened.outcome {
+            ResponseOutcome::Ok(Response::OpenSnapshot(session)) => session.snapshot_id,
+            other => panic!("open_snapshot was refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stranger_cannot_page_or_close_a_session_it_does_not_own() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let snapshot = open_a_session(&server, OWNER);
+        assert_eq!(server.sessions_owned_by(OWNER), 1);
+        assert_eq!(server.sessions_owned_by(STRANGER), 0);
+
+        let mut subscriptions = SubscriptionRegistry::new();
+        for (label, request) in [
+            (
+                "snapshot_tree",
+                Request::SnapshotTree(SnapshotTreeParams {
+                    snapshot_id: snapshot.clone(),
+                    cursor: None,
+                    limit: None,
+                }),
+            ),
+            (
+                "close_snapshot",
+                Request::CloseSnapshot(CloseSnapshotParams {
+                    snapshot_id: snapshot.clone(),
+                }),
+            ),
+        ] {
+            let refused = server.handle(STRANGER, envelope("s", request), &mut subscriptions);
+            match refused.outcome {
+                ResponseOutcome::Err(error) => assert_eq!(
+                    error.code,
+                    ErrorCode::SnapshotNotFound,
+                    "{label} from a stranger must read exactly as a session that \
+                     never existed — never as a permission refusal, which would \
+                     tell one client that another client is there"
+                ),
+                other => panic!("{label} from a stranger was answered: {other:?}"),
+            }
+        }
+
+        // And the owner still has it: a refused stranger changes nothing.
+        assert_eq!(server.sessions_owned_by(OWNER), 1);
+        let paged = server.handle(
+            OWNER,
+            envelope(
+                "p",
+                Request::SnapshotTree(SnapshotTreeParams {
+                    snapshot_id: snapshot,
+                    cursor: None,
+                    limit: None,
+                }),
+            ),
+            &mut subscriptions,
+        );
+        assert!(
+            matches!(
+                paged.outcome,
+                ResponseOutcome::Ok(Response::SnapshotTree(_))
+            ),
+            "the owner pages its own session: {paged:?}"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn a_connection_ending_closes_the_sessions_it_owned_and_no_others() {
+        let vault = tempfile::TempDir::new().expect("vault tempdir");
+        let index = tempfile::TempDir::new().expect("index tempdir");
+        let server = server(&vault, &index);
+        let leaving = open_a_session(&server, OWNER);
+        let staying = open_a_session(&server, STRANGER);
+        assert_ne!(leaving, staying, "two sessions, two identifiers");
+        assert_eq!(server.snapshot_session_count(), 2);
+
+        server.close_sessions_of(OWNER);
+
+        assert_eq!(server.sessions_owned_by(OWNER), 0, "its sessions are gone");
+        assert_eq!(
+            server.sessions_owned_by(STRANGER),
+            1,
+            "and its peer's are untouched"
+        );
+        assert_eq!(
+            server.snapshot_session_count(),
+            1,
+            "the WAL frames the departing connection pinned are released, and \
+             only those"
+        );
+
+        // The departed session's identifier is now nobody's.
+        let mut subscriptions = SubscriptionRegistry::new();
+        let refused = server.handle(
+            OWNER,
+            envelope(
+                "p",
+                Request::SnapshotTree(SnapshotTreeParams {
+                    snapshot_id: leaving,
+                    cursor: None,
+                    limit: None,
+                }),
+            ),
+            &mut subscriptions,
+        );
+        assert!(
+            matches!(refused.outcome, ResponseOutcome::Err(_)),
+            "a closed session is not found: {refused:?}"
+        );
         server.shutdown();
     }
 }

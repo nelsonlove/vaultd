@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { realpathSync } from "./runtime/fs-access";
+
 /**
  * The one time source.
  *
@@ -69,6 +71,22 @@ export interface HostConfig {
   /** `$XDG_STATE_HOME/vaultd-host`. One of the three places the host may write. */
   readonly dataDir: string;
   readonly socketPath: string;
+  readonly engine: EngineMode;
+  /**
+   * Where `vaultd` listens for this vault. Distinct from {@link socketPath},
+   * which is the host's own control socket; see {@link vaultdSocketPathFor}.
+   */
+  readonly engineSocketPath: string;
+  /**
+   * Leave a daemon this host spawned running when the host shuts down.
+   *
+   * Only reachable under `engine: "auto"`, because that is the only mode in
+   * which the host spawns a daemon with a listener. A daemon left behind is
+   * discoverable at {@link engineSocketPath}, refuses any second daemon over
+   * the same index through the writer lease, and is ended by SIGTERM — so a
+   * stray is an inconvenience, never a hazard.
+   */
+  readonly leaveEngineRunning: boolean;
   readonly clock: Clock;
   /** The version the shim reports as Obsidian's own. */
   readonly appVersion: string;
@@ -310,6 +328,54 @@ export function socketPathFor(dataDir: string, vaultRoot: string): string {
 }
 
 /**
+ * Where `vaultd` listens for this vault: `<run dir>/<digest>.sock`.
+ *
+ * **Not the host's own socket.** {@link socketPathFor} names `host.sock`,
+ * under the host's state directory, and carries host operations; this names
+ * the daemon's, under the XDG run directory, and carries the daemon protocol.
+ * Two sockets, two protocols, two paths — the host never proxies the daemon.
+ *
+ * The rule is `crates/vault-server/src/listener.rs`'s, restated rather than
+ * imported because the two processes are two languages: SHA-256 of the
+ * canonical vault root, first sixteen hex characters, under
+ * `$XDG_RUNTIME_DIR/vaultd` when that variable is set and non-empty, else
+ * `<XDG cache dir>/vaultd/run`. The XDG cache directory is the `xdg` crate's —
+ * `$XDG_CACHE_HOME` else `~/.cache`, on Darwin too, which is *not*
+ * `~/Library/Caches`. The daemon's own `tests/socket_info.rs` and this module's
+ * test pin the two halves against the same fixed vector.
+ *
+ * **The root is hashed as given, and it must already be canonical.** The
+ * daemon hashes `vault_index::canonical_root`, which is a `realpath`, so a
+ * caller that passes a symlinked or relative root gets a path no daemon will
+ * ever bind — and under `engine: "auto"` that is not a quiet miss, it is a
+ * second daemon spawned beside a healthy one on every start. {@link
+ * canonicalVaultRoot} is the one place that rule is applied, and
+ * {@link defaultHostConfig} applies it to every config this host builds, so a
+ * caller reaches this function with a canonical root without having to know
+ * that it must.
+ */
+export function vaultdSocketPathFor(vaultRoot: string): string {
+  const digest = createHash("sha256").update(vaultRoot).digest("hex").slice(0, 16);
+  const runtimeDir = process.env.XDG_RUNTIME_DIR;
+  const base =
+    runtimeDir !== undefined && runtimeDir !== ""
+      ? join(runtimeDir, "vaultd")
+      : join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "vaultd", "run");
+  return join(base, `${digest}.sock`);
+}
+
+/**
+ * Where the host gets its engine.
+ *
+ * `auto` probes {@link HostConfig.engineSocketPath} and connects when a daemon
+ * answers, spawning one with `--listen` when none does — so the daemon this
+ * host starts is shareable rather than private. `connect` never spawns and
+ * exits 3 when nothing answers. `spawn` is phase 6's behaviour exactly, never
+ * probes, and owns its daemon's whole life through its stdin.
+ */
+export type EngineMode = "auto" | "connect" | "spawn";
+
+/**
  * The default configuration for one vault root.
  *
  * `vaultdBinary` is the bare name: resolving it is `PATH`'s job, and a caller
@@ -317,8 +383,35 @@ export function socketPathFor(dataDir: string, vaultRoot: string): string {
  * release binary beside the workspace) overrides it. Every calibration value
  * below comes from the phase plan's Global Constraints list.
  */
-export function defaultHostConfig(vaultRoot: string): HostConfig {
+/**
+ * A vault root with every symlink resolved — the same string the daemon hashes.
+ *
+ * **Here rather than in the binary**, because the digest is derived from
+ * whatever root {@link defaultHostConfig} is handed and *every* caller derives
+ * it: the CLI, `LiveHost`, an embedder calling `startHost`, and every test
+ * factory. Canonicalizing in `parseArgs` alone left all of those able to hash a
+ * root the daemon never will, which is the production failure the rule exists
+ * to prevent.
+ *
+ * Through `runtime/fs-access`, the one seam allowed to reach the file system,
+ * so this module still names no fs function. A root that does not exist is
+ * returned unchanged: `realpath` has nothing to resolve, and a missing
+ * directory is the daemon's refusal to make, not this function's.
+ */
+export function canonicalVaultRoot(vaultRoot: string): string {
+  try {
+    return realpathSync(vaultRoot);
+  } catch {
+    return vaultRoot;
+  }
+}
+
+export function defaultHostConfig(given: string): HostConfig {
   const dataDir = hostDataDir();
+  // Once, here, so `vaultRoot`, `--vault`, the host socket's digest and the
+  // daemon socket's digest are all derived from the one string the daemon
+  // itself will hash.
+  const vaultRoot = canonicalVaultRoot(given);
   return {
     vaultRoot,
     vaultdBinary: "vaultd",
@@ -328,6 +421,9 @@ export function defaultHostConfig(vaultRoot: string): HostConfig {
     configDirName: ".obsidian-headless",
     dataDir,
     socketPath: socketPathFor(dataDir, vaultRoot),
+    engine: "auto",
+    engineSocketPath: vaultdSocketPathFor(vaultRoot),
+    leaveEngineRunning: false,
     clock: systemClock(),
     appVersion: "1.7.7",
     // Production can reach the network; `ShimHarness` turns this off for itself

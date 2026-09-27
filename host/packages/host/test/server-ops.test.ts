@@ -597,6 +597,7 @@ describe("host.* operations", () => {
         counters: Record<string, unknown>;
         timers: unknown[];
         unsupported: unknown[];
+        engine: Record<string, unknown>;
       }>("host.info", { refresh: true });
       expect(info.overlap).toMatchObject({
         gui_readable: false,
@@ -609,6 +610,71 @@ describe("host.* operations", () => {
       });
       expect(Array.isArray(info.timers)).toBe(true);
       expect(Array.isArray(info.unsupported)).toBe(true);
+      // **The engine object, in the wire's own spelling.** `source` is null
+      // here and that is the honest answer: this harness drives the host off a
+      // client, with no supervisor to have spawned or connected anything. The
+      // keys are asserted by name because `snake_case` on this socket is a
+      // rule rather than a habit — `server-wire.test.ts` walks the same
+      // payload for camelCase at any depth.
+      expect(info.engine).toEqual({
+        mode: harness.config.engine,
+        source: null,
+        socket_path: harness.config.engineSocketPath,
+        live_state: null,
+      });
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("reports the engine in snake_case, without moving host.hello's live_state", async () => {
+    const harness = await HostHarness.create({ vault: { "A.md": "# A\n" }, enabled: [] });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const info = await client.call<{ engine: Record<string, unknown> }>("host.info", {});
+      // **An exact sorted list, not a `toMatchObject`.** The neighbouring case
+      // asserts the four values; this asserts that there are four and no more,
+      // so a fifth key added without a wire decision fails here rather than
+      // reaching a client that will then depend on it.
+      expect(Object.keys(info.engine).sort()).toEqual([
+        "live_state",
+        "mode",
+        "socket_path",
+        "source",
+      ]);
+      expect(info.engine.mode).toBe(harness.config.engine);
+      expect(info.engine.socket_path).toBe(harness.config.engineSocketPath);
+      // **`host.hello` is answered once per connection**, and `connectClient`
+      // already consumed this one's — so the payload is read back off the
+      // client rather than asked for again, which is what the neighbouring
+      // case does and why it asserts a second hello rejects. The point here is
+      // only that `live_state` is still on `hello`: the `engine` object adds a
+      // second place to read the runtime's state, and moving the first would
+      // break every client reading it today.
+      expect(client.helloPayload()).toHaveProperty("live_state");
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("reports socket_path as null under engine: spawn, where nothing binds it", async () => {
+    // **The same rule the ready line already got (Task 12's L2).** Under
+    // `spawn` the host never passes `--listen`, so `engineSocketPath` names no
+    // socket anything ever bound; advertising it in `host.info` would send a
+    // client to knock on an empty path. This is the per-mode half of the case
+    // above, which only ever exercises the default `auto`.
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      config: { engine: "spawn" },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const info = await client.call<{ engine: Record<string, unknown> }>("host.info", {});
+      expect(info.engine.mode).toBe("spawn");
+      expect(info.engine.socket_path).toBeNull();
     } finally {
       await harness.stop();
     }

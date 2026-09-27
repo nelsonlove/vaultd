@@ -14,6 +14,7 @@ use vault_protocol::{
     ErrorCode, ExpectedDto, Request, RequestEnvelope, ResponseOutcome, WriteNoteParams,
 };
 use vault_server::Server;
+use vault_server::broadcast::ConnectionId;
 use vault_server::runtime::{Runtime, RuntimeOptions, RuntimeTestHooks};
 use vault_server::subscriptions::SubscriptionRegistry;
 
@@ -258,6 +259,7 @@ fn a_mutation_that_cannot_reach_a_saturated_coordinator_is_runtime_overloaded() 
     let server = Server::for_runtime(handle);
     let mut subscriptions = SubscriptionRegistry::new();
     let response = server.handle(
+        ConnectionId::STANDALONE,
         RequestEnvelope {
             version: 1,
             id: "o".into(),
