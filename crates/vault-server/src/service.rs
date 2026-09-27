@@ -150,7 +150,7 @@ struct Seams {
 /// which installs nothing: there would be nobody to read the flag, and a
 /// swallowed SIGTERM would leave it stoppable only by SIGKILL.
 pub fn run(
-    server: Server,
+    mut server: Server,
     notices: Option<Receiver<RuntimeNotice>>,
     options: ServiceOptions,
     watch: Option<crate::signals::SignalWatch>,
@@ -166,6 +166,12 @@ pub fn run(
     };
 
     let listener = Arc::new(SocketListener::bind(&path)?);
+    // Answered by `get_vault_info` so a client on stdio can tell others where
+    // to knock. Set only now, with the bind behind it — the path this daemon
+    // *intends* to bind and the path it actually bound differ in the window
+    // where the bind fails, and nothing can observe that window because `?`
+    // above has already returned.
+    server.set_socket_path(Some(path.display().to_string()));
     let service = Arc::new(Service::new(server));
     let fanout = notices
         .map(|notices| spawn_fanout(Arc::clone(&service.broadcaster), notices))

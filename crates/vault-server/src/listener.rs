@@ -418,7 +418,7 @@ fn bind_with_backlog(path: &Path) -> Result<UnixListener, ListenError> {
     // `sun_path`; clamping the length the same way keeps the NUL terminator
     // inside the struct even on the path where the check above was skipped.
     let stored = bytes.len().min(MAX_SOCKET_PATH_LEN);
-    for (slot, byte) in address.sun_path.iter_mut().zip(bytes.iter()) {
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes.iter().take(stored)) {
         *slot = *byte as libc::c_char;
     }
     // The exact length std itself passes: the offset of `sun_path`, the bytes

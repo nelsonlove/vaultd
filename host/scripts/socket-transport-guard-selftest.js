@@ -14,13 +14,19 @@
  *     node host/scripts/socket-transport-guard-selftest.js   # exits 0 or 1
  *
  * It writes only under `target/tmp/guard-selftest` and one directory of its own
- * in the OS temp dir (deliberately *outside* `target/`, since that is the thing
- * being refused), and it removes both.
+ * under the user's home directory (deliberately *outside* `target/`, since that
+ * is the thing being refused), and it removes both.
+ *
+ * The "outside" directory is rooted at `homedir()` rather than `tmpdir()` on
+ * purpose: `tmpdir()` reads `$TMPDIR`, and this project's own Rust gates
+ * mandate `TMPDIR="$PWD/target/tmp"` — under which the "outside" directory
+ * would land *inside* `target/`, and case 3 below would fail red (`allowed`
+ * where it expects `refused`) for an environment reason, not a guard defect.
  */
 
 const assert = require("node:assert/strict");
 const { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } = require("node:fs");
-const { tmpdir } = require("node:os");
+const { homedir } = require("node:os");
 const { join } = require("node:path");
 
 const { REPO, assertSafeToBuild } = require("./socket-transport-baseline.js");
@@ -41,7 +47,7 @@ function main() {
   rmSync(SCRATCH, { recursive: true, force: true });
   mkdirSync(SCRATCH, { recursive: true });
   // A stand-in for a real vault: outside `target/`, existing, and not empty.
-  const outside = mkdtempSync(join(tmpdir(), "guard-selftest-"));
+  const outside = mkdtempSync(join(homedir(), ".vaultd-guard-selftest-"));
   writeFileSync(join(outside, "Note.md"), "# a note that matters\n");
 
   try {

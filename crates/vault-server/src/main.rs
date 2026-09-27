@@ -134,7 +134,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(_) => Some(vault_server::signals::install()?),
         None => None,
     };
-    let (mut server, notices, canonical_vault_root) = configured_server(&cli)?;
+    let (server, notices, canonical_vault_root) = configured_server(&cli)?;
     let listen = match (&cli.listen, &canonical_vault_root) {
         (None, _) => None,
         (Some(Some(path)), _) => Some(path.clone()),
@@ -146,9 +146,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         (Some(None), None) => unreachable!("--listen requires --vault"),
     };
     // Answered by `get_vault_info` so a client on stdio can tell others where
-    // to knock. Task 6 makes the field reach the wire; setting it here keeps
-    // the one place that knows the path the one place that decides it.
-    server.set_socket_path(listen.as_ref().map(|path| path.display().to_string()));
+    // to knock. Set by `service::run` itself, once the bind that path names
+    // has actually succeeded — not here, where `listen` is only the path this
+    // daemon *intends* to bind.
     vault_server::service::run(
         server,
         notices,

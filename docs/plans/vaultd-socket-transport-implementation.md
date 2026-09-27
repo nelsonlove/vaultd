@@ -4814,7 +4814,7 @@ Create `docs/performance/vaultd-socket-transport-baseline.md`, following `docs/p
 
 | Case | Target |
 | --- | --- |
-| Connection setup, `connect()` to the first `get_health` answer | under 5 ms p50 |
+| Connection setup, `connect()` to the first `health` answer | under 5 ms p50 |
 | `get_note` warm, socket against stdio | socket within 10 percent of stdio |
 | `write_note`, socket against stdio | socket within 10 percent of stdio |
 | `get_note` p50 with a stalled peer, against its single-client value | within 10 percent |

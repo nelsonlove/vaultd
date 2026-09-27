@@ -423,7 +423,7 @@ export class HostOps {
         engine: {
           mode: this.deps.config.engine,
           source: this.deps.engineSource?.() ?? null,
-          socket_path: this.deps.config.engineSocketPath,
+          socket_path: this.deps.config.engine === "spawn" ? null : this.deps.config.engineSocketPath,
           live_state: this.deps.liveState?.() ?? null,
         },
         unsupported: this.deps.policyRecorder

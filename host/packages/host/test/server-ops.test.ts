@@ -657,4 +657,26 @@ describe("host.* operations", () => {
       await harness.stop();
     }
   });
+
+  it("reports socket_path as null under engine: spawn, where nothing binds it", async () => {
+    // **The same rule the ready line already got (Task 12's L2).** Under
+    // `spawn` the host never passes `--listen`, so `engineSocketPath` names no
+    // socket anything ever bound; advertising it in `host.info` would send a
+    // client to knock on an empty path. This is the per-mode half of the case
+    // above, which only ever exercises the default `auto`.
+    const harness = await HostHarness.create({
+      vault: { "A.md": "# A\n" },
+      enabled: [],
+      config: { engine: "spawn" },
+    });
+    try {
+      await harness.lifecycle.start();
+      const client = await harness.connectClient();
+      const info = await client.call<{ engine: Record<string, unknown> }>("host.info", {});
+      expect(info.engine.mode).toBe("spawn");
+      expect(info.engine.socket_path).toBeNull();
+    } finally {
+      await harness.stop();
+    }
+  });
 });
