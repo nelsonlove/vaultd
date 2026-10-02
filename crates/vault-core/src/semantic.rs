@@ -44,6 +44,9 @@ pub enum ReferenceOrigin {
 pub enum Subpath {
     Heading(String),
     Block(String),
+    /// A view of a base. Never produced by the parser — a `#fragment` parses
+    /// as a heading — only by resolution, when the target is a base.
+    View(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -38,6 +38,26 @@ pub struct ResolutionNote {
     pub path: VaultPath,
     pub headings: Vec<String>,
     pub blocks: Vec<String>,
+    /// `Some` for a base: its declared view names, in order. A base has no
+    /// headings or blocks; a subpath on it names a view.
+    pub views: Option<Vec<String>>,
+}
+
+impl ResolutionNote {
+    /// A base's catalog entry: its path and its declared view names.
+    pub fn base(path: VaultPath, views: Vec<String>) -> Self {
+        Self {
+            path,
+            headings: Vec::new(),
+            blocks: Vec::new(),
+            views: Some(views),
+        }
+    }
+
+    /// Whether this entry is a base rather than a note.
+    pub fn is_base(&self) -> bool {
+        self.views.is_some()
+    }
 }
 
 impl From<&ParsedNote> for ResolutionNote {
@@ -54,6 +74,7 @@ impl From<&ParsedNote> for ResolutionNote {
                 .iter()
                 .map(|block| block.value.clone())
                 .collect(),
+            views: None,
         }
     }
 }
@@ -104,6 +125,7 @@ impl From<&Reference> for LinkTarget {
 struct NoteSubpaths {
     heading_keys: BTreeSet<String>,
     block_ids: BTreeSet<String>,
+    views: Option<Vec<String>>,
 }
 
 pub struct Resolver {
@@ -153,6 +175,7 @@ impl Resolver {
             for block in note.blocks {
                 entry.block_ids.insert(block);
             }
+            entry.views = note.views;
             resolver.paths.insert(path);
         }
         resolver
@@ -235,11 +258,33 @@ impl Resolver {
             };
         };
         let known = self.subpaths.get(&target);
+        // A subpath on a base names a view, matched exactly; a block on a base
+        // names nothing. A view subpath on a note names nothing either.
+        if let Some(views) = known.and_then(|entry| entry.views.as_ref()) {
+            let resolved = match &subpath {
+                Subpath::Heading(name) | Subpath::View(name) => {
+                    let as_view = Subpath::View(name.clone());
+                    if views.iter().any(|view| view == name) {
+                        return Resolution::Resolved {
+                            target,
+                            subpath: Some(as_view),
+                        };
+                    }
+                    as_view
+                }
+                Subpath::Block(_) => subpath,
+            };
+            return Resolution::MissingSubpath {
+                target,
+                subpath: resolved,
+            };
+        }
         let found = match &subpath {
             Subpath::Heading(heading) => {
                 known.is_some_and(|entry| entry.heading_keys.contains(&heading.to_lowercase()))
             }
             Subpath::Block(block) => known.is_some_and(|entry| entry.block_ids.contains(block)),
+            Subpath::View(_) => false,
         };
         if found {
             Resolution::Resolved {
@@ -264,6 +309,7 @@ pub fn resolution_diagnostic(resolved: &ResolvedReference) -> Option<Diagnostic>
             let (code, kind) = match subpath {
                 Subpath::Heading(_) => (DiagnosticCode::MissingHeading, "heading"),
                 Subpath::Block(_) => (DiagnosticCode::MissingBlock, "block"),
+                Subpath::View(_) => (DiagnosticCode::MissingView, "view"),
             };
             Some(
                 Diagnostic::new(

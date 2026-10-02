@@ -15,6 +15,7 @@ fn resolution_note(path: &str, headings: &[&str], blocks: &[&str]) -> Resolution
         path: vp(path),
         headings: headings.iter().map(|h| h.to_string()).collect(),
         blocks: blocks.iter().map(|b| b.to_string()).collect(),
+        views: None,
     }
 }
 

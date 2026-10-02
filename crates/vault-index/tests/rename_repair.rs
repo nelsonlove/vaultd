@@ -369,6 +369,51 @@ fn an_attachment_embed_under_a_renamed_folder_is_repaired() {
     assert!(outcome.link_rewrite_failures.is_empty());
 }
 
+/// A base is renamed the way an attachment is: the reference rows reach it,
+/// and every spelling keeps its own shape — the extension, a view subpath, the
+/// display text and an embed's `!` all sit outside the file-target span.
+#[test]
+fn renaming_a_base_repairs_every_link_that_names_it_in_its_own_spelling() {
+    let mut fixture = fixture();
+    std::fs::write(
+        fixture.root.join("Views.base"),
+        "views:\n  - type: table\n    name: Table\n",
+    )
+    .expect("write the base");
+    std::fs::write(fixture.root.join("Plain.md"), "see [[Views.base]] here\n")
+        .expect("write Plain");
+    std::fs::write(fixture.root.join("Embed.md"), "![[Views.base#Table]]\n").expect("write Embed");
+    std::fs::write(fixture.root.join("Shown.md"), "[[Views.base|the views]]\n")
+        .expect("write Shown");
+    std::fs::write(fixture.root.join("Nested/Up.md"), "[[../Views.base]]\n").expect("write Up");
+    std::fs::write(fixture.root.join("Views.md"), "# Views\n").expect("write the namesake note");
+    std::fs::write(fixture.root.join("Namesake.md"), "[[Views]]\n").expect("write Namesake");
+    fixture
+        .service
+        .refresh(false)
+        .expect("index the base links");
+
+    let outcome = rename(&mut fixture, "Views.base", "Renamed.base");
+
+    assert_eq!(read(&fixture, "Plain.md"), "see [[Renamed.base]] here\n");
+    assert_eq!(
+        read(&fixture, "Embed.md"),
+        "![[Renamed.base#Table]]\n",
+        "the view subpath is outside the file-target span and must not move"
+    );
+    assert_eq!(read(&fixture, "Shown.md"), "[[Renamed.base|the views]]\n");
+    assert_eq!(read(&fixture, "Nested/Up.md"), "[[../Renamed.base]]\n");
+    assert_eq!(
+        read(&fixture, "Namesake.md"),
+        "[[Views]]\n",
+        "a link to the note that shares the base's stem names the note, not the base"
+    );
+    assert_eq!(outcome.links_rewritten, 4);
+    assert!(outcome.link_rewrite_failures.is_empty());
+    assert!(fixture.root.join("Renamed.base").is_file());
+    assert!(!fixture.root.join("Views.base").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Compare-and-swap, at plan time and at write time.
 // ---------------------------------------------------------------------------

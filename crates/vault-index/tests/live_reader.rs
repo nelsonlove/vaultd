@@ -304,6 +304,7 @@ fn the_published_graph_resolves_exactly_like_a_fresh_hydration() {
                 path,
                 headings: note.headings,
                 blocks: note.blocks,
+                views: None,
             }
         })
         .collect();

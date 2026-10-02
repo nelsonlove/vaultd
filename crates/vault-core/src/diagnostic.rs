@@ -23,6 +23,8 @@ pub enum DiagnosticCode {
     AmbiguousReference,
     MissingHeading,
     MissingBlock,
+    MissingView,
+    MalformedBase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

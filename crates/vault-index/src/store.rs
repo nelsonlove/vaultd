@@ -579,6 +579,7 @@ impl IndexStore {
                 path,
                 headings: Vec::new(),
                 blocks: Vec::new(),
+                views: None,
             });
         }
         let by_path: std::collections::BTreeMap<String, usize> = catalog

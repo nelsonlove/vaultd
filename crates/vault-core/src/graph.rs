@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::resolver::resolution_diagnostic;
 use crate::vault_source::read_documents;
 use crate::{
-    Diagnostic, ParsedNote, Resolution, ResolvedReference, Resolver, ScanError, VaultPath,
-    VaultSource, parse_note,
+    Diagnostic, ParsedNote, Resolution, ResolutionNote, ResolvedReference, Resolver, ScanError,
+    VaultPath, VaultSource, parse_note,
 };
 
 #[derive(Clone, Debug)]
@@ -29,8 +29,20 @@ pub fn scan_vault(source: &impl VaultSource) -> Result<ScanReport, ScanError> {
     Ok(build_graph(notes, documents.diagnostics))
 }
 
-pub fn build_graph(notes: Vec<ParsedNote>, mut diagnostics: Vec<Diagnostic>) -> ScanReport {
-    let resolver = Resolver::new(&notes);
+pub fn build_graph(notes: Vec<ParsedNote>, diagnostics: Vec<Diagnostic>) -> ScanReport {
+    build_graph_with_bases(notes, Vec::new(), diagnostics)
+}
+
+/// The complete graph with bases in the resolution catalog: every reference
+/// may resolve to a note or to a base (and a base's views), and a base
+/// collects backlinks like a note does. Bases carry no references of their
+/// own, so they add catalog entries and nothing else.
+pub fn build_graph_with_bases(
+    notes: Vec<ParsedNote>,
+    bases: Vec<ResolutionNote>,
+    mut diagnostics: Vec<Diagnostic>,
+) -> ScanReport {
+    let resolver = Resolver::from_catalog(notes.iter().map(ResolutionNote::from).chain(bases));
 
     let mut outgoing: BTreeMap<VaultPath, Vec<ResolvedReference>> = BTreeMap::new();
     let mut backlinks: BTreeMap<VaultPath, Vec<ResolvedReference>> = BTreeMap::new();

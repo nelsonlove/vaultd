@@ -145,7 +145,9 @@ pub fn changed_candidate_keys(change: &ResolutionIdentityChange) -> BTreeSet<Dep
     }
 
     if let (Some(old), Some(new)) = (&change.old, &change.new) {
-        if old.path == new.path && (old.headings != new.headings || old.blocks != new.blocks) {
+        if old.path == new.path
+            && (old.headings != new.headings || old.blocks != new.blocks || old.views != new.views)
+        {
             keys.insert(DependencyKey::new(
                 DependencyKind::ResolvedTarget,
                 old.path.as_str(),

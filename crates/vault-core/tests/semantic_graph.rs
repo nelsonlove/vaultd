@@ -83,6 +83,8 @@ fn code_name(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::AmbiguousReference => "ambiguous_reference",
         DiagnosticCode::MissingHeading => "missing_heading",
         DiagnosticCode::MissingBlock => "missing_block",
+        DiagnosticCode::MissingView => "missing_view",
+        DiagnosticCode::MalformedBase => "malformed_base",
     }
 }
 
@@ -91,6 +93,7 @@ fn subpath_json(subpath: &Option<Subpath>) -> Value {
         None => Value::Null,
         Some(Subpath::Heading(heading)) => json!({ "heading": heading }),
         Some(Subpath::Block(block)) => json!({ "block": block }),
+        Some(Subpath::View(view)) => json!({ "view": view }),
     }
 }
 

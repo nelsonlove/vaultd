@@ -84,11 +84,47 @@ pub enum ReferenceOriginDto {
     Property,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// A reference's subpath. Open-ended like every enum a client decodes from
+/// an event or a response it did not ask to be strict about: a kind this
+/// build does not know is [`SubpathDto::Unknown`], with its value discarded,
+/// rather than a failed line. `view` arrived in protocol version 1 additively
+/// with Bases evaluation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum SubpathDto {
     Heading(String),
     Block(String),
+    View(String),
+    /// A kind this build does not know. Never produced by this server.
+    #[serde(skip_serializing)]
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for SubpathDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            kind: String,
+            #[serde(default)]
+            value: Option<serde_json::Value>,
+        }
+        let Raw { kind, value } = Raw::deserialize(deserializer)?;
+        let text = |value: Option<serde_json::Value>| match value {
+            Some(serde_json::Value::String(text)) => Ok(text),
+            _ => Err(serde::de::Error::custom(format!(
+                "a `{kind}` subpath needs a string value"
+            ))),
+        };
+        Ok(match kind.as_str() {
+            "heading" => SubpathDto::Heading(text(value)?),
+            "block" => SubpathDto::Block(text(value)?),
+            "view" => SubpathDto::View(text(value)?),
+            _ => SubpathDto::Unknown,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

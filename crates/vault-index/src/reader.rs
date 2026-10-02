@@ -210,6 +210,7 @@ impl IndexReader {
                 path,
                 headings: note.headings,
                 blocks: note.blocks,
+                views: None,
             })
         });
         let resolver = Arc::new(Resolver::from_catalog(catalog));

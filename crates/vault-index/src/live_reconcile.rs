@@ -248,6 +248,7 @@ fn graph_identity(graph: &LiveGraph, path: &VaultPath) -> Option<ResolutionNote>
         path: note.path,
         headings: note.headings,
         blocks: note.blocks,
+        views: None,
     })
 }
 

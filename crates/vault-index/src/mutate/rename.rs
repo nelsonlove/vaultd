@@ -109,11 +109,13 @@ fn identity(graph: &LiveGraph, path: &VaultPath) -> ResolutionNote {
             path: note.path,
             headings: note.headings,
             blocks: note.blocks,
+            views: None,
         })
         .unwrap_or_else(|| ResolutionNote {
             path: path.clone(),
             headings: Vec::new(),
             blocks: Vec::new(),
+            views: None,
         })
 }
 
@@ -122,6 +124,7 @@ fn at_path(note: &ResolutionNote, destination: &VaultPath) -> ResolutionNote {
         path: destination.clone(),
         headings: note.headings.clone(),
         blocks: note.blocks.clone(),
+        views: None,
     }
 }
 
@@ -199,6 +202,7 @@ pub(crate) fn plan_repair(
                         path: note.path,
                         headings: note.headings,
                         blocks: note.blocks,
+                        views: None,
                     },
                     to,
                 ),
@@ -671,6 +675,7 @@ fn as_markdown_link(emission: &Emission<'_>, candidate: &str) -> Option<Replacem
             &match subpath {
                 Subpath::Heading(heading) => heading.clone(),
                 Subpath::Block(block) => format!("^{block}"),
+                Subpath::View(view) => view.clone(),
             },
         ));
     }

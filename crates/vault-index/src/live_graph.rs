@@ -75,6 +75,7 @@ fn note_identity(path: &VaultPath, record: &NoteRecord) -> ResolutionNote {
         path: path.clone(),
         headings: record.headings.clone(),
         blocks: record.blocks.clone(),
+        views: None,
     }
 }
 

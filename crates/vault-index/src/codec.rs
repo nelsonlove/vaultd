@@ -153,6 +153,8 @@ pub(crate) fn encode_diagnostic_code(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::AmbiguousReference => "ambiguous_reference",
         DiagnosticCode::MissingHeading => "missing_heading",
         DiagnosticCode::MissingBlock => "missing_block",
+        DiagnosticCode::MissingView => "missing_view",
+        DiagnosticCode::MalformedBase => "malformed_base",
     }
 }
 
@@ -173,6 +175,8 @@ pub(crate) fn decode_diagnostic_code(value: &str) -> Result<DiagnosticCode, Inde
         "ambiguous_reference" => DiagnosticCode::AmbiguousReference,
         "missing_heading" => DiagnosticCode::MissingHeading,
         "missing_block" => DiagnosticCode::MissingBlock,
+        "missing_view" => DiagnosticCode::MissingView,
+        "malformed_base" => DiagnosticCode::MalformedBase,
         other => {
             return Err(IndexError::IncompatibleIndex(format!(
                 "unknown diagnostic code {other:?}"
@@ -246,6 +250,7 @@ pub(crate) fn encode_subpath(subpath: &Subpath) -> (&'static str, &str) {
     match subpath {
         Subpath::Heading(value) => ("heading", value),
         Subpath::Block(value) => ("block", value),
+        Subpath::View(value) => ("view", value),
     }
 }
 
@@ -257,6 +262,7 @@ pub(crate) fn decode_subpath(
         (None, None) => Ok(None),
         (Some("heading"), Some(value)) => Ok(Some(Subpath::Heading(value.to_string()))),
         (Some("block"), Some(value)) => Ok(Some(Subpath::Block(value.to_string()))),
+        (Some("view"), Some(value)) => Ok(Some(Subpath::View(value.to_string()))),
         other => Err(IndexError::IncompatibleIndex(format!(
             "invalid stored subpath {other:?}"
         ))),

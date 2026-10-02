@@ -98,6 +98,8 @@ fn diagnostic_code(value: DiagnosticCode) -> &'static str {
         DiagnosticCode::AmbiguousReference => "ambiguous_reference",
         DiagnosticCode::MissingHeading => "missing_heading",
         DiagnosticCode::MissingBlock => "missing_block",
+        DiagnosticCode::MissingView => "missing_view",
+        DiagnosticCode::MalformedBase => "malformed_base",
     }
 }
 
@@ -115,6 +117,7 @@ fn subpath(value: &Subpath) -> SubpathDto {
     match value {
         Subpath::Heading(text) => SubpathDto::Heading(text.clone()),
         Subpath::Block(text) => SubpathDto::Block(text.clone()),
+        Subpath::View(text) => SubpathDto::View(text.clone()),
     }
 }
 

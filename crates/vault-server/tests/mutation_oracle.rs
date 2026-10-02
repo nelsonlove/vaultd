@@ -338,6 +338,8 @@ fn dto_subpath(subpath: Option<&SubpathDto>) -> String {
     match subpath {
         Some(SubpathDto::Heading(text)) => format!(" #heading {text}"),
         Some(SubpathDto::Block(id)) => format!(" #block {id}"),
+        Some(SubpathDto::View(name)) => format!(" #view {name}"),
+        Some(SubpathDto::Unknown) => " #unknown".to_string(),
         None => String::new(),
     }
 }
@@ -371,6 +373,7 @@ fn core_subpath(subpath: Option<&Subpath>) -> String {
     match subpath {
         Some(Subpath::Heading(text)) => format!(" #heading {text}"),
         Some(Subpath::Block(id)) => format!(" #block {id}"),
+        Some(Subpath::View(name)) => format!(" #view {name}"),
         None => String::new(),
     }
 }

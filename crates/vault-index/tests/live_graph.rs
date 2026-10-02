@@ -18,6 +18,7 @@ fn note(path: &str, headings: &[&str], blocks: &[&str]) -> ResolutionNote {
         path: vp(path),
         headings: headings.iter().map(|h| h.to_string()).collect(),
         blocks: blocks.iter().map(|b| b.to_string()).collect(),
+        views: None,
     }
 }
 
@@ -488,6 +489,7 @@ fn assert_graphs_equivalent(left: &vault_index::LiveGraph, right: &vault_index::
                 path: path.clone(),
                 headings: left_note.headings.clone(),
                 blocks: left_note.blocks.clone(),
+                views: None,
             }),
         };
         let left_by_identity = left.plan_impact(&BTreeSet::new(), std::slice::from_ref(&identity));

@@ -11,11 +11,13 @@ fn lightweight_catalog_uses_the_existing_resolution_rules() {
             path: path("Folder/Note.md"),
             headings: vec!["Exact Heading".into()],
             blocks: vec!["block-1".into()],
+            views: None,
         },
         ResolutionNote {
             path: path("Other.md"),
             headings: vec![],
             blocks: vec![],
+            views: None,
         },
     ]);
 

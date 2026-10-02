@@ -58,6 +58,13 @@ impl VaultPath {
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
     }
+
+    /// Whether this path names an Obsidian base (`.base`, any case).
+    pub fn is_base(&self) -> bool {
+        std::path::Path::new(self.name())
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("base"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
