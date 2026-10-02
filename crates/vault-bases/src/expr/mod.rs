@@ -80,10 +80,33 @@ pub enum BinaryOp {
     Or,
 }
 
+/// The deepest expression tree the parser builds, in nesting levels: a leaf
+/// is one level, and each operator, call, member access, index, list, object
+/// or parenthesis around it adds one.
+///
+/// A `.base` file is untrusted text, and everything that walks the tree
+/// (the parser itself, `Drop`, `Clone`, `PartialEq`, `Debug` and the
+/// evaluator) recurses once per level. Without a cap, a few kilobytes of
+/// `((((…` or `a.b.b.b…` overflow the stack, and a stack overflow aborts the
+/// whole daemon rather than failing one view. 256 levels is far beyond any
+/// hand-written formula and well inside a 2 MiB thread stack.
+pub const MAX_EXPRESSION_DEPTH: usize = 256;
+
 /// An expression that does not parse, with the byte offset into the
 /// expression text where the parser gave up.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpressionError {
+    pub kind: ExpressionErrorKind,
     pub message: String,
     pub position: usize,
+}
+
+/// Why an expression does not parse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpressionErrorKind {
+    /// The text is not in the grammar; `message` says what was expected.
+    Syntax,
+    /// The text nests deeper than `max` levels
+    /// ([`MAX_EXPRESSION_DEPTH`]).
+    ExpressionTooDeep { max: usize },
 }

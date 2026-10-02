@@ -1,4 +1,7 @@
-use super::ExpressionError;
+use std::iter::Peekable;
+use std::str::CharIndices;
+
+use super::{ExpressionError, ExpressionErrorKind};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Token {
@@ -22,9 +25,84 @@ const PUNCTUATION: [&str; 23] = [
 
 fn error(position: usize, message: impl Into<String>) -> ExpressionError {
     ExpressionError {
+        kind: ExpressionErrorKind::Syntax,
         message: message.into(),
         position,
     }
+}
+
+type Chars<'a> = Peekable<CharIndices<'a>>;
+
+/// Exactly `count` hexadecimal digits, consumed; `None` (with nothing
+/// consumed past the first non-digit) when fewer follow. `from_str_radix`
+/// alone is not enough: it takes a leading `+`.
+fn hex_digits(chars: &mut Chars<'_>, count: usize) -> Option<u32> {
+    let mut code = 0;
+    for _ in 0..count {
+        let digit = chars.peek()?.1.to_digit(16)?;
+        chars.next();
+        code = code * 16 + digit;
+    }
+    Some(code)
+}
+
+/// The text of one `\u` escape after the `u`: `HHHH` or `{H…}`.
+fn unicode_escape(chars: &mut Chars<'_>) -> Option<u32> {
+    if chars.peek().map(|&(_, c)| c) != Some('{') {
+        return hex_digits(chars, 4);
+    }
+    chars.next();
+    let mut code: u32 = 0;
+    let mut digits = 0;
+    loop {
+        let (_, c) = chars.next()?;
+        if c == '}' {
+            return (digits > 0).then_some(code);
+        }
+        code = code.checked_mul(16)?.checked_add(c.to_digit(16)?)?;
+        if code > 0x10FFFF {
+            return None;
+        }
+        digits += 1;
+    }
+}
+
+/// One escape sequence after its backslash, read as JavaScript reads it:
+/// `\n \t \r \b \f \v \0`, `\xHH`, `\uHHHH`, `\u{H…}` (a surrogate pair of
+/// two `\uHHHH` combines), and any other character stands for itself.
+/// Provisional (ruling N1, 2026-10-02): Task 13's capture settles it.
+fn escape(chars: &mut Chars<'_>, backslash: usize, escaped: char) -> Result<char, ExpressionError> {
+    let code = match escaped {
+        'n' => return Ok('\n'),
+        't' => return Ok('\t'),
+        'r' => return Ok('\r'),
+        'b' => return Ok('\u{8}'),
+        'f' => return Ok('\u{c}'),
+        'v' => return Ok('\u{b}'),
+        '0' => return Ok('\0'),
+        'x' => hex_digits(chars, 2).ok_or_else(|| error(backslash, "malformed \\x escape"))?,
+        'u' => {
+            let malformed = || error(backslash, "malformed \\u escape");
+            let code = unicode_escape(chars).ok_or_else(malformed)?;
+            if (0xD800..0xDC00).contains(&code) {
+                // A high surrogate must be followed by `\u` and a low one.
+                let mut ahead = chars.clone();
+                let low = match (ahead.next(), ahead.next()) {
+                    (Some((_, '\\')), Some((_, 'u'))) => hex_digits(&mut ahead, 4),
+                    _ => None,
+                };
+                let Some(low) = low.filter(|low| (0xDC00..0xE000).contains(low)) else {
+                    return Err(error(backslash, "lone surrogate in \\u escape"));
+                };
+                *chars = ahead;
+                0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+            } else {
+                code
+            }
+        }
+        other => return Ok(other),
+    };
+    char::from_u32(code).ok_or_else(|| error(backslash, "lone surrogate in \\u escape"))
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -60,7 +138,14 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
             chars.next();
             continue;
         }
-        if c.is_ascii_digit() {
+        // `.5` is a number, as in JavaScript. Provisional (ruling N2,
+        // 2026-10-02): Task 13's capture settles it.
+        let leading_dot = c == '.'
+            && text[start + 1..]
+                .chars()
+                .next()
+                .is_some_and(|n| n.is_ascii_digit());
+        if c.is_ascii_digit() || leading_dot {
             let mut end = start;
             let mut seen_dot = false;
             let mut seen_exponent = false;
@@ -69,13 +154,12 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
                     end = at + 1;
                     chars.next();
                 } else if d == '.' && !seen_dot && !seen_exponent {
-                    // A dot continues the number only when a digit follows:
-                    // `5.isEmpty()` is a method on 5, `2.5` is a decimal.
-                    let next_is_digit = text[at + 1..]
-                        .chars()
-                        .next()
-                        .is_some_and(|n| n.is_ascii_digit());
-                    if !next_is_digit {
+                    // A dot continues the number unless a name follows:
+                    // `5.isEmpty()` is a method on 5, `2.5` is a decimal,
+                    // and `1.` alone is 1, as in JavaScript (provisional,
+                    // ruling N2).
+                    let name_follows = text[at + 1..].chars().next().is_some_and(is_ident_start);
+                    if name_follows {
                         break;
                     }
                     seen_dot = true;
@@ -118,32 +202,16 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
             chars.next();
             let mut value = String::new();
             let mut closed = false;
-            while let Some((_, d)) = chars.next() {
+            while let Some((at, d)) = chars.next() {
                 if d == c {
                     closed = true;
                     break;
                 }
                 if d == '\\' {
-                    let Some((escape_at, escaped)) = chars.next() else {
+                    let Some((_, escaped)) = chars.next() else {
                         break;
                     };
-                    match escaped {
-                        'n' => value.push('\n'),
-                        't' => value.push('\t'),
-                        'r' => value.push('\r'),
-                        '0' => value.push('\0'),
-                        'u' => {
-                            let hex: String = (0..4)
-                                .filter_map(|_| chars.next().map(|(_, h)| h))
-                                .collect();
-                            let code = u32::from_str_radix(&hex, 16)
-                                .ok()
-                                .and_then(char::from_u32)
-                                .ok_or_else(|| error(escape_at, "malformed \\u escape"))?;
-                            value.push(code);
-                        }
-                        other => value.push(other),
-                    }
+                    value.push(escape(&mut chars, at, escaped)?);
                     continue;
                 }
                 value.push(d);
