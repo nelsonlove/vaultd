@@ -7,6 +7,11 @@
 
 mod any;
 mod global;
+mod list;
+mod number;
+mod object;
+mod regexp;
+mod string;
 
 use vault_core::PropertyValue;
 
@@ -53,10 +58,25 @@ pub(crate) fn call_method(
     if any::METHODS.contains(&name) {
         return any::call(&target, name, args, ctx, scope);
     }
-    Err(EvalError::NoSuchMethod {
-        target: target.type_name(),
-        name: name.to_string(),
-    })
+    match target {
+        // A missing property is `null`. `isEmpty` is true for it (the
+        // string and number entries: "or is not present"); every other
+        // method on it is an error cell — "a missing property in a method
+        // call", in the spec's words.
+        Value::Null if name == "isEmpty" => {
+            arity(name, args, 0, 0)?;
+            Ok(Value::Boolean(true))
+        }
+        Value::String(text) => string::call(&text, name, args, ctx, scope),
+        Value::Number(number) => number::call(number, name, args, ctx, scope),
+        Value::List(items) => list::call(items, name, args, ctx, scope),
+        Value::Object(entries) => object::call(entries, name, args),
+        Value::Regexp(regexp) => regexp::call(&regexp, name, args, ctx, scope),
+        other => Err(EvalError::NoSuchMethod {
+            target: other.type_name(),
+            name: name.to_string(),
+        }),
+    }
 }
 
 pub(crate) fn field(
@@ -66,6 +86,8 @@ pub(crate) fn field(
 ) -> Result<Value, EvalError> {
     match target {
         Value::Null => Ok(Value::Null),
+        Value::String(text) => string::field(text, name),
+        Value::List(items) => list::field(items, name),
         other => Err(EvalError::NoSuchField {
             target: other.type_name(),
             name: name.to_string(),
@@ -78,7 +100,16 @@ pub fn is_known_global(name: &str) -> bool {
 }
 
 pub fn is_known_method(name: &str) -> bool {
-    any::METHODS.contains(&name)
+    [
+        any::METHODS,
+        string::METHODS,
+        number::METHODS,
+        list::METHODS,
+        object::METHODS,
+        regexp::METHODS,
+    ]
+    .iter()
+    .any(|methods| methods.contains(&name))
 }
 
 /// Evaluate every argument eagerly — the default for every function except

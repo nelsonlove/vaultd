@@ -116,10 +116,10 @@ fn every_expression_form_evaluates_on_a_memory_source() {
         ("note.obj.sub", Ok(string("s"))),
         ("missing.sub", Ok(Value::Null)),
         (
-            r#"note["my prop"][0].length"#,
+            r#"note["my prop"][0].nope"#,
             Err(EvalError::NoSuchField {
                 target: "string",
-                name: "length".into(),
+                name: "nope".into(),
             }),
         ),
         ("formula.ppu", Err(EvalError::UnknownFormula("ppu".into()))),

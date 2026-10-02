@@ -1,0 +1,18 @@
+{"family":"number","case":"abs","expr":"(-5).abs()","kind":"number","text":"5","source":"published"}
+{"family":"number","case":"ceil","expr":"(2.1).ceil()","kind":"number","text":"3","source":"published"}
+{"family":"number","case":"floor","expr":"(2.9).floor()","kind":"number","text":"2","source":"published"}
+{"family":"number","case":"isEmpty","expr":"5.isEmpty()","kind":"boolean","text":"false","source":"published"}
+{"family":"number","case":"round","expr":"(2.5).round()","kind":"number","text":"3","source":"published"}
+{"family":"number","case":"round:negative_half","expr":"(-2.5).round()","kind":"number","text":"-2","source":"published"}
+{"family":"number","case":"round:digits","expr":"(2.3333).round(2)","kind":"number","text":"2.33","source":"published"}
+{"family":"number","case":"toFixed","expr":"(3.14159).toFixed(2)","kind":"string","text":"3.14","source":"published"}
+{"family":"number","case":"toFixed:tie","expr":"(0.125).toFixed(2)","kind":"string","text":"0.13","source":"published"}
+{"family":"number","case":"toFixed:binary","expr":"(1.005).toFixed(2)","kind":"string","text":"1.00","source":"published"}
+{"family":"number","case":"toFixed:pad","expr":"3.toFixed(2)","kind":"string","text":"3.00","source":"published"}
+{"family":"number","case":"formatted_price","expr":"if(price, price.toFixed(2) + \" dollars\")","props":{"price":3},"kind":"string","text":"3.00 dollars","source":"published"}
+{"family":"number","case":"ppu","expr":"(price / age).toFixed(2)","props":{"price":10,"age":3},"kind":"string","text":"3.33","source":"published"}
+{"family":"number","case":"abs:wrong_arity","expr":"(-5).abs(1)","kind":"error","source":"published"}
+{"family":"number","case":"toFixed:wrong_digits","expr":"(1).toFixed(101)","kind":"error","source":"published"}
+{"family":"number","case":"abs:wrong_receiver","expr":"\"5\".abs()","kind":"error","source":"published"}
+{"family":"number","case":"round:just_below_half","expr":"(0.49999999999999994).round()","kind":"number","text":"0","source":"published"}
+{"family":"number","case":"toFixed:large","expr":"(1e21).toFixed(2)","kind":"string","text":"1e+21","source":"published"}

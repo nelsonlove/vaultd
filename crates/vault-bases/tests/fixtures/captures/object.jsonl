@@ -1,0 +1,7 @@
+{"family":"object","case":"isEmpty:true","expr":"{}.isEmpty()","kind":"boolean","text":"true","source":"published"}
+{"family":"object","case":"isEmpty:false","expr":"{\"a\": 1}.isEmpty()","kind":"boolean","text":"false","source":"published"}
+{"family":"object","case":"keys","expr":"{\"a\": 1, \"b\": 2}.keys()","kind":"list","text":"a, b","source":"published"}
+{"family":"object","case":"values","expr":"{\"a\": 1, \"b\": 2}.values()","kind":"list","text":"1, 2","source":"published"}
+{"family":"object","case":"property_object","expr":"meta.keys()","props":{"meta":{"x":1,"y":2}},"kind":"list","text":"x, y","source":"published"}
+{"family":"object","case":"keys:wrong_arity","expr":"{\"a\": 1}.keys(1)","kind":"error","source":"published"}
+{"family":"object","case":"keys:wrong_receiver","expr":"[1].keys()","kind":"error","source":"published"}

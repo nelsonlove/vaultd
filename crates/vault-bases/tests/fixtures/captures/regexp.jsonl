@@ -1,0 +1,10 @@
+{"family":"regexp","case":"matches","expr":"/abc/.matches(\"abcde\")","kind":"boolean","text":"true","source":"published"}
+{"family":"regexp","case":"matches:false","expr":"/^x/.matches(\"abc\")","kind":"boolean","text":"false","source":"published"}
+{"family":"regexp","case":"matches:case_flag","expr":"/ABC/i.matches(\"abc\")","kind":"boolean","text":"true","source":"published"}
+{"family":"regexp","case":"lookbehind_unsupported","expr":"/(?<=a)b/.matches(\"ab\")","kind":"error","source":"published"}
+{"family":"regexp","case":"invalid_flag","expr":"/a/q.matches(\"a\")","kind":"error","source":"published"}
+{"family":"regexp","case":"invalid_pattern","expr":"/a(/.matches(\"a\")","kind":"error","source":"published"}
+{"family":"regexp","case":"matches:wrong_arity","expr":"/a/.matches()","kind":"error","source":"published"}
+{"family":"regexp","case":"matches:wrong_argument_type","expr":"/a/.matches(1)","kind":"error","source":"published"}
+{"family":"regexp","case":"matches:wrong_receiver","expr":"\"a\".matches(\"a\")","kind":"error","source":"published"}
+{"family":"regexp","case":"matches:global_flag","expr":"/b/g.matches(\"abc\")","kind":"boolean","text":"true","source":"published"}

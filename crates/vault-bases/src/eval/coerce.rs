@@ -228,3 +228,12 @@ pub fn to_display_string(value: &Value) -> Result<String, EvalError> {
         }
     })
 }
+
+/// Equality without coercion, for `contains`, `containsAll`, `containsAny`
+/// and `unique`. JavaScript's `Array.prototype.includes` uses SameValueZero,
+/// so a number never equals a string there; pairings `==` leaves uncaptured
+/// are simply unequal here. A link still equals the file it resolves to (the
+/// syntax page: `authors.contains(this)`).
+pub fn strict_equals(left: &Value, right: &Value) -> bool {
+    loose_equals(left, right).unwrap_or(false)
+}
