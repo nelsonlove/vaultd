@@ -29,7 +29,7 @@
 1. **A prefilter that drops a row the full filter would keep.** Prefilters run before any expression, so a narrowing that is not a superset (case-folded tag comparison, a property whose value is a list, a number literal compared to a string property) silently loses rows. Expected: every extracted prefilter selects a superset of the rows its conjunct accepts, and the conjunct still runs per row. Pinned by `a_prefilter_never_drops_a_row_its_conjunct_keeps` (Task 7, a property test over the in-memory source) and `property_equality_prefilter_keeps_list_and_mixed_case_values` (Task 11, over SQLite).
 2. **A `.base` file that is valid YAML but not a base** (a top-level list, `views: 3`, a view with no `type`, a `filters:` that is a number). Expected: `parse_failed` with a position for every shape the file model cannot read, never a panic and never a silently empty view list. Pinned in Task 1 by `shapes_that_are_yaml_but_not_a_base_fail_with_a_position`.
 3. **Formula cycles and self-reference** (`a: formula.b`, `b: formula.a`). Expected: the formula's cell is an `error` cell naming the cycle, every other cell of the row is computed, and evaluation terminates. Pinned in Task 7 by `a_formula_cycle_is_an_error_cell_not_a_hang`.
-4. **Unicode in property values, tags and view names** (`#tag-🙂`, `name: "Tâble"`, `![[Views.base#Tâble]]`, a `slice` across a multi-byte character). Expected: string length, `slice` and `reverse` count UTF-16 code units the way JavaScript does (the published "follow JavaScript behavior" rule), view names match exactly, and nothing panics on a char boundary. Pinned in Task 4 by `string_indices_count_utf16_units_and_never_split_a_char` and in Task 8 by `a_view_name_with_unicode_resolves`.
+4. **Unicode in property values, tags and view names** (`#tag-🙂`, `name: "Tâble"`, `![[Views.base#Tâble]]`, a `slice` across a multi-byte character). Expected: string `length` and `slice` count UTF-16 code units the way JavaScript does (the published "follow JavaScript behavior" rule); `reverse` on a string with an astral character is `Uncaptured("reverse:astral")` until Task 13 captures it, and Task 13 then adds the UTF-16 test that pins what was captured; view names match exactly; nothing panics on a char boundary. Pinned in Task 4 by `string_indices_count_utf16_units_and_never_split_a_char` and the `reverse:astral` row, and in Task 8 by `a_view_name_with_unicode_resolves`.
 5. **A view evaluated while the vault changes under it** (a cursor from generation N asked at N+1; a base deleted between `list_bases` and `evaluate_base`; the `this_path` note deleted). Expected: `generation_mismatch` for the cursor, `not_found` for the vanished base, `invalid_request` for the vanished `this_path`, and the cache never answers a generation that is not current. Pinned in Task 11 by `a_cursor_from_an_older_generation_is_generation_mismatch` and `a_deleted_base_is_not_found`, and in Task 12 by `the_cache_hits_at_one_generation_and_misses_at_the_next`.
 
 ---
@@ -90,12 +90,15 @@ Every name below crosses a task boundary. A task's **Interfaces** block repeats 
 | `LiveGraph::{base, base_paths, base_identity, candidate_bases}` | fns | 10 | 10, 11, 12 |
 | `vault_index::{BaseReplacement, BaseDelta}` | structs | 10 | 10 |
 | `IndexReader::{list_bases, evaluate_base, read_with_graph}`, `BaseQuery`, `BaseAnswer`, `BaseQueryError`, `BaseSummary`, `BaseStatus`, `parse_property_types` | fns, types | 11 | 11, 12, 13 |
-| `LiveRefreshReport.reresolved` | field | 12 | 12 |
+| `LiveRefreshReport.reresolved`, `BatchOutcome.reresolved` | fields | 12 | 12 |
+| `fixtures::{TemplateFacts, fill_template}`, `CaptureRow.{expect_from, template}` | test support | 13 | 13 |
+| `tests/common::scratch_root()` (vault-index), `scratch()` (each new vault-server test file) | test helpers | 9, 11 | 9–14 |
+| `view::verdict` (three-valued filter) | fn | 7 | 7 |
 | `IndexReader::{prefilter_facts, base_dependencies}`, `PrefilterFacts` | fns, type | 12 | 12 |
-| `vault_protocol::{EvaluateBaseParams, EvaluateBaseResponse, ListBasesParams, BaseSummaryDto, BaseStatusDto, ViewDto, ColumnDto, RowDto, RowKindDto, CellDto, ObjectEntryDto, SummaryDto}` | DTOs | 11 | 11, 12, 14, 15 |
+| `vault_protocol::{EvaluateBaseParams, EvaluateBaseResponse, ListBasesParams, BaseSummaryDto, BaseStatusDto, ViewDto, ColumnDto, RowDto, RowKindDto, CellDto, ObjectEntryDto}` | DTOs | 11 | 11, 12, 14, 15 |
 | `ErrorCode::{BaseInvalid, ViewNotFound, ExpressionInvalid, UnsupportedFunction}` | variants | 11 | 11, 16 |
 | `vault_protocol::{ViewsInvalidatedEventDto, RuntimeEventDto::ViewsInvalidated}` | DTO, variant | 12 | 12, 15 |
-| `vault_server::bases::{BaseCache, DEFAULT_BASE_CACHE_ENTRIES}` | type, const | 11 (single-generation cache), 12 (LRU bound and knob) | 12, 14 |
+| `vault_server::bases::{BaseCache, DEFAULT_BASE_CACHE_ENTRIES, evaluate_base, list_bases, query_error}` | type, const, fns | 11 (single-generation cache; `evaluate_base(reader, cache, types, params)`), 12 (LRU bound and knob; `tracker` joins `evaluate_base` after `cache`) | 12, 14 |
 | `vault_server::views::ViewTracker` | type | 12 | 12 |
 | `Server::set_base_cache_entries(n)`, `--bases-cache-entries` | fn, flag | 12 | 14 |
 | `host/scripts/bases-corpus-copy.js`, `host/scripts/bases-capture.js` | scripts | 13 | 13 |
@@ -4573,7 +4576,7 @@ pub fn is_known_method(name: &str) -> bool {
 }
 ```
 
-`string::FIELDS` and `list::FIELDS` are declared for Task 7's compile-time member check; mark each `#[allow(dead_code)]` until Task 7 reads them, with the comment `// read by view::compile (Task 7)`.
+`string::FIELDS` and `list::FIELDS` are each family's published field list, kept beside `METHODS` for the reader that names a family's surface; no task in this phase reads them, so each carries `#[allow(dead_code, reason = "the family's published field list; no reader in this phase")]` on its own line above the `const` (lint reasons are stable since Rust 1.81, inside the 1.85 floor), and keeps it.
 
 - [ ] **Step 7: Run the tests and see them pass**
 
@@ -5214,7 +5217,7 @@ pub(crate) fn date_arithmetic(
 - in `field`, add the arm `Value::Date(date) => date::field(*date, name, ctx),` above `other =>`, and rename the `_ctx` parameter to `ctx`;
 - `is_known_global` becomes `global::GLOBALS.contains(&name) || date::GLOBALS.contains(&name)`, and `date::METHODS` joins the array in `is_known_method`.
 
-`date::FIELDS` gets the same `#[allow(dead_code)] // read by view::compile (Task 7)` the string and list `FIELDS` carry.
+`date::FIELDS` carries the same `#[allow(dead_code, reason = "the family's published field list; no reader in this phase")]` the string and list `FIELDS` carry.
 
 Add `mod dates;` to `crates/vault-bases/src/lib.rs` and `pub use dates::format_date;` beside the other re-exports.
 
@@ -5262,7 +5265,7 @@ Every row is a file. This task gives the `File` value its fields (the functions 
 **Interfaces:**
 
 - Consumes: `RowSource::{facts, properties, tags, links, embeds, backlinks, resolve}`, `FileFacts`, `LinkFact`, `LinkValue`, `DateValue`, `coerce::strict_equals`, `functions::{eager, arity, typed_property}`, `fixtures::check_family`.
-- Produces: `typed_property(ctx: &EvalContext<'_>, row: Option<&VaultPath>, key: &str, value: &PropertyValue) -> Value` (signature widened); `functions::file::{FIELDS, METHODS}`, `functions::link::{GLOBALS, METHODS}`; `fixtures::capture_vault() -> MemorySource` (the fixed vault every family row runs against from here on).
+- Produces: `typed_property(ctx: &EvalContext<'_>, row: Option<&VaultPath>, key: &str, value: &PropertyValue) -> Value` (signature widened); `functions::file::{FIELDS, METHODS}`, `functions::link::{GLOBALS, METHODS}`; `fixtures::capture_vault(props: &[(String, PropertyValue)]) -> MemorySource` (the fixed vault every family row runs against from here on, with `props` on `Capture.md`).
 
 **This task's checklist:** global `link()`, `file()`; link methods `asFile`, `linksTo`; file fields `name`, `basename`, `path`, `folder`, `ext`, `size`, `properties`, `tags`, `links`, `ctime`, `mtime`, and from the syntax page `backlinks`, `embeds`, `file`; file methods `asLink`, `hasLink`, `hasProperty`, `hasTag`, `inFolder`; frontmatter links; `this`.
 
@@ -5301,7 +5304,7 @@ pub fn capture_vault(props: &[(String, PropertyValue)]) -> MemorySource {
 }
 ```
 
-and in `check_family`, replace the four lines that build `note` and `source` with:
+and in `check_family`, replace the seven lines that build `note` and `source` (from `let mut note = MemoryFile::note()` through `.with("Other.md", MemoryFile::note());`) with:
 
 ```rust
         let source = capture_vault(&row.props);
@@ -5574,6 +5577,7 @@ use crate::value::{DateValue, LinkValue, Value};
 use super::{arity, eager, typed_property};
 
 pub(crate) const METHODS: &[&str] = &["asLink", "hasLink", "hasProperty", "hasTag", "inFolder"];
+#[allow(dead_code, reason = "the family's published field list; no reader in this phase")]
 pub(crate) const FIELDS: &[&str] = &[
     "name", "basename", "path", "folder", "ext", "size", "properties", "tags", "links", "ctime",
     "mtime", "backlinks", "embeds", "file",
@@ -5715,7 +5719,7 @@ pub(crate) fn kind_of(ctx: &EvalContext<'_>, path: &VaultPath) -> Result<FileKin
 }
 ```
 
-`kind_of` is read by Task 7's view evaluation; until then mark it `#[allow(dead_code)] // read by view::evaluate_view (Task 7)`.
+`kind_of` is read by Task 7's view evaluation; until then it carries `#[allow(dead_code, reason = "read by view::evaluate_view from Task 7")]`, which Task 7 deletes.
 
 - [ ] **Step 6: Route them, and give `typed_property` the row**
 
@@ -5810,7 +5814,7 @@ A view is compiled once per evaluation (find it, combine the global and view fil
 **Files:**
 
 - Create: `crates/vault-bases/src/view/mod.rs`, `crates/vault-bases/src/view/prefilter.rs`, `crates/vault-bases/src/view/summary.rs`
-- Modify: `crates/vault-bases/src/lib.rs` (`pub mod view;`), `crates/vault-bases/src/functions/{string,list,date,file}.rs` (drop the `#[allow(dead_code)]` on `FIELDS` and `kind_of` — read here now)
+- Modify: `crates/vault-bases/src/lib.rs` (`pub mod view;`), `crates/vault-bases/src/functions/file.rs` (delete the `#[allow(dead_code, …)]` on `kind_of`, which `evaluate_view` now reads; every `FIELDS` allow stays)
 - Create: `crates/vault-bases/tests/views.rs`, `crates/vault-bases/tests/ordering_properties.rs`
 
 **Interfaces:**
@@ -5843,7 +5847,7 @@ pub mod view {
 
 **This task's checklist:** filters (`and`, `or`, `not` as "none of"), the global-and-view conjunction, formulas with memoization and cycle detection, `sort` (multi-key, stable, per-key direction), `limit` (after sort, before grouping), `groupBy` (direction), summaries — the syntax page's default summaries `Average`, `Min`, `Max`, `Sum`, `Range` (numbers and dates), `Median`, `Stddev`, `Earliest`, `Latest`, `Checked`, `Unchecked`, `Empty`, `Filled`, `Unique` — and custom summary formulas over `values`; the view types `table`, `cards`, `list`, `kanban`, `map` as row data plus declared options (the views page's layout table), and an unknown type kept as declared.
 
-New uncaptured or capture-confirmed items for Task 13, named here so that task can find them: `filter:error_row` (a row whose filter expression errors is **excluded**, the one choice that never shows a row the filter could not admit; the capture confirms), `sort:default` (with no `sort`, rows keep path order), `summary:stddev` (population standard deviation, the definition the syntax page's "standard deviation of all numbers" reads as; the capture confirms the divisor), `limit:before_group` (the spec's stated order, "as Obsidian does; the captures settle it").
+New uncaptured or capture-confirmed items for Task 13, named here so that task can find them: `filter:error_row` (a statement that errors is *unknown* — three-valued: `and` is false if any child is false, `or` is true if any child is true, `not` is false if any child is true, and unknown otherwise — and an unknown verdict excludes the row, inside `not` as anywhere else; provisional, the capture settles it), `sort:default` (with no `sort`, rows keep path order), `summary:stddev` (population standard deviation, the definition the syntax page's "standard deviation of all numbers" reads as; the capture confirms the divisor), `limit:before_group` (the spec's stated order, "as Obsidian does; the captures settle it").
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5973,6 +5977,18 @@ fn not_means_none_of_the_following() {
         None,
     );
     assert_eq!(paths(&result), vec!["Notes/Textbook.md"]);
+}
+
+#[test]
+fn an_error_inside_not_excludes_the_row() {
+    // `price > 2` errors on the two files with no price; `not` must not turn
+    // that error into an admitted row, and every priced note is over 2.
+    let result = run(
+        &books(),
+        "views:\n  - type: table\n    name: T\n    filters:\n      not:\n        - 'price > 2'\n",
+        None,
+    );
+    assert_eq!(paths(&result), Vec::<&str>::new());
 }
 
 #[test]
@@ -6801,17 +6817,56 @@ fn read(reference: &PropertyRef, ctx: &EvalContext<'_>, scope: &Scope) -> Cell {
     }
 }
 
-/// A filter's verdict for one row. An error excludes the row
-/// (`filter:error_row`, confirmed by capture).
-fn admits(filter: &Filter, ctx: &EvalContext<'_>, scope: &Scope) -> bool {
+/// A filter's verdict for one row, three-valued: `None` is a statement that
+/// errored. An error is "unknown", not "false" — otherwise `not` would turn
+/// an erroring statement into an admitted row. `and` is false if any child is
+/// false, else unknown if any is unknown; `or` is true if any child is true,
+/// else unknown if any is unknown; `not` (the views page: "results will not
+/// be shown if any of the conditions in the filter group are met") is false
+/// if any child is true, else unknown if any is unknown. An unknown verdict
+/// at the top excludes the row. **Provisional** — `filter:error_row` (Task
+/// 13) settles whether Obsidian shows such a row.
+fn verdict(filter: &Filter, ctx: &EvalContext<'_>, scope: &Scope) -> Option<bool> {
+    let children = |items: &[Filter]| -> Vec<Option<bool>> {
+        items.iter().map(|item| verdict(item, ctx, scope)).collect()
+    };
     match filter {
-        Filter::Expr(expr) => evaluate(expr, ctx, scope).map(|value| truthy(&value)).unwrap_or(false),
-        Filter::And(items) => items.iter().all(|item| admits(item, ctx, scope)),
-        Filter::Or(items) => items.iter().any(|item| admits(item, ctx, scope)),
-        // The views page: "results will not be shown if any of the
-        // conditions in the filter group are met".
-        Filter::Not(items) => !items.iter().any(|item| admits(item, ctx, scope)),
+        Filter::Expr(expr) => evaluate(expr, ctx, scope).ok().map(|value| truthy(&value)),
+        Filter::And(items) => {
+            let all = children(items);
+            if all.contains(&Some(false)) {
+                Some(false)
+            } else if all.contains(&None) {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        Filter::Or(items) => {
+            let all = children(items);
+            if all.contains(&Some(true)) {
+                Some(true)
+            } else if all.contains(&None) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Filter::Not(items) => {
+            let all = children(items);
+            if all.contains(&Some(true)) {
+                Some(false)
+            } else if all.contains(&None) {
+                None
+            } else {
+                Some(true)
+            }
+        }
     }
+}
+
+fn admits(filter: &Filter, ctx: &EvalContext<'_>, scope: &Scope) -> bool {
+    verdict(filter, ctx, scope) == Some(true)
 }
 
 fn order(a: &Cell, b: &Cell) -> std::cmp::Ordering {
@@ -6945,7 +7000,7 @@ Add `pub mod view;` to `crates/vault-bases/src/lib.rs`.
 
 Run: `cd ~/repos/system/vaultd/.claude/worktrees/live-impl && TMPDIR="$PWD/target/tmp" cargo test -p vault-bases --test views --test ordering_properties; echo "exit=$?"`
 
-Expected: `views` 14 passed, `ordering_properties` 5 passed, `exit=0`.
+Expected: `views` 15 passed, `ordering_properties` 5 passed, `exit=0`.
 
 The expected Median is `10` (prices 3, 10, 30 under `Books/`); `Average` of 10, 3 and 30 is `43 / 3`; `Filled` counts three statuses; `rounded` is `values.mean().round(3)` = `14.333`.
 
@@ -7490,8 +7545,8 @@ fn scalars(service: &IndexService, path: &str) -> Vec<(i64, String, String, Opti
 
 #[test]
 fn a_cold_build_classifies_every_property() {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
     fs::write(
         vault.path().join("Kinds.md"),
         "---\ntitle: Dune\nprice: 12.5\ncount: 3\ndone: true\ndue: 2025-01-01\nstamp: 2025-01-01T10:15\nempty:\ntags: [a, b]\nmeta:\n  x: 1\n---\n",
@@ -7517,8 +7572,8 @@ fn a_cold_build_classifies_every_property() {
 
 #[test]
 fn an_edit_and_a_delete_move_the_scalars_with_the_note() {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
     fs::write(vault.path().join("A.md"), "---\nstatus: open\n---\n").unwrap();
     let mut service = open(&vault, &index);
     assert_eq!(scalars(&service, "A.md")[0].3.as_deref(), Some("open"));
@@ -7540,8 +7595,8 @@ fn an_edit_and_a_delete_move_the_scalars_with_the_note() {
 
 #[test]
 fn a_fresh_index_has_both_new_tables() {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
     let service = open(&vault, &index);
     for table in ["property_scalars", "bases"] {
         let count: i64 = service
@@ -7556,6 +7611,15 @@ fn a_fresh_index_has_both_new_tables() {
 Append to `crates/vault-index/tests/common/mod.rs`:
 
 ```rust
+/// The in-repo scratch root, derived from this crate's manifest directory —
+/// never from `TMPDIR` alone, so a bare `cargo test` cannot reach the OS temp
+/// directory. Every new test in this phase makes its directories here.
+pub fn scratch_root() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&root).expect("create the scratch root");
+    root.canonicalize().expect("canonicalize the scratch root")
+}
+
 /// Claim 6 of the live oracle: `property_scalars` holds exactly one row per
 /// `properties` row, under the same `(note_path, ordinal)` and key, and no
 /// row of its own. Checked in SQL both ways, so a missed insert and a missed
@@ -7601,8 +7665,8 @@ In `crates/vault-index/tests/schema_v3.rs`, rename `schema_version_constants_are
 ```rust
 #[test]
 fn a_genuine_version_three_cache_is_replaced_by_schema_four() {
-    let vault = tempdir().unwrap();
-    let index_dir = tempdir().unwrap();
+    let vault = tempfile::tempdir_in(common::scratch_root()).unwrap();
+    let index_dir = tempfile::tempdir_in(common::scratch_root()).unwrap();
     fs::write(vault.path().join("Note.md"), "---\nstatus: open\n---\n# Note\n").unwrap();
     let index_path = index_dir.path().join("derived.sqlite3");
 
@@ -7856,6 +7920,9 @@ impl PreparedGraphDelta { pub(crate) fn with_bases(self, delta: &BaseDelta) -> S
 pub(crate) fn stored_bases(&self) -> Result<BTreeMap<VaultPath, (String, FileFingerprint)>, IndexError>;
 pub(crate) fn load_base_records(connection: &Connection) -> Result<Vec<(VaultPath, BaseRecord)>, IndexError>;  // free fn, reader and writer alike
 pub(crate) fn apply_bases(transaction: &Transaction<'_>, delta: &BaseDelta) -> Result<(), IndexError>;   // free fn, both publication routes
+pub(crate) fn connection(&self) -> &Connection;   // IndexStore, for the complete route's base reload
+
+// IndexService::publish_delta gains `bases: &BaseDelta` as its last parameter
 ```
 
 `BaseRecord.views` is the parsed file's view names, and empty for a base that failed to parse — such a base still **resolves** (a link to it is a link to a file that exists), and every view subpath on it is `missing_subpath`.
@@ -7869,6 +7936,8 @@ Create `crates/vault-index/tests/bases_index.rs`:
 ```rust
 use std::collections::BTreeSet;
 use std::fs;
+
+mod common;
 
 use tempfile::TempDir;
 use vault_core::{Resolution, Subpath, VaultPath};
@@ -7888,8 +7957,8 @@ fn vp(path: &str) -> VaultPath {
 }
 
 fn fixture(files: &[(&str, &str)]) -> Fixture {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
     for (path, text) in files {
         let full = vault.path().join(path);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -8397,11 +8466,39 @@ In `crates/vault-index/src/store/hydrate.rs`, at the end of `hydrate_live_graph`
 
 - [ ] **Step 6: The complete route**
 
-In `crates/vault-index/src/reconcile.rs`, `try_complete_refresh`:
-
-- after `tree_delta` is computed, plan the bases from the walk:
+In `crates/vault-index/src/reconcile.rs`, the imports become:
 
 ```rust
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+use vault_core::{
+    Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution, ResolutionNote, ScanError,
+    ScanReport, SemanticGraph, Severity, SourceDocument, SourceError, TreeEntryKind, VaultPath,
+    build_graph_with_bases, parse_note,
+};
+
+use crate::bases::{BaseDelta, BaseRecord};
+```
+
+(the other `use crate::…` lines stay; `build_graph` leaves the import because its one use in this file, `reconcile.rs:857`, becomes `build_graph_with_bases` below).
+
+Add to `impl IndexStore` in `crates/vault-index/src/store.rs`, beside `hydrate_live_graph`:
+
+```rust
+    /// The writer's own connection, for the reads a publication makes between
+    /// its plan and its write (the stored base records).
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+```
+
+In `try_complete_refresh`, immediately after the `let tree_delta = if self.source.observes_tree() { … };` statement:
+
+```rust
+        // The bases the walk saw. A source that observes no tree reconciles
+        // no bases (see `bases.rs`).
         let observed_bases: BTreeSet<VaultPath> = observed_tree
             .iter()
             .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
@@ -8410,74 +8507,374 @@ In `crates/vault-index/src/reconcile.rs`, `try_complete_refresh`:
         let base_delta = if self.source.observes_tree() {
             crate::bases::plan(self.source.as_ref(), &self.store.stored_bases()?, &observed_bases, true, verify)?
         } else {
-            crate::bases::BaseDelta::default()
+            BaseDelta::default()
         };
 ```
 
-  (`self.source` is a `Box<dyn ReconcileSource>`, `reconcile.rs:44`);
-- `if !base_delta.is_empty() { semantic_change = true; }` beside the tree's `is_generational` check;
-- pass `base_delta` into both `publish_snapshot` calls as a new parameter after `tree_delta`.
-
-`publish_snapshot` (now with `base_delta: BaseDelta`):
-
-- the catalog of bases is every stored base minus the removed plus the replaced:
+immediately after the existing
 
 ```rust
+        if tree_delta.is_generational() {
+            semantic_change = true;
+        }
+```
+
+add
+
+```rust
+        // A base moving is a change a client can only learn from a new
+        // generation, exactly like a note's.
+        if !base_delta.is_empty() {
+            semantic_change = true;
+        }
+```
+
+and in **both** `self.publish_snapshot(` calls, insert one argument line `base_delta,` directly after the `tree_delta,` line. (The `!semantic_change` early return in between never sees a non-empty base delta: one sets `semantic_change`.)
+
+`publish_snapshot` gains the parameter `base_delta: BaseDelta,` directly after `tree_delta: TreeDelta,`. Inside it, directly before `let resolution_start = Instant::now();`:
+
+```rust
+        // Every base the new snapshot holds: the stored ones this walk did
+        // not remove, overlaid with the ones it replaced. Their identities
+        // join the resolution catalog; their records join the live graph.
         let removed_bases: BTreeSet<&VaultPath> = base_delta.removed.iter().collect();
-        let mut base_records: BTreeMap<VaultPath, BaseRecord> = crate::store::load_base_records(self.store.connection())?
-            .into_iter()
-            .filter(|(path, _)| !removed_bases.contains(path))
-            .collect();
+        let mut base_records: BTreeMap<VaultPath, BaseRecord> =
+            crate::store::load_base_records(self.store.connection())?
+                .into_iter()
+                .filter(|(path, _)| !removed_bases.contains(path))
+                .collect();
         for replacement in &base_delta.replaced {
             base_records.insert(replacement.path.clone(), replacement.record.clone());
         }
-        let base_identities: Vec<ResolutionNote> = base_records.iter().map(|(path, record)| record.identity(path)).collect();
+        let base_identities: Vec<ResolutionNote> = base_records
+            .iter()
+            .map(|(path, record)| record.identity(path))
+            .collect();
 ```
 
-  (add a `pub(crate) fn connection(&self) -> &Connection` on `IndexStore` if there is none; it returns `&self.connection`);
-- `build_graph(all_notes, scan_diagnostics.clone())` becomes `build_graph_with_bases(all_notes, base_identities, scan_diagnostics.clone())`;
-- `Publication { … }` gains `bases: &base_delta`;
-- `live_graph_from_semantic(next_generation, &report.graph)` becomes `live_graph_from_semantic(next_generation, &report.graph, base_records.into_iter().collect())`, and that function gains the parameter `bases: Vec<(VaultPath, BaseRecord)>` and ends `let mut graph = LiveGraph::from_hydrated(generation, notes, references)?; graph.install_bases(bases, &[]); Ok(graph)`.
+then replace `let report = build_graph(all_notes, scan_diagnostics.clone());` with
 
-`IndexService::publish_delta` (the graph half of the targeted route, in `reconcile.rs`) gains a `bases: &BaseDelta` parameter after `replacement_references`, and its `graph.prepare_delta(…)?` becomes `graph.prepare_delta(…)?.with_bases(bases)`; it passes `bases` into the `DeltaPublication` it already receives (the caller fills `DeltaPublication.bases` with the same delta — the debug tripwire at the top gains `debug_assert!(std::ptr::eq(publication.bases, bases))`).
+```rust
+        let report = build_graph_with_bases(all_notes, base_identities, scan_diagnostics.clone());
+```
+
+add `bases: &base_delta,` as the last field of the `Publication { … }` literal, and replace
+
+```rust
+        let prepared = Arc::new(live_graph_from_semantic(next_generation, &report.graph)?);
+```
+
+with
+
+```rust
+        let prepared = Arc::new(live_graph_from_semantic(
+            next_generation,
+            &report.graph,
+            base_records.into_iter().collect(),
+        )?);
+```
+
+`live_graph_from_semantic` becomes (its loop over notes is unchanged; only the signature and the tail move):
+
+```rust
+fn live_graph_from_semantic(
+    generation: Generation,
+    graph: &SemanticGraph,
+    bases: Vec<(VaultPath, BaseRecord)>,
+) -> Result<LiveGraph, IndexError> {
+    let mut notes = Vec::new();
+    let mut references = Vec::new();
+    for path in graph.note_paths() {
+        // … unchanged: push each HydratedNote and its HydratedReferences …
+    }
+    let mut live = LiveGraph::from_hydrated(generation, notes, references)?;
+    live.install_bases(bases, &[]);
+    Ok(live)
+}
+```
+
+where the elided loop is the existing body of the function from `for path in graph.note_paths() {` to its closing `}`, copied as it stands.
+
+`IndexService::publish_delta` gains the parameter `bases: &BaseDelta,` directly after `replacement_references: &[HydratedReference],`. After its existing `debug_assert_eq!(…);` add:
+
+```rust
+        debug_assert!(
+            std::ptr::eq(publication.bases, bases),
+            "the row delta and the graph delta must carry the same base delta"
+        );
+```
+
+and replace the preparation
+
+```rust
+            graph.prepare_delta(
+                expected,
+                replacement_notes,
+                removed_paths,
+                replacement_references,
+            )?
+```
+
+with
+
+```rust
+            graph
+                .prepare_delta(
+                    expected,
+                    replacement_notes,
+                    removed_paths,
+                    replacement_references,
+                )?
+                .with_bases(bases)
+```
+
+Every other caller of `IndexService::publish_delta` the compiler names (tests under `crates/vault-index/tests/`) passes `&vault_index::BaseDelta::default()` as the new last argument, and every `DeltaPublication { … }` literal there gains `bases: &BaseDelta::default(),` — the reference must outlive the call, so bind `let no_bases = BaseDelta::default();` first and pass `&no_bases` to both, which also satisfies the `ptr::eq` tripwire.
 
 - [ ] **Step 7: The targeted routes**
 
-In `crates/vault-index/src/live_reconcile.rs`:
+In `crates/vault-index/src/live_reconcile.rs`, add `use crate::bases::BaseDelta;` and `TreeEntryKind` to the `vault_core` import, then:
 
-- `DirtyBatch` gains `bases: BaseDelta`;
-- `refresh_paths_body`: the base paths a hint named are planned beside the notes, before the `DirtyBatch` is built:
+`DirtyBatch` gains a field:
 
 ```rust
-        let hinted_bases: BTreeSet<VaultPath> = paths.iter().filter(|path| path.is_base() && !path.is_hidden()).cloned().collect();
+    /// The bases this cycle read, planned against the stored ones. Read once,
+    /// with the bodies, so a re-planned attempt re-reads no base.
+    bases: BaseDelta,
+```
+
+In `refresh_paths_body`, replace
+
+```rust
+        let batch = DirtyBatch {
+            states,
+            scan_diagnostics: ScanDiagnostics::Patch(diagnostics),
+            tree: self.observe_tree_paths(paths)?,
+        };
+```
+
+with
+
+```rust
+        // The `.base` paths the hint named, read and planned beside the notes.
+        let hinted_bases: BTreeSet<VaultPath> = paths
+            .iter()
+            .filter(|path| path.is_base() && !path.is_hidden())
+            .cloned()
+            .collect();
         let bases = if self.source.observes_tree() && !hinted_bases.is_empty() {
             crate::bases::plan(self.source.as_ref(), &self.store.stored_bases()?, &hinted_bases, false, false)?
         } else {
             BaseDelta::default()
         };
+        let batch = DirtyBatch {
+            states,
+            scan_diagnostics: ScanDiagnostics::Patch(diagnostics),
+            tree: self.observe_tree_paths(paths)?,
+            bases,
+        };
 ```
 
-  and `DirtyBatch { …, bases }`;
-- `refresh_dirty_paths` (the targeted engine behind `refresh(false)` once a generation exists): from `observed_tree` exactly as the complete route does — `crate::bases::plan(…, &observed_bases, true, verify)?` — into `DirtyBatch.bases`;
-- `try_reconcile_batch`: the nothing-changed early return gains `&& batch.bases.is_empty()`;
-- `select_impact` takes `bases: &BaseDelta` and folds it in: `new_identities` gains `bases.replaced.iter().map(|r| (r.path.clone(), r.record.identity(&r.path)))`; `identity_changes` gains, for each replaced base, `{ old: graph.base_identity(path), new: Some(identity) }`, and for each removed base present in the graph, `{ old: graph.base_identity(path), new: None }`; `removed_set` gains the removed bases. Bases are never `changed_sources` (they carry no references);
-- `graph_identity(graph, path)` becomes `graph.note(path).map(|note| ResolutionNote { path: note.path, headings: note.headings, blocks: note.blocks, views: None }).or_else(|| graph.base_identity(path))`;
-- the complete-resolution catalog loop also inserts every `graph.base_paths()` identity not in `removed_set` and not replaced;
-- `bounded_catalog`'s `collect` closure, beside the `graph.candidate_notes(&key)` loop, adds `for path in graph.candidate_bases(&key) { if !removed_set.contains(&path) { wanted.insert(path); } }` — the replaced bases are already in `added_by_key` through `new_identities`;
-- `try_reconcile_batch` passes `&batch.bases` to `select_impact`, to `DeltaPublication { …, bases: &batch.bases }`, and to `self.publish_delta(…, &batch.bases)`;
-- `confirm_planned_presence` checks each replaced base present and each removed base absent, like notes.
+In `refresh_dirty_paths`, replace
+
+```rust
+        let batch = DirtyBatch {
+            states,
+            scan_diagnostics: ScanDiagnostics::Complete(diagnostics),
+            tree,
+        };
+```
+
+with
+
+```rust
+        let observed_bases: BTreeSet<VaultPath> = observed_tree
+            .iter()
+            .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
+            .map(|entry| entry.path.clone())
+            .collect();
+        let bases = if self.source.observes_tree() {
+            crate::bases::plan(self.source.as_ref(), &self.store.stored_bases()?, &observed_bases, true, verify)?
+        } else {
+            BaseDelta::default()
+        };
+        let batch = DirtyBatch {
+            states,
+            scan_diagnostics: ScanDiagnostics::Complete(diagnostics),
+            tree,
+            bases,
+        };
+```
+
+In `try_reconcile_batch`, the nothing-changed condition becomes
+
+```rust
+        if replaced.is_empty()
+            && removed.is_empty()
+            && !scan_diagnostics_changed
+            && !batch.tree.is_generational()
+            && batch.bases.is_empty()
+        {
+```
+
+the selection call becomes `self.select_impact(&graph, &replaced, &removed, &batch.bases)`, the `DeltaPublication { … }` literal gains `bases: &batch.bases,` after `tree: &batch.tree,`, and the `self.publish_delta(…)` call gains `&batch.bases` as its last argument.
+
+`select_impact` gains the parameter `bases: &BaseDelta` after `removed: &[VaultPath]`, and its first lines become
+
+```rust
+        let changed_sources: BTreeSet<VaultPath> = replaced
+            .iter()
+            .map(|(note, _)| note.source.path().clone())
+            .collect();
+        // A removed base leaves the catalog like a removed note; a replaced
+        // base enters it with its new views. Bases carry no references, so they
+        // are never changed sources.
+        let mut removed_set: BTreeSet<VaultPath> = removed.iter().cloned().collect();
+        removed_set.extend(bases.removed.iter().cloned());
+
+        let mut new_identities: BTreeMap<VaultPath, ResolutionNote> = replaced
+            .iter()
+            .map(|(note, _)| (note.source.path().clone(), ResolutionNote::from(note)))
+            .collect();
+        new_identities.extend(
+            bases
+                .replaced
+                .iter()
+                .map(|replacement| (replacement.path.clone(), replacement.record.identity(&replacement.path))),
+        );
+```
+
+— the two `identity_changes` loops that follow already cover bases, because they go through `graph_identity`, which now answers for a base too. In the complete-resolution catalog branch, directly before `catalog.extend(new_identities);`, add:
+
+```rust
+            for path in graph.base_paths() {
+                if removed_set.contains(path) || new_identities.contains_key(path) {
+                    continue;
+                }
+                if let Some(identity) = graph.base_identity(path) {
+                    catalog.insert(path.clone(), identity);
+                }
+            }
+```
+
+`graph_identity` becomes:
+
+```rust
+/// The graph's current identity for `path`, as resolution sees it: a note's
+/// headings and blocks, or a base's views.
+fn graph_identity(graph: &LiveGraph, path: &VaultPath) -> Option<ResolutionNote> {
+    graph
+        .note(path)
+        .map(|note| ResolutionNote {
+            path: note.path,
+            headings: note.headings,
+            blocks: note.blocks,
+            views: None,
+        })
+        .or_else(|| graph.base_identity(path))
+}
+```
+
+In `bounded_catalog`'s `collect` closure, directly after the `for id in graph.candidate_notes(&key) { … }` loop:
+
+```rust
+            for path in graph.candidate_bases(&key) {
+                if !removed_set.contains(&path) {
+                    wanted.insert(path);
+                }
+            }
+```
+
+(a replaced base is already reached through `added_by_key`, built from `new_identities`, and the final catalog fill goes through `graph_identity`).
+
+`confirm_planned_presence`, directly before its final `for (path, expected) in expectations {` loop:
+
+```rust
+        for replacement in &batch.bases.replaced {
+            expectations.insert(&replacement.path, true);
+        }
+        for path in &batch.bases.removed {
+            expectations.insert(path, false);
+        }
+```
 
 `PathChanges` needs nothing: a base is a file, so its tree row moving already puts its path in `changes` through `merge_tree_changes` — which is what Task 12's staleness rule reads.
 
 - [ ] **Step 8: The reader, link repair, and the diagnostics union**
 
-In `crates/vault-index/src/reader.rs`, `resolver()`'s catalog becomes the notes chained with `graph.base_paths().filter_map(|path| graph.base_identity(path))`.
+In `crates/vault-index/src/reader.rs`, `resolver()`'s catalog construction becomes:
 
-In `crates/vault-index/src/mutate/rename.rs`:
+```rust
+        let notes = graph.note_paths().into_iter().filter_map(|path| {
+            graph.note(&path).map(|note| vault_core::ResolutionNote {
+                path,
+                headings: note.headings,
+                blocks: note.blocks,
+                views: None,
+            })
+        });
+        let bases: Vec<vault_core::ResolutionNote> = graph
+            .base_paths()
+            .filter_map(|path| graph.base_identity(path))
+            .collect();
+        let resolver = Arc::new(Resolver::from_catalog(notes.chain(bases)));
+```
 
-- `identity(graph, path)` tries `graph.note(path)` (with `views: None`), then `graph.base_identity(path)`, then the synthetic attachment identity;
-- `at_path(note, destination)` copies `views` too;
-- the post-move catalog also inserts every base: `for path in graph.base_paths() { if !moves.contains_key(path) { catalog.insert(path.clone(), graph.base_identity(path).expect("listed")); } }`, and for a moved base `catalog.insert(to.clone(), at_path(&identity(graph, from), to));` beside the moved-note branch (and `note_destinations.insert(to.clone())`).
+In `crates/vault-index/src/mutate/rename.rs`, `identity` and `at_path` become:
+
+```rust
+/// The identity a path carries in `graph`, as resolution sees it: a note's
+/// headings and blocks, a base's views, or — for an attachment or a folder —
+/// a synthetic identity with neither, which is exactly what
+/// `changed_candidate_keys` needs to produce its lookup keys.
+fn identity(graph: &LiveGraph, path: &VaultPath) -> ResolutionNote {
+    graph
+        .note(path)
+        .map(|note| ResolutionNote {
+            path: note.path,
+            headings: note.headings,
+            blocks: note.blocks,
+            views: None,
+        })
+        .or_else(|| graph.base_identity(path))
+        .unwrap_or_else(|| ResolutionNote {
+            path: path.clone(),
+            headings: Vec::new(),
+            blocks: Vec::new(),
+            views: None,
+        })
+}
+
+fn at_path(note: &ResolutionNote, destination: &VaultPath) -> ResolutionNote {
+    ResolutionNote {
+        path: destination.clone(),
+        headings: note.headings.clone(),
+        blocks: note.blocks.clone(),
+        views: note.views.clone(),
+    }
+}
+```
+
+In `plan_repair`, the comment above the post-move catalog becomes "The catalog the vault will have *after* the moves, so a preserved spelling is checked against the world it will actually live in: notes and bases, never attachments — putting an attachment in a resolver would invent a note that does not exist." Directly after its `for path in graph.note_paths() { … }` loop, add:
+
+```rust
+    for path in graph.base_paths() {
+        if moves.contains_key(path) {
+            continue;
+        }
+        if let Some(base) = graph.base_identity(path) {
+            catalog.insert(path.clone(), base);
+        }
+    }
+```
+
+and inside the `for (from, to) in moves {` loop, after its `if let Some(note) = graph.note(from) { … }` block:
+
+```rust
+        if graph.base(from).is_some() {
+            catalog.insert(to.clone(), at_path(&identity(graph, from), to));
+            note_destinations.insert(to.clone());
+        }
+```
 
 The move itself goes through the existing coordinator path, whose reconciliation of `from` and `to` is a targeted refresh naming two `.base` paths — Step 7's route.
 
@@ -8566,12 +8963,11 @@ pub fn parse_property_types(json: &str) -> BTreeMap<String, PropertyType>;   // 
 
 // vault-protocol (all Serialize + Deserialize + Clone + Debug + Eq + PartialEq)
 pub struct EvaluateBaseParams { pub path: String, pub view: Option<String>, pub this_path: Option<String>, pub cursor: Option<String>, pub limit: Option<u32> }
-pub struct EvaluateBaseResponse { pub generation: u64, pub view: ViewDto, pub columns: Vec<ColumnDto>, pub rows: Vec<RowDto>, pub summaries: Vec<SummaryDto>, pub total_rows: u64, pub next_cursor: Option<String> }
+pub struct EvaluateBaseResponse { pub generation: u64, pub view: ViewDto, pub columns: Vec<ColumnDto>, pub rows: Vec<RowDto>, pub summaries: BTreeMap<String, CellDto>, pub total_rows: u64, pub next_cursor: Option<String> }
 pub struct ViewDto { #[serde(rename = "type")] pub kind: String, pub name: String, pub options: serde_json::Value }
 pub struct ColumnDto { pub property: String, pub display_name: Option<String>, pub settings: serde_json::Value }
 pub struct RowDto { pub path: String, pub kind: RowKindDto, pub group: Option<CellDto> /* skipped when None */, pub cells: Vec<CellDto> }
 pub enum RowKindDto { Note, File, Unknown }
-pub struct SummaryDto { pub property: String, pub name: String, pub value: CellDto }
 pub enum CellDto { Null, String { value }, Number { value: serde_json::Number }, Boolean { value }, Date { value: String, has_time: bool },
     Duration { value: i64, months: i64 }, List { value: Vec<CellDto> }, Object { value: Vec<ObjectEntryDto> },
     Link { target: String, display: Option<Box<CellDto>>, resolved: Option<String> }, File { path: String },
@@ -8586,11 +8982,17 @@ ErrorCode::{BaseInvalid, ViewNotFound, ExpressionInvalid, UnsupportedFunction}
 // vault-server
 pub const DEFAULT_BASE_CACHE_ENTRIES: usize = 64;
 pub(crate) struct BaseCache { /* one generation's results */ }
-pub(crate) fn evaluate_base(server: &Server, params: EvaluateBaseParams) -> Result<EvaluateBaseResponse, ProtocolError>;
-pub(crate) fn list_bases(server: &Server, params: ListBasesParams) -> Result<PageResponse<BaseSummaryDto>, ProtocolError>;
+pub(crate) fn evaluate_base(
+    reader: &IndexReader,
+    cache: &BaseCache,
+    types: impl FnOnce() -> BTreeMap<String, vault_bases::PropertyType>,
+    params: EvaluateBaseParams,
+) -> Result<EvaluateBaseResponse, ProtocolError>;   // Task 12 adds `tracker: &ViewTracker` after `cache`
+pub(crate) fn list_bases(reader: &IndexReader, params: ListBasesParams) -> Result<PageResponse<BaseSummaryDto>, ProtocolError>;
+pub(crate) fn query_error(value: BaseQueryError) -> ProtocolError;
 ```
 
-Wire shapes, settled here and documented in Task 16: a cell is internally tagged by `kind` (`{"kind":"string","value":"x"}`, `{"kind":"date","value":"2025-01-01","has_time":false}`, `{"kind":"duration","value":86400000,"months":0}`, `{"kind":"link","target":"Other","display":null,"resolved":"Other.md"}`, `{"kind":"error","message":"division by zero"}`); a date's `value` is ISO 8601 in the daemon's zone — `YYYY-MM-DD` without a time, `YYYY-MM-DDTHH:mm:ss.SSS±HH:MM` with one; `summaries` is a list of `{property, name, value}` (the spec's "name to typed value", keyed by both, because one property may carry a summary and two properties may share a summary name); `next_cursor` is absent-or-null exactly as every other page.
+Wire shapes, settled here and documented in Task 16: a cell is internally tagged by `kind` (`{"kind":"string","value":"x"}`, `{"kind":"date","value":"2025-01-01","has_time":false}`, `{"kind":"duration","value":86400000,"months":0}`, `{"kind":"link","target":"Other","display":null,"resolved":"Other.md"}`, `{"kind":"error","message":"division by zero"}`); a duration carries `months` beside its milliseconds because the published reference's duration units include months (the syntax page's table: `M`, `month`, `months`), which no millisecond count can represent; an object is an ordered list of `{key, value}` entries, as the protocol's existing property DTO already represents mappings (`PropertyMappingEntryDto`), and the spec's cell model is amended to say so (a fact correction, in this plan's commit); a date's `value` is ISO 8601 in the daemon's zone — `YYYY-MM-DD` without a time, `YYYY-MM-DDTHH:mm:ss.SSS±HH:MM` with one; `summaries` is a JSON object from name to typed value, as the spec says; the name is the key the view's own `summaries` map declares the summary under (`summaries: {price: Average}` answers `"summaries": {"price": {"kind":"number","value":14.3}}`), because that key is unique within a view while two properties may share a summary function, and the function each key names is already in the view's declaration; `next_cursor` is absent-or-null exactly as every other page.
 
 Property types come from the vault's `.obsidian/types.json` (`{"types": {"<key>": "date" | "datetime" | "number" | "checkbox" | "text" | "multitext" | "tags" | "aliases"}}`), read by the server through its raw read engine on each cache miss (one small file per evaluation), because that is where Obsidian declares them; a missing or unreadable file means no declared types. The spec does not mention this file; the plan's report names it as a ruling to confirm.
 
@@ -8599,6 +9001,8 @@ Property types come from the vault's `.obsidian/types.json` (`{"types": {"<key>"
 Create `crates/vault-index/tests/bases_query.rs`:
 
 ```rust
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -8616,8 +9020,8 @@ fn vp(path: &str) -> VaultPath {
 }
 
 fn service(files: &[(&str, &str)]) -> (IndexService, TempDir, TempDir) {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
     for (path, body) in files {
         let full = vault.path().join(path);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -9286,19 +9690,13 @@ pub struct RowDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SummaryDto {
-    pub property: String,
-    pub name: String,
-    pub value: CellDto,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EvaluateBaseResponse {
     pub generation: u64,
     pub view: ViewDto,
     pub columns: Vec<ColumnDto>,
     pub rows: Vec<RowDto>,
-    pub summaries: Vec<SummaryDto>,
+    /// Name to typed value; the name is the view's `summaries` key.
+    pub summaries: std::collections::BTreeMap<String, CellDto>,
     pub total_rows: u64,
     pub next_cursor: Option<String>,
 }
@@ -9320,7 +9718,7 @@ pub struct BaseSummaryDto {
 }
 ```
 
-In `crates/vault-protocol/src/operations.rs`: `Request` gains `EvaluateBase(EvaluateBaseParams),` and `ListBases(ListBasesParams),` (after `CloseSnapshot`); `Response` gains `EvaluateBase(EvaluateBaseResponse),` and `ListBases(PageResponse<BaseSummaryDto>),`. In `crates/vault-protocol/src/error.rs`: `ErrorCode` gains `BaseInvalid, ViewNotFound, ExpressionInvalid, UnsupportedFunction` before `Unknown`, and `Deserialize` gains `"base_invalid"`, `"view_not_found"`, `"expression_invalid"`, `"unsupported_function"`. In `crates/vault-protocol/src/lib.rs`: `mod bases;` and `pub use bases::{BaseStatusDto, BaseSummaryDto, CellDto, ColumnDto, EvaluateBaseParams, EvaluateBaseResponse, ListBasesParams, ObjectEntryDto, RowDto, RowKindDto, SummaryDto, ViewDto};`.
+In `crates/vault-protocol/src/operations.rs`: `Request` gains `EvaluateBase(EvaluateBaseParams),` and `ListBases(ListBasesParams),` (after `CloseSnapshot`); `Response` gains `EvaluateBase(EvaluateBaseResponse),` and `ListBases(PageResponse<BaseSummaryDto>),`. In `crates/vault-protocol/src/error.rs`: `ErrorCode` gains `BaseInvalid, ViewNotFound, ExpressionInvalid, UnsupportedFunction` before `Unknown`, and `Deserialize` gains `"base_invalid"`, `"view_not_found"`, `"expression_invalid"`, `"unsupported_function"`. In `crates/vault-protocol/src/lib.rs`: `mod bases;` and `pub use bases::{BaseStatusDto, BaseSummaryDto, CellDto, ColumnDto, EvaluateBaseParams, EvaluateBaseResponse, ListBasesParams, ObjectEntryDto, RowDto, RowKindDto, ViewDto};`.
 
 `Response` keeps its `Eq` derive: `serde_json::Number` and `serde_json::Value` are both `Eq`.
 
@@ -9336,11 +9734,19 @@ use vault_protocol::{CellDto, ErrorCode, Response, ResponseOutcome};
 
 use daemon::Daemon;
 
+/// The in-repo scratch root (`target/tmp`), from this crate's manifest
+/// directory rather than `TMPDIR` — the socket harness's `tmp_root` rule.
+fn scratch() -> std::path::PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&root).expect("create the scratch root");
+    root.canonicalize().expect("canonicalize the scratch root")
+}
+
 const BASE: &str = "formulas:\n  double: 'price * 2'\n  bad: 'price +'\nproperties:\n  price:\n    displayName: Price\nsummaries:\n  top: 'values.reduce(if(acc == null || value > acc, value, acc), null)'\nviews:\n  - type: table\n    name: Table\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, price, formula.double]\n    sort:\n      - property: price\n        direction: DESC\n    summaries:\n      price: top\n  - type: cards\n    name: Cards\n    image: cover\n  - type: table\n    name: Bad\n    order: [formula.bad]\n  - type: table\n    name: Odd\n    filters: 'frobnicate(price)'\n";
 
 fn vault() -> (TempDir, TempDir) {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(scratch()).unwrap();
+    let index = TempDir::new_in(scratch()).unwrap();
     std::fs::create_dir_all(vault.path().join("Books")).unwrap();
     for (name, price) in [("A", 3), ("B", 30), ("C", 10)] {
         std::fs::write(vault.path().join(format!("Books/{name}.md")), format!("---\nprice: {price}\n---\n")).unwrap();
@@ -9392,8 +9798,8 @@ fn evaluate_base_answers_rows_columns_summaries_and_typed_cells() {
     assert_eq!(answer.rows[0].cells[2], CellDto::Number { value: serde_json::Number::from(60) });
     assert_eq!(answer.total_rows, 3);
     assert!(answer.next_cursor.is_none());
-    assert_eq!(answer.summaries[0].name, "top");
-    assert_eq!(answer.summaries[0].value, CellDto::Number { value: serde_json::Number::from(30) });
+    assert_eq!(answer.summaries.len(), 1);
+    assert_eq!(answer.summaries["price"], CellDto::Number { value: serde_json::Number::from(30) });
 
     let Response::EvaluateBase(cards) = ok(&mut daemon, &evaluate(r#"{"path":"Views.base","view":"Cards"}"#)) else { panic!() };
     assert_eq!(cards.view.options, serde_json::json!({"image": "cover"}));
@@ -9584,7 +9990,7 @@ use vault_core::VaultPath;
 use vault_index::{BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, IndexReader};
 use vault_protocol::{
     BaseStatusDto, BaseSummaryDto, ColumnDto, ErrorCode, EvaluateBaseParams, EvaluateBaseResponse, ListBasesParams,
-    PageResponse, ProtocolError, RowDto, RowKindDto, SummaryDto, ViewDto,
+    PageResponse, ProtocolError, RowDto, RowKindDto, ViewDto,
 };
 
 use crate::convert;
@@ -9765,7 +10171,7 @@ pub(crate) fn evaluate_base(
             .result
             .summaries
             .iter()
-            .map(|summary| SummaryDto { property: summary.property.clone(), name: summary.name.clone(), value: convert::cell(&summary.value, clock) })
+            .map(|summary| (summary.property.clone(), convert::cell(&summary.value, clock)))
             .collect(),
         total_rows: rows.len() as u64,
         next_cursor: (next < rows.len()).then(|| {
@@ -9928,7 +10334,8 @@ A `resync_required` (any reason) carries no change set; a client that receives o
 - Create: `crates/vault-server/src/views.rs`
 - Modify: `crates/vault-index/src/query/bases.rs` (`prefilter_facts`, `base_dependencies`), `crates/vault-index/src/lib.rs`, `crates/vault-index/src/live_reconcile.rs` (`LiveRefreshReport.reresolved`)
 - Modify: `crates/vault-protocol/src/events.rs` (`ViewsInvalidatedEventDto`, the variant, the visitor arm), `crates/vault-protocol/src/lib.rs`
-- Create: `crates/vault-server/tests/bases_freshness.rs`
+- Create: `crates/vault-server/tests/bases_freshness.rs`, `crates/vault-index/tests/reresolved.rs`
+- Modify: `crates/vault-server/tests/conformance.rs` (the `views_invalidated` proof), `crates/vault-server/src/broadcast.rs` and `crates/vault-server/src/bin/vault-live-bench.rs` (the new report field)
 
 **Interfaces:**
 
@@ -9953,6 +10360,13 @@ impl IndexReader {
 impl BaseCache { pub(crate) fn with_capacity(capacity: usize) -> Self; pub(crate) fn len(&self) -> usize; }
 pub(crate) struct ViewTracker;  // record(), stale_views()
 impl Server { pub fn set_base_cache_entries(&mut self, entries: usize); pub(crate) fn stale_views(&self, report: &LiveRefreshReport) -> Vec<ViewsInvalidatedEventDto>; }
+pub(crate) fn evaluate_base(
+    reader: &IndexReader,
+    cache: &BaseCache,
+    tracker: &ViewTracker,
+    types: impl FnOnce() -> BTreeMap<String, vault_bases::PropertyType>,
+    params: EvaluateBaseParams,
+) -> Result<EvaluateBaseResponse, ProtocolError>;   // widened from Task 11 by `tracker`
 impl SubscriptionRegistry { pub fn enqueue_views_invalidated(&mut self, events: &[ViewsInvalidatedEventDto]); }
 pub use bases::DEFAULT_BASE_CACHE_ENTRIES;
 ```
@@ -9971,11 +10385,19 @@ use vault_protocol::{EventEnvelope, Response, ResponseOutcome, RuntimeEventDto};
 
 use daemon::Daemon;
 
+/// The in-repo scratch root (`target/tmp`), from this crate's manifest
+/// directory rather than `TMPDIR` — the socket harness's `tmp_root` rule.
+fn scratch() -> std::path::PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&root).expect("create the scratch root");
+    root.canonicalize().expect("canonicalize the scratch root")
+}
+
 const BASE: &str = "views:\n  - type: table\n    name: InBooks\n    filters: 'file.inFolder(\"Books\")'\n    order: [price]\n    sort:\n      - property: price\n        direction: ASC\n  - type: table\n    name: Tagged\n    filters: 'file.hasTag(\"t\")'\n";
 
 fn setup() -> (TempDir, TempDir, Daemon) {
-    let vault = TempDir::new().unwrap();
-    let index = TempDir::new().unwrap();
+    let vault = TempDir::new_in(scratch()).unwrap();
+    let index = TempDir::new_in(scratch()).unwrap();
     std::fs::create_dir_all(vault.path().join("Books")).unwrap();
     std::fs::create_dir_all(vault.path().join("Other")).unwrap();
     std::fs::write(vault.path().join("Books/A.md"), "---\nprice: 1\n---\n").unwrap();
@@ -10095,6 +10517,81 @@ fn the_cache_hits_at_one_generation_and_misses_at_the_next() {
     assert_eq!(third.0, first.0 + 1);
     assert_ne!(third.1, first.1, "a new generation recomputes, so now() moved");
 }
+
+fn write_base(daemon: &mut Daemon, path: &str, text: &str) -> u64 {
+    generation_of(
+        daemon,
+        &format!(r#"{{"version":1,"id":"b","request":{{"method":"write_file","params":{{"path":"{path}","content_base64":"{}","expected":{{"any":true}}}}}}}}"#, base64_of(text)),
+    )
+}
+
+#[test]
+fn a_base_created_while_nobody_listened_is_tracked_once_someone_does() {
+    let (vault, _index, mut daemon) = setup();
+    daemon.call(r#"{"version":1,"id":"u","request":{"method":"unsubscribe","params":{"subscription_id":"sub-1"}}}"#);
+    std::fs::create_dir_all(vault.path().join("New")).unwrap();
+    write_base(&mut daemon, "N.base", "views:\n  - type: table\n    name: V\n    filters: 'file.inFolder(\"New\")'\n");
+    daemon.drain_events();
+    daemon.call(r#"{"version":1,"id":"s2","request":{"method":"subscribe_events","params":{}}}"#);
+    let entered = generation_of(&mut daemon, r#"{"version":1,"id":"w","request":{"method":"write_note","params":{"path":"New/X.md","content":"x\n","expected":{"absent":true}}}}"#);
+    assert!(invalidated_at(&mut daemon, entered).contains("N.base#V"), "the base born unobserved is in the catalog");
+}
+
+#[test]
+fn clause_five_a_view_reading_this_is_stale_when_any_note_changes() {
+    let (_vault, _index, mut daemon) = setup();
+    write_base(&mut daemon, "This.base", "views:\n  - type: table\n    name: ThisView\n    filters:\n      and:\n        - file.inFolder(\"Books\")\n        - 'file.name != this.file.name'\n");
+    daemon.call(r#"{"version":1,"id":"e","request":{"method":"evaluate_base","params":{"path":"This.base"}}}"#);
+    let unrelated = generation_of(&mut daemon, r#"{"version":1,"id":"w","request":{"method":"write_note","params":{"path":"Other/U.md","content":"plain\n","expected":{"absent":true}}}}"#);
+    // Other/U.md is outside the prefilter and was never a row: only clause 5
+    // can name ThisView, and the other two views stay quiet.
+    assert_eq!(invalidated_at(&mut daemon, unrelated), set(&["This.base#ThisView"]));
+}
+
+#[test]
+fn clause_six_a_row_whose_link_target_appears_is_stale() {
+    let (vault, _index, mut daemon) = setup();
+    std::fs::create_dir_all(vault.path().join("Refs")).unwrap();
+    std::fs::write(vault.path().join("Refs/R.md"), "---\nref: \"[[Target]]\"\n---\n").unwrap();
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    write_base(&mut daemon, "Refs.base", "views:\n  - type: table\n    name: Refs\n    filters: 'file.inFolder(\"Refs\")'\n");
+    daemon.call(r#"{"version":1,"id":"e","request":{"method":"evaluate_base","params":{"path":"Refs.base"}}}"#);
+    let appeared = generation_of(&mut daemon, r#"{"version":1,"id":"w","request":{"method":"write_note","params":{"path":"Target.md","content":"# Target\n","expected":{"absent":true}}}}"#);
+    // Target.md is outside every prefilter and no row changed its bytes; the
+    // only path to Refs is R.md's reference re-resolving.
+    assert_eq!(invalidated_at(&mut daemon, appeared), set(&["Refs.base#Refs"]));
+}
+```
+
+Create `crates/vault-index/tests/reresolved.rs` — clause 6's input, pinned where it is computed:
+
+```rust
+mod common;
+
+use std::collections::BTreeSet;
+
+use tempfile::TempDir;
+use vault_core::VaultPath;
+use vault_index::{ChangeCause, IndexConfig, IndexService};
+
+#[test]
+fn a_source_whose_reference_reresolves_is_reported_and_a_body_edit_is_not() {
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    std::fs::write(vault.path().join("R.md"), "---\nref: \"[[Target]]\"\n---\n[[Target]]\n").unwrap();
+    let config = IndexConfig::explicit(vault.path(), index.path().join("i.sqlite3")).unwrap();
+    let mut service = IndexService::open(config).unwrap();
+    service.refresh(false).unwrap();
+    let target: BTreeSet<VaultPath> = [VaultPath::new("Target.md").unwrap()].into();
+
+    std::fs::write(vault.path().join("Target.md"), "# Target\n").unwrap();
+    let created = service.refresh_paths(target.clone(), ChangeCause::Watcher).unwrap();
+    assert_eq!(created.reresolved, vec![VaultPath::new("R.md").unwrap()]);
+
+    std::fs::write(vault.path().join("Target.md"), "# Target\n\nmore\n").unwrap();
+    let edited = service.refresh_paths(target, ChangeCause::Watcher).unwrap();
+    assert!(edited.reresolved.is_empty(), "a body edit moves no resolution: {:?}", edited.reresolved);
+}
 ```
 
 Add a unit-test module to `crates/vault-server/src/bases.rs` (after Step 3 writes the LRU):
@@ -10190,10 +10687,12 @@ In `crates/vault-server/src/connection.rs`, the dispatcher's notice arm (`connec
 
 ```rust
             ServerInput::Notice(notice) => {
-                // Computed before the notice is consumed, and only when
-                // someone could hear it: the rule is cheap, not free.
+                // Computed for every committed generation, whether or not this
+                // connection has a subscription: the tracker must see each
+                // generation to keep its base catalog current, and the answer
+                // is memoized per generation, so N connections pay once.
                 let stale = match notice.as_ref() {
-                    RuntimeNotice::Generation(report) if !subscriptions.is_empty() => server.stale_views(report),
+                    RuntimeNotice::Generation(report) => server.stale_views(report),
                     _ => Vec::new(),
                 };
                 subscriptions.enqueue_notice(*notice);
@@ -10208,7 +10707,40 @@ In `crates/vault-server/src/connection.rs`, the dispatcher's notice arm (`connec
 
 - [ ] **Step 4: The index answers the two facts the rule needs**
 
-First, clause 6's input. In `crates/vault-index/src/live_reconcile.rs`, `LiveRefreshReport` and `BatchOutcome` gain `pub reresolved: Vec<VaultPath>` (sorted, deduplicated): the source notes of the *incoming* selected references — those whose source was not itself replaced — whose new resolution differs from their stored one. In `try_reconcile_batch`'s loop over `by_source`, where each `existing` reference is re-resolved, push `path.clone()` onto a local `reresolved` set when `resolution != existing.resolution` (`existing` is the stored `ResolvedReference`, so `existing.resolution` is the answer the index held before this cycle), and carry the set into `BatchOutcome`. Every other `BatchOutcome` and `LiveRefreshReport` literal the compiler names (the nothing-changed early return, the complete route's report in `reconcile.rs`, test and bench literals in `crates/vault-server/src/broadcast.rs` and `src/bin/vault-live-bench.rs`) gets `reresolved: Vec::new()`. A replaced source is already in `changes.modified`, so it needs no entry here.
+First, clause 6's input: the source notes of the *incoming* selected references (those whose source was not itself replaced — a replaced source is already in `changes.modified`) whose new resolution differs from the stored one. In `crates/vault-index/src/live_reconcile.rs`:
+
+- `LiveRefreshReport` gains, after `affected_reference_count`:
+
+```rust
+    /// Notes whose own bytes did not change but at least one of whose
+    /// references now resolves differently, sorted. The staleness rule treats
+    /// them as changed (a frontmatter link's target appeared or vanished).
+    pub reresolved: Vec<VaultPath>,
+```
+
+- `BatchOutcome` gains `pub(crate) reresolved: Vec<VaultPath>,`;
+- in `try_reconcile_batch`, immediately before `for (path, ordinals) in &by_source {`, add `let mut reresolved: BTreeSet<VaultPath> = BTreeSet::new();`, and inside that loop replace
+
+```rust
+                let target = LinkTarget::from(&existing.reference);
+                let resolution = resolver.resolve_target(path, &target);
+```
+
+  with
+
+```rust
+                let target = LinkTarget::from(&existing.reference);
+                let resolution = resolver.resolve_target(path, &target);
+                // `existing` is the stored `ResolvedReference`: its resolution
+                // is the answer the index held before this cycle.
+                if resolution != existing.resolution {
+                    reresolved.insert(path.clone());
+                }
+```
+
+- the `DeltaPublishOutcome::Committed` arm's `BatchOutcome { … }` gains `reresolved: reresolved.into_iter().collect(),`, and the nothing-changed early return's `BatchOutcome { … }` gains `reresolved: Vec::new(),`;
+- `refresh_paths`'s `outcome.map(|batch| LiveRefreshReport { … })` gains `reresolved: batch.reresolved,`;
+- the two other `LiveRefreshReport` literals in the workspace — `crates/vault-server/src/broadcast.rs:475` (a test) and `crates/vault-server/src/bin/vault-live-bench.rs:684` — gain `reresolved: Vec::new(),`.
 
 Then the two reads.
 
@@ -10370,17 +10902,26 @@ impl ViewTracker {
         // The views of a base that just vanished still need their event, so
         // their names are taken from the previous map before it is refreshed.
         let previous: BTreeMap<VaultPath, Views> = state.dependencies.clone().unwrap_or_default();
-        let refreshed = match &state.dependencies {
-            None => reader.base_dependencies(None).map(|(_, all)| all),
-            Some(_) if changed_bases.is_empty() => Ok(previous.clone()),
-            Some(_) => reader.base_dependencies(Some(&changed_bases)).map(|(_, fresh)| {
+        // The catalog is patched incrementally only when this report follows
+        // directly on the last generation the tracker decided; after any gap
+        // (a generation no dispatcher saw, a resync, the first call) it is
+        // reloaded whole, so a base created in the gap is never missed.
+        let continuous = state.dependencies.is_some()
+            && state.decided.as_ref().map(|(decided, _)| *decided)
+                == report.previous_generation.map(vault_index::Generation::get);
+        let refreshed = if !continuous {
+            reader.base_dependencies(None).map(|(_, all)| all)
+        } else if changed_bases.is_empty() {
+            Ok(previous.clone())
+        } else {
+            reader.base_dependencies(Some(&changed_bases)).map(|(_, fresh)| {
                 let mut merged = previous.clone();
                 for path in &changed_bases {
                     merged.remove(path);
                 }
                 merged.extend(fresh);
                 merged
-            }),
+            })
         };
         // When the index cannot answer, every known view is stale: the one
         // failure that may never become a false negative.
@@ -10499,7 +11040,7 @@ In `crates/vault-server/src/lib.rs`:
 - `Server` gains `views: views::ViewTracker` (default in both constructors);
 - `pub fn set_base_cache_entries(&mut self, entries: usize) { self.base_cache = bases::BaseCache::with_capacity(entries); }` beside `set_socket_path`;
 - `pub(crate) fn stale_views(&self, report: &vault_index::LiveRefreshReport) -> Vec<vault_protocol::ViewsInvalidatedEventDto>` returns `self.views.stale_views(reader, report)` when there is a reader and `Vec::new()` otherwise;
-- the `EvaluateBase` arm passes `&self.views` after `&self.base_cache`.
+- the `EvaluateBase` arm's call becomes `bases::evaluate_base(reader, &self.base_cache, &self.views, || self.property_types(), params)`.
 
 In `crates/vault-server/src/main.rs`, `Cli` gains:
 
@@ -10525,7 +11066,23 @@ TMPDIR="$PWD/target/tmp" cargo test -p vault-server --lib bases; echo "exit=$?"
 TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test conformance --test subscriptions; echo "exit=$?"
 ```
 
-Expected: 4 passed, 2 passed, and the conformance and subscription suites green, each `exit=0`. The conformance transcript now carries `views_invalidated` lines after its mutations (the fixture base `Views.base` has views with no prefilter, so every mutation stales them — clause 3's vacuous case); both transports carry the same ones in the same place, which is what that test compares.
+First add the conformance proof that the event is really in the transcript — append to `crates/vault-server/tests/conformance.rs`:
+
+```rust
+/// The Bases fixtures and the mutations after them must produce at least one
+/// `views_invalidated` line, or "both transports carry the same ones" would
+/// pass vacuously over a transcript that carries none.
+#[test]
+fn the_fixture_set_produces_a_views_invalidated_event() {
+    let (transcript, _) = normalized(Transport::Stdio, &fixtures());
+    assert!(
+        transcript.iter().any(|line| line.contains(r#""type":"views_invalidated""#)),
+        "no views_invalidated line in the transcript"
+    );
+}
+```
+
+Expected: 7 passed, 2 passed, and the conformance and subscription suites green, each `exit=0`; and `TMPDIR="$PWD/target/tmp" cargo test -p vault-index --test reresolved; echo "exit=$?"` passes with `exit=0`. The conformance transcript now carries `views_invalidated` lines after its mutations (the fixture base `Views.base` has views with no prefilter, so every mutation stales them — clause 3's vacuous case); both transports carry the same ones in the same place, which is what that test compares.
 
 - [ ] **Step 8: The gates**
 
@@ -10579,6 +11136,8 @@ This is the task that turns "published" and "uncaptured" into "captured". Five s
 
 - Consumes: the fixture `.jsonl` files (Tasks 3–7), `IndexService`, `IndexReader::evaluate_base`, `BaseQuery`, `parse_property_types` (Task 11), `Clock::fixed`, `fixtures::render_text`.
 - Produces: `crates/vault-server/tests/fixtures/bases-captures/meta.json` — `{"captured_at_ms": …, "zone": "…", "obsidian_version": "…", "corpus": "target/tmp/bases-corpus"}`; one `views/<slug>.json` per view — `{"base": "…", "view": "…", "exit_code": 0, "stdout": "<base:query format=json output, verbatim>"}`; one `functions/<family>.json` per family with the same shape per row view; and every fixture row with `"source":"captured"`.
+
+**Rows whose answer is the row file's own facts.** A family row runs on `Capture.md` in the unit fixtures (`capture_vault`: name `Capture.md`, root folder, size 42, created one day and modified one hour before `FIXTURE_NOW_MS`) and on `Captures/<family>/rN.md` in the corpus, with that file's real size and times. Such a row cannot carry one literal `text` that both answer. So a row may carry `"expect_from": "corpus"` and a `"template"` instead of `"text"`: `{name}`, `{basename}`, `{path}`, `{folder}`, `{size}`, `{ctime:<Moment format>}`, `{mtime:<Moment format>}` and `{age_ms}` (`now − ctime`) are filled from the row file's facts — `Capture.md`'s in `check_family`, the corpus row note's (its tree entry in the index, the same `stat` Obsidian reads; the generated notes postdate `MANIFEST.json`, so the manifest does not list them) in the replay. The rows that take a template when Task 13 flips them, and their templates: `name` → `{name}`, `basename` → `{basename}`, `path` → `{path}`, `size` → `{size}`, `ctime` → `{ctime:YYYY-MM-DD HH:mm}`, `age` → `{age_ms}`, `asLink` → `{name}`; `folder:root` is settled by the `#folder_root` probe (a corpus row note is never at the root), and every other `file`/`link` row's answer (`Other.md`, `Folder/image.png`, the tag and link rows) is the same literal in both, because the generator writes the same companions at the same paths. This is what makes Step 9's "no row left uncaptured" reachable.
 
 **The capture probes** (generated by stage 2, read at stage 5; each answers one named item from Tasks 2–8):
 
@@ -10789,7 +11348,7 @@ Create `host/scripts/bases-capture.js`:
  */
 
 const { execFileSync, spawnSync } = require("node:child_process");
-const { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } = require("node:fs");
+const { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } = require("node:fs");
 const { join, relative, resolve, sep } = require("node:path");
 
 const REPO = resolve(__dirname, "..", "..");
@@ -10834,9 +11393,18 @@ const ROW_BODY = "#book #Project/Active [[Other]] [[Missing]] ![[Folder/image.pn
 
 function generate(options) {
   const root = join(options.corpus, "Captures");
-  mkdirSync(join(root, "Folder"), { recursive: true });
-  writeFileSync(join(root, "Other.md"), "---\nstatus: done\n---\n[[Capture]]\n");
-  writeFileSync(join(root, "Folder", "image.png"), Buffer.alloc(1000));
+  mkdirSync(root, { recursive: true });
+  // The two companions every row links to live at the corpus root, exactly
+  // where `capture_vault` puts them, so a row's literal answer (`Other.md`,
+  // `Folder/image.png`) is the same in the corpus as in the unit fixtures.
+  for (const companion of ["Other.md", join("Folder", "image.png")]) {
+    if (existsSync(join(options.corpus, companion))) {
+      throw new Error(`${companion} already exists in the corpus; the capture rows need that path`);
+    }
+  }
+  mkdirSync(join(options.corpus, "Folder"), { recursive: true });
+  writeFileSync(join(options.corpus, "Folder", "image.png"), Buffer.alloc(1000));
+  const rowPaths = [];
   for (const family of FAMILIES) {
     const dir = join(root, family);
     mkdirSync(dir, { recursive: true });
@@ -10848,11 +11416,18 @@ function generate(options) {
       if (/\bthis\b/.test(row.expr)) return;
       const note = `r${index}`;
       writeFileSync(join(dir, `${note}.md`), `${frontmatter(row.props)}${ROW_BODY}`);
+      rowPaths.push(`Captures/${family}/${note}`);
       formulas.push(`  f${index}: ${yamlString(row.expr)}`);
       views.push(`  - type: table\n    name: ${note}\n    filters: ${yamlString(`file.path == "Captures/${family}/${note}.md"`)}\n    order: [formula.f${index}]`);
     });
     writeFileSync(join(root, `${family}.base`), `formulas:\n${formulas.join("\n")}\nviews:\n${views.join("\n")}\n`);
   }
+  // `Other.md` links back to every row, so a row's first backlink is
+  // `Other.md` here as it is in `capture_vault`.
+  writeFileSync(
+    join(options.corpus, "Other.md"),
+    `---\nstatus: done\n---\n${rowPaths.map((path) => `[[${path}]]`).join("\n")}\n`,
+  );
   const probe = (name, notes, view) => ({ name, notes, view });
   const probes = [
     probe("filter_error_row", [["a", { price: 3 }], ["b", {}]], "    filters: 'price > 2'"),
@@ -11096,7 +11671,7 @@ fn every_captured_view_replays_exactly() {
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixtures.join("meta.json")).expect("meta.json")).unwrap();
     let clock = Clock::fixed(meta["captured_at_ms"].as_i64().unwrap(), meta["zone"].as_str().unwrap());
 
-    let index = tempfile::TempDir::new().unwrap();
+    let index = tempfile::TempDir::new_in(root.join("target/tmp")).unwrap();
     let config = IndexConfig::explicit(&corpus, index.path().join("index.sqlite3")).unwrap();
     let mut service = IndexService::open(config).unwrap();
     service.refresh(false).unwrap();
@@ -11142,6 +11717,49 @@ fn every_captured_view_replays_exactly() {
     }
     assert!(failures.is_empty(), "{} of {} views differ:\n{}", failures.len(), all.len(), failures.join("\n"));
 }
+
+/// Every family row with `expect_from: corpus` agrees with its capture once
+/// the template is filled from the corpus row note's own facts.
+#[test]
+#[ignore = "needs the hand-made corpus under target/tmp/bases-corpus"]
+fn every_templated_row_agrees_with_its_capture() {
+    use vault_bases::fixtures::{TemplateFacts, fill_template, load_captures};
+    let root = repo();
+    let corpus = root.join("target/tmp/bases-corpus");
+    let fixtures = root.join("crates/vault-server/tests/fixtures/bases-captures");
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixtures.join("meta.json")).unwrap()).unwrap();
+    let clock = Clock::fixed(meta["captured_at_ms"].as_i64().unwrap(), meta["zone"].as_str().unwrap());
+    let index = tempfile::TempDir::new_in(root.join("target/tmp")).unwrap();
+    let mut service = IndexService::open(IndexConfig::explicit(&corpus, index.path().join("i.sqlite3")).unwrap()).unwrap();
+    service.refresh(false).unwrap();
+    let reader = service.reader().unwrap();
+    let captured = captures(&fixtures);
+    let mut failures = Vec::new();
+    for family in ["coercion", "global", "any", "string", "number", "list", "object", "regexp", "date", "link", "file"] {
+        for (index, row) in load_captures(family).iter().enumerate() {
+            let Some(template) = &row.template else { continue };
+            let note = format!("Captures/{family}/r{index}.md");
+            let Some(capture) = captured.iter().find(|c| c.base == format!("Captures/{family}.base") && c.view == format!("r{index}")) else {
+                failures.push(format!("{family} {}: no capture", row.case));
+                continue;
+            };
+            let (_, entries) = reader.tree_entries_for(&[VaultPath::new(note.as_str()).unwrap()]).unwrap();
+            let entry = entries[0].clone().expect("the row note is indexed");
+            let facts = TemplateFacts {
+                path: note.clone(),
+                size: entry.size.unwrap_or(0),
+                ctime_ms: entry.ctime_unix_ms,
+                mtime_ms: entry.mtime_unix_ms,
+            };
+            let expected = fill_template(template, &facts, &clock);
+            let got = capture.rows.first().and_then(|(_, cells)| cells.first()).cloned().unwrap_or_default();
+            if got != expected {
+                failures.push(format!("{family} {}: template gives {expected:?}, Obsidian showed {got:?}", row.case));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 ```
 
 `rows_of` above is the starting shape — an array of objects with a `path` (or `file`) key and one key per column. Rewrite it to the shape Step 6 recorded, and make the module comment's last paragraph say what that shape was; the rest of the file does not change.
@@ -11150,18 +11768,94 @@ Run: `TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test bases_replay --
 
 - [ ] **Step 8: Settle every difference**
 
+First give the fixtures the template form (the rule above). In `crates/vault-bases/src/fixtures.rs`, `CaptureRow` gains `pub expect_from: Option<String>` and `pub template: Option<String>` (read in `load_captures` with `field("expect_from")` and `field("template")`), and add:
+
+```rust
+/// The row file's own facts a template may name.
+pub struct TemplateFacts {
+    pub path: String,
+    pub size: u64,
+    pub ctime_ms: i64,
+    pub mtime_ms: i64,
+}
+
+/// Fill `{name}`, `{basename}`, `{path}`, `{folder}`, `{size}`,
+/// `{ctime:<fmt>}`, `{mtime:<fmt>}` and `{age_ms}` from `facts`.
+pub fn fill_template(template: &str, facts: &TemplateFacts, clock: &Clock) -> String {
+    let name = facts.path.rsplit('/').next().unwrap_or(&facts.path).to_string();
+    let basename = match name.rfind('.') {
+        Some(dot) if dot > 0 => name[..dot].to_string(),
+        _ => name.clone(),
+    };
+    let folder = facts.path.rsplit_once('/').map(|(folder, _)| folder.to_string()).unwrap_or_default();
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let close = rest[open..].find('}').map_or(rest.len(), |at| open + at);
+        let token = &rest[open + 1..close];
+        let date = |ms: i64, format: &str| {
+            crate::dates::format_date(crate::DateValue { epoch_ms: ms, has_time: true }, format, clock).unwrap_or_default()
+        };
+        out.push_str(&match token.split_once(':') {
+            Some(("ctime", format)) => date(facts.ctime_ms, format),
+            Some(("mtime", format)) => date(facts.mtime_ms, format),
+            _ => match token {
+                "name" => name.clone(),
+                "basename" => basename.clone(),
+                "path" => facts.path.clone(),
+                "folder" => folder.clone(),
+                "size" => facts.size.to_string(),
+                "age_ms" => (clock.now_ms - facts.ctime_ms).to_string(),
+                other => format!("{{{other}}}"),
+            },
+        });
+        rest = &rest[(close + 1).min(rest.len())..];
+    }
+    out.push_str(rest);
+    out
+}
+```
+
+and in `check_family`, the expected text becomes `row.template` filled from `Capture.md`'s facts when a template is present:
+
+```rust
+                } else if let Some(text) = row
+                    .template
+                    .as_ref()
+                    .map(|template| {
+                        fill_template(
+                            template,
+                            &TemplateFacts {
+                                path: "Capture.md".into(),
+                                size: 42,
+                                ctime_ms: FIXTURE_NOW_MS - 86_400_000,
+                                mtime_ms: FIXTURE_NOW_MS - 3_600_000,
+                            },
+                            &clock,
+                        )
+                    })
+                    .or_else(|| row.text.clone())
+                {
+```
+
+(replacing the `else if let Some(text) = &row.text {` line and dereferencing `text` as a `String` below it). Then rewrite the seven templated rows of `file.jsonl` to the form, for example `{"family":"file","case":"name","expr":"file.name","kind":"string","expect_from":"corpus","template":"{name}","source":"captured"}`, and run `every_templated_row_agrees_with_its_capture` with the replay.
+
+Then work the differences:
+
 Work the failure list until the replay exits 0, one cause at a time, re-running the replay after each change. Every change lands where the case was named:
 
 - an `uncaptured` row's case (`EvalError::Uncaptured("<case>")` in `coerce.rs`, `functions/*.rs`): replace the `Uncaptured` arm with the captured behaviour, and in that family's `.jsonl` set the row's `kind`/`text` to what was captured and `source` to `captured`;
 - `MIXED_TYPE_RANK`: reorder it to the `#sort_mixed` capture and rewrite its doc comment to cite the capture instead of calling itself provisional;
 - `filter:error_row`, `sort:default`, `summary:stddev`, `limit:before_group`: make `view/mod.rs` and `view/summary.rs` do what the probe shows, and replace each "(confirmed by capture)" note with the capture's file name;
 - `view:case`: if `meta.json`'s `embeds_resolved` shows the lower-case embed resolving, make `Resolver::with_subpath`'s view match case-insensitive and flip `a_subpath_on_a_base_is_a_view`'s third assertion — the only change outside `vault-bases` this step may make;
+- `reverse:astral`: implement what the capture shows (code points or UTF-16 units), and add `astral_reverse_matches_the_capture` to `crates/vault-bases/tests/functions_reference.rs` asserting `"a🙂".reverse()` equals the captured string exactly;
 - `hyphenated_identifier`: if `#hyphen` shows `99`, the tokenizer joins `-` inside an identifier when no space surrounds it; change `is_ident_continue` accordingly and add the case to `syntax_examples.rs`;
 - a `published` row that the capture contradicts: the capture wins (the spec: parity comes from captures); change the code and the row, set `source` to `captured`, and list the contradiction — the published sentence, the captured value — in the task report;
 - a cell-text difference with equal values (a date shown differently, a list joined differently): fix `render_text` in `fixtures.rs`, dropping the "Provisional" note on the rule that changed;
 - a whole-row difference in a corpus view: find the clause responsible with a smaller probe if needed (add it to `generate`, re-run stages 4 and 7 — the scratch vault is still open), and fix it in the module that owns it.
 
-Every row in every `crates/vault-bases/tests/fixtures/captures/*.jsonl` file whose case was captured ends with `"source":"captured"`; a row that could not be captured (a `this` row skipped by `generate`) keeps `published` and is covered by a corpus view instead.
+Every row in every `crates/vault-bases/tests/fixtures/captures/*.jsonl` file whose case was captured ends with `"source":"captured"` — a templated row once `every_templated_row_agrees_with_its_capture` passes for it, a probe-settled row (`folder:root` and the other probe rows) with the probe's answer as its `kind` and `text`; a row that could not be captured (a `this` row skipped by `generate`) keeps `published` and is covered by a corpus view instead.
 
 - [ ] **Step 9: Run everything**
 
@@ -11308,8 +12002,10 @@ The rule runs inside the dispatcher, so the harness cannot time it alone; time i
     #[test]
     #[ignore = "a timing measurement, run by Task 14"]
     fn the_rule_with_fifty_bases_is_under_a_millisecond() {
-        let vault = tempfile::TempDir::new().unwrap();
-        let index = tempfile::TempDir::new().unwrap();
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let vault = tempfile::TempDir::new_in(&scratch).unwrap();
+        let index = tempfile::TempDir::new_in(&scratch).unwrap();
         for at in 0..1000 {
             std::fs::write(vault.path().join(format!("N{at:04}.md")), format!("---\nrank: {}\n---\n#g{}\n", at % 100, at % 10)).unwrap();
         }
@@ -11418,7 +12114,7 @@ Expected: `Switched to branch 'spike/htmx-client'`, `exit=0` twice. Every step u
 
 - [ ] **Step 3: Write the failing smoke checks**
 
-In `spikes/htmx-client/smoke.js`, inside `checkLinks()` after the existing `![[Views.base#Table]]` block (which already branches on `resolved`; with this daemon it takes the resolved branch), add:
+In `spikes/htmx-client/smoke.js`, inside `checkLinks()`, **replace** the existing `if (baseRef.resolution.kind === "resolved") { … } else { … }` block — the one that asserts `${a("/file?path=Views.base", "embed")} <small>#Table</small>` for a resolved embed and the `unresolved` mark otherwise — with the checks below. That old assertion describes the file link the server stops emitting for a `.base` embed in Step 4; left in place, it would fail the smoke after Step 4 and make Step 5 unreachable. The line after it (`/file?path=Views.base serves the YAML`) stays: `/file` still serves the bytes.
 
 ```js
     if (baseRef.resolution.kind !== "resolved" || baseRef.resolution.subpath?.kind !== "view") {
@@ -11516,7 +12212,7 @@ async function pageView(client, path, view, thisPath, limit) {
     const group = row.group ? `<td><small>${esc(cellText(row.group))}</small></td>` : "";
     return `<tr><td>${noteLink(row.path)}</td>${group}${cells}</tr>`;
   }).join("");
-  const sums = answer.summaries.map((s) => `<li>${esc(s.property)} · ${esc(s.name)}: ${esc(cellText(s.value))}</li>`).join("");
+  const sums = Object.entries(answer.summaries).map(([name, value]) => `<li>${esc(name)}: ${esc(cellText(value))}</li>`).join("");
   return `<div><b>${esc(answer.view.name)}</b> <small>${esc(answer.view.type)} · generation ${answer.generation} · ${answer.total_rows} rows</small>` +
     `<table><tr><th>file</th>${head}</tr>${body}</table>${sums ? `<ul>${sums}</ul>` : ""}</div>`;
 }
@@ -11641,14 +12337,14 @@ Make these edits, prose one paragraph per line:
 ````markdown
 ### `evaluate_base`
 
-Evaluates one view of a `.base` file at the current generation and answers its rows. `path` names the base; `view` names a view (absent means the first declared view, as Obsidian opens a base); `this_path` names the note that embeds the base (absent means the base itself — what `this` is); `cursor` and `limit` page the rows like every collection operation. The answer carries the `generation`, the `view` as declared (`type`, `name`, and every other key in `options`), the `columns` (the view's `order`, each with the `display_name` and the settings its `properties` entry declares), the page of `rows` (each a `path`, a `kind` of `note` or `file`, a `group` cell when the view groups, and one cell per column), the `summaries` (one `{property, name, value}` per summary the view declares), `total_rows`, and `next_cursor`. The daemon renders nothing: a client turns cells into a table, cards, a list or a board. Every view type — `table`, `cards`, `list`, `kanban`, `map`, and a plugin's own — evaluates to the same row data; an unknown type is passed through as declared.
+Evaluates one view of a `.base` file at the current generation and answers its rows. `path` names the base; `view` names a view (absent means the first declared view, as Obsidian opens a base); `this_path` names the note that embeds the base (absent means the base itself — what `this` is); `cursor` and `limit` page the rows like every collection operation. The answer carries the `generation`, the `view` as declared (`type`, `name`, and every other key in `options`), the `columns` (the view's `order`, each with the `display_name` and the settings its `properties` entry declares), the page of `rows` (each a `path`, a `kind` of `note` or `file`, a `group` cell when the view groups, and one cell per column), the `summaries` (an object from name to typed value — the name is the key the view's own `summaries` map declares it under, so `summaries: {price: Average}` answers `"price": <cell>`), `total_rows`, and `next_cursor`. The daemon renders nothing: a client turns cells into a table, cards, a list or a board. Every view type — `table`, `cards`, `list`, `kanban`, `map`, and a plugin's own — evaluates to the same row data; an unknown type is passed through as declared.
 
 ```json
 {"version":1,"id":"b","request":{"method":"evaluate_base","params":{"path":"Books.base","view":"Table","this_path":"Home.md","limit":2}}}
 ```
 
 ```json
-{"version":1,"id":"b","outcome":{"status":"ok","value":{"type":"evaluate_base","value":{"generation":7,"view":{"type":"table","name":"Table","options":{}},"columns":[{"property":"file.name","display_name":null,"settings":{}},{"property":"price","display_name":"Price","settings":{}}],"rows":[{"path":"Books/Ulysses.md","kind":"note","cells":[{"kind":"string","value":"Ulysses.md"},{"kind":"number","value":30}]},{"path":"Books/Dune.md","kind":"note","cells":[{"kind":"string","value":"Dune.md"},{"kind":"number","value":10}]}],"summaries":[{"property":"price","name":"Average","value":{"kind":"number","value":14.333333333333334}}],"total_rows":3,"next_cursor":"eyJnZW5lcmF0aW9uIjo3fQ"}}}}
+{"version":1,"id":"b","outcome":{"status":"ok","value":{"type":"evaluate_base","value":{"generation":7,"view":{"type":"table","name":"Table","options":{}},"columns":[{"property":"file.name","display_name":null,"settings":{}},{"property":"price","display_name":"Price","settings":{}}],"rows":[{"path":"Books/Ulysses.md","kind":"note","cells":[{"kind":"string","value":"Ulysses.md"},{"kind":"number","value":30}]},{"path":"Books/Dune.md","kind":"note","cells":[{"kind":"string","value":"Dune.md"},{"kind":"number","value":10}]}],"summaries":{"price":{"kind":"number","value":14.333333333333334}},"total_rows":3,"next_cursor":"eyJnZW5lcmF0aW9uIjo3fQ"}}}}
 ```
 
 A result is computed once per (base, view, `this_path`, generation) and its pages are cut from that one computation, so `now()` and `random()` cannot move between pages. The computation is cached in a bounded LRU (`--bases-cache-entries`, default 64); every entry of an older generation is dropped on the first request at a newer one. A cursor binds the generation, the base, the view, `this_path` and the row position: a cursor for another view is `invalid_cursor`, and a cursor from an older generation is `generation_mismatch` with `current_generation`. An evaluation runs on the requesting connection's dispatcher and takes no lease: a long one delays that connection's next request, never another connection and never reconciliation.
@@ -11662,7 +12358,7 @@ Pages every `.base` file the index holds, in path order, with its declared view 
 ```
 ````
 
-2. A new top-level section `## Bases`, after **Snapshot sessions** and before **Transports**, holding: how a `.base` is indexed (reconciled in the same generation as notes, on both routes; a base that does not parse is still indexed, still resolves, lists with `parse_failed`, and has a `malformed_base` diagnostic under its path in `get_diagnostics`); **base targets and the view subpath** — a link whose target reaches a `.base` resolves to it, and a subpath on a base is a view name matched exactly (`![[Books.base#Table]]` resolves with subpath `{"kind":"view","value":"Table"}`; an undeclared view is `missing_subpath` with a `missing_view` diagnostic; a block subpath on a base is `missing_subpath`); a reference keeps its parsed subpath as `heading` — only the *resolution* names a view; **The cell model** — the fifteen cell kinds exactly as Task 11 defines them, one line each, including the ISO date form, durations as milliseconds plus calendar months, whole numbers as integers, and `{"kind":"error","message":…}` for a cell whose expression failed on that row (its row stays); **property types** — read from the vault's `.obsidian/types.json` on each evaluation; **the language** — the whole published reference, with the evaluation order (prefilters, filters, formulas, sort, limit, groupBy, summaries) and the rule that where neither a published page nor a runtime capture fixes a behaviour the answer is an error naming the case.
+2. A new top-level section `## Bases`, after **Snapshot sessions** and before **Transports**, holding: how a `.base` is indexed (reconciled in the same generation as notes, on both routes; a base that does not parse is still indexed, still resolves, lists with `parse_failed`, and has a `malformed_base` diagnostic under its path in `get_diagnostics`); **base targets and the view subpath** — a link whose target reaches a `.base` resolves to it, and a subpath on a base is a view name matched exactly (`![[Books.base#Table]]` resolves with subpath `{"kind":"view","value":"Table"}`; an undeclared view is `missing_subpath` with a `missing_view` diagnostic; a block subpath on a base is `missing_subpath`); a reference keeps its parsed subpath as `heading` — only the *resolution* names a view; **The cell model** — the fourteen cell kinds plus `unknown` (the client-side catch-all the server never emits), exactly as Task 11 defines them, one line each, including the ISO date form, durations as milliseconds plus calendar months, whole numbers as integers, and `{"kind":"error","message":…}` for a cell whose expression failed on that row (its row stays); **property types** — read from the vault's `.obsidian/types.json` on each evaluation; **the language** — the whole published reference, with the evaluation order (prefilters, filters, formulas, sort, limit, groupBy, summaries) and the rule that where neither a published page nor a runtime capture fixes a behaviour the answer is an error naming the case.
 
 3. Under **Events**, after `### config_changed`, add:
 
@@ -11793,11 +12489,11 @@ Every function on the published reference appears in exactly one task's checklis
 
 ## Self-review
 
-**1. Spec coverage.** The table above walks every section and bullet of the spec. Three spec statements needed a choice the spec does not make, and each is a ruling named in the plan report rather than decided silently: property types are read from `.obsidian/types.json` (the spec never names where types come from); the copy script excludes a guarded private folder (the spec says "the real vault's 51 bases", and that folder's notes must not leave it); and the staleness rule gains two conservative clauses (`this`, and notes whose references re-resolved) so its documented approximation has no false negative.
+**1. Spec coverage.** The table above walks every section and bullet of the spec. Three spec points were ruled by the controller on the consistency review and are implemented as ruled: `summaries` on the wire is an object from name (the view's `summaries` key) to typed value; a duration keeps `months` because the published duration-unit table lists months; an object cell is an ordered `{key, value}` entry list, as the protocol's property DTO already represents mappings, recorded in the spec as a fact correction in the same commit. A filter statement that errors is three-valued *unknown* (Task 7), so an error inside `not` excludes the row like an error anywhere else, provisional until `filter:error_row` is captured. Three spec statements needed a choice the spec does not make, and each is a ruling named in the plan report rather than decided silently: property types are read from `.obsidian/types.json` (the spec never names where types come from); the copy script excludes a guarded private folder (the spec counts the maintainer's bases, and the vault policy forbids moving that material out of its area); and the staleness rule gains two conservative clauses (`this`, and notes whose references re-resolved) so its documented approximation has no false negative; both clauses and the `reresolved` computation have their own tests (Task 12), and the rule runs on every committed generation and reloads its base catalog after any gap, so a base created while no client listened is still tracked.
 
 **2. Placeholder scan.** No `TBD`, `TODO`, "implement later", "add error handling", "add validation", "handle edge cases", "write tests for the above", or "similar to Task N". Task 13's stage 5 cannot carry the code it will write — the captures decide it — so it names, for every uncaptured case and provisional rule, the exact function to change, the fixture row to flip, and the probe that settles it; that is the capture-driven table the spec asks for, not an unwritten step.
 
-**3. Type consistency.** Checked against the Shared names table: `parse_base` and `BaseFile` (1, 10, 11); `Expr` with `position` on `Call` and `Method` (2, 7); `RowSource`'s nine methods and `Prefilter`/`ScalarLiteral` defined in Task 3's `source.rs`, extracted in 7, served in 11, matched in 12; `EvalContext::new` with four arguments and `with_formulas` (3), `reborrow` (7); `typed_property` widened from three to four parameters in 6, and every later caller uses four; `Cell = Result<Value, EvalError>` (7, 11); `ResolutionNote.views` (8, 10); `BaseRecord`/`BaseDelta`/`BaseReplacement` (10, 11, 12); `BaseQuery` with `types` (11, 13); `evaluate_base` in `vault-server` gains `tracker` in 12 and every caller passes it; `LiveRefreshReport.reresolved` added in 12 and consumed only there; `DEFAULT_BASE_CACHE_ENTRIES` (11, 12, 14).
+**3. Type consistency.** Checked against the Shared names table: `parse_base` and `BaseFile` (1, 10, 11); `Expr` with `position` on `Call` and `Method` (2, 7); `RowSource`'s nine methods and `Prefilter`/`ScalarLiteral` defined in Task 3's `source.rs`, extracted in 7, served in 11, matched in 12; `EvalContext::new` with four arguments and `with_formulas` (3), `reborrow` (7); `typed_property` widened from three to four parameters in 6, and every later caller uses four; `Cell = Result<Value, EvalError>` (7, 11); `ResolutionNote.views` (8, 10); `BaseRecord`/`BaseDelta`/`BaseReplacement` (10, 11, 12); `BaseQuery` with `types` (11, 13); `evaluate_base` in `vault-server` is `(reader, cache, types, params)` in 11 and `(reader, cache, tracker, types, params)` from 12, with its one caller updated in 12; `list_bases(reader, params)` (11); `capture_vault(props)` (6, 13); `summaries` is `BTreeMap<String, CellDto>` everywhere it is built or read (11, 15, 16) and no `SummaryDto` remains; `LiveRefreshReport.reresolved` and `BatchOutcome.reresolved` added in 12, consumed by the rule and pinned by `tests/reresolved.rs`; `fill_template`/`TemplateFacts` (13, used by `check_family` and the replay); `scratch_root`/`scratch` in every new test that makes a directory; `IndexService::publish_delta`'s new last parameter `bases` (10) passed by its one production caller and every test caller; `DEFAULT_BASE_CACHE_ENTRIES` (11, 12, 14).
 
 **4. Review Focus.** Each of the five lines has its test in its owning task: the superset property (7 and 11), the YAML-but-not-a-base shapes (1), the formula cycle (7), Unicode positions and view names (4, 8), and the vault changing under a view (11, 12).
 
