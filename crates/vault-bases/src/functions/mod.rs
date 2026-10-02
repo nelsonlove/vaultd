@@ -7,24 +7,55 @@
 
 mod any;
 mod date;
+pub(crate) mod file;
 mod global;
+mod link;
 mod list;
 mod number;
 mod object;
 mod regexp;
 mod string;
 
-use vault_core::PropertyValue;
+use vault_core::{PropertyValue, VaultPath};
 
 use crate::eval::{EvalContext, EvalError, Scope, property_value};
 use crate::expr::{BinaryOp, Expr};
 use crate::source::PropertyType;
 use crate::value::Value;
 
-/// A property value with its declared type applied: a date- or
+/// Every wikilink string in `value` (in lists too) as a `Link` resolved from
+/// `row`. One call per list level, with a small frame: the depth is the
+/// YAML's, and `property_value` already walks it the same way.
+fn links_in(ctx: &EvalContext<'_>, row: Option<&VaultPath>, value: Value) -> Value {
+    match value {
+        Value::String(text) => match (row, link::parse_wikilink(&text)) {
+            (Some(row), Some(_)) => link::make_link(ctx, row, &text, None)
+                .map(Value::Link)
+                .unwrap_or(Value::String(text)),
+            _ => Value::String(text),
+        },
+        Value::List(items) => Value::List(
+            items
+                .into_iter()
+                .map(|item| links_in(ctx, row, item))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// A property value with its declared type applied, and with every wikilink
+/// written in frontmatter as a `Link` — the syntax page: "Wikilinks in
+/// frontmatter properties are automatically recognized as Link objects."
+/// Links resolve from `row`, the note that wrote them. A date- or
 /// datetime-typed property's text becomes a date (text that does not parse
-/// stays text, as Obsidian shows it). Task 6 adds frontmatter links.
-pub(crate) fn typed_property(ctx: &EvalContext<'_>, key: &str, value: &PropertyValue) -> Value {
+/// stays text, as Obsidian shows it).
+pub(crate) fn typed_property(
+    ctx: &EvalContext<'_>,
+    row: Option<&VaultPath>,
+    key: &str,
+    value: &PropertyValue,
+) -> Value {
     let plain = property_value(value);
     match (ctx.source.property_type(key), &plain) {
         (Some(PropertyType::Date | PropertyType::DateTime), Value::String(text)) => {
@@ -32,7 +63,7 @@ pub(crate) fn typed_property(ctx: &EvalContext<'_>, key: &str, value: &PropertyV
                 .map(Value::Date)
                 .unwrap_or(plain)
         }
-        _ => plain,
+        _ => links_in(ctx, row, plain),
     }
 }
 
@@ -58,6 +89,9 @@ pub(crate) fn call_global(
     }
     if date::GLOBALS.contains(&name) {
         return date::call_global(name, args, ctx, scope);
+    }
+    if link::GLOBALS.contains(&name) {
+        return link::call_global(name, args, ctx, scope);
     }
     Err(EvalError::UnknownFunction(name.to_string()))
 }
@@ -87,6 +121,8 @@ pub(crate) fn call_method(
         Value::Object(entries) => object::call(entries, name, args),
         Value::Regexp(regexp) => regexp::call(&regexp, name, args, ctx, scope),
         Value::Date(date) => date::call(date, name, args, ctx, scope),
+        Value::File(path) => file::call(&path, name, args, ctx, scope),
+        Value::Link(link) => link::call(&link, name, args, ctx, scope),
         other => Err(EvalError::NoSuchMethod {
             target: other.type_name(),
             name: name.to_string(),
@@ -100,6 +136,7 @@ pub(crate) fn field(target: &Value, name: &str, ctx: &EvalContext<'_>) -> Result
         Value::String(text) => string::field(text, name),
         Value::List(items) => list::field(items, name),
         Value::Date(date) => date::field(*date, name, ctx),
+        Value::File(path) => file::field(path, name, ctx),
         other => Err(EvalError::NoSuchField {
             target: other.type_name(),
             name: name.to_string(),
@@ -108,7 +145,9 @@ pub(crate) fn field(target: &Value, name: &str, ctx: &EvalContext<'_>) -> Result
 }
 
 pub fn is_known_global(name: &str) -> bool {
-    global::GLOBALS.contains(&name) || date::GLOBALS.contains(&name)
+    global::GLOBALS.contains(&name)
+        || date::GLOBALS.contains(&name)
+        || link::GLOBALS.contains(&name)
 }
 
 pub fn is_known_method(name: &str) -> bool {
@@ -120,6 +159,8 @@ pub fn is_known_method(name: &str) -> bool {
         object::METHODS,
         regexp::METHODS,
         date::METHODS,
+        file::METHODS,
+        link::METHODS,
     ]
     .iter()
     .any(|methods| methods.contains(&name))

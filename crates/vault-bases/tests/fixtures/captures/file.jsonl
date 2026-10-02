@@ -1,0 +1,36 @@
+{"family":"file","case":"name","expr":"file.name","kind":"string","expect_from":"corpus","template":"{name}","source":"published"}
+{"family":"file","case":"basename","expr":"file.basename","kind":"string","expect_from":"corpus","template":"{basename}","source":"published"}
+{"family":"file","case":"path","expr":"file.path","kind":"string","expect_from":"corpus","template":"{path}","source":"published"}
+{"family":"file","case":"folder:root","expr":"file.folder","kind":"error","source":"uncaptured"}
+{"family":"file","case":"ext","expr":"file.ext","kind":"string","text":"md","source":"published"}
+{"family":"file","case":"ext_filter","expr":"file.ext == \"md\"","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"size","expr":"file.size","kind":"number","expect_from":"corpus","template":"{size}","source":"published"}
+{"family":"file","case":"ctime","expr":"file.ctime.format(\"YYYY-MM-DD HH:mm\")","kind":"string","expect_from":"corpus","template":"{ctime:YYYY-MM-DD HH:mm}","source":"published"}
+{"family":"file","case":"mtime_within_week","expr":"file.mtime > now() - \"1 week\"","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"age","expr":"now() - file.ctime","kind":"duration","expect_from":"corpus","template":"{age_ms}","source":"published"}
+{"family":"file","case":"properties","expr":"file.properties.keys()","props":{"a":1,"b":2},"kind":"list","text":"a, b","source":"published"}
+{"family":"file","case":"tags:spelling","expr":"file.tags","kind":"error","source":"uncaptured"}
+{"family":"file","case":"links","expr":"file.links.length","kind":"number","text":"2","source":"published"}
+{"family":"file","case":"links_resolve","expr":"file.links[0].asFile().path","kind":"string","text":"Other.md","source":"published"}
+{"family":"file","case":"embeds","expr":"file.embeds.length","kind":"number","text":"1","source":"published"}
+{"family":"file","case":"backlinks","expr":"file.backlinks[0].name","kind":"string","text":"Other.md","source":"published"}
+{"family":"file","case":"file_field","expr":"file.file.path","kind":"string","expect_from":"corpus","template":"{path}","source":"published"}
+{"family":"file","case":"asLink","expr":"file.asLink()","kind":"link","expect_from":"corpus","template":"{name}","source":"published"}
+{"family":"file","case":"asLink:display","expr":"file.asLink(\"Display\")","kind":"link","text":"Display","source":"published"}
+{"family":"file","case":"hasLink:string","expr":"file.hasLink(\"Other\")","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"hasLink:link","expr":"file.hasLink(link(\"Other\"))","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"hasLink:absent","expr":"file.hasLink(\"Folder/Deep/Inner.md\")","kind":"boolean","text":"false","source":"published"}
+{"family":"file","case":"hasLink:embed","expr":"file.hasLink(\"Folder/image.png\")","kind":"error","source":"uncaptured"}
+{"family":"file","case":"hasLink:this","expr":"file.hasLink(this.file)","kind":"boolean","text":"false","source":"published"}
+{"family":"file","case":"hasProperty","expr":"file.hasProperty(\"a\")","props":{"a":1},"kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"hasProperty:absent","expr":"file.hasProperty(\"b\")","props":{"a":1},"kind":"boolean","text":"false","source":"published"}
+{"family":"file","case":"hasTag","expr":"file.hasTag(\"book\")","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"hasTag:case","expr":"file.hasTag(\"BOOK\")","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"hasTag:nested","expr":"file.hasTag(\"project\")","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"hasTag:prefix_is_not_nesting","expr":"file.hasTag(\"proj\")","kind":"boolean","text":"false","source":"published"}
+{"family":"file","case":"hasTag:any_of","expr":"file.hasTag(\"tag1\", \"#book\")","kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"inFolder:not","expr":"file.inFolder(\"Folder\")","kind":"boolean","text":"false","source":"published"}
+{"family":"file","case":"this_name","expr":"this.file.name","kind":"string","text":"Capture.md","source":"published"}
+{"family":"file","case":"frontmatter_link_equals_this","expr":"author == this","props":{"author":"[[Capture]]"},"kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"frontmatter_links_contain_this","expr":"authors.contains(this)","props":{"authors":["[[Other]]","[[Capture]]"]},"kind":"boolean","text":"true","source":"published"}
+{"family":"file","case":"frontmatter_link_display","expr":"author","props":{"author":"[[Other|The other]]"},"kind":"link","text":"The other","source":"published"}

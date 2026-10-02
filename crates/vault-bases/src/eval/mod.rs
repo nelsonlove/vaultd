@@ -140,8 +140,8 @@ impl Scope {
 }
 
 /// A YAML property value as a Bases value. A declared date type is applied
-/// by `functions::typed_property`; links in frontmatter by
-/// `functions::link::frontmatter_links` (Task 6). Here: the YAML types.
+/// and wikilinks in frontmatter become links in `functions::typed_property`.
+/// Here: the YAML types.
 pub(crate) fn property_value(value: &PropertyValue) -> Value {
     match value {
         PropertyValue::Null => Value::Null,
@@ -177,7 +177,7 @@ pub(crate) fn row_property(
     Ok(properties
         .iter()
         .find(|(have, _)| have == key)
-        .map(|(_, value)| functions::typed_property(ctx, key, value))
+        .map(|(_, value)| functions::typed_property(ctx, Some(row), key, value))
         .unwrap_or(Value::Null))
 }
 
@@ -414,7 +414,12 @@ fn identifier(name: &str, ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value,
                 ctx.source
                     .properties(row)?
                     .iter()
-                    .map(|(key, value)| (key.clone(), functions::typed_property(ctx, key, value)))
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            functions::typed_property(ctx, Some(row), key, value),
+                        )
+                    })
                     .collect(),
             ))
         }

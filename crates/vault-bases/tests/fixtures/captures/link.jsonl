@@ -1,0 +1,16 @@
+{"family":"link","case":"link","expr":"link(\"Other\")","kind":"link","text":"Other","source":"published"}
+{"family":"link","case":"link:display","expr":"link(\"Other\", \"display\")","kind":"link","text":"display","source":"published"}
+{"family":"link","case":"link:icon_display","expr":"link(\"Other\", icon(\"plus\"))","kind":"link","text":"plus","source":"published"}
+{"family":"link","case":"link:url","expr":"link(\"https://obsidian.md\")","kind":"link","text":"https://obsidian.md","source":"published"}
+{"family":"link","case":"link:from_date_string","expr":"link(file.ctime.date().toString())","kind":"error","source":"uncaptured"}
+{"family":"link","case":"asFile","expr":"link(\"[[Other]]\").asFile().path","kind":"string","text":"Other.md","source":"published"}
+{"family":"link","case":"asFile:unresolved","expr":"link(\"Nowhere\").asFile()","kind":"null","text":"","source":"published"}
+{"family":"link","case":"asFile:url","expr":"link(\"https://obsidian.md\").asFile()","kind":"null","text":"","source":"published"}
+{"family":"link","case":"linksTo","expr":"link(\"Other\").linksTo(this)","kind":"boolean","text":"true","source":"published"}
+{"family":"link","case":"linksTo:not","expr":"link(\"Other\").linksTo(file(\"Folder/image.png\"))","kind":"boolean","text":"false","source":"published"}
+{"family":"link","case":"file:from_link","expr":"file(link(\"[[Other]]\")).path","kind":"string","text":"Other.md","source":"published"}
+{"family":"link","case":"file:from_path","expr":"file(\"Other.md\").name","kind":"string","text":"Other.md","source":"published"}
+{"family":"link","case":"file:missing","expr":"file(\"path to file\")","kind":"error","source":"uncaptured"}
+{"family":"link","case":"equal:same_file","expr":"link(\"Other\") == link(\"[[Other]]\")","kind":"boolean","text":"true","source":"published"}
+{"family":"link","case":"equal:unresolved_same_text","expr":"link(\"Nowhere\") == link(\"Nowhere\")","kind":"boolean","text":"true","source":"published"}
+{"family":"link","case":"equal:file","expr":"link(\"Other\") == file(\"Other.md\")","kind":"boolean","text":"true","source":"published"}
