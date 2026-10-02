@@ -14,12 +14,37 @@ pub(crate) const METHODS: &[&str] = &["asFile", "linksTo"];
 
 /// `[[Target|Display]]` or `[[Target]]` as written in a property, else
 /// `None`. The display half is kept; the subpath stays in the target text.
+/// Exactly one wikilink: text holding a second `[[` or `]]`
+/// (`"[[a]] and [[b]]"`) or an empty target (`"[[]]"`) is not one.
 pub(crate) fn parse_wikilink(text: &str) -> Option<(String, Option<String>)> {
     let inner = text.trim().strip_prefix("[[")?.strip_suffix("]]")?;
-    Some(match inner.split_once('|') {
-        Some((target, display)) => (target.to_string(), Some(display.to_string())),
-        None => (inner.to_string(), None),
-    })
+    if inner.contains("[[") || inner.contains("]]") {
+        return None;
+    }
+    let (target, display) = match inner.split_once('|') {
+        Some((target, display)) => (target, Some(display.to_string())),
+        None => (inner, None),
+    };
+    if target.trim().is_empty() {
+        return None;
+    }
+    Some((target.to_string(), display))
+}
+
+/// The file `spelling` names, written in `from`: a wikilink's brackets come
+/// off first, and a URL names no file. `make_link`, `hasLink` and `linksTo`
+/// all resolve a string this way.
+pub(crate) fn resolve_spelling(
+    ctx: &EvalContext<'_>,
+    from: &VaultPath,
+    spelling: &str,
+) -> Result<Option<VaultPath>, EvalError> {
+    let target =
+        parse_wikilink(spelling).map_or_else(|| spelling.to_string(), |(target, _)| target);
+    if is_url(&target) {
+        return Ok(None);
+    }
+    Ok(ctx.source.resolve(from, &target)?)
 }
 
 /// `scheme://…` with a URL scheme (RFC 3986: a letter, then letters, digits,
@@ -41,20 +66,33 @@ pub(crate) fn make_link(
     target: &str,
     display: Option<Value>,
 ) -> Result<LinkValue, EvalError> {
+    let resolved = resolve_spelling(ctx, from, target)?;
     let (target, written_display) = match parse_wikilink(target) {
         Some((target, display)) => (target, display),
         None => (target.to_string(), None),
-    };
-    let resolved = if is_url(&target) {
-        None
-    } else {
-        ctx.source.resolve(from, &target)?
     };
     Ok(LinkValue {
         target,
         display: display.or(written_display.map(Value::String)).map(Box::new),
         resolved,
     })
+}
+
+/// Whether `from` links to `wanted`, the one rule `file.hasLink` and
+/// `link.linksTo` share. **Provisional** (cases `hasLink:embed` and
+/// `linksTo:embed`, settled by Task 13's capture): an embed counts as a
+/// link, as it counts as a backlink.
+pub(crate) fn reaches(
+    ctx: &EvalContext<'_>,
+    from: &VaultPath,
+    wanted: &VaultPath,
+) -> Result<bool, EvalError> {
+    let hits = |facts: Vec<crate::source::LinkFact>| {
+        facts
+            .iter()
+            .any(|fact| fact.resolved.as_ref() == Some(wanted))
+    };
+    Ok(hits(ctx.source.links(from)?) || hits(ctx.source.embeds(from)?))
 }
 
 fn missing() -> EvalError {
@@ -150,18 +188,13 @@ pub(crate) fn call(
             let wanted = match wanted {
                 Some(Value::File(path)) => Some(path),
                 Some(Value::Link(other)) => other.resolved,
-                Some(Value::String(spelling)) => ctx.source.resolve(from, &spelling)?,
+                Some(Value::String(spelling)) => resolve_spelling(ctx, from, &spelling)?,
                 _ => return Err(EvalError::Argument("linksTo takes a file".into())),
             };
             let Some(wanted) = wanted else {
                 return Ok(Value::Boolean(false));
             };
-            Ok(Value::Boolean(
-                ctx.source
-                    .links(from)?
-                    .iter()
-                    .any(|fact| fact.resolved.as_ref() == Some(&wanted)),
-            ))
+            Ok(Value::Boolean(reaches(ctx, from, &wanted)?))
         }
         _ => Err(EvalError::NoSuchMethod {
             target: "link",

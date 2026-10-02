@@ -187,15 +187,32 @@ pub(crate) fn row_property(
     scope: &Scope,
     key: &str,
 ) -> Result<Value, EvalError> {
-    let Some(row) = &scope.row else {
-        return Ok(Value::Null);
-    };
-    let properties = ctx.source.properties(row)?;
+    match &scope.row {
+        Some(row) => file_property(ctx, row, key),
+        None => Ok(Value::Null),
+    }
+}
+
+/// A note property of `path`, by exact key, typed and with its frontmatter
+/// links resolved from `path`. Missing (or not a note) is `null`.
+fn file_property(ctx: &EvalContext<'_>, path: &VaultPath, key: &str) -> Result<Value, EvalError> {
+    let properties = ctx.source.properties(path)?;
     Ok(properties
         .iter()
         .find(|(have, _)| have == key)
-        .map(|(_, value)| functions::typed_property(ctx, Some(row), key, value))
+        .map(|(_, value)| functions::typed_property(ctx, Some(path), key, value))
         .unwrap_or(Value::Null))
+}
+
+/// `this.<name>`: the syntax page says `this` "points to properties of the
+/// embedding file", so any name but `file` is that file's property; `file`
+/// is the file itself. With nothing embedding the base, `this` is the base,
+/// which has no properties, so every property is `null`.
+fn this_member(ctx: &EvalContext<'_>, name: &str) -> Result<Value, EvalError> {
+    match name {
+        "file" => Ok(Value::File(ctx.this_path.clone())),
+        _ => file_property(ctx, ctx.this_path, name),
+    }
 }
 
 fn row_file(scope: &Scope) -> Result<Value, EvalError> {
@@ -467,6 +484,7 @@ fn member(
             match root.as_str() {
                 "note" => return row_property(ctx, scope, name),
                 "formula" => return ctx.formulas.formula(name, ctx, scope),
+                "this" => return this_member(ctx, name),
                 _ => {}
             }
         }
@@ -492,6 +510,9 @@ fn index_of(
     if let (Expr::Identifier(root), Expr::String(key)) = (target, index) {
         if root == "note" && scope.local(root).is_none() {
             return row_property(ctx, scope, key);
+        }
+        if root == "this" && scope.local(root).is_none() {
+            return this_member(ctx, key);
         }
     }
     let value = evaluate(target, ctx, scope)?;

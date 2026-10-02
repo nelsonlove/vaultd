@@ -187,7 +187,8 @@ pub fn render_text(value: &Value, clock: &Clock) -> String {
 
 /// The vault every capture row runs against, from Task 6 on. `Capture.md`
 /// is the row (and `this`); the others exist to be linked, embedded and
-/// listed. A row's `props` are added to `Capture.md`.
+/// listed (Task 13's generator writes the same companions at the same
+/// paths). A row's `props` are added to `Capture.md`.
 pub fn capture_vault(props: &[(String, PropertyValue)]) -> MemorySource {
     let mut capture = MemoryFile::note()
         .times(FIXTURE_NOW_MS - 86_400_000, FIXTURE_NOW_MS - 3_600_000)
@@ -210,6 +211,10 @@ pub fn capture_vault(props: &[(String, PropertyValue)]) -> MemorySource {
         )
         .with("Folder/image.png", MemoryFile::attachment(1000))
         .with("Folder/Deep/Inner.md", MemoryFile::note())
+        // A name with no extension and a dotfile, for `name`, `basename`
+        // and `ext`.
+        .with("Folder/README", MemoryFile::attachment(10))
+        .with("Folder/.gitignore", MemoryFile::attachment(5))
 }
 
 /// The row file's own facts a template may name.
@@ -224,6 +229,12 @@ pub struct TemplateFacts {
 /// `{ctime:<fmt>}`, `{mtime:<fmt>}` and `{age_ms}` (`now - ctime`) from
 /// `facts`. An unknown token is copied as written, so a misspelt template
 /// goes red rather than silently empty.
+///
+/// Two limits. `{ctime:<fmt>}` and `{mtime:<fmt>}` format with
+/// `dates::format_date`, the formatter `file.ctime.format(…)` itself calls,
+/// so such a row tests the instant, not the formatter (the `date` family
+/// tests that). `{folder}` of a root file is the unsettled `folder:root`
+/// case, so it is left as `{folder}` and goes red rather than encode `""`.
 pub fn fill_template(template: &str, facts: &TemplateFacts, clock: &Clock) -> String {
     let name = facts
         .path
@@ -238,8 +249,7 @@ pub fn fill_template(template: &str, facts: &TemplateFacts, clock: &Clock) -> St
     let folder = facts
         .path
         .rsplit_once('/')
-        .map(|(folder, _)| folder.to_string())
-        .unwrap_or_default();
+        .map_or_else(|| "{folder}".to_string(), |(folder, _)| folder.to_string());
     let date = |ms: i64, format: &str| {
         crate::dates::format_date(
             crate::DateValue {

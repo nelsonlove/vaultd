@@ -161,12 +161,12 @@ impl MemoryFile {
     }
 }
 
-/// An in-memory vault for tests: no I/O, resolution by exact path, path plus
-/// `.md`, or a unique case-insensitive file name or stem. These are three of
-/// the stages `vault_core::Resolver` uses, not all: it ignores `from`, so a
-/// same-file link (`[[#heading]]`) and a `./` or `../` relative link resolve
-/// to nothing here, where the daemon's resolver resolves them. A test that
-/// needs either must not rely on this source.
+/// An in-memory vault for tests: no I/O, resolution by the stages
+/// `vault_core::Resolver` uses — a same-file link (`[[#heading]]`) is the
+/// writing note; a `./` or `../` link is an exact path relative to the
+/// writing note's folder (nothing when it climbs above the root); otherwise
+/// an exact path, path plus `.md`, or a unique case-insensitive file name or
+/// stem. An ambiguous name resolves to nothing here, as it does there.
 ///
 /// It also records what it was asked ([`MemorySource::log`]), so a test can
 /// show that a prefilter narrowed the rows the source had to read, not only
@@ -254,13 +254,27 @@ impl MemorySource {
         self.files.get(path)
     }
 
-    fn lookup(&self, target: &str) -> Option<VaultPath> {
-        let file_part = target
+    fn lookup(&self, from: &VaultPath, target: &str) -> Option<VaultPath> {
+        let spelled = target
             .trim_start_matches("[[")
             .trim_end_matches("]]")
-            .split(['#', '|'])
+            .split('|')
             .next()
             .unwrap_or_default();
+        let file_part = spelled.split('#').next().unwrap_or_default();
+        // A same-file link (`[[#heading]]`) is the note that wrote it.
+        if file_part.is_empty() {
+            return spelled.starts_with('#').then(|| from.clone());
+        }
+        // `./` and `../` are relative to the writing note's folder, and only
+        // an exact path (or path plus `.md`) answers them.
+        if file_part.starts_with("./") || file_part.starts_with("../") {
+            let relative = relative_to(from, file_part)?;
+            return [relative.clone(), format!("{relative}.md")]
+                .into_iter()
+                .filter_map(|spelling| VaultPath::new(spelling).ok())
+                .find(|path| self.files.contains_key(path));
+        }
         for spelling in [file_part.to_string(), format!("{file_part}.md")] {
             if let Ok(path) = VaultPath::new(spelling) {
                 if self.files.contains_key(&path) {
@@ -296,6 +310,26 @@ impl MemorySource {
             }
         }
     }
+}
+
+/// `spelling` (`./x` or `../x`) against the folder of `from`, as
+/// `vault_core`'s resolver normalises it; `None` above the vault root.
+fn relative_to(from: &VaultPath, spelling: &str) -> Option<String> {
+    let mut stack: Vec<&str> = from.as_str().split('/').collect();
+    stack.pop();
+    for component in spelling.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            component => stack.push(component),
+        }
+    }
+    if stack.is_empty() {
+        return None;
+    }
+    Some(stack.join("/"))
 }
 
 /// A path's extension without the dot, `""` when it has none — the same
@@ -352,7 +386,7 @@ impl RowSource for MemorySource {
                     .map(|target| LinkFact {
                         raw_target: target.clone(),
                         display: None,
-                        resolved: self.lookup(target),
+                        resolved: self.lookup(path, target),
                     })
                     .collect()
             })
@@ -368,7 +402,7 @@ impl RowSource for MemorySource {
                     .map(|target| LinkFact {
                         raw_target: target.clone(),
                         display: None,
-                        resolved: self.lookup(target),
+                        resolved: self.lookup(path, target),
                     })
                     .collect()
             })
@@ -380,18 +414,18 @@ impl RowSource for MemorySource {
         Ok(self
             .files
             .iter()
-            .filter(|(_, file)| {
+            .filter(|(source, file)| {
                 file.links
                     .iter()
                     .chain(file.embeds.iter())
-                    .any(|target| self.lookup(target).as_ref() == Some(path))
+                    .any(|target| self.lookup(source, target).as_ref() == Some(path))
             })
             .map(|(source, _)| source.clone())
             .collect())
     }
 
-    fn resolve(&self, _from: &VaultPath, target: &str) -> Result<Option<VaultPath>, SourceError> {
-        Ok(self.lookup(target))
+    fn resolve(&self, from: &VaultPath, target: &str) -> Result<Option<VaultPath>, SourceError> {
+        Ok(self.lookup(from, target))
     }
 
     fn property_type(&self, key: &str) -> Option<PropertyType> {

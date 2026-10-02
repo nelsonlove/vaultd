@@ -4,7 +4,7 @@ use vault_core::VaultPath;
 
 use crate::eval::{EvalContext, EvalError, Scope};
 use crate::expr::Expr;
-use crate::source::{FileKind, LinkFact, extension};
+use crate::source::{FileKind, LinkFact, extension, folder_key};
 use crate::value::{DateValue, LinkValue, Value};
 
 use super::{arity, eager, typed_property};
@@ -12,7 +12,7 @@ use super::{arity, eager, typed_property};
 pub(crate) const METHODS: &[&str] = &["asLink", "hasLink", "hasProperty", "hasTag", "inFolder"];
 #[allow(
     dead_code,
-    reason = "the published field list; Task 7's compile step is its first reader"
+    reason = "the family's published field list; no reader in this phase"
 )]
 pub(crate) const FIELDS: &[&str] = &[
     "name",
@@ -55,6 +55,16 @@ fn tag_matches(tag: &str, wanted: &str) -> bool {
     tag == wanted || tag.starts_with(&format!("{wanted}/"))
 }
 
+/// The file name without its extension; a dotfile (`.gitignore`) and a name
+/// with no dot keep the whole name, as [`extension`] gives them none.
+fn basename(path: &VaultPath) -> &str {
+    let name = path.name();
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => &name[..dot],
+        _ => name,
+    }
+}
+
 pub(crate) fn field(
     path: &VaultPath,
     name: &str,
@@ -69,13 +79,7 @@ pub(crate) fn field(
         "file" => Value::File(path.clone()),
         "path" => Value::String(path.as_str().to_string()),
         "name" => Value::String(path.name().to_string()),
-        "basename" => {
-            let file_name = path.name();
-            Value::String(match file_name.rfind('.') {
-                Some(dot) if dot > 0 => file_name[..dot].to_string(),
-                _ => file_name.to_string(),
-            })
-        }
+        "basename" => Value::String(basename(path).to_string()),
         "ext" => Value::String(extension(path).to_string()),
         // Whether a root file's folder is `""` or `"/"` is not published.
         "folder" => match path.as_str().rsplit_once('/') {
@@ -136,7 +140,7 @@ fn target_path(
     Ok(match value {
         Value::File(path) => Some(path),
         Value::Link(link) => link.resolved,
-        Value::String(spelling) => ctx.source.resolve(from, &spelling)?,
+        Value::String(spelling) => super::link::resolve_spelling(ctx, from, &spelling)?,
         other => {
             return Err(EvalError::Argument(format!(
                 "expected a file or a path, not {}",
@@ -155,32 +159,27 @@ pub(crate) fn call(
 ) -> Result<Value, EvalError> {
     let values = eager(args, ctx, scope)?;
     Ok(match name {
+        // **Provisional** (`asLink`, settled by Task 13's capture): with no
+        // display given, the link shows what Obsidian shows for a link to a
+        // file, its basename.
         "asLink" => {
             arity(name, args, 0, 1)?;
+            let display = values
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Value::String(basename(path).to_string()));
             Value::Link(LinkValue {
                 target: path.as_str().to_string(),
-                display: values.into_iter().next().map(Box::new),
+                display: Some(Box::new(display)),
                 resolved: Some(path.clone()),
             })
         }
         "hasLink" => {
             arity(name, args, 1, 1)?;
             let argument = values.into_iter().next().expect("one argument");
-            let Some(wanted) = target_path(ctx, path, argument)? else {
-                return Ok(Value::Boolean(false));
-            };
-            let reaches = |facts: Vec<LinkFact>| {
-                facts
-                    .iter()
-                    .any(|fact| fact.resolved.as_ref() == Some(&wanted))
-            };
-            if reaches(ctx.source.links(path)?) {
-                Value::Boolean(true)
-            } else if reaches(ctx.source.embeds(path)?) {
-                // Whether an embed counts as a link here is not published.
-                return Err(EvalError::Uncaptured("hasLink:embed".into()));
-            } else {
-                Value::Boolean(false)
+            match target_path(ctx, path, argument)? {
+                Some(wanted) => Value::Boolean(super::link::reaches(ctx, path, &wanted)?),
+                None => Value::Boolean(false),
             }
         }
         "hasProperty" => match values.as_slice() {
@@ -216,10 +215,11 @@ pub(crate) fn call(
         }
         // The functions page: "the specified folder or one of its
         // sub-folders" — a whole path segment, so `Notes` never matches
-        // `Notes2/…`.
+        // `Notes2/…`; the vault root (`""`) holds every file. The folder is
+        // read by `folder_key`, as the prefilter reads it.
         "inFolder" => match values.as_slice() {
             [Value::String(folder)] => {
-                let folder = folder.trim_matches('/');
+                let folder = folder_key(folder);
                 Value::Boolean(
                     folder.is_empty() || path.as_str().starts_with(&format!("{folder}/")),
                 )
@@ -238,7 +238,6 @@ pub(crate) fn call(
 }
 
 /// Whether a row is a note, for the row's `kind`.
-#[allow(dead_code, reason = "read by view::evaluate_view from Task 7")]
 pub(crate) fn kind_of(ctx: &EvalContext<'_>, path: &VaultPath) -> Result<FileKind, EvalError> {
     Ok(ctx
         .source

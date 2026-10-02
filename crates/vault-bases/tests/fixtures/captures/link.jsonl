@@ -13,4 +13,5 @@
 {"family":"link","case":"file:missing","expr":"file(\"path to file\")","kind":"error","source":"uncaptured"}
 {"family":"link","case":"equal:same_file","expr":"link(\"Other\") == link(\"[[Other]]\")","kind":"boolean","text":"true","source":"published"}
 {"family":"link","case":"equal:unresolved_same_text","expr":"link(\"Nowhere\") == link(\"Nowhere\")","kind":"boolean","text":"true","source":"published"}
+{"family":"link","case":"linksTo:embed","expr":"link(\"Capture\").linksTo(file(\"Folder/image.png\"))","kind":"boolean","text":"true","source":"provisional"}
 {"family":"link","case":"equal:file","expr":"link(\"Other\") == file(\"Other.md\")","kind":"boolean","text":"true","source":"published"}

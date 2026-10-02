@@ -55,7 +55,7 @@
 {"family":"date","case":"relative:calendar_months","expr":"date(\"2026-02-14 10:30:00\").relative()","kind":"string","text":"2 months ago","source":"provisional","now_ms":1774967400000}
 {"family":"date","case":"relative:twenty_six_days","expr":"(now() - \"26d\").relative()","kind":"string","text":"a month ago","source":"provisional"}
 {"family":"date","case":"relative:twenty_five_days","expr":"(now() - \"25d\").relative()","kind":"string","text":"25 days ago","source":"provisional"}
-{"family":"date","case":"format:unlisted_run","expr":"date(\"2025-01-01 10:00:00.123\").format(\"SSSS\")","kind":"error","source":"published"}
+{"family":"date","case":"format:unlisted_run","expr":"date(\"2025-01-01 10:00:00.123\").format(\"SSSS\")","kind":"error","source":"provisional"}
 {"family":"date","case":"format:unclosed_bracket","expr":"now().format(\"[at\")","kind":"error","source":"provisional"}
 {"family":"date","case":"format:unclosed_bracket_literal","expr":"now().format(\"[HH\")","kind":"string","text":"[10","source":"provisional"}
 {"family":"date","case":"arith:hours_in_whole_days_without_time","expr":"today() + \"24h\"","kind":"date","text":"2026-01-16","source":"provisional"}

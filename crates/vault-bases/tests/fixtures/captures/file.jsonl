@@ -15,12 +15,12 @@
 {"family":"file","case":"embeds","expr":"file.embeds.length","kind":"number","text":"1","source":"published"}
 {"family":"file","case":"backlinks","expr":"file.backlinks[0].name","kind":"string","text":"Other.md","source":"published"}
 {"family":"file","case":"file_field","expr":"file.file.path","kind":"string","expect_from":"corpus","template":"{path}","source":"published"}
-{"family":"file","case":"asLink","expr":"file.asLink()","kind":"link","expect_from":"corpus","template":"{name}","source":"published"}
+{"family":"file","case":"asLink","expr":"file.asLink()","kind":"link","expect_from":"corpus","template":"{basename}","source":"provisional"}
 {"family":"file","case":"asLink:display","expr":"file.asLink(\"Display\")","kind":"link","text":"Display","source":"published"}
 {"family":"file","case":"hasLink:string","expr":"file.hasLink(\"Other\")","kind":"boolean","text":"true","source":"published"}
 {"family":"file","case":"hasLink:link","expr":"file.hasLink(link(\"Other\"))","kind":"boolean","text":"true","source":"published"}
 {"family":"file","case":"hasLink:absent","expr":"file.hasLink(\"Folder/Deep/Inner.md\")","kind":"boolean","text":"false","source":"published"}
-{"family":"file","case":"hasLink:embed","expr":"file.hasLink(\"Folder/image.png\")","kind":"error","source":"uncaptured"}
+{"family":"file","case":"hasLink:embed","expr":"file.hasLink(\"Folder/image.png\")","kind":"boolean","text":"true","source":"provisional"}
 {"family":"file","case":"hasLink:this","expr":"file.hasLink(this.file)","kind":"boolean","text":"false","source":"published"}
 {"family":"file","case":"hasProperty","expr":"file.hasProperty(\"a\")","props":{"a":1},"kind":"boolean","text":"true","source":"published"}
 {"family":"file","case":"hasProperty:absent","expr":"file.hasProperty(\"b\")","props":{"a":1},"kind":"boolean","text":"false","source":"published"}
@@ -34,3 +34,12 @@
 {"family":"file","case":"frontmatter_link_equals_this","expr":"author == this","props":{"author":"[[Capture]]"},"kind":"boolean","text":"true","source":"published"}
 {"family":"file","case":"frontmatter_links_contain_this","expr":"authors.contains(this)","props":{"authors":["[[Other]]","[[Capture]]"]},"kind":"boolean","text":"true","source":"published"}
 {"family":"file","case":"frontmatter_link_display","expr":"author","props":{"author":"[[Other|The other]]"},"kind":"link","text":"The other","source":"published"}
+{"family":"file","case":"inFolder:root","expr":"file.inFolder(\"\")","kind":"boolean","text":"true","source":"provisional"}
+{"family":"file","case":"name:no_extension","expr":"file(\"Folder/README\").name","kind":"string","text":"README","source":"provisional"}
+{"family":"file","case":"basename:no_extension","expr":"file(\"Folder/README\").basename","kind":"string","text":"README","source":"provisional"}
+{"family":"file","case":"ext:no_extension","expr":"file(\"Folder/README\").ext","kind":"string","text":"","source":"provisional"}
+{"family":"file","case":"name:dotfile","expr":"file(\"Folder/.gitignore\").name","kind":"string","text":".gitignore","source":"provisional"}
+{"family":"file","case":"basename:dotfile","expr":"file(\"Folder/.gitignore\").basename","kind":"string","text":".gitignore","source":"provisional"}
+{"family":"file","case":"ext:dotfile","expr":"file(\"Folder/.gitignore\").ext","kind":"string","text":"","source":"provisional"}
+{"family":"file","case":"this_property","expr":"this.status","props":{"status":"draft"},"kind":"string","text":"draft","source":"published"}
+{"family":"file","case":"this_file_is_the_file","expr":"this.file.isType(\"file\")","props":{"file":"shadow"},"kind":"boolean","text":"true","source":"published"}

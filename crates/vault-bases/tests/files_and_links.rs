@@ -1,6 +1,8 @@
 use vault_bases::eval::{EvalContext, Scope, evaluate};
 use vault_bases::expr::parse_expression;
-use vault_bases::fixtures::{FIXTURE_NOW_MS, FIXTURE_ZONE, capture_vault, check_family};
+use vault_bases::fixtures::{
+    FIXTURE_NOW_MS, FIXTURE_ZONE, capture_vault, check_family, render_text,
+};
 use vault_bases::{Clock, MemoryFile, MemorySource, Value, no_span};
 use vault_core::{PropertyValue, VaultPath};
 
@@ -247,7 +249,9 @@ fn this_is_the_embedding_file_when_one_is_given() {
 }
 
 #[test]
-fn this_is_the_base_itself_when_nothing_embeds_it() {
+fn this_given_as_the_base_reads_the_base_file() {
+    // The default (no embedding note, so `this` is the base) is applied by
+    // the caller of `evaluate_view` (Task 11); here the base is given.
     let source = capture_vault(&[]).with("Captures.base", MemoryFile::attachment(7));
     let row = "Capture.md";
     let base = "Captures.base";
@@ -330,4 +334,181 @@ fn a_deeply_nested_frontmatter_list_fits_a_one_mebibyte_stack() {
         "{:?}",
         bottom.1
     );
+}
+
+/// A vault where relative links only resolve from the right folder:
+/// `./Sib` and `./B` exist under `Sub/`, not at the root, where the base is.
+fn relative_vault() -> MemorySource {
+    capture_vault(&[])
+        .with(
+            "Sub/Row.md",
+            MemoryFile::note().property("up", PropertyValue::String("[[./Sib]]".into())),
+        )
+        .with("Sub/Sib.md", MemoryFile::note())
+        .with("Sub/A.md", MemoryFile::note().link("./B"))
+        .with("Sub/B.md", MemoryFile::note())
+}
+
+#[test]
+fn a_frontmatter_link_resolves_from_the_note_that_wrote_it_not_the_base() {
+    let source = relative_vault();
+    let row = "Sub/Row.md";
+    assert_eq!(
+        on(&source, row, row, "up.asFile().path"),
+        Value::String("Sub/Sib.md".into())
+    );
+    assert_eq!(
+        on(&source, row, row, "note.up.asFile().path"),
+        Value::String("Sub/Sib.md".into())
+    );
+    assert_eq!(
+        on(&source, row, row, "file.properties.up.asFile().path"),
+        Value::String("Sub/Sib.md".into())
+    );
+    // `this.up` resolves from `this`, the note that wrote it.
+    assert_eq!(
+        on(&source, "Capture.md", row, "this.up.asFile().path"),
+        Value::String("Sub/Sib.md".into())
+    );
+}
+
+#[test]
+fn links_to_resolves_a_string_from_the_linked_file_and_has_link_from_the_row() {
+    let source = relative_vault();
+    let row = "Capture.md";
+    assert_eq!(
+        on(&source, row, row, r#"link("Sub/A").linksTo("./B")"#),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        on(&source, row, row, r#"link("Sub/A").linksTo("[[./B]]")"#),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        on(&source, "Sub/A.md", row, r#"file.hasLink("./B")"#),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        on(&source, "Sub/A.md", row, "file.links[0].asFile().path"),
+        Value::String("Sub/B.md".into())
+    );
+    assert_eq!(
+        on(&source, "Sub/B.md", row, "file.backlinks[0].path"),
+        Value::String("Sub/A.md".into())
+    );
+    // From the root, `./B` names nothing.
+    assert_eq!(
+        on(&source, row, row, r#"link("./B").asFile()"#),
+        Value::Null
+    );
+    // Climbing above the root names nothing.
+    assert_eq!(
+        on(&source, row, row, r#"link("Sub/A").linksTo("../../B")"#),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn a_same_file_link_is_the_note_that_wrote_it() {
+    let source = capture_vault(&[]).with("Self.md", MemoryFile::note().link("#Heading"));
+    assert_eq!(
+        on(&source, "Self.md", "Self.md", "file.links[0].asFile().path"),
+        Value::String("Self.md".into())
+    );
+}
+
+#[test]
+fn in_folder_reads_the_folder_as_the_prefilter_does() {
+    let inner = "Folder/Deep/Inner.md";
+    // The vault root holds every file.
+    assert_eq!(on_row(inner, r#"file.inFolder("")"#), Value::Boolean(true));
+    assert_eq!(on_row(inner, r#"file.inFolder("/")"#), Value::Boolean(true));
+    assert_eq!(
+        on_row("Capture.md", r#"file.inFolder("")"#),
+        Value::Boolean(true)
+    );
+    // A leading slash names the same folder.
+    assert_eq!(
+        on_row(inner, r#"file.inFolder("/Folder")"#),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        on_row(inner, r#"file.inFolder("/Folder/Deep/")"#),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn this_carries_the_embedding_files_properties_and_file() {
+    let source = capture_vault(&[]);
+    let row = "Folder/Deep/Inner.md";
+    assert_eq!(
+        on(&source, row, "Other.md", "this.status"),
+        Value::String("done".into())
+    );
+    assert_eq!(
+        on(&source, row, "Other.md", r#"this["status"]"#),
+        Value::String("done".into())
+    );
+    assert_eq!(on(&source, row, "Other.md", "this.missing"), Value::Null);
+    assert_eq!(
+        on(&source, row, "Other.md", "this.file"),
+        Value::File(VaultPath::new("Other.md").unwrap())
+    );
+    // The row's own `status` is not `this`'s.
+    assert_eq!(
+        on(&source, "Other.md", "Capture.md", "this.status"),
+        Value::Null
+    );
+    assert_eq!(
+        on(&source, "Other.md", "Capture.md", "status"),
+        Value::String("done".into())
+    );
+    // With no embedding note, `this` is the base, which has no properties.
+    let with_base = source.with("Captures.base", MemoryFile::attachment(7));
+    assert_eq!(
+        on(&with_base, row, "Captures.base", "this.status"),
+        Value::Null
+    );
+    assert_eq!(
+        on(&with_base, row, "Captures.base", "this.file.name"),
+        Value::String("Captures.base".into())
+    );
+}
+
+#[test]
+fn as_link_shows_the_files_basename() {
+    let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
+    let link = on_row("Folder/Deep/Inner.md", "file.asLink()");
+    assert_eq!(render_text(&link, &clock), "Inner");
+    assert_eq!(
+        on_row(
+            "Folder/Deep/Inner.md",
+            r#"file.asLink() == file("Folder/Deep/Inner.md")"#
+        ),
+        Value::Boolean(true)
+    );
+    let named = on_row("Folder/Deep/Inner.md", r#"file.asLink("Named")"#);
+    assert_eq!(render_text(&named, &clock), "Named");
+}
+
+#[test]
+fn text_holding_more_than_one_wikilink_or_an_empty_one_stays_text() {
+    let props = [
+        (
+            "two".to_string(),
+            PropertyValue::String("[[Other]] and [[Capture]]".into()),
+        ),
+        ("empty".to_string(), PropertyValue::String("[[]]".into())),
+        ("bar".to_string(), PropertyValue::String("[[|x]]".into())),
+    ];
+    let source = capture_vault(&props);
+    let row = "Capture.md";
+    for key in ["two", "empty", "bar"] {
+        assert_eq!(
+            on(&source, row, row, &format!(r#"{key}.isType("string")"#)),
+            Value::Boolean(true),
+            "{key}"
+        );
+    }
 }
