@@ -137,6 +137,10 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
         r#"/a/q.matches("a")"#,
         r#"/a(/.matches("a")"#,
         r#"/(?<=a)b/.matches("ab")"#,
+        r#"/a/gg.matches("a")"#,
+        r#"/a/igi.matches("a")"#,
+        r#"/b/y.matches("abc")"#,
+        r#""abc".replace(/b/y, "x")"#,
     ] {
         match run_on_empty_vault(text) {
             Err(EvalError::Argument(message)) => {

@@ -16,3 +16,5 @@
 {"family":"number","case":"abs:wrong_receiver","expr":"\"5\".abs()","kind":"error","source":"published"}
 {"family":"number","case":"round:just_below_half","expr":"(0.49999999999999994).round()","kind":"number","text":"0","source":"published"}
 {"family":"number","case":"toFixed:large","expr":"(1e21).toFixed(2)","kind":"string","text":"1e+21","source":"published"}
+{"family":"number","case":"toFixed:small_negative","expr":"(-0.001).toFixed(2)","kind":"string","text":"-0.00","source":"provisional"}
+{"family":"number","case":"toFixed:negative_zero","expr":"(-0).toFixed(2)","kind":"string","text":"0.00","source":"provisional"}

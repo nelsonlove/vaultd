@@ -235,12 +235,81 @@ fn arithmetic(
     }
 }
 
+/// JavaScript's `\s`: `WhiteSpace` and `LineTerminator`, as class members in
+/// the `regex` crate's syntax. Rust's Unicode `\s` adds U+0085 and lacks
+/// U+FEFF.
+const JS_SPACE_CLASS: &str =
+    r"\t\n\x0B\x0C\r \xA0\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
+
+/// Rewrite JavaScript's character-class escapes into the `regex` crate's
+/// syntax with JavaScript's meaning. Without the `u` flag JavaScript's `\d`
+/// is `[0-9]`, `\w` is `[0-9A-Za-z_]` and `\b` is the boundary of that `\w`;
+/// the `regex` crate's are Unicode-wide (`\d` matches `٣`). `\s` is spelled
+/// out as [`JS_SPACE_CLASS`]. Inside a class (`[\d.]`) the members are
+/// inlined, or nested as a negated class for `\D`, `\W`, `\S`. Every other
+/// escape is copied as written.
+fn javascript_classes(source: &str) -> String {
+    const WORD: &str = "0-9A-Za-z_";
+    let mut out = String::with_capacity(source.len() + 16);
+    let mut in_class = false;
+    let mut chars = source.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let Some(escaped) = chars.next() else {
+                    out.push('\\');
+                    break;
+                };
+                let rewritten = match (escaped, in_class) {
+                    ('d', false) => "[0-9]".to_string(),
+                    ('d', true) => "0-9".to_string(),
+                    ('D', _) => "[^0-9]".to_string(),
+                    // `(?-i:…)` so that case folding cannot widen the class
+                    // (the `regex` crate folds `k` to the Kelvin sign).
+                    ('w', false) => format!("(?-i:[{WORD}])"),
+                    ('w', true) => WORD.to_string(),
+                    ('W', _) => format!("[^{WORD}]"),
+                    ('s', false) => format!("[{JS_SPACE_CLASS}]"),
+                    ('s', true) => JS_SPACE_CLASS.to_string(),
+                    ('S', _) => format!("[^{JS_SPACE_CLASS}]"),
+                    ('b', false) => r"(?-u:\b)".to_string(),
+                    ('B', false) => r"(?-u:\B)".to_string(),
+                    (other, _) => format!("\\{other}"),
+                };
+                out.push_str(&rewritten);
+            }
+            '[' if !in_class => {
+                in_class = true;
+                out.push(c);
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Compile a regular expression literal. The `regex` crate has no
 /// look-around and no back-references; a pattern that needs them is an
 /// argument error naming the pattern, never a silently different match.
+///
+/// Flags: `i`, `m`, `s` map onto the builder; `g` is read by `replace`; `u`
+/// and `d` change nothing the evaluator exposes (`d` adds match indices no
+/// function returns). `y` (sticky) is refused: it anchors each match at the
+/// expression's `lastIndex`, state a Bases value does not carry, so no
+/// function could honour it. A repeated flag is refused, as JavaScript
+/// refuses it.
 pub(crate) fn compile_regexp(source: &str, flags: &str) -> Result<RegexpValue, EvalError> {
-    let mut builder = regex::RegexBuilder::new(source);
-    for flag in flags.chars() {
+    let mut builder = regex::RegexBuilder::new(&javascript_classes(source));
+    for (at, flag) in flags.char_indices() {
+        if flags[..at].contains(flag) {
+            return Err(EvalError::Argument(format!(
+                "regular expression flag {flag:?} is repeated"
+            )));
+        }
         match flag {
             'i' => {
                 builder.case_insensitive(true);
@@ -251,7 +320,12 @@ pub(crate) fn compile_regexp(source: &str, flags: &str) -> Result<RegexpValue, E
             's' => {
                 builder.dot_matches_new_line(true);
             }
-            'g' | 'u' | 'y' | 'd' => {}
+            'g' | 'u' | 'd' => {}
+            'y' => {
+                return Err(EvalError::Argument(
+                    "the sticky regular expression flag 'y' is not supported".into(),
+                ));
+            }
             other => {
                 return Err(EvalError::Argument(format!(
                     "unknown regular expression flag {other:?}"

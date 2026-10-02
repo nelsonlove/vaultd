@@ -7,7 +7,7 @@
 {"family":"list","case":"filter","expr":"[1,2,3,4].filter(value > 2)","kind":"list","text":"3, 4","source":"published"}
 {"family":"list","case":"filter:index","expr":"[\"a\",\"b\",\"c\"].filter(index != 1)","kind":"list","text":"a, c","source":"published"}
 {"family":"list","case":"flat","expr":"[1,[2,3]].flat()","kind":"list","text":"1, 2, 3","source":"published"}
-{"family":"list","case":"flat:one_level","expr":"[1,[2,[3]]].flat().length","kind":"number","text":"3","source":"published"}
+{"family":"list","case":"flat:one_level","expr":"[1,[2,[3]]].flat()[2].isType(\"list\")","kind":"boolean","text":"true","source":"provisional"}
 {"family":"list","case":"isEmpty","expr":"[1,2,3].isEmpty()","kind":"boolean","text":"false","source":"published"}
 {"family":"list","case":"isEmpty:true","expr":"[].isEmpty()","kind":"boolean","text":"true","source":"published"}
 {"family":"list","case":"join","expr":"[1,2,3].join(\",\")","kind":"string","text":"1,2,3","source":"published"}
@@ -33,3 +33,6 @@
 {"family":"list","case":"containsAll:wrong_arity","expr":"[1].containsAll()","kind":"error","source":"published"}
 {"family":"list","case":"flat:wrong_receiver","expr":"(1).flat()","kind":"error","source":"published"}
 {"family":"list","case":"length:on_number","expr":"(1).length","kind":"error","source":"published"}
+{"family":"list","case":"unique:first_copy","expr":"[2, 1, 2].unique()","kind":"list","text":"2, 1","source":"provisional"}
+{"family":"list","case":"slice:negative","expr":"[1, 2, 3].slice(-2)","kind":"list","text":"2, 3","source":"provisional"}
+{"family":"list","case":"slice:negative_end","expr":"[1, 2, 3, 4].slice(-3, -1)","kind":"list","text":"2, 3","source":"provisional"}

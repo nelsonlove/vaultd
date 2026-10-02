@@ -8,3 +8,13 @@
 {"family":"regexp","case":"matches:wrong_argument_type","expr":"/a/.matches(1)","kind":"error","source":"published"}
 {"family":"regexp","case":"matches:wrong_receiver","expr":"\"a\".matches(\"a\")","kind":"error","source":"published"}
 {"family":"regexp","case":"matches:global_flag","expr":"/b/g.matches(\"abc\")","kind":"boolean","text":"true","source":"published"}
+{"family":"regexp","case":"flag:repeated","expr":"/a/gg.matches(\"a\")","kind":"error","source":"provisional"}
+{"family":"regexp","case":"flag:sticky_refused","expr":"/b/y.matches(\"abc\")","kind":"error","source":"provisional"}
+{"family":"regexp","case":"digit:ascii_only","expr":"/\\d/.matches(\"٣\")","kind":"boolean","text":"false","source":"provisional"}
+{"family":"regexp","case":"digit:in_class","expr":"/[\\d]/.matches(\"٣\")","kind":"boolean","text":"false","source":"provisional"}
+{"family":"regexp","case":"digit:negated","expr":"/^\\D$/.matches(\"٣\")","kind":"boolean","text":"true","source":"provisional"}
+{"family":"regexp","case":"word:ascii_only","expr":"/\\w/.matches(\"é\")","kind":"boolean","text":"false","source":"provisional"}
+{"family":"regexp","case":"word:case_flag","expr":"/^\\w$/i.matches(\"\u212a\")","kind":"boolean","text":"false","source":"provisional"}
+{"family":"regexp","case":"space:feff","expr":"/\\s/.matches(\"\ufeff\")","kind":"boolean","text":"true","source":"provisional"}
+{"family":"regexp","case":"space:nel","expr":"/\\s/.matches(\"\u0085\")","kind":"boolean","text":"false","source":"provisional"}
+{"family":"regexp","case":"boundary:ascii","expr":"/a\\b/.matches(\"aé\")","kind":"boolean","text":"true","source":"provisional"}

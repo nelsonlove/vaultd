@@ -66,7 +66,9 @@ pub(crate) fn to_fixed(value: f64, digits: usize) -> String {
     } else {
         format!("{}.{}", &number[..split], &number[split..])
     };
-    if value < 0.0 && body.chars().any(|c| c.is_ascii_digit() && c != '0') {
+    // ECMA-262: "if x < 0, let s be "-"", so `-0.001` is `-0.00`; `-0` is
+    // not below 0 and has no sign.
+    if value < 0.0 {
         format!("-{body}")
     } else {
         body

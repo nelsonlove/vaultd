@@ -5,3 +5,6 @@
 {"family":"object","case":"property_object","expr":"meta.keys()","props":{"meta":{"x":1,"y":2}},"kind":"list","text":"x, y","source":"published"}
 {"family":"object","case":"keys:wrong_arity","expr":"{\"a\": 1}.keys(1)","kind":"error","source":"published"}
 {"family":"object","case":"keys:wrong_receiver","expr":"[1].keys()","kind":"error","source":"published"}
+{"family":"object","case":"keys:integer_order","expr":"{\"b\": 1, \"1\": 2}.keys()","kind":"error","source":"uncaptured"}
+{"family":"object","case":"values:integer_order","expr":"{\"b\": 1, \"1\": 2}.values()","kind":"error","source":"uncaptured"}
+{"family":"object","case":"keys:one_integer_key","expr":"{\"1\": 2}.keys()","kind":"list","text":"1","source":"provisional"}
