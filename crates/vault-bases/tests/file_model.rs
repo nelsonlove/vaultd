@@ -223,6 +223,84 @@ fn byte_spans_survive_multibyte_text() {
 }
 
 #[test]
+fn a_yaml_syntax_error_after_multibyte_text_reports_a_byte_position() {
+    // "☃" is 3 bytes and 1 char, so a char index would land 2 bytes early.
+    // saphyr stops at the end of the text, so the error sits at the last byte.
+    let text = "a: \u{2603}\u{2603}\u{2603}\nb: [1, 2";
+    let error = parse_base(text).expect_err("an unclosed flow sequence");
+    let span = error.span.expect("a position");
+    assert_eq!(span.start(), text.len(), "{span:?} is a byte offset");
+    assert!(text.is_char_boundary(span.start()));
+}
+
+#[test]
+fn a_property_keeps_its_unknown_settings_in_order() {
+    let base = parse_base(
+        "properties:\n  status:\n    width: 120\n    displayName: Status\n    wrap: true\n",
+    )
+    .expect("a property with view settings parses");
+    let (key, settings) = &base.properties[0];
+    assert_eq!(key, "status");
+    assert_eq!(settings.display_name.as_deref(), Some("Status"));
+    assert_eq!(
+        settings.options,
+        vec![
+            ("width".to_string(), PropertyValue::Integer(120)),
+            ("wrap".to_string(), PropertyValue::Boolean(true)),
+        ]
+    );
+}
+
+#[test]
+fn an_empty_section_is_accepted_as_empty() {
+    for section in ["filters", "formulas", "properties", "summaries", "views"] {
+        let text = format!("{section}:\n");
+        let base = parse_base(&text).unwrap_or_else(|error| panic!("{text:?}: {error:?}"));
+        assert_eq!(base, vault_bases::BaseFile::default(), "{text:?}");
+    }
+}
+
+#[test]
+fn an_empty_view_section_is_accepted_as_empty() {
+    for section in ["filters", "order", "sort", "groupBy", "summaries", "limit"] {
+        let text = format!("views:\n  - type: table\n    name: T\n    {section}:\n");
+        let base = parse_base(&text).unwrap_or_else(|error| panic!("{text:?}: {error:?}"));
+        let view = &base.views[0];
+        assert!(view.filters.is_none(), "{text:?}");
+        assert!(view.order.is_empty(), "{text:?}");
+        assert!(view.sort.is_empty(), "{text:?}");
+        assert!(view.group_by.is_none(), "{text:?}");
+        assert!(view.summaries.is_empty(), "{text:?}");
+        assert!(view.limit.is_none(), "{text:?}");
+        assert!(view.options.is_empty(), "{text:?}");
+    }
+}
+
+#[test]
+fn a_duplicate_key_inside_a_view_is_last_wins() {
+    let base = parse_base(
+        "views:\n  - type: table\n    name: First\n    limit: 1\n    name: Second\n    extra: a\n    extra: b\n",
+    )
+    .expect("duplicate keys parse");
+    let view = &base.views[0];
+    assert_eq!(view.name, "Second");
+    assert_eq!(view.limit, Some(1));
+    assert_eq!(
+        view.options,
+        vec![("extra".to_string(), PropertyValue::String("b".into()))]
+    );
+}
+
+#[test]
+fn a_duplicate_key_at_the_top_level_is_last_wins() {
+    let base = parse_base(
+        "formulas:\n  a: '1'\n  a: '2'\nformulas:\n  b: '3'\n  b: '4'\nviews:\n  - type: table\n    name: T\n",
+    )
+    .expect("duplicate keys parse");
+    assert_eq!(base.formulas, vec![("b".to_string(), "4".to_string())]);
+}
+
+#[test]
 fn parses_the_syntax_page_single_and_snippet() {
     // The one snippet on `obsidian.md/help/bases/syntax` that is not part of
     // the full example above, verbatim.

@@ -110,6 +110,27 @@ impl BaseFile {
 
 type Entries<'a> = &'a [(Spanned<String>, Spanned<PropertyValue>)];
 
+/// A section's value, or `None` when the section is declared empty. Obsidian
+/// writes an empty section (`formulas:`) as YAML null; it is read as absent
+/// everywhere, at the top level and inside a view, never as an error.
+fn section(value: &Spanned<PropertyValue>) -> Option<&Spanned<PropertyValue>> {
+    match value.value {
+        PropertyValue::Null => None,
+        _ => Some(value),
+    }
+}
+
+/// The value of `name` in a mapping, last-wins when the key repeats (the
+/// YAML adapter already collapses a repeated key to its last value; this
+/// states the same rule for every lookup), and `None` when it is empty.
+fn lookup<'a>(entries: Entries<'a>, name: &str) -> Option<&'a Spanned<PropertyValue>> {
+    entries
+        .iter()
+        .rev()
+        .find(|(key, _)| key.value == name)
+        .and_then(|(_, value)| section(value))
+}
+
 fn mapping<'a>(
     value: &'a Spanned<PropertyValue>,
     what: &str,
@@ -234,12 +255,7 @@ const VIEW_KEYS: [&str; 8] = [
 
 fn view(value: &Spanned<PropertyValue>, index: usize) -> Result<ViewDecl, BaseParseError> {
     let entries = mapping(value, "a view")?;
-    let get = |name: &str| {
-        entries
-            .iter()
-            .find(|(key, _)| key.value == name)
-            .map(|(_, v)| v)
-    };
+    let get = |name: &str| lookup(entries, name);
     let kind = match get("type") {
         Some(kind) => plain_string(kind, "a view type")?,
         None => {
@@ -276,17 +292,13 @@ fn view(value: &Spanned<PropertyValue>, index: usize) -> Result<ViewDecl, BasePa
                 .iter()
                 .map(|item| {
                     let entries = mapping(item, "a sort key")?;
-                    let property = entries
-                        .iter()
-                        .find(|(key, _)| key.value == "property")
-                        .ok_or_else(|| {
-                            BaseParseError::at(item.span, "a sort key needs a property")
-                        })?;
-                    let direction_value = entries.iter().find(|(key, _)| key.value == "direction");
+                    let property = lookup(entries, "property").ok_or_else(|| {
+                        BaseParseError::at(item.span, "a sort key needs a property")
+                    })?;
                     Ok(SortKey {
-                        property: plain_string(&property.1, "a sort property")?,
-                        direction: match direction_value {
-                            Some((_, value)) => direction(value)?,
+                        property: plain_string(property, "a sort property")?,
+                        direction: match lookup(entries, "direction") {
+                            Some(value) => direction(value)?,
                             None => Direction::Asc,
                         },
                     })
@@ -299,15 +311,12 @@ fn view(value: &Spanned<PropertyValue>, index: usize) -> Result<ViewDecl, BasePa
         None => None,
         Some(group) => {
             let entries = mapping(group, "groupBy")?;
-            let property = entries
-                .iter()
-                .find(|(key, _)| key.value == "property")
+            let property = lookup(entries, "property")
                 .ok_or_else(|| BaseParseError::at(group.span, "groupBy needs a property"))?;
-            let direction_value = entries.iter().find(|(key, _)| key.value == "direction");
             Some(GroupBy {
-                property: plain_string(&property.1, "a groupBy property")?,
-                direction: match direction_value {
-                    Some((_, value)) => direction(value)?,
+                property: plain_string(property, "a groupBy property")?,
+                direction: match lookup(entries, "direction") {
+                    Some(value) => direction(value)?,
                     None => Direction::Asc,
                 },
             })
@@ -360,6 +369,11 @@ pub fn parse_base(text: &str) -> Result<BaseFile, BaseParseError> {
     let entries = mapping(&root, "a base")?;
     let mut base = BaseFile::default();
     for (key, value) in entries {
+        // An empty section is absent; the YAML adapter has already collapsed
+        // a repeated top-level key to its last value (last-wins).
+        let Some(value) = section(value) else {
+            continue;
+        };
         match key.value.as_str() {
             "filters" => base.filters = Some(filter(value)?),
             "formulas" => base.formulas = named_expressions(value, "a formula")?,
@@ -367,10 +381,8 @@ pub fn parse_base(text: &str) -> Result<BaseFile, BaseParseError> {
             "properties" => {
                 for (property, settings) in mapping(value, "properties")? {
                     let settings_entries = mapping(settings, "a property's settings")?;
-                    let display_name = settings_entries
-                        .iter()
-                        .find(|(key, _)| key.value == "displayName")
-                        .map(|(_, value)| plain_string(value, "displayName"))
+                    let display_name = lookup(settings_entries, "displayName")
+                        .map(|value| plain_string(value, "displayName"))
                         .transpose()?;
                     base.properties.push((
                         property.value.clone(),
@@ -387,7 +399,6 @@ pub fn parse_base(text: &str) -> Result<BaseFile, BaseParseError> {
                         base.views.push(view(item, index)?);
                     }
                 }
-                PropertyValue::Null => {}
                 _ => return Err(BaseParseError::at(value.span, "views must be a list")),
             },
             _ => {}
