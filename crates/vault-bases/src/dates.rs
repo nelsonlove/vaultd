@@ -212,7 +212,7 @@ const WEEKDAYS: [&str; 7] = [
     "Saturday",
 ];
 
-/// The tokens, longest first within each letter, so `MMMM` wins over `MM`.
+/// The tokens Moment's `format` documents that this crate implements.
 const TOKENS: [&str; 33] = [
     "YYYY", "YY", "Q", "MMMM", "MMM", "MM", "M", "Do", "DDDD", "DDD", "DD", "D", "dddd", "ddd",
     "dd", "d", "HH", "H", "hh", "h", "mm", "m", "ss", "s", "SSS", "SS", "S", "A", "a", "ZZ", "Z",
@@ -247,9 +247,18 @@ pub fn format_date(date: DateValue, format: &str, clock: &Clock) -> Result<Strin
     let mut rest = format;
     while let Some(c) = rest.chars().next() {
         if c == '[' {
-            let close = rest.find(']').unwrap_or(rest.len());
-            out.push_str(&rest[1..close]);
-            rest = &rest[(close + 1).min(rest.len())..];
+            // An unclosed `[` is a literal `[`, and what follows is read as
+            // tokens, as in Moment.
+            match rest.find(']') {
+                Some(close) => {
+                    out.push_str(&rest[1..close]);
+                    rest = &rest[close + 1..];
+                }
+                None => {
+                    out.push('[');
+                    rest = &rest[1..];
+                }
+            }
             continue;
         }
         if !c.is_ascii_alphabetic() {
@@ -257,14 +266,23 @@ pub fn format_date(date: DateValue, format: &str, clock: &Clock) -> Result<Strin
             rest = &rest[c.len_utf8()..];
             continue;
         }
-        let Some(token) = TOKENS.iter().find(|token| rest.starts_with(**token)) else {
-            let run: String = rest.chars().take_while(|d| *d == c).collect();
-            return Err(EvalError::UnsupportedFormatToken(run));
+        // A token is the whole run of one letter, matched exactly, so a
+        // length the list does not name (`SSSS`, `MMMMM`) is refused rather
+        // than split into two listed tokens. `Do` is the one token of two
+        // letters.
+        let run = rest.bytes().take_while(|b| *b == c as u8).count();
+        let token = if c == 'D' && run == 1 && rest[1..].starts_with('o') {
+            "Do"
+        } else {
+            &rest[..run]
         };
+        if !TOKENS.contains(&token) {
+            return Err(EvalError::UnsupportedFormatToken(token.to_string()));
+        }
         let year = i32::from(at.year());
         let month = i32::from(at.month());
         let day = i32::from(at.day());
-        let text = match *token {
+        let text = match token {
             "YYYY" => format!("{year:04}"),
             "YY" => format!("{:02}", year.rem_euclid(100)),
             "Q" => ((month - 1) / 3 + 1).to_string(),
@@ -306,23 +324,72 @@ pub fn format_date(date: DateValue, format: &str, clock: &Clock) -> Result<Strin
     Ok(out)
 }
 
-/// JavaScript's `Math.round`.
+/// JavaScript's `Math.round`: a half rounds up, and the fraction is taken
+/// from the floor, so `0.49999999999999994` stays 0.
 fn round(value: f64) -> i64 {
-    (value + 0.5).floor() as i64
+    let floor = value.floor();
+    (if value - floor >= 0.5 {
+        floor + 1.0
+    } else {
+        floor
+    }) as i64
 }
 
-/// Moment's `fromNow` with its default thresholds (`ss` 44, `s` 45, `m` 45,
-/// `h` 22, `d` 26, `M` 11), locale `en`: the duration is measured in each
-/// unit and rounded, and the first threshold that holds picks the wording.
+/// Moment's `positiveMomentsDifference`, for `base <= other`: the whole
+/// calendar months between the two local dates, one fewer when adding them
+/// to `base` passes `other`, and the rest in exact milliseconds.
+fn months_and_ms(base: &Zoned, other: &Zoned) -> (i64, i64) {
+    let plus = |months: i64| {
+        let span = Span::new().try_months(months).ok()?;
+        base.checked_add(span).ok()
+    };
+    let mut months = (i64::from(other.year()) - i64::from(base.year())) * 12
+        + i64::from(other.month())
+        - i64::from(base.month());
+    let mut landed = plus(months);
+    if landed
+        .as_ref()
+        .is_some_and(|at| at.timestamp() > other.timestamp())
+    {
+        months -= 1;
+        landed = plus(months);
+    }
+    let end = other.timestamp().as_millisecond();
+    match landed {
+        Some(at) => (months, end - at.timestamp().as_millisecond()),
+        None => (0, end - base.timestamp().as_millisecond()),
+    }
+}
+
+/// Moment's `fromNow` (2.30), locale `en`, default thresholds (`ss` 44, `s`
+/// 45, `m` 45, `h` 22, `d` 26, `M` 11). As Moment's `from` does, the span is
+/// whole calendar months plus milliseconds; each unit is then measured as
+/// `Duration#as` measures it (months spread into days by the average month
+/// for the small units, the milliseconds folded into months for the large
+/// ones) and rounded, and the first threshold that holds picks the wording.
+/// Provisional: the wording is settled by Task 13's capture.
 pub(crate) fn relative(date: DateValue, clock: &Clock) -> String {
-    let difference = date.epoch_ms - clock.now_ms;
-    let ms = difference.unsigned_abs() as f64;
-    let seconds = round(ms / 1000.0);
-    let minutes = round(ms / 60_000.0);
-    let hours = round(ms / 3_600_000.0);
-    let days_exact = ms / DAY_MS as f64;
-    let days = round(days_exact);
-    let months_exact = days_exact * 4800.0 / 146_097.0;
+    let now = zoned(
+        DateValue {
+            epoch_ms: clock.now_ms,
+            has_time: true,
+        },
+        clock,
+    );
+    let then = zoned(date, clock);
+    let future = date.epoch_ms > clock.now_ms;
+    let (months, ms) = if future {
+        months_and_ms(&now, &then)
+    } else {
+        months_and_ms(&then, &now)
+    };
+    let (months, ms) = (months as f64, ms as f64);
+    let month_days = round(months * 146_097.0 / 4800.0) as f64;
+    let seconds = round(month_days * 86_400.0 + ms / 1000.0);
+    let minutes = round(month_days * 1440.0 + ms / 60_000.0);
+    let hours = round(month_days * 24.0 + ms / 3_600_000.0);
+    let days = round(month_days + ms / DAY_MS as f64);
+    let months_exact = months + ms / DAY_MS as f64 * 4800.0 / 146_097.0;
     let months = round(months_exact);
     let years = round(months_exact / 12.0);
     let phrase = if seconds <= 44 {
@@ -350,7 +417,7 @@ pub(crate) fn relative(date: DateValue, clock: &Clock) -> String {
     } else {
         format!("{years} years")
     };
-    if difference > 0 {
+    if future {
         format!("in {phrase}")
     } else {
         format!("{phrase} ago")

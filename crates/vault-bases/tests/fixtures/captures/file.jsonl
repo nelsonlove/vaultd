@@ -7,7 +7,7 @@
 {"family":"file","case":"size","expr":"file.size","kind":"number","expect_from":"corpus","template":"{size}","source":"published"}
 {"family":"file","case":"ctime","expr":"file.ctime.format(\"YYYY-MM-DD HH:mm\")","kind":"string","expect_from":"corpus","template":"{ctime:YYYY-MM-DD HH:mm}","source":"published"}
 {"family":"file","case":"mtime_within_week","expr":"file.mtime > now() - \"1 week\"","kind":"boolean","text":"true","source":"published"}
-{"family":"file","case":"age","expr":"now() - file.ctime","kind":"duration","expect_from":"corpus","template":"{age_ms}","source":"published"}
+{"family":"file","case":"age","expr":"now() - file.ctime","kind":"number","expect_from":"corpus","template":"{age_ms}","source":"published"}
 {"family":"file","case":"properties","expr":"file.properties.keys()","props":{"a":1,"b":2},"kind":"list","text":"a, b","source":"published"}
 {"family":"file","case":"tags:spelling","expr":"file.tags","kind":"error","source":"uncaptured"}
 {"family":"file","case":"links","expr":"file.links.length","kind":"number","text":"2","source":"published"}

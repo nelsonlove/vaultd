@@ -151,11 +151,11 @@ pub(crate) fn arithmetic(
     let too_long = || EvalError::Argument("the duration is out of range".into());
     match (op, left, right) {
         (BinaryOp::Add, Value::Date(date), other) => date_plus(*date, other, 1),
+        // The syntax page: "the millisecond difference between the two" — a
+        // number, so `(a - b) / 86400000` and `a - b > n` work. Whole
+        // milliseconds, so there is nothing to round.
         (BinaryOp::Sub, Value::Date(a), Value::Date(b)) => {
-            Ok(Some(Value::Duration(DurationValue {
-                months: 0,
-                ms: a.epoch_ms - b.epoch_ms,
-            })))
+            Ok(Some(Value::Number((a.epoch_ms - b.epoch_ms) as f64)))
         }
         (BinaryOp::Sub, Value::Date(date), other) => date_plus(*date, other, -1),
         (BinaryOp::Add, Value::Duration(a), Value::Duration(b)) => {

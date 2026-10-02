@@ -198,6 +198,17 @@ fn any_other_format_letter_is_an_unsupported_token_named() {
         ("YYYY-ww", "ww"),
         ("k", "k"),
         ("E", "E"),
+        // A run of a listed letter at a length the list does not name is
+        // refused whole, never split into two listed tokens.
+        ("SSSS", "SSSS"),
+        ("MMMMM", "MMMMM"),
+        ("YYYYY", "YYYYY"),
+        ("Y", "Y"),
+        ("HHH", "HHH"),
+        ("Mo", "o"),
+        ("DDDo", "o"),
+        // An unclosed `[` is a literal `[`, so `t` is then read as a token.
+        ("[at", "t"),
     ] {
         assert_eq!(
             eval(&format!("now().format({format:?})")),
@@ -207,6 +218,8 @@ fn any_other_format_letter_is_an_unsupported_token_named() {
     }
     // Escaped letters and non-letters are not tokens.
     assert_eq!(string("now().format(\"[W] -/:.,\")"), "W -/:.,");
+    assert_eq!(string("now().format(\"[HH\")"), "[10");
+    assert_eq!(string("now().format(\"HHmm Do\")"), "1030 15th");
 }
 
 #[test]
@@ -319,6 +332,8 @@ fn durations_add_subtract_and_scale() {
         eval("duration(\"2h\") - duration(\"30m\")"),
         duration(0, 5_400_000)
     );
+    // Provisional: a fraction of a duration rounds its whole months
+    // (`1y * 1.5` is 18 months; `1M * 0.4` would be 0). Task 13 settles it.
     assert_eq!(eval("duration(\"1y\") * 1.5"), duration(18, 0));
     assert_eq!(
         eval("duration(duration(\"-2 weeks\"))"),
@@ -357,7 +372,10 @@ fn relative_turns_at_moments_default_thresholds() {
         ("46m", "an hour ago"),
         ("21h", "21 hours ago"),
         ("23h", "a day ago"),
+        ("36h", "2 days ago"),
+        ("7d", "7 days ago"),
         ("25d", "25 days ago"),
+        ("26d", "a month ago"),
         ("27d", "a month ago"),
         ("3M", "3 months ago"),
         ("13M", "a year ago"),
@@ -417,4 +435,10 @@ fn bad_dates_durations_and_overflows_are_typed_errors_never_panics() {
     );
     assert!(matches!(eval("now() + 1"), Err(EvalError::Type(_))));
     assert!(matches!(eval("1 + now()"), Err(EvalError::Type(_))));
+}
+
+#[test]
+#[should_panic(expected = "not a representable instant")]
+fn a_fixed_clock_outside_the_representable_range_is_refused() {
+    let _ = Clock::fixed(i64::MAX, FIXTURE_ZONE);
 }

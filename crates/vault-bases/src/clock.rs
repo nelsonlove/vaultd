@@ -19,8 +19,12 @@ impl Clock {
     }
 
     /// A clock stopped at `now_ms` in the named zone. Panics on an unknown
-    /// zone name: that is a test-authoring error, not an input.
+    /// zone name or an instant outside jiff's range: either is a
+    /// test-authoring error, not an input.
     pub fn fixed(now_ms: i64, zone: &str) -> Self {
+        if let Err(error) = jiff::Timestamp::from_millisecond(now_ms) {
+            panic!("now_ms {now_ms} is not a representable instant: {error}");
+        }
         Self {
             now_ms,
             zone: jiff::tz::TimeZone::get(zone)
