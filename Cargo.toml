@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/vault-bases",
     "crates/vault-core",
     "crates/vault-index",
     "crates/vault-protocol",
@@ -27,6 +28,7 @@ notify = "8.2.0"
 rusqlite = { version = "0.32.1", features = ["bundled", "trace"] }
 sha2 = "0.10"
 xdg = "3.0"
+jiff = "0.2"
 markdown = "1.0"
 percent-encoding = "2.3"
 proptest = "1.9"

@@ -400,6 +400,61 @@ pub(crate) fn parse_frontmatter(document: &SourceDocument) -> FrontmatterParse {
     parse
 }
 
+/// A YAML document that could not be read, with where it broke.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YamlDocumentError {
+    pub message: String,
+    pub span: SourceSpan,
+}
+
+/// Parse a whole YAML document — not a frontmatter payload — into the same
+/// spanned value model frontmatter properties use.
+///
+/// The base parser is the caller: a `.base` file is one YAML document from its
+/// first byte, so the payload offset is zero and every span this returns
+/// indexes `text` directly, in bytes. It reuses this module's `CharToByte`
+/// table and container-span repair rather than a second `saphyr` adapter, so
+/// the two readers cannot disagree about where a value sits.
+///
+/// `Ok(None)` is an empty (or whitespace-only, or `null`) document.
+pub fn parse_yaml_document(
+    text: &str,
+) -> Result<Option<Spanned<PropertyValue>>, YamlDocumentError> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let table = CharToByte::new(text);
+    let documents = MarkedYaml::load_from_str(text).map_err(|error| {
+        // saphyr's scan error carries the char index it stopped at; convert
+        // it like every other marker.
+        let at = table.byte(error.marker().index());
+        YamlDocumentError {
+            message: error.to_string(),
+            span: SourceSpan::new(at, at).expect("an empty span is ordered"),
+        }
+    })?;
+    let whole = SourceSpan::new(0, text.len()).expect("the whole text is ordered");
+    let root = match documents.as_slice() {
+        [] => return Ok(None),
+        [root] => root,
+        _ => {
+            return Err(YamlDocumentError {
+                message: "expected one YAML document".into(),
+                span: whole,
+            });
+        }
+    };
+    if matches!(root.data, YamlData::Value(Scalar::Null)) {
+        return Ok(None);
+    }
+    convert_value(root, &table, 0, text)
+        .map(Some)
+        .map_err(|diagnostic| YamlDocumentError {
+            message: diagnostic.message,
+            span: diagnostic.span.unwrap_or(whole),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_frontmatter;
@@ -411,5 +466,27 @@ mod tests {
         let document = SourceDocument::new(VaultPath::new("Broken.md").expect("valid path"), text);
         let parse = parse_frontmatter(&document);
         assert_eq!(parse.body_start, text.find("# Recoverable").unwrap());
+    }
+
+    #[test]
+    fn a_yaml_document_reports_byte_spans_past_multibyte_text() {
+        let text = "name: Tâble\nlimit: 10\n";
+        let root = super::parse_yaml_document(text)
+            .expect("parses")
+            .expect("non-empty");
+        let crate::PropertyValue::Mapping(entries) = &root.value else {
+            panic!("a mapping: {root:?}");
+        };
+        let (key, value) = &entries[1];
+        assert_eq!(key.value, "limit");
+        assert_eq!(&text[value.span.start()..value.span.end()], "10");
+    }
+
+    #[test]
+    fn a_yaml_document_error_names_where_it_broke() {
+        let text = "a: [1, 2\n";
+        let error = super::parse_yaml_document(text).expect_err("unclosed flow");
+        assert!(error.span.start() <= text.len());
+        assert!(!error.message.is_empty());
     }
 }

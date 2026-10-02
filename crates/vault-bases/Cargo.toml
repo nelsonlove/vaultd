@@ -1,0 +1,22 @@
+[package]
+name = "vault-bases"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# The capture-fixture reader and the cell-text renderer. Off in production
+# builds; the crate's own tests and `vault-server`'s replay suite enable it.
+fixtures = ["dep:serde_json"]
+
+[dependencies]
+jiff.workspace = true
+regex.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+vault-core = { path = "../vault-core" }
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+vault-bases = { path = ".", features = ["fixtures"] }
