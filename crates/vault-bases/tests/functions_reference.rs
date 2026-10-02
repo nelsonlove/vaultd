@@ -171,14 +171,14 @@ fn start_and_end_checks_are_not_interchangeable() {
 #[test]
 fn nested_list_lambdas_fit_a_two_mebibyte_stack_at_the_nesting_cap() {
     use vault_bases::Value;
-    use vault_bases::expr::{MAX_EXPRESSION_DEPTH, parse_expression};
+    use vault_bases::expr::{MAX_DEPTH, parse_expression};
 
     // The deepest `[1].map([1].map(…value…))` chain the parser accepts, and
     // the same through `filter` and `reduce`: each level re-enters the
     // evaluator from inside a list method.
     fn deepest(open: &str, inner: &str, close: &str) -> (usize, String) {
         let mut best = None;
-        for levels in 1..=MAX_EXPRESSION_DEPTH {
+        for levels in 1..=MAX_DEPTH {
             let text = format!("{}{inner}{}", open.repeat(levels), close.repeat(levels));
             if parse_expression(&text).is_err() {
                 break;

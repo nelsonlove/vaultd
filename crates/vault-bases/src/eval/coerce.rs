@@ -38,10 +38,16 @@ fn case(prefix: &str, left: &Value, right: &Value) -> EvalError {
 /// The syntax page: links "are equivalent as long as they point to the same
 /// file, or if the file does not exist when looked up, their link text must be
 /// identical."
+///
+/// Provisional reading, for the capture to settle: link text is compared
+/// only when *neither* link resolves. A resolved link never equals an
+/// unresolved one, so `==` stays transitive across links and the files they
+/// resolve to.
 fn link_equals(left: &LinkValue, right: &LinkValue) -> bool {
     match (&left.resolved, &right.resolved) {
         (Some(a), Some(b)) => a == b,
-        _ => left.target == right.target,
+        (None, None) => left.target == right.target,
+        _ => false,
     }
 }
 
@@ -112,12 +118,17 @@ fn rank(value: &Value) -> usize {
 /// A total order for `sort`: same-kind values by [`compare`] (falling back to
 /// equal where that is uncaptured, so a stable sort keeps their input order),
 /// different kinds by [`MIXED_TYPE_RANK`].
+///
+/// Numbers order numerically, with every NaN after every other number and
+/// equal to any other NaN, and `-0` equal to `0`. The order must be total:
+/// since Rust 1.81 `slice::sort_by` may panic on a comparator that is not.
 pub fn sort_order(left: &Value, right: &Value) -> Ordering {
     let by_rank = rank(left).cmp(&rank(right));
     if by_rank != Ordering::Equal {
         return by_rank;
     }
     match (left, right) {
+        (Value::Number(a), Value::Number(b)) => number_order(*a, *b),
         (Value::Link(a), Value::Link(b)) => utf16_order(&a.target, &b.target),
         (Value::File(a), Value::File(b)) => utf16_order(a.as_str(), b.as_str()),
         (Value::Duration(a), Value::Duration(b)) => (a.months, a.ms).cmp(&(b.months, b.ms)),
@@ -125,9 +136,32 @@ pub fn sort_order(left: &Value, right: &Value) -> Ordering {
     }
 }
 
+/// Numbers for [`sort_order`]: NaN last and equal to NaN, the rest by value.
+fn number_order(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left
+            .partial_cmp(&right)
+            .expect("two numbers that are not NaN are ordered"),
+    }
+}
+
 /// ECMAScript `Number::toString` (ECMA-262 §6.1.6.1.20), over Rust's shortest
 /// round-trip digits, which are the digits that algorithm specifies.
+///
+/// Total: NaN is `NaN` and the infinities are `Infinity` and `-Infinity`, as
+/// in JavaScript. Non-finite numbers reach here from a literal (`1e400`), a
+/// YAML property (`.inf`, `.nan`) or `number()`; how a Bases cell shows them
+/// is provisional until the capture settles it.
 pub fn number_to_string(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
     if value == 0.0 {
         return "0".into();
     }
@@ -161,9 +195,15 @@ pub fn number_to_string(value: f64) -> String {
     }
 }
 
-/// JavaScript's `StringToNumber` grammar, minus `Infinity` (a cell cannot
-/// hold a non-finite number) and minus the empty string (JavaScript says 0;
-/// whether Bases does is the uncaptured `number:empty_string`).
+/// JavaScript's `StringToNumber` grammar, minus `Infinity` (refused here,
+/// provisionally) and minus the empty string (JavaScript says 0; whether
+/// Bases does is the uncaptured `number:empty_string`).
+///
+/// Known corners that still differ from JavaScript: `0b…` and `0o…` are
+/// refused (JavaScript: binary and octal), a hex string over 64 bits is
+/// refused (JavaScript: a rounded number), and the trimmed whitespace is
+/// Rust's `char::is_whitespace` (it trims U+0085, which JavaScript keeps,
+/// and keeps U+FEFF, which JavaScript trims).
 pub fn parse_js_number(text: &str) -> Option<f64> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -173,6 +213,9 @@ pub fn parse_js_number(text: &str) -> Option<f64> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
     {
+        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
         return u64::from_str_radix(hex, 16).ok().map(|value| value as f64);
     }
     let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);

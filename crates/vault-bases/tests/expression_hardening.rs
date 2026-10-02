@@ -6,7 +6,7 @@
 //! if the capture differs, the capture wins and these rows change.
 
 use vault_bases::expr::{
-    BinaryOp, Expr, ExpressionError, ExpressionErrorKind, MAX_EXPRESSION_DEPTH, parse_expression,
+    BinaryOp, Expr, ExpressionError, ExpressionErrorKind, MAX_DEPTH, parse_expression,
 };
 
 /// The default stack of a spawned Rust thread, and of a test thread.
@@ -68,9 +68,7 @@ fn deep_input_is_a_typed_error_on_a_two_mebibyte_stack() {
             let error = parse_expression(&text).expect_err(label);
             assert_eq!(
                 error.kind,
-                ExpressionErrorKind::ExpressionTooDeep {
-                    max: MAX_EXPRESSION_DEPTH
-                },
+                ExpressionErrorKind::ExpressionTooDeep { max: MAX_DEPTH },
                 "{label}: {}",
                 error.message
             );
@@ -81,9 +79,9 @@ fn deep_input_is_a_typed_error_on_a_two_mebibyte_stack() {
 }
 
 #[test]
-fn the_cap_is_exactly_max_expression_depth_levels() {
-    assert_eq!(MAX_EXPRESSION_DEPTH, 256);
-    let levels = MAX_EXPRESSION_DEPTH;
+fn the_cap_is_exactly_max_depth_levels() {
+    assert_eq!(MAX_DEPTH, 64);
+    let levels = MAX_DEPTH;
     // A leaf is one level and each wrapper adds one. Parentheses add no
     // node, but each open one is a level of the parser's own recursion,
     // counted from the whole expression as level one.
@@ -119,9 +117,7 @@ fn the_cap_is_exactly_max_expression_depth_levels() {
             let error = parse_expression(&over_cap).expect_err(label);
             assert_eq!(
                 error.kind,
-                ExpressionErrorKind::ExpressionTooDeep {
-                    max: MAX_EXPRESSION_DEPTH
-                },
+                ExpressionErrorKind::ExpressionTooDeep { max: MAX_DEPTH },
                 "{label} over the cap"
             );
         });

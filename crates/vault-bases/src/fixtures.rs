@@ -13,7 +13,7 @@ use vault_core::{PropertyValue, VaultPath};
 
 use crate::clock::Clock;
 use crate::eval::coerce::number_to_string;
-use crate::eval::{EvalContext, Scope, evaluate};
+use crate::eval::{EvalContext, EvalError, Scope, evaluate};
 use crate::expr::parse_expression;
 use crate::source::{MemoryFile, MemorySource, no_span};
 use crate::value::Value;
@@ -183,17 +183,28 @@ pub fn check_family(family: &str) -> Vec<String> {
         let row_path = VaultPath::new("Capture.md").expect("a valid path");
         let base_path = VaultPath::new("Captures.base").expect("a valid path");
         let ctx = EvalContext::new(&source, &clock, &base_path, &row_path);
-        let outcome = parse_expression(&row.expr)
-            .map_err(|error| format!("parse: {} at {}", error.message, error.position))
-            .and_then(|expr| {
-                evaluate(&expr, &ctx, &Scope::row(&row_path)).map_err(|error| error.to_string())
-            });
         let label = format!("[{}] {} `{}`", row.source, row.case, row.expr);
+        // A row's expression must parse: a parse error is a broken row, never
+        // the error an `error` row expects.
+        let expr = match parse_expression(&row.expr) {
+            Ok(expr) => expr,
+            Err(error) => {
+                failures.push(format!(
+                    "{label}: does not parse: {} at {}",
+                    error.message, error.position
+                ));
+                continue;
+            }
+        };
+        let outcome = evaluate(&expr, &ctx, &Scope::row(&row_path));
         match (row.kind.as_str(), outcome) {
             ("error", Err(error)) => {
-                if row.source == "uncaptured" && !error.contains("not captured yet") {
+                // An uncaptured row must answer `Uncaptured` naming exactly
+                // its own case, so a renamed case goes red.
+                let named = EvalError::Uncaptured(row.case.clone());
+                if row.source == "uncaptured" && error != named {
                     failures.push(format!(
-                        "{label}: an uncaptured case must answer Uncaptured, got {error}"
+                        "{label}: an uncaptured case must answer {named:?}, got {error:?}"
                     ));
                 }
             }

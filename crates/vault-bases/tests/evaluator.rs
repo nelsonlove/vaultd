@@ -5,10 +5,10 @@
 //! this file pins that every `Expr` variant the parser builds reaches a
 //! defined answer through [`evaluate`] on a [`MemorySource`], that an error
 //! is a typed [`EvalError`] value and never a panic, and that the walk fits a
-//! 2 MiB stack at [`MAX_EXPRESSION_DEPTH`] levels in a debug build.
+//! 2 MiB stack at [`MAX_DEPTH`] levels in a debug build.
 
 use vault_bases::eval::{EvalContext, EvalError, Formulas, Scope, evaluate};
-use vault_bases::expr::{MAX_EXPRESSION_DEPTH, parse_expression};
+use vault_bases::expr::{MAX_DEPTH, parse_expression};
 use vault_bases::{Clock, MemoryFile, MemorySource, Value, no_span, number, text};
 use vault_core::{PropertyValue, VaultPath};
 
@@ -253,55 +253,360 @@ fn errors_are_typed_values_never_panics() {
     );
 }
 
-/// A debug build needs a 2 MiB stack for the parser at 256 levels; the
-/// evaluator adds a frame per level, so it must fit the same stack.
+/// The deepest expression built from `open` × k, `inner`, `close` × k that
+/// the parser accepts, and the same with one more level, which it must
+/// refuse as too deep.
+fn deepest(open: &str, inner: &str, close: &str) -> (String, String) {
+    let build = |levels: usize| format!("{}{inner}{}", open.repeat(levels), close.repeat(levels));
+    let mut levels = 0;
+    while parse_expression(&build(levels + 1)).is_ok() {
+        levels += 1;
+        assert!(levels <= MAX_DEPTH, "{open:?} nests past the cap");
+    }
+    (build(levels), build(levels + 1))
+}
+
+/// Every recursive shape at the nesting cap: the deepest form the parser
+/// accepts evaluates to `expected`, and one level more is the typed
+/// too-deep error. Eager calls (`max(`, `escapeHTML(`) cost the most stack
+/// per level, and list lambdas re-enter the evaluator from a list method.
+fn every_shape_at_the_cap() {
+    use vault_bases::expr::ExpressionErrorKind;
+
+    let shapes: [(&str, &str, &str, Option<Value>); 15] = [
+        ("1+", "1", "", None),
+        ("-", "1", "", None),
+        ("!", "true", "", None),
+        ("(", "1", ")", Some(Value::Number(1.0))),
+        ("", "missing", ".sub", Some(Value::Null)),
+        ("if(true, ", "1", ")", Some(Value::Number(1.0))),
+        ("[", "1", "]", None),
+        ("{a: ", "1", "}", None),
+        ("max(", "1", ")", Some(Value::Number(1.0))),
+        ("min(2, ", "1", ")", Some(Value::Number(1.0))),
+        ("escapeHTML(", "\"x\"", ")", Some(Value::String("x".into()))),
+        ("true && ", "true", "", Some(Value::Boolean(true))),
+        ("[1].map(", "value", ")", None),
+        ("[1].filter(", "true", ")", None),
+        ("[1].reduce(", "acc", ", 0)", None),
+    ];
+    for (open, inner, close, expected) in shapes {
+        let (at_cap, over_cap) = deepest(open, inner, close);
+        let got = on_row(&at_cap);
+        match &expected {
+            Some(value) => assert_eq!(got.as_ref(), Ok(value), "{open:?} at the cap"),
+            None => assert!(got.is_ok(), "{open:?} at the cap: {got:?}"),
+        }
+        let error = parse_expression(&over_cap).expect_err("one level over the cap");
+        assert_eq!(
+            error.kind,
+            ExpressionErrorKind::ExpressionTooDeep { max: MAX_DEPTH },
+            "{open:?} over the cap"
+        );
+    }
+}
+
+fn on_stack(bytes: usize, body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(bytes)
+        .spawn(body)
+        .expect("spawn")
+        .join()
+        .expect("no stack overflow and no panic");
+}
+
+/// The daemon's connection threads have 2 MiB; a debug build at the cap must
+/// fit that with room to spare.
 #[test]
 fn the_walk_fits_a_two_mebibyte_stack_at_the_nesting_cap() {
-    let handle = std::thread::Builder::new()
-        .stack_size(2 << 20)
-        .spawn(|| {
-            let levels = MAX_EXPRESSION_DEPTH;
-            let cases = [
-                (
-                    format!("1{}", "+1".repeat(levels - 1)),
-                    Value::Number(levels as f64),
-                ),
-                (format!("{}1", "-".repeat(levels - 1)), Value::Number(-1.0)),
-                (
-                    format!("{}true", "!".repeat(levels - 1)),
-                    Value::Boolean(false),
-                ),
-                (
-                    format!("{}1{}", "(".repeat(levels - 1), ")".repeat(levels - 1)),
-                    Value::Number(1.0),
-                ),
-                (format!("missing{}", ".sub".repeat(levels - 1)), Value::Null),
-                (
-                    format!(
-                        "{}1{}",
-                        "if(true, ".repeat(levels - 1),
-                        ")".repeat(levels - 1)
-                    ),
-                    Value::Number(1.0),
-                ),
-            ];
-            for (expr, expected) in cases {
-                assert_eq!(on_row(&expr), Ok(expected), "{} bytes", expr.len());
-            }
-            let nested = on_row(&format!(
-                "{}1{}",
-                "[".repeat(levels - 1),
-                "]".repeat(levels - 1)
-            ))
-            .expect("a nested list");
-            let mut depth = 1;
-            let mut at = &nested;
-            while let Value::List(items) = at {
-                depth += 1;
-                at = &items[0];
-            }
-            assert_eq!(depth, levels);
+    assert_eq!(MAX_DEPTH, 64);
+    on_stack(2 << 20, every_shape_at_the_cap);
+}
+
+/// The headroom proof: the same shapes fit half the daemon's stack.
+#[test]
+fn the_walk_fits_a_one_mebibyte_stack_at_the_nesting_cap() {
+    on_stack(1 << 20, every_shape_at_the_cap);
+}
+
+/// A source whose one note has the YAML non-finite numbers, parsed by
+/// `vault_core` exactly as the daemon parses a note.
+fn yaml_source() -> MemorySource {
+    let text = "---\ninf: .inf\nninf: -.inf\nnan: .nan\nhuge: 1e400\n---\n";
+    let document = vault_core::SourceDocument::new(path(ROW), text);
+    let mut note = MemoryFile::note();
+    for property in vault_core::parse_properties(&document) {
+        note = note.property(&property.key.value, property.value.value);
+    }
+    MemorySource::new().with(ROW, note)
+}
+
+fn on_yaml(expr: &str) -> Result<Value, EvalError> {
+    let source = yaml_source();
+    let clock = Clock::fixed(0, "UTC");
+    let (base, this) = (path(BASE), path(THIS));
+    let ctx = EvalContext::new(&source, &clock, &base, &this);
+    let parsed = parse_expression(expr).unwrap_or_else(|error| panic!("{expr:?}: {error:?}"));
+    evaluate(&parsed, &ctx, &Scope::row(&path(ROW)))
+}
+
+#[test]
+fn yaml_non_finite_numbers_reach_the_evaluator_and_format_as_javascript_does() {
+    for (expr, text) in [
+        ("inf.toString()", "Infinity"),
+        ("ninf.toString()", "-Infinity"),
+        ("nan.toString()", "NaN"),
+        ("huge.toString()", "Infinity"),
+        ("[inf, nan].toString()", "Infinity,NaN"),
+        ("(1e400).toString()", "Infinity"),
+        ("inf + \"\"", "Infinity"),
+    ] {
+        assert_eq!(on_yaml(expr), Ok(Value::String(text.into())), "{expr}");
+    }
+    let Ok(Value::Number(nan)) = on_yaml("nan") else {
+        panic!("a .nan property is a number");
+    };
+    assert!(nan.is_nan());
+    let clock = Clock::fixed(0, "UTC");
+    assert_eq!(
+        vault_bases::fixtures::render_text(&Value::Number(nan), &clock),
+        "NaN"
+    );
+    assert_eq!(
+        on_yaml("max(1, nan).toString()"),
+        Ok(Value::String("NaN".into())),
+        "a NaN operand makes max NaN, as Math.max does"
+    );
+}
+
+/// JavaScript: NaN is falsy (M6 in the Task 3 review).
+#[test]
+fn nan_is_falsy() {
+    assert_eq!(on_yaml("nan.isTruthy()"), Ok(Value::Boolean(false)));
+    assert_eq!(on_yaml("!nan"), Ok(Value::Boolean(true)));
+    assert_eq!(on_yaml("if(nan, 1, 2)"), Ok(Value::Number(2.0)));
+    assert_eq!(on_yaml("inf.isTruthy()"), Ok(Value::Boolean(true)));
+}
+
+/// `false < true`, as JavaScript orders booleans (M7 in the Task 3 review).
+#[test]
+fn booleans_order_false_before_true() {
+    for (expr, expected) in [
+        ("false < true", true),
+        ("true < false", false),
+        ("true > false", true),
+        ("false >= true", false),
+        ("true <= true", true),
+    ] {
+        assert_eq!(on_row(expr), Ok(Value::Boolean(expected)), "{expr}");
+    }
+}
+
+/// The syntax page's `author == this`: a link equals the file it resolves to
+/// (M9 in the Task 3 review), and link text is compared only when neither
+/// side resolves, so `==` stays transitive.
+#[test]
+fn a_link_equals_the_file_it_resolves_to() {
+    use vault_bases::LinkValue;
+    use vault_bases::eval::coerce::loose_equals;
+
+    let link = |target: &str, resolved: Option<&str>| {
+        Value::Link(LinkValue {
+            target: target.into(),
+            display: None,
+            resolved: resolved.map(path),
         })
-        .expect("spawn");
-    handle.join().expect("no stack overflow and no panic");
+    };
+    let file = Value::File(path("A.md"));
+    let resolved = link("A", Some("A.md"));
+    let unresolved = link("A", None);
+    assert_eq!(loose_equals(&resolved, &file), Ok(true));
+    assert_eq!(loose_equals(&file, &resolved), Ok(true));
+    assert_eq!(loose_equals(&link("B", Some("B.md")), &file), Ok(false));
+    assert_eq!(loose_equals(&unresolved, &file), Ok(false));
+    assert_eq!(
+        loose_equals(&unresolved, &resolved),
+        Ok(false),
+        "an unresolved link is not equal to a resolved one with the same text"
+    );
+    assert_eq!(loose_equals(&unresolved, &link("A", None)), Ok(true));
+    assert_eq!(loose_equals(&unresolved, &link("a", None)), Ok(false));
+}
+
+/// Every numeric corner through formatting, arithmetic, comparison and the
+/// number functions: each answer is a value or a typed error, never a panic,
+/// and every value renders as a cell.
+#[test]
+fn every_numeric_corner_is_a_value_or_a_typed_error() {
+    let corners = [
+        "0",
+        "(-0)",
+        "1",
+        "(-1)",
+        "0.5",
+        "1e21",
+        "1e-7",
+        "5e-324",
+        "1.7976931348623157e308",
+        "1e400",
+        "(-1e400)",
+        "inf",
+        "ninf",
+        "nan",
+        "huge",
+    ];
+    let unary = [
+        "({a}).toString()",
+        "({a}) + \"\"",
+        "-({a})",
+        "!({a})",
+        "({a}).isTruthy()",
+        "number({a})",
+        "({a}).toFixed(2)",
+        "({a}).round()",
+        "({a}).abs()",
+        "({a}).ceil()",
+        "({a}).floor()",
+        "if({a}, 1, 2)",
+        "list({a})",
+    ];
+    let binary = [
+        "({a}) + ({b})",
+        "({a}) - ({b})",
+        "({a}) * ({b})",
+        "({a}) / ({b})",
+        "({a}) % ({b})",
+        "({a}) < ({b})",
+        "({a}) >= ({b})",
+        "({a}) == ({b})",
+        "({a}) != ({b})",
+        "max({a}, {b})",
+        "min({a}, {b})",
+        "[{a}, {b}].sort()",
+        "[{a}, {b}].toString()",
+        "[{a}, {b}].mean()",
+    ];
+    let clock = Clock::fixed(0, "UTC");
+    let mut count = 0;
+    for a in corners {
+        let mut exprs: Vec<String> = unary.iter().map(|t| t.replace("{a}", a)).collect();
+        for b in corners {
+            exprs.extend(binary.iter().map(|t| t.replace("{a}", a).replace("{b}", b)));
+        }
+        for expr in exprs {
+            if let Ok(value) = on_yaml(&expr) {
+                vault_bases::fixtures::render_text(&value, &clock);
+            }
+            count += 1;
+        }
+    }
+    assert_eq!(
+        count,
+        corners.len() * (unary.len() + corners.len() * binary.len())
+    );
+}
+
+mod sort_order_is_total {
+    use std::cmp::Ordering;
+
+    use proptest::prelude::*;
+    use vault_bases::eval::coerce::sort_order;
+    use vault_bases::{DateValue, DurationValue, LinkValue, Value};
+    use vault_core::VaultPath;
+
+    fn number() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            Just(f64::NAN),
+            Just(-f64::NAN),
+            Just(f64::INFINITY),
+            Just(f64::NEG_INFINITY),
+            Just(0.0),
+            Just(-0.0),
+            -3.0..3.0f64,
+            any::<f64>(),
+        ]
+    }
+
+    fn value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            number().prop_map(Value::Number),
+            "[a-cA-C]{0,3}".prop_map(Value::String),
+            any::<bool>().prop_map(Value::Boolean),
+            (-3i64..3, any::<bool>())
+                .prop_map(|(epoch_ms, has_time)| Value::Date(DateValue { epoch_ms, has_time })),
+            (-2i64..2, -2i64..2)
+                .prop_map(|(months, ms)| Value::Duration(DurationValue { months, ms })),
+            "[ab]{1,2}".prop_map(|name| Value::File(VaultPath::new(format!("{name}.md")).unwrap())),
+            ("[ab]{1,2}", any::<bool>()).prop_map(|(target, resolves)| Value::Link(LinkValue {
+                resolved: resolves.then(|| VaultPath::new(format!("{target}.md")).unwrap()),
+                target,
+                display: None,
+            })),
+            "[ab]{0,2}".prop_map(Value::Icon),
+        ];
+        leaf.prop_recursive(2, 8, 3, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..3).prop_map(Value::List),
+                prop::collection::vec(("[ab]", inner), 0..2).prop_map(Value::Object),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn antisymmetric(a in value(), b in value()) {
+            prop_assert_eq!(sort_order(&a, &b), sort_order(&b, &a).reverse());
+            prop_assert_eq!(sort_order(&a, &a), Ordering::Equal);
+        }
+
+        #[test]
+        fn transitive(a in value(), b in value(), c in value()) {
+            let (ab, bc, ac) = (sort_order(&a, &b), sort_order(&b, &c), sort_order(&a, &c));
+            if ab != Ordering::Greater && bc != Ordering::Greater {
+                prop_assert_ne!(ac, Ordering::Greater, "{:?} {:?} {:?}", a, b, c);
+            }
+            if ab == Ordering::Equal && bc == Ordering::Equal {
+                prop_assert_eq!(ac, Ordering::Equal, "{:?} {:?} {:?}", a, b, c);
+            }
+        }
+
+        /// Numbers alone, so a NaN lands between two numbers often.
+        #[test]
+        fn transitive_over_numbers(a in number(), b in number(), c in number()) {
+            let (a, b, c) = (Value::Number(a), Value::Number(b), Value::Number(c));
+            let (ab, bc, ac) = (sort_order(&a, &b), sort_order(&b, &c), sort_order(&a, &c));
+            if ab != Ordering::Greater && bc != Ordering::Greater {
+                prop_assert_ne!(ac, Ordering::Greater, "{:?} {:?} {:?}", a, b, c);
+            }
+        }
+
+        #[test]
+        fn sort_by_never_panics_and_sorts(mut values in prop::collection::vec(value(), 0..40)) {
+            values.sort_by(sort_order);
+            for pair in values.windows(2) {
+                prop_assert_ne!(sort_order(&pair[0], &pair[1]), Ordering::Greater);
+            }
+        }
+    }
+
+    #[test]
+    fn nan_sorts_after_every_number_and_equal_to_nan() {
+        for number in [f64::NEG_INFINITY, -1.0, -0.0, 0.0, 1e308, f64::INFINITY] {
+            assert_eq!(
+                sort_order(&Value::Number(f64::NAN), &Value::Number(number)),
+                Ordering::Greater
+            );
+        }
+        assert_eq!(
+            sort_order(&Value::Number(f64::NAN), &Value::Number(-f64::NAN)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            sort_order(&Value::Number(-0.0), &Value::Number(0.0)),
+            Ordering::Equal
+        );
+    }
 }

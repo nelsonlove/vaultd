@@ -161,8 +161,11 @@ impl MemoryFile {
 }
 
 /// An in-memory vault for tests: no I/O, resolution by exact path, path plus
-/// `.md`, or a unique case-insensitive file name or stem — the same three
-/// stages `vault_core::Resolver` uses, enough to make link tests meaningful.
+/// `.md`, or a unique case-insensitive file name or stem. These are three of
+/// the stages `vault_core::Resolver` uses, not all: it ignores `from`, so a
+/// same-file link (`[[#heading]]`) and a `./` or `../` relative link resolve
+/// to nothing here, where the daemon's resolver resolves them. A test that
+/// needs either must not rely on this source.
 #[derive(Clone, Debug, Default)]
 pub struct MemorySource {
     files: BTreeMap<VaultPath, MemoryFile>,

@@ -1,5 +1,5 @@
 use super::token::{Spanned, Token, tokenize};
-use super::{BinaryOp, Expr, ExpressionError, ExpressionErrorKind, MAX_EXPRESSION_DEPTH, UnaryOp};
+use super::{BinaryOp, Expr, ExpressionError, ExpressionErrorKind, MAX_DEPTH, UnaryOp};
 
 struct Parser {
     tokens: Vec<Spanned>,
@@ -56,12 +56,8 @@ impl Parser {
 
     fn too_deep(&self) -> ExpressionError {
         ExpressionError {
-            kind: ExpressionErrorKind::ExpressionTooDeep {
-                max: MAX_EXPRESSION_DEPTH,
-            },
-            message: format!(
-                "expression nested too deeply (more than {MAX_EXPRESSION_DEPTH} levels)"
-            ),
+            kind: ExpressionErrorKind::ExpressionTooDeep { max: MAX_DEPTH },
+            message: format!("expression nested too deeply (more than {MAX_DEPTH} levels)"),
             position: self.position(),
         }
     }
@@ -71,7 +67,7 @@ impl Parser {
     /// gets its height here, so no tree deeper than the cap can exist.
     fn wrap(&self, children: usize) -> Result<usize, ExpressionError> {
         let height = children + 1;
-        if height > MAX_EXPRESSION_DEPTH {
+        if height > MAX_DEPTH {
             return Err(self.too_deep());
         }
         Ok(height)
@@ -93,7 +89,7 @@ impl Parser {
     }
 
     fn expression(&mut self, minimum: u8) -> Result<Node, ExpressionError> {
-        if self.depth >= MAX_EXPRESSION_DEPTH {
+        if self.depth >= MAX_DEPTH {
             return Err(self.too_deep());
         }
         self.depth += 1;
@@ -161,7 +157,7 @@ impl Parser {
     // Each compound form below has its own function rather than an arm of
     // one large match: an unoptimised build gives a function one stack slot
     // per local of every arm, and these frames repeat once per nesting
-    // level, so small frames are what keep MAX_EXPRESSION_DEPTH levels
+    // level, so small frames are what keep MAX_DEPTH levels
     // inside a 2 MiB thread stack.
 
     fn prefix(&mut self) -> Result<Node, ExpressionError> {
@@ -318,7 +314,7 @@ impl Parser {
 
 /// Parse one expression string. The whole input must be one expression:
 /// trailing tokens are an error naming where they start. An expression that
-/// nests deeper than [`MAX_EXPRESSION_DEPTH`] levels is an
+/// nests deeper than [`MAX_DEPTH`] levels is an
 /// [`ExpressionErrorKind::ExpressionTooDeep`] error, never a stack overflow.
 pub fn parse_expression(text: &str) -> Result<Expr, ExpressionError> {
     let mut parser = Parser {

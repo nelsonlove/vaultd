@@ -119,9 +119,13 @@ pub(crate) fn eager(
     ctx: &EvalContext<'_>,
     scope: &Scope,
 ) -> Result<Vec<Value>, EvalError> {
-    args.iter()
-        .map(|arg| crate::eval::evaluate(arg, ctx, scope))
-        .collect()
+    // A plain loop, not an iterator `collect`: in a debug build the
+    // iterator adapters add several frames per nesting level.
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(crate::eval::evaluate(arg, ctx, scope)?);
+    }
+    Ok(values)
 }
 
 pub(crate) fn arity(name: &str, args: &[Expr], least: usize, most: usize) -> Result<(), EvalError> {

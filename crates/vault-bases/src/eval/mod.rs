@@ -274,7 +274,7 @@ pub(crate) fn compile_regexp(source: &str, flags: &str) -> Result<RegexpValue, E
 /// Evaluate `expr` for one row.
 ///
 /// The walk recurses once per tree level, and the parser caps a tree at
-/// [`crate::expr::MAX_EXPRESSION_DEPTH`] levels, so the recursion is bounded.
+/// [`crate::expr::MAX_DEPTH`] levels, so the recursion is bounded.
 /// Each node kind is its own small function: one large `match` here would
 /// give every level the frame of the largest arm, and a debug build at the
 /// cap would then overflow a 2 MiB thread stack (the

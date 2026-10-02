@@ -44,3 +44,8 @@
 {"family":"coercion","case":"property:list_index","expr":"property[0]","props":{"property":["a","b"]},"kind":"string","text":"a","source":"published"}
 {"family":"coercion","case":"property:list_index_out_of_range","expr":"property[5]","props":{"property":["a"]},"kind":"null","text":"","source":"published"}
 {"family":"coercion","case":"index:string","expr":"\"abc\"[0]","kind":"error","source":"uncaptured"}
+{"family":"coercion","case":"cmp:boolean","expr":"false < true","kind":"boolean","text":"true","source":"published"}
+{"family":"coercion","case":"cmp:boolean_reversed","expr":"true < false","kind":"boolean","text":"false","source":"published"}
+{"family":"coercion","case":"number_text:infinity","expr":"(1e400).toString()","kind":"string","text":"Infinity","source":"provisional"}
+{"family":"coercion","case":"number_text:negative_infinity","expr":"(-1e400).toString()","kind":"string","text":"-Infinity","source":"provisional"}
+{"family":"coercion","case":"number_cell:infinity","expr":"1e400","kind":"number","text":"Infinity","source":"provisional"}

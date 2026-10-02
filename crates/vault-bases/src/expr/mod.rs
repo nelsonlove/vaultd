@@ -88,9 +88,14 @@ pub enum BinaryOp {
 /// (the parser itself, `Drop`, `Clone`, `PartialEq`, `Debug` and the
 /// evaluator) recurses once per level. Without a cap, a few kilobytes of
 /// `((((…` or `a.b.b.b…` overflow the stack, and a stack overflow aborts the
-/// whole daemon rather than failing one view. 256 levels is far beyond any
-/// hand-written formula and well inside a 2 MiB thread stack.
-pub const MAX_EXPRESSION_DEPTH: usize = 256;
+/// whole daemon rather than failing one view.
+///
+/// Why 64 and not more: in a debug build the evaluator spends up to about
+/// 10 KiB of stack per level (nested eager calls such as `max(max(…))`), so
+/// 256 nested calls needed 2.5 MiB, and the daemon's connection threads have
+/// 2 MiB. No real base nests past a handful of levels, so 64 keeps every
+/// shape inside a 1 MiB stack, with room for the families still to come.
+pub const MAX_DEPTH: usize = 64;
 
 /// An expression that does not parse, with the byte offset into the
 /// expression text where the parser gave up.
@@ -107,6 +112,6 @@ pub enum ExpressionErrorKind {
     /// The text is not in the grammar; `message` says what was expected.
     Syntax,
     /// The text nests deeper than `max` levels
-    /// ([`MAX_EXPRESSION_DEPTH`]).
+    /// ([`MAX_DEPTH`]).
     ExpressionTooDeep { max: usize },
 }
