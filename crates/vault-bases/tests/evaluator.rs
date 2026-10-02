@@ -125,7 +125,7 @@ fn every_expression_form_evaluates_on_a_memory_source() {
         ("formula.ppu", Err(EvalError::UnknownFormula("ppu".into()))),
         // Calls and methods.
         ("if(price, 1, 2)", Ok(Value::Number(1.0))),
-        ("today()", Err(EvalError::UnknownFunction("today".into()))),
+        ("nowish()", Err(EvalError::UnknownFunction("nowish".into()))),
         ("x.isTruthy()", Ok(Value::Boolean(true))),
         // Unary.
         ("-x", Ok(Value::Number(-3.0))),
@@ -273,7 +273,7 @@ fn deepest(open: &str, inner: &str, close: &str) -> (String, String) {
 fn every_shape_at_the_cap() {
     use vault_bases::expr::ExpressionErrorKind;
 
-    let shapes: [(&str, &str, &str, Option<Value>); 15] = [
+    let shapes: [(&str, &str, &str, Option<Value>); 18] = [
         ("1+", "1", "", None),
         ("-", "1", "", None),
         ("!", "true", "", None),
@@ -289,6 +289,9 @@ fn every_shape_at_the_cap() {
         ("[1].map(", "value", ")", None),
         ("[1].filter(", "true", ")", None),
         ("[1].reduce(", "acc", ", 0)", None),
+        ("date(", "now()", ")", None),
+        ("duration(", "\"1d\"", ")", None),
+        ("", "now()", ".date()", None),
     ];
     for (open, inner, close, expected) in shapes {
         let (at_cap, over_cap) = deepest(open, inner, close);

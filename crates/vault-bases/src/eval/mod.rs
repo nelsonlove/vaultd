@@ -140,7 +140,7 @@ impl Scope {
 }
 
 /// A YAML property value as a Bases value. A declared date type is applied
-/// by `functions::date::typed_property` (Task 5); links in frontmatter by
+/// by `functions::typed_property`; links in frontmatter by
 /// `functions::link::frontmatter_links` (Task 6). Here: the YAML types.
 pub(crate) fn property_value(value: &PropertyValue) -> Value {
     match value {

@@ -1,0 +1,50 @@
+{"family":"date","case":"date:parse_datetime","expr":"date(\"2025-01-01 12:00:00\").format(\"YYYY-MM-DD HH:mm:ss\")","kind":"string","text":"2025-01-01 12:00:00","source":"published"}
+{"family":"date","case":"date:parse_date","expr":"date(\"2025-05-27\").format(\"YYYY-MM-DD\")","kind":"string","text":"2025-05-27","source":"published"}
+{"family":"date","case":"date:invalid","expr":"date(\"not a date\")","kind":"error","source":"published"}
+{"family":"date","case":"arith:month_then_hours","expr":"(date(\"2024-12-01\") + \"1M\" + \"4h\" + \"3m\").format(\"YYYY-MM-DD HH:mm:ss\")","kind":"string","text":"2025-01-01 04:03:00","source":"published"}
+{"family":"date","case":"now","expr":"now().format(\"YYYY-MM-DD HH:mm\")","kind":"string","text":"2026-01-15 10:30","source":"published"}
+{"family":"date","case":"today","expr":"today().format(\"YYYY-MM-DD HH:mm:ss\")","kind":"string","text":"2026-01-15 00:00:00","source":"published"}
+{"family":"date","case":"date_method","expr":"now().date().format(\"YYYY-MM-DD HH:mm:ss\")","kind":"string","text":"2026-01-15 00:00:00","source":"published"}
+{"family":"date","case":"time","expr":"now().time()","kind":"string","text":"10:30:00","source":"published"}
+{"family":"date","case":"isEmpty","expr":"now().isEmpty()","kind":"boolean","text":"false","source":"published"}
+{"family":"date","case":"arith:date_minus_date","expr":"(now() + \"1d\") - now()","kind":"duration","text":"86400000","source":"published"}
+{"family":"date","case":"arith:one_day_spelled","expr":"(now() + \"1 day\").format(\"YYYY-MM-DD HH:mm\")","kind":"string","text":"2026-01-16 10:30","source":"published"}
+{"family":"date","case":"arith:seven_days","expr":"(today() + \"7d\").format(\"YYYY-MM-DD\")","kind":"string","text":"2026-01-22","source":"published"}
+{"family":"date","case":"arith:week_back","expr":"(now() - \"1 week\").format(\"YYYY-MM-DD\")","kind":"string","text":"2026-01-08","source":"published"}
+{"family":"date","case":"arith:minus_hours","expr":"(now() - \"2h\").format(\"HH:mm\")","kind":"string","text":"08:30","source":"published"}
+{"family":"date","case":"arith:duration_times","expr":"(now() + (duration('1d') * 2)).format(\"YYYY-MM-DD\")","kind":"string","text":"2026-01-17","source":"published"}
+{"family":"date","case":"duration:times_number","expr":"duration('5h') * 2","kind":"duration","text":"36000000","source":"published"}
+{"family":"date","case":"duration:number_on_left","expr":"2 * duration('5h')","kind":"error","source":"published"}
+{"family":"date","case":"duration:invalid","expr":"duration(\"soon\")","kind":"error","source":"published"}
+{"family":"date","case":"arith:exact_day_across_dst","expr":"(date(\"2026-03-07 12:00:00\") + \"1d\").format(\"YYYY-MM-DD HH:mm\")","kind":"string","text":"2026-03-08 13:00","source":"published"}
+{"family":"date","case":"arith:calendar_day_without_time","expr":"(date(\"2026-03-07\") + \"1d\").format(\"YYYY-MM-DD HH:mm\")","kind":"string","text":"2026-03-08 00:00","source":"published"}
+{"family":"date","case":"field:year","expr":"now().year","kind":"number","text":"2026","source":"published"}
+{"family":"date","case":"field:month","expr":"now().month","kind":"number","text":"1","source":"published"}
+{"family":"date","case":"field:day","expr":"now().day","kind":"number","text":"15","source":"published"}
+{"family":"date","case":"field:hour","expr":"now().hour","kind":"number","text":"10","source":"published"}
+{"family":"date","case":"field:minute","expr":"now().minute","kind":"number","text":"30","source":"published"}
+{"family":"date","case":"field:second","expr":"now().second","kind":"number","text":"0","source":"published"}
+{"family":"date","case":"field:millisecond","expr":"now().millisecond","kind":"number","text":"0","source":"published"}
+{"family":"date","case":"compare","expr":"date(\"2024-01-01\") < date(\"2024-02-01\")","kind":"boolean","text":"true","source":"published"}
+{"family":"date","case":"equal_instant","expr":"date(\"2024-01-01 00:00:00\") == date(\"2024-01-01\")","kind":"boolean","text":"true","source":"published"}
+{"family":"date","case":"format:long","expr":"date(\"2025-05-27 14:05:09\").format(\"dddd, MMMM Do YYYY, h:mm:ss a\")","kind":"string","text":"Tuesday, May 27th 2025, 2:05:09 pm","source":"published"}
+{"family":"date","case":"format:short_names","expr":"date(\"2025-05-27\").format(\"ddd MMM D, YY\")","kind":"string","text":"Tue May 27, 25","source":"published"}
+{"family":"date","case":"format:escaped_and_quarter","expr":"date(\"2025-05-27\").format(\"[Quarter] Q\")","kind":"string","text":"Quarter 2","source":"published"}
+{"family":"date","case":"format:offset","expr":"now().format(\"Z ZZ\")","kind":"string","text":"-05:00 -0500","source":"published"}
+{"family":"date","case":"format:day_of_year_and_weekday_number","expr":"date(\"2025-02-01\").format(\"DDDD d\")","kind":"string","text":"032 6","source":"published"}
+{"family":"date","case":"format:unsupported_token","expr":"now().format(\"W\")","kind":"error","source":"published"}
+{"family":"date","case":"relative:days_ago","expr":"(now() - \"3d\").relative()","kind":"string","text":"3 days ago","source":"published"}
+{"family":"date","case":"relative:in_hours","expr":"(now() + \"2h\").relative()","kind":"string","text":"in 2 hours","source":"provisional"}
+{"family":"date","case":"relative:few_seconds","expr":"(now() - \"30s\").relative()","kind":"string","text":"a few seconds ago","source":"provisional"}
+{"family":"date","case":"relative:a_minute","expr":"(now() - \"50s\").relative()","kind":"string","text":"a minute ago","source":"provisional"}
+{"family":"date","case":"relative:a_month","expr":"(now() - \"30d\").relative()","kind":"string","text":"a month ago","source":"provisional"}
+{"family":"date","case":"relative:years","expr":"(now() - \"2y\").relative()","kind":"string","text":"2 years ago","source":"provisional"}
+{"family":"date","case":"render:date_without_time","expr":"date(\"2025-01-01\")","kind":"date","text":"2025-01-01","source":"provisional"}
+{"family":"date","case":"render:date_with_time","expr":"date(\"2025-01-01 00:00:00\")","kind":"date","text":"2025-01-01 00:00","source":"provisional"}
+{"family":"date","case":"render:now","expr":"now()","kind":"date","text":"2026-01-15 10:30","source":"provisional"}
+{"family":"date","case":"render:today","expr":"today()","kind":"date","text":"2026-01-15","source":"provisional"}
+{"family":"date","case":"render:date_method","expr":"now().date()","kind":"date","text":"2026-01-15","source":"provisional"}
+{"family":"date","case":"arith:months_keep_no_time","expr":"date(\"2024-12-01\") + \"1M\"","kind":"date","text":"2025-01-01","source":"provisional"}
+{"family":"date","case":"arith:hours_give_a_time","expr":"date(\"2025-01-01\") + \"4h\"","kind":"date","text":"2025-01-01 04:00","source":"provisional"}
+{"family":"date","case":"arith:calendar_day_without_time_across_dst","expr":"(date(\"2026-03-08\") + \"1d\").format(\"YYYY-MM-DD HH:mm\")","kind":"string","text":"2026-03-09 00:00","source":"provisional"}
+{"family":"date","case":"arith:exact_day_from_midnight_across_dst","expr":"(date(\"2026-03-08 00:00:00\") + \"1d\").format(\"YYYY-MM-DD HH:mm\")","kind":"string","text":"2026-03-09 01:00","source":"published"}

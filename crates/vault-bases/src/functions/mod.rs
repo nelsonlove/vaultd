@@ -6,6 +6,7 @@
 //! step (Task 7) answers `unsupported_function` for anything outside it.
 
 mod any;
+mod date;
 mod global;
 mod list;
 mod number;
@@ -17,23 +18,33 @@ use vault_core::PropertyValue;
 
 use crate::eval::{EvalContext, EvalError, Scope, property_value};
 use crate::expr::{BinaryOp, Expr};
+use crate::source::PropertyType;
 use crate::value::Value;
 
-/// A property value with its declared type applied. Task 5 adds dates and
-/// Task 6 adds frontmatter links; until then, the YAML type.
-pub(crate) fn typed_property(_ctx: &EvalContext<'_>, _key: &str, value: &PropertyValue) -> Value {
-    property_value(value)
+/// A property value with its declared type applied: a date- or
+/// datetime-typed property's text becomes a date (text that does not parse
+/// stays text, as Obsidian shows it). Task 6 adds frontmatter links.
+pub(crate) fn typed_property(ctx: &EvalContext<'_>, key: &str, value: &PropertyValue) -> Value {
+    let plain = property_value(value);
+    match (ctx.source.property_type(key), &plain) {
+        (Some(PropertyType::Date | PropertyType::DateTime), Value::String(text)) => {
+            crate::dates::parse_date_text(text, ctx.clock)
+                .map(Value::Date)
+                .unwrap_or(plain)
+        }
+        _ => plain,
+    }
 }
 
 /// Date and duration arithmetic, when either side is a date or a duration.
-/// `Ok(None)` hands the operation back to plain arithmetic. Task 5 fills it.
+/// `Ok(None)` hands the operation back to plain arithmetic.
 pub(crate) fn date_arithmetic(
-    _op: BinaryOp,
-    _left: &Value,
-    _right: &Value,
-    _ctx: &EvalContext<'_>,
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+    ctx: &EvalContext<'_>,
 ) -> Result<Option<Value>, EvalError> {
-    Ok(None)
+    date::arithmetic(op, left, right, ctx)
 }
 
 pub(crate) fn call_global(
@@ -44,6 +55,9 @@ pub(crate) fn call_global(
 ) -> Result<Value, EvalError> {
     if global::GLOBALS.contains(&name) {
         return global::call(name, args, ctx, scope);
+    }
+    if date::GLOBALS.contains(&name) {
+        return date::call_global(name, args, ctx, scope);
     }
     Err(EvalError::UnknownFunction(name.to_string()))
 }
@@ -72,6 +86,7 @@ pub(crate) fn call_method(
         Value::List(items) => list::call(items, name, args, ctx, scope),
         Value::Object(entries) => object::call(entries, name, args),
         Value::Regexp(regexp) => regexp::call(&regexp, name, args, ctx, scope),
+        Value::Date(date) => date::call(date, name, args, ctx, scope),
         other => Err(EvalError::NoSuchMethod {
             target: other.type_name(),
             name: name.to_string(),
@@ -79,15 +94,12 @@ pub(crate) fn call_method(
     }
 }
 
-pub(crate) fn field(
-    target: &Value,
-    name: &str,
-    _ctx: &EvalContext<'_>,
-) -> Result<Value, EvalError> {
+pub(crate) fn field(target: &Value, name: &str, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
     match target {
         Value::Null => Ok(Value::Null),
         Value::String(text) => string::field(text, name),
         Value::List(items) => list::field(items, name),
+        Value::Date(date) => date::field(*date, name, ctx),
         other => Err(EvalError::NoSuchField {
             target: other.type_name(),
             name: name.to_string(),
@@ -96,7 +108,7 @@ pub(crate) fn field(
 }
 
 pub fn is_known_global(name: &str) -> bool {
-    global::GLOBALS.contains(&name)
+    global::GLOBALS.contains(&name) || date::GLOBALS.contains(&name)
 }
 
 pub fn is_known_method(name: &str) -> bool {
@@ -107,6 +119,7 @@ pub fn is_known_method(name: &str) -> bool {
         list::METHODS,
         object::METHODS,
         regexp::METHODS,
+        date::METHODS,
     ]
     .iter()
     .any(|methods| methods.contains(&name))
