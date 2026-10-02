@@ -8,6 +8,7 @@
 //! a runtime capture under `tests/fixtures/captures/`, and where neither
 //! exists the evaluator answers a typed error rather than a guess.
 
+pub mod expr;
 mod file;
 mod value;
 
