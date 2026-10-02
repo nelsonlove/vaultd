@@ -165,6 +165,35 @@ fn provisional_string_escapes_follow_javascript() {
     }
 }
 
+/// The source text `"<backslash>u<hex>…"`, built from a `char` so that no
+/// editor or transcription can turn the escape into the literal character.
+fn u_escapes(hex: &[&str]) -> String {
+    let backslash = '\\';
+    let body: String = hex.iter().map(|h| format!("{backslash}u{h}")).collect();
+    format!("\"{body}\"")
+}
+
+/// Provisional (ruling N1): a four-digit `\uHHHH` escape is one character.
+#[test]
+fn provisional_a_four_digit_u_escape_is_one_character() {
+    for (hex, expected) in [("0041", "A"), ("00e9", "\u{e9}"), ("20AC", "\u{20ac}")] {
+        let text = u_escapes(&[hex]);
+        assert_eq!(text.len(), 8, "{text} is the escape, not the character");
+        assert_eq!(string(&text).expect(&text), expected, "{text}");
+    }
+}
+
+/// Provisional (ruling N1): a high and a low surrogate escape combine into
+/// one character, as JavaScript's UTF-16 strings do.
+#[test]
+fn provisional_a_surrogate_pair_combines_into_one_character() {
+    let text = u_escapes(&["D83D", "DE00"]);
+    assert_eq!(text.len(), 14, "{text} is the escapes, not the character");
+    let value = string(&text).expect(&text);
+    assert_eq!(value, "\u{1F600}");
+    assert_eq!(value.chars().count(), 1);
+}
+
 /// Provisional (ruling N1): a malformed `\x` or `\u` escape is a typed
 /// error at the backslash, never accepted.
 #[test]
