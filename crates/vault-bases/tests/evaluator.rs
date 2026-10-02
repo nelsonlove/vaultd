@@ -233,7 +233,7 @@ fn errors_are_typed_values_never_panics() {
     ] {
         assert_eq!(on_row(expr), Err(expected), "{expr:?}");
     }
-    for expr in [r#"-"a""#, "true * 2", "[1] - 1", "obj - 1"] {
+    for expr in [r#"-"a""#, "[1] - 1", "obj - 1"] {
         assert!(
             matches!(on_row(expr), Err(EvalError::Type(_))),
             "{expr:?}: {:?}",
@@ -247,10 +247,24 @@ fn errors_are_typed_values_never_panics() {
         ),
         "`file` without a row is a type error"
     );
-    assert!(
-        matches!(on_row("1e308 * 10"), Err(EvalError::Type(_))),
-        "an infinite result is an error, not a cell holding Infinity"
-    );
+    // Open questions for the capture (Task 13): JavaScript would answer each
+    // of these with a value; until a capture settles it, each is uncaptured.
+    for (expr, case) in [
+        ("1e308 * 10", "arith:nonfinite"),
+        ("1e400 + 1", "arith:nonfinite"),
+        ("1 + true", "arith:mixed_bool"),
+        ("true * 2", "arith:mixed_bool"),
+        ("true + true", "arith:mixed_bool"),
+        ("[1] + [2]", "arith:list_plus_list"),
+        (r#"number("Infinity")"#, "number:infinity_string"),
+        (r#"number(" -Infinity ")"#, "number:infinity_string"),
+    ] {
+        assert_eq!(
+            on_row(expr),
+            Err(EvalError::Uncaptured(case.into())),
+            "{expr:?}"
+        );
+    }
 }
 
 /// The deepest expression built from `open` × k, `inner`, `close` × k that

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use vault_core::{PropertyValue, SourceSpan, Spanned, VaultPath};
 
@@ -166,10 +167,33 @@ impl MemoryFile {
 /// same-file link (`[[#heading]]`) and a `./` or `../` relative link resolve
 /// to nothing here, where the daemon's resolver resolves them. A test that
 /// needs either must not rely on this source.
+///
+/// It also records what it was asked ([`MemorySource::log`]), so a test can
+/// show that a prefilter narrowed the rows the source had to read, not only
+/// that the answer was right. A clone shares the record.
 #[derive(Clone, Debug, Default)]
 pub struct MemorySource {
     files: BTreeMap<VaultPath, MemoryFile>,
     types: BTreeMap<String, PropertyType>,
+    log: Arc<Mutex<SourceLog>>,
+}
+
+/// What a [`MemorySource`] was asked, since it was built or last cleared.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceLog {
+    /// The prefilters of every `candidates` call, in call order.
+    pub candidates: Vec<Vec<Prefilter>>,
+    /// Every path a per-file question (`facts`, `properties`, `tags`,
+    /// `links`, `embeds`, `backlinks`) was asked about.
+    pub rows_read: BTreeSet<VaultPath>,
+}
+
+/// A folder argument as `file.inFolder` reads it: without leading or
+/// trailing `/`, so `"/Notes/"` and `"Notes"` name the same folder and `""`
+/// is the vault root. The prefilter extractor and [`MemorySource`] use it,
+/// so a prefilter admits exactly the folder its conjunct tests.
+pub(crate) fn folder_key(folder: &str) -> &str {
+    folder.trim_matches('/')
 }
 
 /// A text property value with an empty span — the span is never read by
@@ -209,7 +233,24 @@ impl MemorySource {
         self
     }
 
+    /// What this source has been asked so far.
+    pub fn log(&self) -> SourceLog {
+        self.record().clone()
+    }
+
+    /// Forget what this source has been asked.
+    pub fn clear_log(&self) {
+        *self.record() = SourceLog::default();
+    }
+
+    fn record(&self) -> std::sync::MutexGuard<'_, SourceLog> {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn file(&self, path: &VaultPath) -> Option<&MemoryFile> {
+        self.record().rows_read.insert(path.clone());
         self.files.get(path)
     }
 
@@ -239,7 +280,7 @@ impl MemorySource {
     fn admits(&self, path: &VaultPath, file: &MemoryFile, prefilter: &Prefilter) -> bool {
         match prefilter {
             Prefilter::InFolder(folder) => {
-                let folder = folder.trim_end_matches('/');
+                let folder = folder_key(folder);
                 folder.is_empty() || path.as_str().starts_with(&format!("{folder}/"))
             }
             Prefilter::HasTag(tags) => file.tags.iter().any(|have| {
@@ -269,6 +310,7 @@ pub fn extension(path: &VaultPath) -> &str {
 
 impl RowSource for MemorySource {
     fn candidates(&self, prefilters: &[Prefilter]) -> Result<Vec<VaultPath>, SourceError> {
+        self.record().candidates.push(prefilters.to_vec());
         Ok(self
             .files
             .iter()
@@ -334,6 +376,7 @@ impl RowSource for MemorySource {
     }
 
     fn backlinks(&self, path: &VaultPath) -> Result<Vec<VaultPath>, SourceError> {
+        self.record().rows_read.insert(path.clone());
         Ok(self
             .files
             .iter()

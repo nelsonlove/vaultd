@@ -314,3 +314,24 @@ fn parses_the_syntax_page_single_and_snippet() {
     );
     assert!(base.views.is_empty());
 }
+
+/// A property declared with nothing under it (`properties:\n  x:`) is the
+/// empty-settings case under the empty-section rule, not an error; a
+/// declared neighbour keeps its settings.
+#[test]
+fn a_property_with_null_settings_has_empty_settings() {
+    let base = parse_base("properties:\n  x:\n  y:\n    displayName: Why\n").expect("parses");
+    assert_eq!(
+        base.properties,
+        vec![
+            ("x".to_string(), vault_bases::PropertySettings::default()),
+            (
+                "y".to_string(),
+                vault_bases::PropertySettings {
+                    display_name: Some("Why".into()),
+                    options: Vec::new(),
+                }
+            ),
+        ]
+    );
+}

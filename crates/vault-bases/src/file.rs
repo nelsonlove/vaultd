@@ -380,7 +380,12 @@ pub fn parse_base(text: &str) -> Result<BaseFile, BaseParseError> {
             "summaries" => base.summaries = named_expressions(value, "a summary formula")?,
             "properties" => {
                 for (property, settings) in mapping(value, "properties")? {
-                    let settings_entries = mapping(settings, "a property's settings")?;
+                    // `properties:\n  x:` declares `x` with no settings: an
+                    // empty section, read as empty, not as an error.
+                    let settings_entries = match section(settings) {
+                        Some(settings) => mapping(settings, "a property's settings")?,
+                        None => &[],
+                    };
                     let display_name = lookup(settings_entries, "displayName")
                         .map(|value| plain_string(value, "displayName"))
                         .transpose()?;

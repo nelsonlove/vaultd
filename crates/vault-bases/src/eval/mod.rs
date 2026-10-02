@@ -33,6 +33,10 @@ pub enum EvalError {
     UnknownFormula(String),
     #[error("formula cycle through {0}")]
     FormulaCycle(String),
+    /// Formulas that read formulas nest past the evaluator's depth budget
+    /// (the same [`crate::expr::MAX_DEPTH`] levels one expression may have).
+    #[error("formulas nested too deeply (more than {max} levels)")]
+    FormulaTooDeep { max: usize },
     #[error("{0} is not captured yet")]
     Uncaptured(String),
     #[error("unsupported format token {0}")]
@@ -91,6 +95,19 @@ impl<'a> EvalContext<'a> {
     pub fn with_formulas(mut self, formulas: &'a dyn Formulas) -> Self {
         self.formulas = formulas;
         self
+    }
+
+    /// The same context, borrowed for a shorter life, so a view can swap in
+    /// its own formula table without the caller giving theirs up.
+    pub fn reborrow(&self) -> EvalContext<'_> {
+        EvalContext {
+            source: self.source,
+            clock: self.clock,
+            base_path: self.base_path,
+            this_path: self.this_path,
+            formulas: self.formulas,
+            random_state: Cell::new(self.random_state.get()),
+        }
     }
 
     /// A number in `[0, 1)`. The functions page: "The number generation
@@ -198,11 +215,13 @@ fn arithmetic(
     if let Some(value) = functions::date_arithmetic(op, &left, &right, ctx)? {
         return Ok(value);
     }
+    // Whether arithmetic that leaves the finite numbers gives JavaScript's
+    // `Infinity`/`NaN` or an error is not published (`arith:nonfinite`).
     let finite = |number: f64| {
         if number.is_finite() {
             Ok(Value::Number(number))
         } else {
-            Err(EvalError::Type("the result is not a finite number".into()))
+            Err(EvalError::Uncaptured("arith:nonfinite".into()))
         }
     };
     match (op, &left, &right) {
@@ -226,6 +245,15 @@ fn arithmetic(
         ),
         (_, Value::Null, _) | (_, _, Value::Null) => {
             Err(EvalError::Uncaptured("arith:null".into()))
+        }
+        // JavaScript would convert a boolean to 0 or 1 and concatenate two
+        // lists as text; whether Bases does either is not published.
+        (_, Value::Boolean(_), Value::Number(_) | Value::Boolean(_))
+        | (_, Value::Number(_), Value::Boolean(_)) => {
+            Err(EvalError::Uncaptured("arith:mixed_bool".into()))
+        }
+        (BinaryOp::Add, Value::List(_), Value::List(_)) => {
+            Err(EvalError::Uncaptured("arith:list_plus_list".into()))
         }
         _ => Err(EvalError::Type(format!(
             "cannot apply {op:?} to {} and {}",

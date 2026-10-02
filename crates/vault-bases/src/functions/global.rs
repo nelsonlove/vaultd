@@ -107,6 +107,11 @@ fn number(args: &[Expr], ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value, 
         Value::String(text) if text.trim().is_empty() => {
             Err(EvalError::Uncaptured("number:empty_string".into()))
         }
+        // JavaScript's `Number("Infinity")` is Infinity; whether Bases
+        // answers it or refuses it is not published.
+        Value::String(text) if matches!(text.trim(), "Infinity" | "+Infinity" | "-Infinity") => {
+            Err(EvalError::Uncaptured("number:infinity_string".into()))
+        }
         Value::String(text) => parse_js_number(&text)
             .map(Value::Number)
             .ok_or_else(|| EvalError::Argument(format!("{text:?} is not a number"))),

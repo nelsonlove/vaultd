@@ -49,3 +49,6 @@
 {"family":"coercion","case":"number_text:infinity","expr":"(1e400).toString()","kind":"string","text":"Infinity","source":"provisional"}
 {"family":"coercion","case":"number_text:negative_infinity","expr":"(-1e400).toString()","kind":"string","text":"-Infinity","source":"provisional"}
 {"family":"coercion","case":"number_cell:infinity","expr":"1e400","kind":"number","text":"Infinity","source":"provisional"}
+{"family":"coercion","case":"arith:mixed_bool","expr":"1 + true","kind":"error","source":"uncaptured"}
+{"family":"coercion","case":"arith:list_plus_list","expr":"[1] + [2]","kind":"error","source":"uncaptured"}
+{"family":"coercion","case":"arith:nonfinite","expr":"1e308 * 10","kind":"error","source":"uncaptured"}

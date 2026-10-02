@@ -18,6 +18,7 @@ pub mod fixtures;
 pub mod functions;
 mod source;
 mod value;
+pub mod view;
 
 pub use clock::Clock;
 pub use dates::format_date;
@@ -27,6 +28,6 @@ pub use file::{
 };
 pub use source::{
     FileFacts, FileKind, LinkFact, MemoryFile, MemorySource, Prefilter, PropertyType, RowSource,
-    ScalarLiteral, SourceError, extension, no_span, number, text,
+    ScalarLiteral, SourceError, SourceLog, extension, no_span, number, text,
 };
 pub use value::{DateValue, DurationValue, LinkValue, RegexpValue, Value};

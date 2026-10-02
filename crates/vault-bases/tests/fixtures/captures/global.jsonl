@@ -18,3 +18,4 @@
 {"family":"global","case":"icon:kind","expr":"icon(\"arrow-right\")","kind":"icon","text":"arrow-right","source":"published"}
 {"family":"global","case":"image:url","expr":"image(\"https://obsidian.md/images/obsidian-logo-gradient.svg\")","kind":"image","text":"https://obsidian.md/images/obsidian-logo-gradient.svg","source":"published"}
 {"family":"global","case":"unknown_function","expr":"frobnicate(1)","kind":"error","source":"published"}
+{"family":"global","case":"number:infinity_string","expr":"number(\"Infinity\")","kind":"error","source":"uncaptured"}
