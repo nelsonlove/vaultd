@@ -202,6 +202,21 @@ impl IndexStore {
                     usize_to_i64(property.value.span.end(), "property value span end")?,
                 ],
             )?;
+            let scalar = codec::property_scalar(&property.value.value);
+            transaction.execute(
+                "INSERT INTO property_scalars \
+                 (note_path, ordinal, key_text, key_fold, kind, string_value, number_value) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    path,
+                    usize_to_i64(ordinal, "property ordinal")?,
+                    property.key.value,
+                    property.key.value.to_lowercase(),
+                    scalar.kind,
+                    scalar.string_value,
+                    scalar.number_value,
+                ],
+            )?;
         }
 
         for (ordinal, alias) in note.aliases.iter().enumerate() {

@@ -603,3 +603,73 @@ pub(crate) struct ReferenceColumns<'a> {
     pub subpath_value: Option<&'a str>,
     pub display: Option<&'a str>,
 }
+
+/// One `property_scalars` row's value columns.
+pub(crate) struct StoredScalar {
+    pub kind: &'static str,
+    pub string_value: Option<String>,
+    pub number_value: Option<f64>,
+}
+
+fn digits(text: &[u8]) -> bool {
+    !text.is_empty() && text.iter().all(u8::is_ascii_digit)
+}
+
+/// `YYYY-MM-DD`, optionally followed by `[ T]HH:mm[:ss[.fff]]`.
+fn looks_like_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 10
+        || !(digits(&bytes[0..4])
+            && bytes[4] == b'-'
+            && digits(&bytes[5..7])
+            && bytes[7] == b'-'
+            && digits(&bytes[8..10]))
+    {
+        return false;
+    }
+    let rest = &bytes[10..];
+    if rest.is_empty() {
+        return true;
+    }
+    if !(rest[0] == b' ' || rest[0] == b'T') || rest.len() < 6 {
+        return false;
+    }
+    let time = &rest[1..];
+    if !(digits(&time[0..2]) && time[2] == b':' && digits(&time[3..5])) {
+        return false;
+    }
+    let tail = &time[5..];
+    match tail {
+        [] => true,
+        [b':', seconds @ ..] => {
+            let (whole, fraction) = match seconds.iter().position(|b| *b == b'.') {
+                Some(at) => (&seconds[..at], Some(&seconds[at + 1..])),
+                None => (seconds, None),
+            };
+            whole.len() == 2 && digits(whole) && fraction.is_none_or(digits)
+        }
+        _ => false,
+    }
+}
+
+/// Classify one property value into its `property_scalars` columns. The
+/// `date` kind is lexical (see `looks_like_date`): the index knows no
+/// property types, so the kind is a read optimisation, never a correctness
+/// input.
+pub(crate) fn property_scalar(value: &PropertyValue) -> StoredScalar {
+    let (kind, string_value, number_value) = match value {
+        PropertyValue::Null => ("null", None, None),
+        PropertyValue::Boolean(flag) => ("boolean", None, Some(if *flag { 1.0 } else { 0.0 })),
+        PropertyValue::Integer(number) => ("number", None, Some(*number as f64)),
+        PropertyValue::Float(number) => ("number", None, Some(*number)),
+        PropertyValue::String(text) if looks_like_date(text) => ("date", Some(text.clone()), None),
+        PropertyValue::String(text) => ("string", Some(text.clone()), None),
+        PropertyValue::Sequence(_) => ("list", None, None),
+        PropertyValue::Mapping(_) => ("object", None, None),
+    };
+    StoredScalar {
+        kind,
+        string_value,
+        number_value,
+    }
+}

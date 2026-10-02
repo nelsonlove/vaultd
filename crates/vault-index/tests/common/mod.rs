@@ -947,3 +947,44 @@ pub fn snapshot_from_index(service: &vault_index::IndexService) -> SemanticSnaps
         diagnostics,
     }
 }
+
+/// The in-repo scratch root, derived from this crate's manifest directory —
+/// never from `TMPDIR` alone, so a bare `cargo test` cannot reach the OS temp
+/// directory. Every new test in this phase makes its directories here.
+pub fn scratch_root() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&root).expect("create the scratch root");
+    root.canonicalize().expect("canonicalize the scratch root")
+}
+
+/// Claim 6 of the live oracle: `property_scalars` holds exactly one row per
+/// `properties` row, under the same `(note_path, ordinal)` and key, and no
+/// row of its own. Checked in SQL both ways, so a missed insert and a missed
+/// delete are both caught.
+pub fn property_scalars_mirror(connection: &rusqlite::Connection) -> Result<(), String> {
+    let missing: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM properties p LEFT JOIN property_scalars s \
+             ON s.note_path = p.note_path AND s.ordinal = p.ordinal \
+             WHERE s.note_path IS NULL OR s.key_text != p.key_text",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let stray: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM property_scalars s LEFT JOIN properties p \
+             ON s.note_path = p.note_path AND s.ordinal = p.ordinal \
+             WHERE p.note_path IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if missing == 0 && stray == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{missing} properties rows without a matching scalar, {stray} scalars without a property"
+        ))
+    }
+}

@@ -24,13 +24,15 @@
 //!    route stats only the paths a hint named (plus the folders above them),
 //!    so this is where "it converges on what a complete walk would write"
 //!    stops being an assumption.
+//! 6. **Scalar mirror** — `property_scalars` mirrors `properties` row for
+//!    row.
 //!
 //! The operation alphabet deliberately includes the changes that are
 //! invisible to the cheap signals: `Touch` moves metadata without content,
 //! and `PreserveFingerprintWrite` moves content without metadata.
 //!
 //! It also includes the daemon's *own* writes. A mutation and an external
-//! edit must be indistinguishable to the semantic layer: the same five claims
+//! edit must be indistinguishable to the semantic layer: the same six claims
 //! hold whether the bytes arrived through `std::fs` or through
 //! `MutationEngine`, and a batch carrying a mutation reconciles under
 //! `ChangeCause::Mutation` rather than `ChangeCause::Watcher`. The generator
@@ -590,6 +592,11 @@ impl Oracle {
             "the index wrote into the vault while reconciling {:?}",
             batch
         );
+
+        // (6) The scalar index mirrors the properties it is derived from.
+        if let Err(message) = common::property_scalars_mirror(self.service.connection_for_test()) {
+            return Err(TestCaseError::fail(format!("{message} after {batch:?}")));
+        }
 
         if report.complete_resolution {
             self.complete_resolutions += 1;
