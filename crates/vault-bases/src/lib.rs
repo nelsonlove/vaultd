@@ -8,12 +8,23 @@
 //! a runtime capture under `tests/fixtures/captures/`, and where neither
 //! exists the evaluator answers a typed error rather than a guess.
 
+mod clock;
+pub mod eval;
 pub mod expr;
 mod file;
+#[cfg(feature = "fixtures")]
+pub mod fixtures;
+pub mod functions;
+mod source;
 mod value;
 
+pub use clock::Clock;
 pub use file::{
     BaseFile, BaseParseError, Direction, FilterNode, GroupBy, PropertySettings, SortKey, ViewDecl,
     parse_base,
+};
+pub use source::{
+    FileFacts, FileKind, LinkFact, MemoryFile, MemorySource, Prefilter, PropertyType, RowSource,
+    ScalarLiteral, SourceError, extension, no_span, number, text,
 };
 pub use value::{DateValue, DurationValue, LinkValue, RegexpValue, Value};

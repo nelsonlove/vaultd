@@ -1,0 +1,30 @@
+/// The evaluator's notion of "now" and of local time.
+///
+/// Obsidian evaluates in the device's local zone (`today()` is local
+/// midnight), so the daemon passes [`Clock::system`] and every test passes
+/// [`Clock::fixed`] with an explicit IANA zone: a test that read the machine's
+/// zone would pass on one desk and fail on another.
+#[derive(Clone, Debug)]
+pub struct Clock {
+    pub now_ms: i64,
+    pub zone: jiff::tz::TimeZone,
+}
+
+impl Clock {
+    pub fn system() -> Self {
+        Self {
+            now_ms: jiff::Timestamp::now().as_millisecond(),
+            zone: jiff::tz::TimeZone::system(),
+        }
+    }
+
+    /// A clock stopped at `now_ms` in the named zone. Panics on an unknown
+    /// zone name: that is a test-authoring error, not an input.
+    pub fn fixed(now_ms: i64, zone: &str) -> Self {
+        Self {
+            now_ms,
+            zone: jiff::tz::TimeZone::get(zone)
+                .unwrap_or_else(|error| panic!("unknown time zone {zone:?}: {error}")),
+        }
+    }
+}

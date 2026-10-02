@@ -1,0 +1,20 @@
+{"family":"global","case":"if:true","expr":"if(true, \"a\", \"b\")","kind":"string","text":"a","source":"published"}
+{"family":"global","case":"if:falsy_no_else","expr":"if(0, \"a\")","kind":"null","text":"","source":"published"}
+{"family":"global","case":"if:published","expr":"if(isModified, \"Modified\", \"Unmodified\")","props":{"isModified":false},"kind":"string","text":"Unmodified","source":"published"}
+{"family":"global","case":"if:lazy","expr":"if(true, 1, 1 / 0)","kind":"number","text":"1","source":"published"}
+{"family":"global","case":"list:wraps","expr":"list(\"value\")","kind":"list","text":"value","source":"published"}
+{"family":"global","case":"list:keeps_list","expr":"list([1, 2])[1]","kind":"number","text":"2","source":"published"}
+{"family":"global","case":"number:string","expr":"number(\"3.4\")","kind":"number","text":"3.4","source":"published"}
+{"family":"global","case":"number:boolean","expr":"number(true)","kind":"number","text":"1","source":"published"}
+{"family":"global","case":"number:invalid","expr":"number(\"abc\")","kind":"error","source":"published"}
+{"family":"global","case":"number:empty_string","expr":"number(\"\")","kind":"error","source":"uncaptured"}
+{"family":"global","case":"number:null","expr":"number(missing)","kind":"error","source":"uncaptured"}
+{"family":"global","case":"max:numbers","expr":"max(1, 5, 3)","kind":"number","text":"5","source":"published"}
+{"family":"global","case":"min:numbers","expr":"min(4, -1, 3)","kind":"number","text":"-1","source":"published"}
+{"family":"global","case":"max:not_a_number","expr":"max(1, \"a\")","kind":"error","source":"published"}
+{"family":"global","case":"random:range","expr":"random() >= 0 && random() < 1","kind":"boolean","text":"true","source":"published"}
+{"family":"global","case":"escapeHTML:five","expr":"escapeHTML(\"<a href='x'>&\\\"</a>\")","kind":"string","text":"&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;","source":"published"}
+{"family":"global","case":"html:kind","expr":"html(\"<b>x</b>\")","kind":"html","text":"<b>x</b>","source":"published"}
+{"family":"global","case":"icon:kind","expr":"icon(\"arrow-right\")","kind":"icon","text":"arrow-right","source":"published"}
+{"family":"global","case":"image:url","expr":"image(\"https://obsidian.md/images/obsidian-logo-gradient.svg\")","kind":"image","text":"https://obsidian.md/images/obsidian-logo-gradient.svg","source":"published"}
+{"family":"global","case":"unknown_function","expr":"frobnicate(1)","kind":"error","source":"published"}
