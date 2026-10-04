@@ -8,7 +8,7 @@ use crate::{LinkTarget, Resolution, ResolutionNote, VaultPath};
 /// spellings `Resolver::exact_lookup` tries; `Filename`/`Stem` are the
 /// case-insensitive name-stage maps; `ResolvedTarget` covers same-note
 /// subpath references and any reference that already resolved to a target
-/// (so heading/block membership changes on that target can be tracked).
+/// (so heading, block or view membership changes on that target can be tracked).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DependencyKind {
     ExactPath,
@@ -118,7 +118,7 @@ pub struct ResolutionIdentityChange {
 ///   implicit-extension, filename, and stem key for the affected path(s) is
 ///   included, since any reference reaching that path via any lookup route
 ///   could change its answer.
-/// - When the path is stable but heading/block membership changed, only the
+/// - When the path is stable but heading, block or view membership changed, only the
 ///   `ResolvedTarget` key for that path is included: exact/filename/stem
 ///   lookup outcomes for other references cannot change, but subpath
 ///   resolutions (missing-heading, missing-block) against this target can.

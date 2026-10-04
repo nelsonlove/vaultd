@@ -31,7 +31,7 @@ pub struct ResolvedReference {
 }
 
 /// The lightweight per-note inputs resolution actually needs: the path plus
-/// heading and block identity. A resolver can be rebuilt from these without
+/// heading and block identity, or, for a base, its view names. A resolver can be rebuilt from these without
 /// reparsing any note body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionNote {

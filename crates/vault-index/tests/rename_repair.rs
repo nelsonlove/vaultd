@@ -373,7 +373,7 @@ fn an_attachment_embed_under_a_renamed_folder_is_repaired() {
 /// and every spelling keeps its own shape — the extension, a view subpath, the
 /// display text and an embed's `!` all sit outside the file-target span.
 #[test]
-fn renaming_a_base_repairs_every_link_that_names_it_in_its_own_spelling() {
+fn renaming_a_base_at_the_vault_root_repairs_every_link_that_names_it_in_its_own_spelling() {
     let mut fixture = fixture();
     std::fs::write(
         fixture.root.join("Views.base"),

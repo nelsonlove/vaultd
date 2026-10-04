@@ -685,3 +685,39 @@ pub(crate) fn property_scalar(value: &PropertyValue) -> StoredScalar {
         number_value,
     }
 }
+
+#[cfg(test)]
+mod wire_spellings {
+    use super::*;
+
+    #[test]
+    fn the_stored_spellings_of_bases_are_pinned() {
+        assert_eq!(
+            encode_diagnostic_code(DiagnosticCode::MissingView),
+            "missing_view"
+        );
+        assert_eq!(
+            encode_diagnostic_code(DiagnosticCode::MalformedBase),
+            "malformed_base"
+        );
+        assert_eq!(
+            decode_diagnostic_code("malformed_base").unwrap(),
+            DiagnosticCode::MalformedBase
+        );
+        assert_eq!(
+            decode_diagnostic_code("missing_view").unwrap(),
+            DiagnosticCode::MissingView
+        );
+        let view = Subpath::View("Table".into());
+        assert_eq!(encode_subpath(&view), ("view", "Table"));
+        assert_eq!(
+            decode_subpath(Some("view"), Some("Table")).unwrap(),
+            Some(view)
+        );
+        assert_eq!(
+            decode_subpath(Some("heading"), Some("Table")).unwrap(),
+            Some(Subpath::Heading("Table".into())),
+            "the stored kind `heading` stays a heading"
+        );
+    }
+}

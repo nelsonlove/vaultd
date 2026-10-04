@@ -1037,3 +1037,44 @@ fn value_cell(
         },
     }
 }
+
+#[cfg(test)]
+mod wire_spellings {
+    use super::*;
+    use vault_core::VaultPath;
+
+    #[test]
+    fn a_view_subpath_maps_to_the_view_dto() {
+        let resolved = Resolution::Resolved {
+            target: VaultPath::new("Views.base").unwrap(),
+            subpath: Some(Subpath::View("Table".into())),
+        };
+        assert_eq!(
+            resolution(&resolved),
+            ResolutionDto::Resolved {
+                target: "Views.base".into(),
+                subpath: Some(SubpathDto::View("Table".into())),
+            }
+        );
+        let missing = Resolution::MissingSubpath {
+            target: VaultPath::new("Views.base").unwrap(),
+            subpath: Subpath::View("Nope".into()),
+        };
+        assert_eq!(
+            resolution(&missing),
+            ResolutionDto::MissingSubpath {
+                target: "Views.base".into(),
+                subpath: SubpathDto::View("Nope".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn the_base_diagnostic_codes_keep_their_wire_spellings() {
+        assert_eq!(diagnostic_code(DiagnosticCode::MissingView), "missing_view");
+        assert_eq!(
+            diagnostic_code(DiagnosticCode::MalformedBase),
+            "malformed_base"
+        );
+    }
+}
