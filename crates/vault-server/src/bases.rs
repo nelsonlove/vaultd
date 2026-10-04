@@ -16,7 +16,7 @@ use vault_core::VaultPath;
 use vault_index::{BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, IndexError, IndexReader};
 use vault_protocol::{
     BaseStatusDto, BaseSummaryDto, ColumnDto, ErrorCode, EvaluateBaseParams, EvaluateBaseResponse,
-    ListBasesParams, PageResponse, ProtocolError, RowDto, RowKindDto, ViewDto,
+    ListBasesParams, OptionEntryDto, PageResponse, ProtocolError, RowDto, RowKindDto, ViewDto,
 };
 
 use crate::convert;
@@ -265,7 +265,7 @@ pub(crate) fn evaluate_base(
         view: ViewDto {
             kind: answer.view.kind.clone(),
             name: answer.view.name.clone(),
-            options: convert::options(&answer.view.options),
+            options: option_entries(&answer.view.options),
         },
         columns: answer
             .columns
@@ -273,7 +273,7 @@ pub(crate) fn evaluate_base(
             .map(|column| ColumnDto {
                 property: column.property.clone(),
                 display_name: column.display_name.clone(),
-                settings: convert::options(&column.settings),
+                settings: option_entries(&column.settings),
             })
             .collect(),
         rows: page,
@@ -299,6 +299,18 @@ pub(crate) fn evaluate_base(
             })
         }),
     })
+}
+
+/// Declared key-value pairs as ordered entries, each value in the existing
+/// property DTO's shape.
+fn option_entries(entries: &[(String, vault_core::PropertyValue)]) -> Vec<OptionEntryDto> {
+    entries
+        .iter()
+        .map(|(key, value)| OptionEntryDto {
+            key: key.clone(),
+            value: convert::property_value(value),
+        })
+        .collect()
 }
 
 pub(crate) fn list_bases(

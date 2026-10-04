@@ -353,9 +353,9 @@ Bytes outside the addressed spans are preserved exactly, and the span is as narr
 
 ### `write_file`
 
-Raw bytes to any vault file that is **not** an indexable note: an attachment, a hidden path, or the `.obsidian` zone. `content_base64` is base64 in the standard alphabet with padding (RFC 4648 §4, not the URL-safe variant); anything else is `invalid_request`. `read_file` answers in the same encoding.
+Raw bytes to any vault file that is **not** an indexable note: an attachment, a `.base` file, a hidden path, or the `.obsidian` zone. `content_base64` is base64 in the standard alphabet with padding (RFC 4648 §4, not the URL-safe variant); anything else is `invalid_request`. `read_file` answers in the same encoding.
 
-`semantic` answers "did these bytes land inside the indexed universe", and `generation` is present exactly when `semantic` is true. A write into the configuration zone, or into any hidden folder, answers `semantic: false` with no `generation` — nothing there is indexed, so no generation will ever contain it — and emits a `config_changed` event when it was in the zone. An attachment inside the vault answers `semantic: true` with a real generation: no semantic rows moved, but the file tree did.
+`semantic` answers "did these bytes land inside the indexed universe", and `generation` is present exactly when `semantic` is true. A write into the configuration zone, or into any hidden folder, answers `semantic: false` with no `generation` — nothing there is indexed, so no generation will ever contain it — and emits a `config_changed` event when it was in the zone. An attachment inside the vault answers `semantic: true` with a real generation: no semantic rows moved, but the file tree did. A `.base` file inside the vault answers `semantic: true` with a real generation too, and there semantic rows did move: a base is an indexed file kind, parsed and reconciled in the same generation as the write.
 
 Both fields answer about **where the bytes landed**, not about the path the request carried. A symlink or a case-folded spelling can resolve across the boundary in either direction, and answering from the request would name a generation that will never contain the write.
 

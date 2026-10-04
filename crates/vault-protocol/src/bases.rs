@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::semantic::SpanDto;
+use crate::semantic::{PropertyValueDto, SpanDto};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EvaluateBaseParams {
@@ -32,20 +32,30 @@ pub struct ListBasesParams {
     pub limit: Option<u32>,
 }
 
+/// One declared key and its YAML value, in declared order: a view's open
+/// options and a column's settings are carried the way `PropertyValueDto`
+/// carries a mapping, so neither order nor a repeated key is lost.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OptionEntryDto {
+    pub key: String,
+    pub value: PropertyValueDto,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ViewDto {
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
-    /// Every key of the view the core does not own, as declared.
-    pub options: serde_json::Value,
+    /// Every key of the view the core does not own, as declared, in order.
+    pub options: Vec<OptionEntryDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ColumnDto {
     pub property: String,
     pub display_name: Option<String>,
-    pub settings: serde_json::Value,
+    /// The property's declared settings other than `displayName`, in order.
+    pub settings: Vec<OptionEntryDto>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

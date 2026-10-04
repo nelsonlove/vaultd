@@ -881,41 +881,6 @@ fn non_finite_text(value: f64) -> &'static str {
     }
 }
 
-/// A YAML value as plain JSON, for a view's open options and a column's
-/// settings. A non-finite float has no JSON number, so it travels as
-/// JavaScript's text for it.
-pub(crate) fn json_of(value: &PropertyValue) -> serde_json::Value {
-    match value {
-        PropertyValue::Null => serde_json::Value::Null,
-        PropertyValue::Boolean(flag) => serde_json::Value::Bool(*flag),
-        PropertyValue::Integer(number) => serde_json::Value::from(*number),
-        PropertyValue::Float(number) => match serde_json::Number::from_f64(*number) {
-            Some(number) => serde_json::Value::Number(number),
-            None => serde_json::Value::String(non_finite_text(*number).to_string()),
-        },
-        PropertyValue::String(text) => serde_json::Value::String(text.clone()),
-        PropertyValue::Sequence(items) => {
-            serde_json::Value::Array(items.iter().map(|item| json_of(&item.value)).collect())
-        }
-        PropertyValue::Mapping(entries) => serde_json::Value::Object(
-            entries
-                .iter()
-                .map(|(key, value)| (key.value.clone(), json_of(&value.value)))
-                .collect(),
-        ),
-    }
-}
-
-/// Declared key-value pairs as one JSON object.
-pub(crate) fn options(entries: &[(String, PropertyValue)]) -> serde_json::Value {
-    serde_json::Value::Object(
-        entries
-            .iter()
-            .map(|(key, value)| (key.clone(), json_of(value)))
-            .collect(),
-    )
-}
-
 /// A date as ISO 8601 in the clock's zone: `YYYY-MM-DD` without a time,
 /// `YYYY-MM-DDTHH:mm:ss.SSS±HH:MM` with one.
 fn iso_date(date: vault_bases::DateValue, clock: &vault_bases::Clock) -> String {
@@ -952,9 +917,11 @@ pub(crate) fn cell(
 /// has rows (`values.reduce([acc], [])`), and both this conversion and the
 /// JSON writer recurse once per level; the value at the cap becomes an error
 /// cell (the levels above it are kept) rather than a stack overflow on the
-/// dispatcher thread. Each cell level is
-/// two JSON levels, so 32 keeps a whole response inside `serde_json`'s
-/// default reading limit of 128 for every client.
+/// dispatcher thread. A cell level is at most three JSON levels (an `object`
+/// cell: the cell, its `value` array, the entry; a `list` takes two), and
+/// the response envelope around a cell is eight, so 32 cell levels make at
+/// most 8 + 3 x 32 + 1 = 105 JSON levels, inside `serde_json`'s default
+/// reading limit of 128 for every client.
 const MAX_CELL_DEPTH: usize = 32;
 
 fn value_cell(

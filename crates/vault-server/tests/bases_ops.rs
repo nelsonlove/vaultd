@@ -130,7 +130,121 @@ fn evaluate_base_answers_rows_columns_summaries_and_typed_cells() {
     );
 
     let cards = self::answer(&mut daemon, r#"{"path":"Views.base","view":"Cards"}"#);
-    assert_eq!(cards.view.options, serde_json::json!({"image": "cover"}));
+    assert_eq!(
+        cards.view.options,
+        vec![vault_protocol::OptionEntryDto {
+            key: "image".into(),
+            value: vault_protocol::PropertyValueDto::String("cover".into()),
+        }]
+    );
+}
+
+/// View options and column settings keep their declared order (and a key
+/// order no hash or sorted map would keep), as the property DTO does.
+#[test]
+fn options_and_settings_keep_declared_order() {
+    let (vault, index) = vault_of(&[
+        ("A.md", "---\nprice: 1\n---\n"),
+        (
+            "Order.base",
+            "properties:\n  price:\n    displayName: Price\n    zeta: 1\n    beta: 2\n    omega: 3\n    alpha: 4\n    kappa: 5\nviews:\n  - type: cards\n    name: Cards\n    order: [price]\n    zulu: 1\n    bravo: 2\n    yankee: 3\n    alpha: 4\n    mike: 5\n",
+        ),
+    ]);
+    let mut daemon = started(&vault, &index);
+    let answer = answer(&mut daemon, r#"{"path":"Order.base"}"#);
+    let keys = |entries: &[vault_protocol::OptionEntryDto]| -> Vec<String> {
+        entries.iter().map(|entry| entry.key.clone()).collect()
+    };
+    assert_eq!(
+        keys(&answer.view.options),
+        vec!["zulu", "bravo", "yankee", "alpha", "mike"]
+    );
+    assert_eq!(answer.columns[0].display_name.as_deref(), Some("Price"));
+    assert_eq!(
+        keys(&answer.columns[0].settings),
+        vec!["zeta", "beta", "omega", "alpha", "kappa"]
+    );
+    assert_eq!(
+        answer.view.options[0].value,
+        vault_protocol::PropertyValueDto::Integer(1)
+    );
+}
+
+/// An object cell keeps its entries in the order the value holds them.
+#[test]
+fn an_object_cell_keeps_its_entry_order() {
+    let (vault, index) = vault_of(&[
+        (
+            "A.md",
+            "---\nm:\n  e: 1\n  b: 2\n  d: 3\n  a: 4\n  c: 5\n---\n",
+        ),
+        (
+            "Obj.base",
+            "views:\n  - type: table\n    name: T\n    order: [m]\n",
+        ),
+    ]);
+    let mut daemon = started(&vault, &index);
+    let answer = answer(&mut daemon, r#"{"path":"Obj.base"}"#);
+    let CellDto::Object { value } = &answer.rows[0].cells[0] else {
+        panic!("an object cell: {:?}", answer.rows[0].cells[0]);
+    };
+    let keys: Vec<&str> = value.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, vec!["e", "b", "d", "a", "c"]);
+    assert_eq!(
+        value[0].value,
+        CellDto::Number {
+            value: serde_json::Number::from(1)
+        }
+    );
+}
+
+/// All three non-finite numbers travel as `string` cells holding
+/// JavaScript's text. Provisional until the Task 13 capture.
+#[test]
+fn non_finite_numbers_are_javascript_text() {
+    let (vault, index) = vault_of(&[
+        ("A.md", "---\nbig: .inf\nsmall: -.inf\nodd: .nan\n---\n"),
+        (
+            "Num.base",
+            "views:\n  - type: table\n    name: T\n    order: [big, small, odd]\n",
+        ),
+    ]);
+    let mut daemon = started(&vault, &index);
+    let answer = answer(&mut daemon, r#"{"path":"Num.base"}"#);
+    let text = |value: &str| CellDto::String {
+        value: value.into(),
+    };
+    assert_eq!(
+        answer.rows[0].cells,
+        vec![text("Infinity"), text("-Infinity"), text("NaN")]
+    );
+}
+
+/// A cursor names its base: replayed on another base with the same view
+/// argument and `this_path`, it is refused.
+#[test]
+fn a_cursor_belongs_to_its_base() {
+    use base64::Engine as _;
+    let (vault, index) = vault();
+    let mut daemon = started(&vault, &index);
+    let content = base64::engine::general_purpose::STANDARD.encode(BASE);
+    ok(
+        &mut daemon,
+        &format!(
+            r#"{{"version":1,"id":"w","request":{{"method":"write_file","params":{{"path":"Other.base","content_base64":"{content}","expected":{{"absent":true}}}}}}}}"#
+        ),
+    );
+    let first = answer(&mut daemon, r#"{"path":"Views.base","limit":2}"#);
+    let cursor = first.next_cursor.expect("a next page");
+    let other = answer(&mut daemon, r#"{"path":"Other.base","limit":2}"#);
+    assert_eq!(other.total_rows, 3, "the other base evaluates on its own");
+    let error = err(
+        &mut daemon,
+        &evaluate(&format!(
+            r#"{{"path":"Other.base","limit":2,"cursor":"{cursor}"}}"#
+        )),
+    );
+    assert_eq!(error.code, ErrorCode::InvalidCursor, "{error:?}");
 }
 
 #[test]
@@ -199,6 +313,9 @@ fn paging_walks_every_row_exactly_once() {
     let mut cursor: Option<String> = None;
     let mut pages = 0;
     loop {
+        // A pager that never ends fails here rather than running into the
+        // suite's timeout: 23 rows cannot take more than 24 pages.
+        assert!(pages <= 23, "the pager did not end after {pages} pages");
         let params = match &cursor {
             None => r#"{"path":"All.base","limit":5}"#.to_string(),
             Some(cursor) => format!(r#"{{"path":"All.base","limit":5,"cursor":"{cursor}"}}"#),
@@ -464,40 +581,76 @@ fn declared_property_types_come_from_the_configuration_zone() {
     );
 }
 
-/// A cell nested deeper than the wire carries is cut with an error cell at
-/// the cap, and the response still parses.
-#[test]
-fn a_cell_nested_too_deeply_is_an_error_cell() {
-    let deep = format!("{}1{}", "[".repeat(40), "]".repeat(40));
-    let shallow = format!("{}1{}", "[".repeat(3), "]".repeat(3));
-    let (vault, index) = vault_of(&[
-        ("A.md", "x\n"),
-        (
-            "Deep.base",
-            &format!(
-                "formulas:\n  deep: '{deep}'\n  shallow: '{shallow}'\nviews:\n  - type: table\n    name: T\n    order: [formula.deep, formula.shallow]\n"
-            ),
-        ),
-    ]);
-    let mut daemon = started(&vault, &index);
-    let answer = answer(&mut daemon, r#"{"path":"Deep.base"}"#);
-    // The wire keeps the first 32 levels and puts an error cell where the
-    // 33rd would begin.
-    let mut cell = &answer.rows[0].cells[0];
+/// Nested list cells and how many of them there are before a non-list.
+fn list_levels(cell: &CellDto) -> (usize, &CellDto) {
+    let mut cell = cell;
     let mut levels = 0;
     while let CellDto::List { value } = cell {
         assert_eq!(value.len(), 1);
         cell = &value[0];
         levels += 1;
     }
-    assert_eq!(levels, 32, "{:?}", answer.rows[0].cells[0]);
-    assert!(
-        matches!(cell, CellDto::Error { message } if message.contains("nested too deeply")),
-        "{cell:?}"
+    (levels, cell)
+}
+
+/// The depth cap at its boundary. A cell may be 32 levels deep counting its
+/// leaf: 31 nested lists around a number arrive whole, 32 nested lists keep
+/// their 32 levels and the leaf becomes the error cell; 31 nested objects
+/// (three JSON levels each, the widest cell) still fit a client's 128-level
+/// JSON reading limit, which this harness's own parse proves. 40 levels are
+/// cut at the same place.
+#[test]
+fn a_cell_nested_too_deeply_is_an_error_cell() {
+    let lists = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let objects = |depth: usize| format!("{}1{}", "{\"a\": ".repeat(depth), "}".repeat(depth));
+    let (vault, index) = vault_of(&[
+        ("A.md", "x\n"),
+        (
+            "Deep.base",
+            &format!(
+                "formulas:\n  whole: '{}'\n  cut: '{}'\n  far: '{}'\n  objects: '{}'\nviews:\n  - type: table\n    name: T\n    order: [formula.whole, formula.cut, formula.far, formula.objects]\n",
+                lists(31),
+                lists(32),
+                lists(40),
+                objects(31)
+            ),
+        ),
+    ]);
+    let mut daemon = started(&vault, &index);
+    let answer = answer(&mut daemon, r#"{"path":"Deep.base"}"#);
+    let cells = &answer.rows[0].cells;
+
+    let (levels, leaf) = list_levels(&cells[0]);
+    assert_eq!(levels, 31);
+    assert_eq!(
+        leaf,
+        &CellDto::Number {
+            value: serde_json::Number::from(1)
+        },
+        "31 lists arrive whole"
     );
-    let shallow = &answer.rows[0].cells[1];
-    assert!(
-        !serde_json::to_string(shallow).unwrap().contains("error"),
-        "a shallow list is whole: {shallow:?}"
+    for (index, wanted) in [(1, 32), (2, 32)] {
+        let (levels, leaf) = list_levels(&cells[index]);
+        assert_eq!(levels, wanted, "column {index}");
+        assert!(
+            matches!(leaf, CellDto::Error { message } if message.contains("nested too deeply")),
+            "column {index}: {leaf:?}"
+        );
+    }
+
+    let mut cell = &cells[3];
+    let mut levels = 0;
+    while let CellDto::Object { value } = cell {
+        assert_eq!(value.len(), 1);
+        cell = &value[0].value;
+        levels += 1;
+    }
+    assert_eq!(levels, 31);
+    assert_eq!(
+        cell,
+        &CellDto::Number {
+            value: serde_json::Number::from(1)
+        },
+        "31 objects arrive whole"
     );
 }

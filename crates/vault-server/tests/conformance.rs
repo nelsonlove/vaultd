@@ -114,6 +114,18 @@ fn build_vault() -> (TempDir, TempDir, TempDir) {
     )
     .expect("write Views.base");
     std::fs::write(vault.path().join("Broken.base"), "views: [\n").expect("write Broken.base");
+    // The three non-finite numbers, so their `string` cells travel over both
+    // doors (provisional until the Task 13 capture).
+    std::fs::write(
+        vault.path().join("Numbers.md"),
+        "---\nbig: .inf\nsmall: -.inf\nodd: .nan\n---\n",
+    )
+    .expect("write Numbers.md");
+    std::fs::write(
+        vault.path().join("Numbers.base"),
+        "views:\n  - type: table\n    name: Odd\n    filters: 'file.name == \"Numbers.md\"'\n    order: [big, small, odd]\n",
+    )
+    .expect("write Numbers.base");
     (vault, index, run)
 }
 
@@ -419,6 +431,14 @@ fn the_socket_answers_the_fixture_set_exactly_as_stdio_does() {
             .iter()
             .any(|line| line.contains(r#""next_cursor":""#)),
         "no response carried a non-null cursor, so the paging proved nothing"
+    );
+
+    // c52 carries all three non-finite texts as `string` cells.
+    assert!(
+        over_stdio.iter().any(|line| line.contains(
+            r#""cells":[{"kind":"string","value":"Infinity"},{"kind":"string","value":"-Infinity"},{"kind":"string","value":"NaN"}]"#
+        )),
+        "the non-finite row is in the transcript"
     );
 
     assert_events_are_where_they_arrived(&over_stdio, "stdio");

@@ -36,6 +36,8 @@
 {"version":1,"id":"c49","request":{"method":"evaluate_base","params":{"path":"Views.base","this_path":"Gone.md"}}}
 {"version":1,"id":"c50","request":{"method":"evaluate_base","params":{"path":"Views.base","limit":0}}}
 {"version":1,"id":"c51","request":{"method":"evaluate_base","params":{"path":"Nowhere.base"}}}
+# Non-finite numbers as `string` cells (NaN, Infinity, -Infinity): provisional until the Task 13 capture.
+{"version":1,"id":"c52","request":{"method":"evaluate_base","params":{"path":"Numbers.base"}}}
 # Refusals, each of which must read identically through either door.
 {"version":1,"id":"c10","request":{"method":"get_note","params":{"path":"Nowhere.md"}}}
 {"version":1,"id":"c11","request":{"method":"get_note","params":{"path":"../escape.md"}}}
