@@ -82,3 +82,16 @@ pub fn decode_dependency_key_for_test(
 ) -> Result<vault_core::DependencyKey, IndexError> {
     codec::decode_dependency_key(kind, comparison_key)
 }
+
+/// Decode a stored `properties.value_json` and classify it the way
+/// `property_scalars` stores it: `(kind, string_value, number_value)`. The
+/// scalar-mirror oracle compares every stored scalar row to this, so a route
+/// that writes the right rows with the wrong values is caught without the
+/// tests duplicating the crate's private property encoding.
+#[doc(hidden)]
+pub fn property_scalar_for_test(
+    value_json: &str,
+) -> Result<(&'static str, Option<String>, Option<f64>), IndexError> {
+    let scalar = codec::property_scalar(&codec::decode_property_value(value_json)?);
+    Ok((scalar.kind, scalar.string_value, scalar.number_value))
+}

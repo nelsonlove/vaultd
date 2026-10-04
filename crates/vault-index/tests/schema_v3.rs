@@ -84,8 +84,8 @@ fn schema_version_constants_are_four() {
 
 #[test]
 fn a_fresh_index_carries_the_structural_tables() {
-    let vault = TempDir::new().expect("vault tempdir");
-    let index = TempDir::new().expect("index tempdir");
+    let vault = TempDir::new_in(common::scratch_root()).expect("vault tempdir");
+    let index = TempDir::new_in(common::scratch_root()).expect("index tempdir");
     let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3"))
         .expect("fresh config");
     let connection = vault_index::open_index_for_test(&config).expect("open fresh index");

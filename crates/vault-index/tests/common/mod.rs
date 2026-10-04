@@ -961,7 +961,10 @@ pub fn scratch_root() -> PathBuf {
 /// Claim 6 of the live oracle: `property_scalars` holds exactly one row per
 /// `properties` row, under the same `(note_path, ordinal)` and key, and no
 /// row of its own. Checked in SQL both ways, so a missed insert and a missed
-/// delete are both caught.
+/// delete are both caught. Every matched row's columns are then compared too:
+/// `key_fold` is the key lowercased in Rust, and `kind`, `string_value` and
+/// `number_value` are what the crate's classifier makes of the decoded
+/// `properties.value_json` (a NaN is stored as NULL by SQLite).
 pub fn property_scalars_mirror(connection: &rusqlite::Connection) -> Result<(), String> {
     let missing: i64 = connection
         .query_row(
@@ -981,13 +984,58 @@ pub fn property_scalars_mirror(connection: &rusqlite::Connection) -> Result<(), 
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    if missing == 0 && stray == 0 {
-        Ok(())
-    } else {
-        Err(format!(
+    if missing != 0 || stray != 0 {
+        return Err(format!(
             "{missing} properties rows without a matching scalar, {stray} scalars without a property"
-        ))
+        ));
     }
+    let mut statement = connection
+        .prepare(
+            "SELECT p.note_path, p.ordinal, p.key_text, p.value_json, s.key_fold, s.kind, \
+             s.string_value, s.number_value FROM properties p JOIN property_scalars s \
+             ON s.note_path = p.note_path AND s.ordinal = p.ordinal",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (path, ordinal, key_text, value_json, key_fold, kind, string_value, number_value) =
+            row.map_err(|error| error.to_string())?;
+        let (expected_kind, expected_string, expected_number) =
+            vault_index::property_scalar_for_test(&value_json)
+                .map_err(|error| error.to_string())?;
+        let expected_number = expected_number.filter(|number| !number.is_nan());
+        let numbers_match = match (expected_number, number_value) {
+            (None, None) => true,
+            (Some(expected), Some(stored)) => expected == stored,
+            _ => false,
+        };
+        if key_fold != key_text.to_lowercase()
+            || kind != expected_kind
+            || string_value != expected_string
+            || !numbers_match
+        {
+            return Err(format!(
+                "scalar row {path}#{ordinal} is ({key_fold:?}, {kind:?}, {string_value:?}, \
+                 {number_value:?}); expected ({:?}, {expected_kind:?}, {expected_string:?}, \
+                 {expected_number:?})",
+                key_text.to_lowercase()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One `bases` row as the drift oracle compares it: path, content revision,

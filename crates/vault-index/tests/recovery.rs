@@ -216,7 +216,7 @@ fn a_genuine_version_one_explicit_cache_with_matching_identity_is_replaced_by_sc
     assert_eq!(report.generation, Generation::new(1));
 }
 
-/// The schema-v3 bump seen from a real v2 cache: authentic v2 DDL, v2 version
+/// A schema bump seen from a real v2 cache: authentic v2 DDL, v2 version
 /// stamps, and the matching vault identity, so the open path has to classify
 /// it as `Obsolete` on its versions alone — the one case a bumped
 /// `user_version` cannot prove. It must rebuild, not be refused and not be
@@ -224,8 +224,8 @@ fn a_genuine_version_one_explicit_cache_with_matching_identity_is_replaced_by_sc
 /// structural tables present.
 #[test]
 fn a_genuine_version_two_cache_is_replaced_by_the_current_schema() {
-    let vault = tempdir().unwrap();
-    let index_dir = tempdir().unwrap();
+    let vault = tempfile::tempdir_in(common::scratch_root()).unwrap();
+    let index_dir = tempfile::tempdir_in(common::scratch_root()).unwrap();
     fs::write(
         vault.path().join("Note.md"),
         "# Note\n\n- [x] done\n    - nested\n",

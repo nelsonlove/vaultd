@@ -143,3 +143,185 @@ fn a_fresh_index_has_both_new_tables() {
         "a vault with no .base files leaves the bases table empty"
     );
 }
+
+/// The two routes a warm refresh can take over an index that already holds
+/// a generation: the ordinary `refresh(false)`, which computes a dirty set and
+/// publishes through the delta route, and the complete route
+/// (`refresh_complete_for_test`), which re-inventories the whole vault and
+/// publishes through `begin_publish` with a previous generation. Both must
+/// leave `property_scalars` mirroring `properties`, value for value.
+#[test]
+fn both_warm_refresh_routes_keep_the_scalars_in_step() {
+    for complete in [false, true] {
+        let vault = TempDir::new_in(common::scratch_root()).unwrap();
+        let index = TempDir::new_in(common::scratch_root()).unwrap();
+        fs::write(
+            vault.path().join("A.md"),
+            "---\nstatus: open\nrank: 1\n---\n",
+        )
+        .unwrap();
+        fs::write(vault.path().join("B.md"), "---\nowner: kim\n---\n").unwrap();
+        let mut service = open(&vault, &index);
+        let before = service.current_generation().unwrap().unwrap().get();
+
+        fs::write(
+            vault.path().join("A.md"),
+            "---\nstatus: closed\nrank: 2.5\ndone: false\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.path().join("C.md"),
+            "---\ndue: 2026-10-03\ntags: [x]\n---\n",
+        )
+        .unwrap();
+        fs::remove_file(vault.path().join("B.md")).unwrap();
+        let report = if complete {
+            service.refresh_complete_for_test(false).unwrap()
+        } else {
+            service.refresh(false).unwrap()
+        };
+        assert_eq!(report.generation.get(), before + 1, "complete = {complete}");
+
+        assert_eq!(
+            scalars(&service, "A.md"),
+            vec![
+                (
+                    0,
+                    "status".into(),
+                    "string".into(),
+                    Some("closed".into()),
+                    None
+                ),
+                (1, "rank".into(), "number".into(), None, Some(2.5)),
+                (2, "done".into(), "boolean".into(), None, Some(0.0)),
+            ],
+            "complete = {complete}"
+        );
+        assert!(
+            scalars(&service, "B.md").is_empty(),
+            "complete = {complete}"
+        );
+        assert_eq!(
+            scalars(&service, "C.md"),
+            vec![
+                (
+                    0,
+                    "due".into(),
+                    "date".into(),
+                    Some("2026-10-03".into()),
+                    None
+                ),
+                (1, "tags".into(), "list".into(), None, None),
+            ],
+            "complete = {complete}"
+        );
+        common::property_scalars_mirror(service.connection_for_test())
+            .unwrap_or_else(|message| panic!("complete = {complete}: {message}"));
+    }
+}
+
+/// The `date` kind means what the schema comment says: `YYYY-MM-DD`,
+/// optionally `[ T]HH:mm[:ss[.fff]]`, each field in range. Long strings,
+/// out-of-range fields, other separators and zone suffixes are strings.
+#[test]
+fn only_a_date_shaped_string_is_a_date() {
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    fs::write(
+        vault.path().join("Dates.md"),
+        "---\n\
+         day: \"2026-10-03\"\n\
+         minute: \"2026-10-03 14:30\"\n\
+         second: \"2026-10-03T14:30:00\"\n\
+         fraction: \"2025-01-01 10:15:30.250\"\n\
+         words: \"hello world!\"\n\
+         month: \"2026-13-45\"\n\
+         compact: \"20261003\"\n\
+         trailing: \"2025-01-01 notes\"\n\
+         slash: \"2025/01/01\"\n\
+         zulu: \"2025-01-01T10:15:30Z\"\n\
+         hour: \"2026-10-03T24:00\"\n\
+         ---\n",
+    )
+    .unwrap();
+    let service = open(&vault, &index);
+    let kinds: Vec<(String, String)> = scalars(&service, "Dates.md")
+        .into_iter()
+        .map(|(_, key, kind, _, _)| (key, kind))
+        .collect();
+    let expected: Vec<(String, String)> = [
+        ("day", "date"),
+        ("minute", "date"),
+        ("second", "date"),
+        ("fraction", "date"),
+        ("words", "string"),
+        ("month", "string"),
+        ("compact", "string"),
+        ("trailing", "string"),
+        ("slash", "string"),
+        ("zulu", "string"),
+        ("hour", "string"),
+    ]
+    .into_iter()
+    .map(|(key, kind)| (key.to_string(), kind.to_string()))
+    .collect();
+    assert_eq!(kinds, expected);
+    common::property_scalars_mirror(service.connection_for_test()).expect("mirror");
+}
+
+/// `key_fold` is the key lowercased in Rust, Unicode included, and it is the
+/// lookup column: `Status` is found as `status`, `Größe` as `größe`.
+#[test]
+fn keys_are_folded_in_rust_for_lookup() {
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    fs::write(
+        vault.path().join("Keys.md"),
+        "---\nStatus: open\nGRÖSSE: 3\nGröße: 4\n---\n",
+    )
+    .unwrap();
+    let service = open(&vault, &index);
+    let connection = service.connection_for_test();
+    let found = |fold: &str| -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT note_path, key_text FROM property_scalars WHERE key_fold = ?1 \
+                 ORDER BY ordinal",
+            )
+            .unwrap();
+        statement
+            .query_map([fold], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(found("status"), vec![("Keys.md".into(), "Status".into())]);
+    assert_eq!(found("größe"), vec![("Keys.md".into(), "Größe".into())]);
+    assert_eq!(found("grösse"), vec![("Keys.md".into(), "GRÖSSE".into())]);
+    assert!(found("Status").is_empty(), "the stored fold is lowercase");
+    common::property_scalars_mirror(connection).expect("mirror");
+}
+
+/// Booleans are numbers in `number_value`: `true` is 1.0 and `false` is 0.0,
+/// as the schema comment says, and the two never coincide.
+#[test]
+fn true_and_false_are_stored_as_one_and_zero() {
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    fs::write(
+        vault.path().join("Flags.md"),
+        "---\nshown: true\nhidden: false\n---\n",
+    )
+    .unwrap();
+    let service = open(&vault, &index);
+    let rows = scalars(&service, "Flags.md");
+    assert_eq!(
+        rows,
+        vec![
+            (0, "shown".into(), "boolean".into(), None, Some(1.0)),
+            (1, "hidden".into(), "boolean".into(), None, Some(0.0)),
+        ]
+    );
+    assert_ne!(rows[0].4, rows[1].4);
+    common::property_scalars_mirror(service.connection_for_test()).expect("mirror");
+}

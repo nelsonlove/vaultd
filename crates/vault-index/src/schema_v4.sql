@@ -229,10 +229,13 @@ CREATE INDEX scan_diagnostics_severity ON scan_diagnostics(severity, ordinal);
 -- property_scalars: one row per `properties` row, same key, classifying the
 -- value for indexed narrowing. `string_value` is set for `string` and `date`
 -- (the text as written); `number_value` for `number` (and 1/0 for
--- `boolean`). Lists and objects are recorded by kind only and evaluated per
--- row. `key_fold` is the lowercased key, the lookup column. The `date` kind
--- is lexical — a string shaped `YYYY-MM-DD`, optionally followed by
--- `[ T]HH:mm[:ss[.fff]]` — because the index knows no property types (those
+-- `boolean`); it is NULL for a NaN, and approximate for an integer beyond
+-- 2^53. Lists and objects are recorded by kind only and evaluated per row.
+-- `key_fold` is the key lowercased in Rust (`to_lowercase`, never SQL
+-- `lower()`), the lookup column. The `date` kind is lexical — a string
+-- shaped `YYYY-MM-DD`, optionally followed by `[ T]HH:mm[:ss[.fff]]`, with
+-- each field in its calendar or clock range (month lengths unchecked) —
+-- because the index knows no property types (those
 -- live in `.obsidian/types.json`); the row source applies the declared type
 -- at evaluation, and the prefilter only ever narrows to "notes that carry
 -- this key", so the kind column is a read optimisation and never a

@@ -25,7 +25,13 @@
 //!    so this is where "it converges on what a complete walk would write"
 //!    stops being an assumption.
 //! 6. **Scalar mirror** — `property_scalars` mirrors `properties` row for
-//!    row.
+//!    row, column for column.
+//!
+//! A batch normally reconciles through the targeted route (`refresh_paths`).
+//! A batch that carries `CompleteRefresh` instead reconciles through the
+//! complete route over the existing index (`refresh_complete_for_test`, the
+//! whole-vault inventory and `begin_publish` with a previous generation), so
+//! every claim above is also checked after that route.
 //!
 //! The operation alphabet deliberately includes the changes that are
 //! invisible to the cheap signals: `Touch` moves metadata without content,
@@ -185,6 +191,10 @@ enum Operation {
         path: String,
         body: String,
     },
+    /// Not a change to the vault: the batch that carries it reconciles
+    /// through the complete route over the existing index instead of the
+    /// targeted one. Every claim must hold after either route.
+    CompleteRefresh,
 }
 
 /// What the mutation engine answered, for the operations that ask it
@@ -416,6 +426,8 @@ fn apply(root: &Path, engine: &vault_index::MutationEngine, operation: &Operatio
                 expected: vault_index::Precondition::Any,
             }));
         }
+        // Nothing to apply: the batch's reconciliation route is the change.
+        Operation::CompleteRefresh => {}
     }
     Applied {
         touched,
@@ -538,16 +550,42 @@ impl Oracle {
         } else {
             ChangeCause::Watcher
         };
-        let report = self
-            .service
-            .refresh_paths(touched, cause)
-            .map_err(|error| TestCaseError::fail(format!("targeted refresh failed: {error}")))?;
-        prop_assert_eq!(
-            report.cause,
-            cause,
-            "the report must carry the cause the batch was reconciled under after {:?}",
-            batch
-        );
+        let complete_route = batch
+            .iter()
+            .any(|operation| matches!(operation, Operation::CompleteRefresh));
+        let (generation, complete_resolution) = if complete_route {
+            // The complete route over the existing index: a whole-vault
+            // inventory published through `begin_publish` with a previous
+            // generation. It carries no cause; the claims below are the same.
+            // An unverified complete refresh trusts every fingerprint, so a
+            // batch whose content moved under an unchanged fingerprint asks
+            // for the verified mode, which reads every body; every other
+            // batch takes the unverified mode, so both modes are driven.
+            let verify = batch
+                .iter()
+                .any(|operation| matches!(operation, Operation::PreserveFingerprintWrite { .. }));
+            let report = self
+                .service
+                .refresh_complete_for_test(verify)
+                .map_err(|error| {
+                    TestCaseError::fail(format!("complete refresh failed: {error}"))
+                })?;
+            (report.generation, false)
+        } else {
+            let report = self
+                .service
+                .refresh_paths(touched, cause)
+                .map_err(|error| {
+                    TestCaseError::fail(format!("targeted refresh failed: {error}"))
+                })?;
+            prop_assert_eq!(
+                report.cause,
+                cause,
+                "the report must carry the cause the batch was reconciled under after {:?}",
+                batch
+            );
+            (report.generation, report.complete_resolution)
+        };
 
         // (3) Generation exactness, in both directions.
         let wanted = if changed {
@@ -556,7 +594,7 @@ impl Oracle {
             self.generation
         };
         prop_assert_eq!(
-            report.generation.get(),
+            generation.get(),
             wanted,
             "generation must advance exactly once iff client-visible state changed \
              (changed = {}) after {:?}",
@@ -598,12 +636,12 @@ impl Oracle {
             return Err(TestCaseError::fail(format!("{message} after {batch:?}")));
         }
 
-        if report.complete_resolution {
+        if complete_resolution {
             self.complete_resolutions += 1;
         }
         self.expected = expected;
         self.expected_tree = expected_tree;
-        self.generation = report.generation.get();
+        self.generation = generation.get();
         Ok(())
     }
 
@@ -721,6 +759,7 @@ fn operation() -> impl Strategy<Value = Operation> {
             .prop_map(|(path, body)| Operation::MutateWriteCaseVariant { path, body }),
         1 => (hidden_slot(), body())
             .prop_map(|(path, body)| Operation::MutateWriteHidden { path, body }),
+        2 => Just(Operation::CompleteRefresh),
     ]
 }
 
@@ -1045,6 +1084,7 @@ const INTERESTING_STATES: &[&str] = &[
     "frontmatter is patched through the mutation engine",
     "the mutation engine refuses a case-variant spelling",
     "the mutation engine refuses a hidden path",
+    "a batch reconciles through the complete route",
 ];
 
 /// The interesting state one mutation operation reached, judged from the
@@ -1190,6 +1230,10 @@ fn the_generators_reach_every_interesting_state() {
                     if let Some(state) = mutation_state(operation, applied.answer.as_ref()) {
                         reached.insert(state);
                     }
+                }
+                Operation::CompleteRefresh => {
+                    reached.insert("a batch reconciles through the complete route");
+                    apply(&root, &engine, operation);
                 }
                 _ => {
                     apply(&root, &engine, operation);

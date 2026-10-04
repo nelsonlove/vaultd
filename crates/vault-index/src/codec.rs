@@ -615,15 +615,26 @@ fn digits(text: &[u8]) -> bool {
     !text.is_empty() && text.iter().all(u8::is_ascii_digit)
 }
 
-/// `YYYY-MM-DD`, optionally followed by `[ T]HH:mm[:ss[.fff]]`.
+/// Two ASCII digits whose value lies in `low..=high`.
+fn two_digits_in(text: &[u8], low: u8, high: u8) -> bool {
+    text.len() == 2 && digits(text) && {
+        let value = (text[0] - b'0') * 10 + (text[1] - b'0');
+        (low..=high).contains(&value)
+    }
+}
+
+/// `YYYY-MM-DD`, optionally followed by `[ T]HH:mm[:ss[.fff]]`, with the
+/// month in 01-12, the day in 01-31, the hour in 00-23 and the minute and
+/// second in 00-59. The check is lexical: it does not know month lengths,
+/// so `2026-02-31` is date-shaped.
 fn looks_like_date(text: &str) -> bool {
     let bytes = text.as_bytes();
     if bytes.len() < 10
         || !(digits(&bytes[0..4])
             && bytes[4] == b'-'
-            && digits(&bytes[5..7])
+            && two_digits_in(&bytes[5..7], 1, 12)
             && bytes[7] == b'-'
-            && digits(&bytes[8..10]))
+            && two_digits_in(&bytes[8..10], 1, 31))
     {
         return false;
     }
@@ -635,7 +646,8 @@ fn looks_like_date(text: &str) -> bool {
         return false;
     }
     let time = &rest[1..];
-    if !(digits(&time[0..2]) && time[2] == b':' && digits(&time[3..5])) {
+    if !(two_digits_in(&time[0..2], 0, 23) && time[2] == b':' && two_digits_in(&time[3..5], 0, 59))
+    {
         return false;
     }
     let tail = &time[5..];
@@ -646,7 +658,7 @@ fn looks_like_date(text: &str) -> bool {
                 Some(at) => (&seconds[..at], Some(&seconds[at + 1..])),
                 None => (seconds, None),
             };
-            whole.len() == 2 && digits(whole) && fraction.is_none_or(digits)
+            two_digits_in(whole, 0, 59) && fraction.is_none_or(digits)
         }
         _ => false,
     }
