@@ -187,15 +187,19 @@ pub(crate) fn apply_bases(
 /// The one hydration statement that reads `source_bytes`, and only from
 /// `bases`: a base's bytes are its whole state, and re-parsing them is what
 /// keeps a restart from reading the vault.
-pub(crate) const BASE_RECORDS_SQL: &str =
-    "SELECT path, source_bytes, parse_status, diagnostics_json FROM bases ORDER BY path";
+pub(crate) const BASE_RECORDS_SQL: &str = "SELECT path, content_revision, source_bytes, \
+     parse_status, diagnostics_json FROM bases ORDER BY path";
 
-/// Every stored base, re-parsed from its stored bytes — hydration and the
-/// complete route both read this, so neither reads the vault for a base it
-/// already knows. A base stored as `parse_failed` stays failed even when
-/// its stored bytes re-parse (an unreadable file is stored with no bytes),
-/// with the message its stored diagnostic carries, so the graph and the row
-/// always agree.
+/// Every stored base, re-parsed from its stored bytes with the current
+/// parser — hydration and the complete route's cold build read this, so
+/// neither reads the vault for a base the index already holds.
+///
+/// A base stored as unreadable (its revision says so; it was stored with no
+/// bytes) stays a failure, with the message its stored diagnostic carries.
+/// Every other row is what its bytes parse to now, so a row written by an
+/// older parser generation is answered by this one; `plan` re-reads such a
+/// row on the next refresh (its revision is not current), which brings the
+/// row itself up to date.
 pub(crate) fn load_base_records(
     connection: &Connection,
 ) -> Result<Vec<(VaultPath, BaseRecord)>, IndexError> {
@@ -204,26 +208,25 @@ pub(crate) fn load_base_records(
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
-        .map(|(path, bytes, status, diagnostics)| {
+        .map(|(path, revision, bytes, status, diagnostics)| {
             let path = codec::decode_path(&path)?;
-            let text = String::from_utf8_lossy(&bytes);
-            let record = BaseRecord::parse(&text);
-            let record = match status.as_str() {
-                "parsed" => record,
-                "parse_failed" if record.error.is_some() => record,
-                "parse_failed" => BaseRecord::unreadable(stored_base_message(&diagnostics)),
-                other => {
-                    return Err(IndexError::IncompatibleIndex(format!(
-                        "unknown base parse status {other}"
-                    )));
-                }
+            if status != "parsed" && status != "parse_failed" {
+                return Err(IndexError::IncompatibleIndex(format!(
+                    "unknown base parse status {status}"
+                )));
+            }
+            let record = if crate::bases::revision_is_unreadable(&revision) {
+                BaseRecord::unreadable(stored_base_message(&diagnostics))
+            } else {
+                BaseRecord::parse(&String::from_utf8_lossy(&bytes))
             };
             Ok((path, record))
         })

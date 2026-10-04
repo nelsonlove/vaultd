@@ -1007,9 +1007,9 @@ pub struct MutationOutcome {
     pub revision: Option<String>,
     pub links_rewritten: u64,
     pub link_rewrite_failures: Vec<LinkRewriteFailure>,
-    /// Whether this mutation **changed anything the semantic layer indexes**,
-    /// which is to say the Markdown half of the index: notes, their
-    /// frontmatter, their links.
+    /// Whether this mutation **changed anything the semantic layer indexes**:
+    /// notes, their frontmatter, their links — and bases, whose rows and view
+    /// lists move resolution (see [`indexes_semantics`]).
     ///
     /// An independent fact each constructor states deliberately, *not* one
     /// derived from `changed_paths`. The two answer different questions and
@@ -1022,15 +1022,16 @@ pub struct MutationOutcome {
     /// | --- | --- |
     /// | `write_note` | `true` — the target is a note by construction |
     /// | `create_folder` | `false` — a folder holds no indexed semantics |
-    /// | `delete_note` of a note | `true` |
+    /// | `delete_note` of a note or a base | `true` |
     /// | `delete_note` of an attachment | `false` |
-    /// | `delete_folder` | `true` iff it removed at least one note |
-    /// | `copy_file` | `true` iff the **destination** is Markdown |
-    /// | `rename_note` / `rename_folder` | `true` iff any Markdown path moved |
+    /// | `delete_folder` | `true` iff it removed at least one note or base |
+    /// | `copy_file` | `true` iff the **destination** is a note or a base |
+    /// | `rename_note` / `rename_folder` | `true` iff any note or base moved |
     /// | `patch_frontmatter` | `true` |
-    /// | `write_file` | **always `false`** — the zone holds no semantics, an
-    ///   attachment holds none, and an *indexable* `.md` path is refused with
-    ///   [`MutationError::IsANote`] rather than written raw |
+    /// | `write_file` | `true` only for an indexable `.base` — the zone holds
+    ///   no semantics, an attachment holds none, and an *indexable* `.md`
+    ///   path is refused with [`MutationError::IsANote`] rather than written
+    ///   raw |
     ///
     /// It is deliberately **not** the same question as "does this write live
     /// inside the indexed vault", which is what the wire's
@@ -1059,6 +1060,13 @@ pub fn in_config_zone(path: &VaultPath) -> bool {
         || text
             .strip_prefix(CONFIG_ZONE)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a file at `path` is one the semantic half of the index parses: a
+/// note, or a base outside the territory the scan never lists. A base's row
+/// and view list move resolution, so a mutation that moves one is semantic.
+pub fn indexes_semantics(path: &VaultPath) -> bool {
+    path.is_markdown() || (path.is_base() && !is_unindexable(path))
 }
 
 /// Whether the semantic layer would ever read a note at `path` — the union of
@@ -1480,10 +1488,10 @@ impl MutationEngine {
     /// whose semantics no generation describes. `write_note` serves that path
     /// and gives the caller read-your-writes.
     ///
-    /// The consequence is that **every** raw write reports `semantic: false`:
-    /// the zone is not indexed, an attachment holds no semantics, and a note
-    /// cannot arrive here. That is what keeps raw I/O entirely out of the
-    /// *semantic* layer.
+    /// The consequence is that a raw write reports `semantic: false` except
+    /// for an indexable `.base`, which the index parses: the zone is not
+    /// indexed, an attachment holds no semantics, and a note cannot arrive
+    /// here.
     ///
     /// It does **not** keep raw I/O out of the generation model, and the
     /// difference matters. Since the tree pre-task the index holds a row for
@@ -1574,15 +1582,16 @@ impl MutationEngine {
         } else {
             BTreeSet::from([written.clone()])
         };
+        // A base is the one thing a raw write can reach that the index
+        // parses; nothing else it can reach carries semantics.
+        let semantic = written.is_base() && !is_unindexable(&written);
         Ok(MutationOutcome {
             changed_paths,
             written: Some(written),
             revision: Some(revision_of(content)),
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
-            // Nothing a raw write can reach carries semantics the index reads,
-            // so by the invariant on `MutationOutcome` this is unconditional.
-            semantic: false,
+            semantic,
         })
     }
 
@@ -2093,7 +2102,7 @@ impl MutationEngine {
             revision: None,
             links_rewritten: 0,
             link_rewrite_failures: Vec::new(),
-            semantic: stored.is_markdown(),
+            semantic: indexes_semantics(&stored),
         })
     }
 
@@ -2166,7 +2175,7 @@ impl MutationEngine {
         // Read off the Markdown subset, not off `changed_paths`, per the
         // `MutationOutcome::semantic` table: a folder of attachments moves
         // every tree row under it and no semantic row at all.
-        let semantic = removed.iter().any(VaultPath::is_markdown);
+        let semantic = removed.iter().any(indexes_semantics);
         let mut changed_paths: BTreeSet<VaultPath> = removed.into_iter().collect();
         // The folder itself is a tree row too, and an empty folder's delete
         // moves nothing else.
@@ -2472,7 +2481,7 @@ impl MutationEngine {
             &destination_path,
         )?;
         let written = self.written_path(&destination_path, &destination, stored_to);
-        let semantic = written.is_markdown();
+        let semantic = indexes_semantics(&written);
         Ok(MutationOutcome {
             // Ruling B4: the destination is a new tree row whatever its
             // extension, and a created path the outcome does not name is a row
@@ -2636,7 +2645,7 @@ impl MutationEngine {
         self.recheck_present(from, &resolved, expected)?;
 
         let changed_paths = self.rename_paths_onto(from, to, reservation)?;
-        let semantic = changed_paths.iter().any(VaultPath::is_markdown);
+        let semantic = changed_paths.iter().any(indexes_semantics);
         // Read after the move, from the file that is now there. Any failure is
         // swallowed rather than propagated, for `written_path`'s reason: the
         // move already landed, and a mutation that succeeded must never be
@@ -2705,7 +2714,7 @@ impl MutationEngine {
             // Read off the Markdown subset, not off `changed_paths`, per the
             // `MutationOutcome::semantic` table: a folder of attachments moves
             // every tree row under it and no semantic row at all.
-            semantic: changed_paths.iter().any(VaultPath::is_markdown),
+            semantic: changed_paths.iter().any(indexes_semantics),
             changed_paths,
             written: None,
             // A folder has no bytes to hash, so it reports no revision — never

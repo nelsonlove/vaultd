@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use vault_bases::{BaseFile, BaseParseError, parse_base};
-use vault_core::{ResolutionNote, ScanError, SourceDocument, VaultPath};
+use vault_core::{ResolutionNote, ScanError, SourceDocument, TreeEntry, TreeEntryKind, VaultPath};
 
 use crate::error::IndexError;
 use crate::inventory::ReconcileSource;
 use crate::model::FileFingerprint;
+use crate::store::TreeDelta;
 
 /// One parsed base as the index holds it: the parsed file (for evaluation),
 /// its view names (for resolution), and the parse error when it did not
@@ -80,17 +81,85 @@ pub struct BaseDelta {
 }
 
 impl BaseDelta {
+    /// Whether this delta moves no base at all.
     pub fn is_empty(&self) -> bool {
         self.replaced.is_empty() && self.removed.is_empty()
     }
 
-    pub fn paths(&self) -> BTreeSet<VaultPath> {
-        self.replaced
-            .iter()
-            .map(|replacement| replacement.path.clone())
-            .chain(self.removed.iter().cloned())
-            .collect()
+    /// This delta minus what `stored` already says: a replacement whose
+    /// stored revision is already its own and a removal whose row is already
+    /// gone are dropped. A publish attempt that lost its compare-and-swap to
+    /// a writer that applied the same change then publishes nothing for it.
+    pub(crate) fn unapplied(
+        &self,
+        stored: &BTreeMap<VaultPath, (String, FileFingerprint)>,
+    ) -> Self {
+        Self {
+            replaced: self
+                .replaced
+                .iter()
+                .filter(|replacement| {
+                    stored
+                        .get(&replacement.path)
+                        .map(|(revision, _)| revision.as_str())
+                        != Some(replacement.revision.as_str())
+                })
+                .cloned()
+                .collect(),
+            removed: self
+                .removed
+                .iter()
+                .filter(|path| stored.contains_key(*path))
+                .cloned()
+                .collect(),
+        }
     }
+}
+
+/// The parser generation a stored base row was parsed by. It prefixes every
+/// stored `content_revision`, so a row parsed by another generation never
+/// equals a fresh read: [`plan`] re-reads it and hydration trusts its fresh
+/// parse over its stored status. The crate version is the workspace version
+/// `vault-bases` shares; the trailing number is bumped by hand when the
+/// parser's output changes within one version.
+pub(crate) const BASE_PARSER_VERSION: &str =
+    concat!("vault-bases/", env!("CARGO_PKG_VERSION"), "#1");
+
+/// Whether a stored revision was written by this parser generation.
+pub(crate) fn revision_is_current(revision: &str) -> bool {
+    revision
+        .strip_prefix(BASE_PARSER_VERSION)
+        .is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// The stored revision for one read outcome. Readable text is the parser
+/// generation and the text's own content revision; an unreadable or
+/// non-UTF-8 file is marked as such and hashes what was learned instead (the
+/// raw bytes, or the error), so it can never share a revision with a
+/// readable file — an empty base included.
+fn base_revision(path: &VaultPath, outcome: &ReadOutcome) -> String {
+    match outcome {
+        ReadOutcome::Text(text) => format!(
+            "{BASE_PARSER_VERSION} {}",
+            SourceDocument::new(path.clone(), text.clone())
+                .revision()
+                .as_str()
+        ),
+        ReadOutcome::NotUtf8(bytes) => format!(
+            "{BASE_PARSER_VERSION} unreadable:bytes:blake3:{}",
+            blake3::hash(bytes)
+        ),
+        ReadOutcome::Unreadable(message) => format!(
+            "{BASE_PARSER_VERSION} unreadable:error:blake3:{}",
+            blake3::hash(message.as_bytes())
+        ),
+    }
+}
+
+enum ReadOutcome {
+    Text(Arc<str>),
+    NotUtf8(Vec<u8>),
+    Unreadable(String),
 }
 
 /// Read one base as it is on disk now, `None` when it is absent. A base
@@ -103,18 +172,12 @@ fn read_base(
     let Some(before) = source.fingerprint(path)? else {
         return Ok(None);
     };
-    let (text, record): (Arc<str>, BaseRecord) = match source.read_bytes(path) {
-        Ok(bytes) => match SourceDocument::from_utf8(path.clone(), bytes) {
-            Ok(document) => {
-                let text: Arc<str> = document.text().into();
-                let record = BaseRecord::parse(&text);
-                (text, record)
-            }
-            Err(error) => (Arc::from(""), BaseRecord::unreadable(error.to_string())),
+    let outcome = match source.read_bytes(path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => ReadOutcome::Text(text.into()),
+            Err(error) => ReadOutcome::NotUtf8(error.into_bytes()),
         },
-        Err(ScanError::UnreadableFile { message, .. }) => {
-            (Arc::from(""), BaseRecord::unreadable(message))
-        }
+        Err(ScanError::UnreadableFile { message, .. }) => ReadOutcome::Unreadable(message),
         Err(ScanError::InaccessibleRoot { message }) => {
             return Err(IndexError::InvalidVaultRoot(message));
         }
@@ -122,43 +185,73 @@ fn read_base(
     if source.fingerprint(path)? != Some(before) {
         return Err(IndexError::VaultChangedDuringRefresh);
     }
-    let revision = SourceDocument::new(path.clone(), text.clone())
-        .revision()
-        .as_str()
-        .to_string();
+    let revision = base_revision(path, &outcome);
+    let (source_text, record) = match outcome {
+        ReadOutcome::Text(text) => {
+            let record = BaseRecord::parse(&text);
+            (text, record)
+        }
+        ReadOutcome::NotUtf8(_) => (
+            Arc::from(""),
+            BaseRecord::unreadable(format!("{} is not valid UTF-8", path.as_str())),
+        ),
+        ReadOutcome::Unreadable(message) => (Arc::from(""), BaseRecord::unreadable(message)),
+    };
     Ok(Some(BaseReplacement {
         path: path.clone(),
         revision,
-        source: text,
+        source: source_text,
         fingerprint: before,
         record,
     }))
 }
 
-/// The delta that brings `stored` to what is on disk for `candidates` (the
-/// bases the walk saw, or the base paths a hint named). A candidate whose
-/// revision did not move is left alone; a stored base that is not on disk is
-/// removed. `complete` also removes every stored base the candidates do not
-/// name; `verify` re-reads even an unchanged fingerprint.
+/// What one route knows about the base paths it reconciles.
+#[derive(Debug, Default)]
+pub(crate) struct BaseCandidates {
+    /// Paths that are base files now: the walk's `File` entries, or hinted
+    /// paths whose tree entry says `File`.
+    pub(crate) files: BTreeSet<VaultPath>,
+    /// Paths known not to be base files now: hinted paths with no tree entry,
+    /// or one that is a folder or excluded (a symlink). A stored row for one
+    /// is removed.
+    pub(crate) absent: BTreeSet<VaultPath>,
+    /// Files whose tree row (size, ctime and mtime in milliseconds) did not
+    /// move in this walk. A stored, current-generation row for one is trusted
+    /// without a `stat`.
+    pub(crate) settled: BTreeSet<VaultPath>,
+    /// The candidates are a complete walk: a stored base not among `files`
+    /// is removed.
+    pub(crate) complete: bool,
+}
+
+/// The delta that brings `stored` to what is on disk for `candidates`.
 ///
-/// A revision-identical re-read with a new fingerprint (a `touch`) is
-/// dropped: its stored fingerprint stays stale until the next content
-/// change, which costs one extra read per touched base per complete refresh
-/// and never publishes a generation.
+/// A file whose stored row is current is skipped without a read when its
+/// tree row is settled, or when its fingerprint still equals the stored
+/// one; `verify` reads every file. A read whose revision equals the stored
+/// one is dropped: the bases row and the live graph do not move, though the
+/// file's tree row may (a `touch` still publishes a tree generation), and
+/// the stored fingerprint stays stale, so the file is re-read on each refresh
+/// that does not see its tree row settled until its content changes.
 pub(crate) fn plan(
     source: &dyn ReconcileSource,
     stored: &BTreeMap<VaultPath, (String, FileFingerprint)>,
-    candidates: &BTreeSet<VaultPath>,
-    complete: bool,
+    candidates: &BaseCandidates,
     verify: bool,
 ) -> Result<BaseDelta, IndexError> {
     let mut delta = BaseDelta::default();
-    for path in candidates {
+    let mut removed: BTreeSet<VaultPath> = BTreeSet::new();
+    for path in &candidates.files {
         if !path.is_base() || path.is_hidden() {
             continue;
         }
         let known = stored.get(path);
-        if !verify {
+        let current = known.is_some_and(|(revision, _)| revision_is_current(revision));
+        if current && !verify {
+            if candidates.settled.contains(path) {
+                continue;
+            }
             if let (Some((_, fingerprint)), Some(now)) = (known, source.fingerprint(path)?) {
                 if *fingerprint == now {
                     continue;
@@ -175,17 +268,82 @@ pub(crate) fn plan(
             }
             None => {
                 if known.is_some() {
-                    delta.removed.push(path.clone());
+                    removed.insert(path.clone());
                 }
             }
         }
     }
-    if complete {
+    for path in &candidates.absent {
+        if stored.contains_key(path) {
+            removed.insert(path.clone());
+        }
+    }
+    if candidates.complete {
         for path in stored.keys() {
-            if !candidates.contains(path) {
-                delta.removed.push(path.clone());
+            if !candidates.files.contains(path) {
+                removed.insert(path.clone());
             }
         }
     }
+    delta.removed = removed.into_iter().collect();
     Ok(delta)
+}
+
+/// The candidates a complete walk gives: every `File` entry ending in
+/// `.base`, settled unless this walk's tree delta created or modified its row.
+pub(crate) fn walk_candidates(observed: &[TreeEntry], tree: &TreeDelta) -> BaseCandidates {
+    let moved: BTreeSet<&VaultPath> = tree.created().iter().chain(tree.modified()).collect();
+    let files: BTreeSet<VaultPath> = observed
+        .iter()
+        .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
+        .map(|entry| entry.path.clone())
+        .collect();
+    let settled = files
+        .iter()
+        .filter(|path| !moved.contains(path))
+        .cloned()
+        .collect();
+    BaseCandidates {
+        files,
+        absent: BTreeSet::new(),
+        settled,
+        complete: true,
+    }
+}
+
+/// Whether `path` is a base file in the tree right now — what the walk would
+/// list. A folder named `X.base`, a symlink and an absent path are not.
+pub(crate) fn is_base_file(
+    source: &dyn ReconcileSource,
+    path: &VaultPath,
+) -> Result<bool, IndexError> {
+    Ok(source
+        .tree_entry(path)?
+        .is_some_and(|entry| entry.kind == TreeEntryKind::File))
+}
+
+/// The candidates a hint gives: each hinted, non-hidden `.base` path is a
+/// file when its tree entry says so, and absent otherwise.
+pub(crate) fn hint_candidates(
+    source: &dyn ReconcileSource,
+    hinted: &BTreeSet<VaultPath>,
+) -> Result<BaseCandidates, IndexError> {
+    let mut candidates = BaseCandidates::default();
+    for path in hinted {
+        if !path.is_base() || path.is_hidden() {
+            continue;
+        }
+        if is_base_file(source, path)? {
+            candidates.files.insert(path.clone());
+        } else {
+            candidates.absent.insert(path.clone());
+        }
+    }
+    Ok(candidates)
+}
+
+/// Whether a stored revision marks a file that could not be read as text
+/// (stored with no bytes). Every parser generation writes the same marker.
+pub(crate) fn revision_is_unreadable(revision: &str) -> bool {
+    revision.contains(" unreadable:")
 }

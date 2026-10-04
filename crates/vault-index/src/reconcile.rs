@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use vault_core::{
     Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution, ResolutionNote, ScanError,
-    ScanReport, SemanticGraph, Severity, SourceDocument, SourceError, TreeEntryKind, VaultPath,
+    ScanReport, SemanticGraph, Severity, SourceDocument, SourceError, VaultPath,
     build_graph_with_bases, parse_note,
 };
 
@@ -649,16 +649,10 @@ impl IndexService {
         // The bases the walk saw. A source that observes no tree reconciles
         // no bases (see `bases.rs`).
         let base_delta = if self.source.observes_tree() {
-            let observed_bases: BTreeSet<VaultPath> = observed_tree
-                .iter()
-                .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
-                .map(|entry| entry.path.clone())
-                .collect();
             crate::bases::plan(
                 self.source.as_ref(),
                 &self.store.stored_bases()?,
-                &observed_bases,
-                true,
+                &crate::bases::walk_candidates(&observed_tree, &tree_delta),
                 verify,
             )?
         } else {
@@ -884,12 +878,26 @@ impl IndexService {
         // Every base the new snapshot holds: the stored ones this walk did
         // not remove, overlaid with the ones it replaced. Their identities
         // join the resolution catalog; their records join the live graph.
+        // The unchanged ones come from the published graph when it is at the
+        // generation this publication replaces — its records are exactly the
+        // stored rows, already parsed — and from the stored bytes otherwise.
         let removed_bases: BTreeSet<&VaultPath> = base_delta.removed.iter().collect();
-        let mut base_records: BTreeMap<VaultPath, BaseRecord> =
-            crate::store::load_base_records(self.store.connection())?
-                .into_iter()
-                .filter(|(path, _)| !removed_bases.contains(path))
-                .collect();
+        let stored_records: Vec<(VaultPath, BaseRecord)> =
+            match previous.map(|generation| self.published_graph(generation)) {
+                Some(Ok(graph)) => graph
+                    .base_paths()
+                    .filter_map(|path| {
+                        graph
+                            .base(path)
+                            .map(|record| (path.clone(), record.clone()))
+                    })
+                    .collect(),
+                _ => crate::store::load_base_records(self.store.connection())?,
+            };
+        let mut base_records: BTreeMap<VaultPath, BaseRecord> = stored_records
+            .into_iter()
+            .filter(|(path, _)| !removed_bases.contains(path))
+            .collect();
         for replacement in &base_delta.replaced {
             base_records.insert(replacement.path.clone(), replacement.record.clone());
         }

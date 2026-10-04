@@ -186,9 +186,11 @@ mod tests {
         BLOCKS_SQL, CANDIDATES_SQL, GENERATION_SQL, HEADINGS_SQL, NOTES_SQL, REFERENCES_SQL,
     };
 
-    /// Every SQL statement hydration runs, checked directly against its
-    /// literal text so a future edit that starts selecting a note-body or
-    /// metadata column fails this test immediately.
+    /// Every statement hydration runs against the note tables, checked
+    /// directly against its literal text so a future edit that starts
+    /// selecting a note-body or metadata column fails this test immediately.
+    /// `BASE_RECORDS_SQL`, the one stated exception, is pinned by
+    /// `the_base_hydration_query_reads_only_the_bases_table`.
     const HYDRATION_QUERIES: &[&str] = &[
         GENERATION_SQL,
         NOTES_SQL,

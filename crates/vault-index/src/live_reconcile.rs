@@ -23,7 +23,7 @@ use std::time::Instant;
 use vault_core::{
     DependencyKey, Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution,
     ResolutionIdentityChange, ResolutionNote, ResolvedReference, Resolver, ScanError, Severity,
-    SourceDocument, SourceError, TreeEntryKind, VaultPath, changed_candidate_keys, parse_note,
+    SourceDocument, SourceError, VaultPath, changed_candidate_keys, parse_note,
     reference_dependencies, resolution_diagnostic,
 };
 
@@ -413,12 +413,14 @@ impl IndexService {
             .filter(|path| path.is_base() && !path.is_hidden())
             .cloned()
             .collect();
+        // A hinted path the walk would not list as a file — a folder named
+        // `X.base`, a symlink, a path that is gone — is planned as absent, so
+        // a stale row for it is removed and no row is ever written for it.
         let bases = if self.source.observes_tree() && !hinted_bases.is_empty() {
             crate::bases::plan(
                 self.source.as_ref(),
                 &self.store.stored_bases()?,
-                &hinted_bases,
-                false,
+                &crate::bases::hint_candidates(self.source.as_ref(), &hinted_bases)?,
                 false,
             )?
         } else {
@@ -492,16 +494,10 @@ impl IndexService {
         // The bases the walk saw, planned exactly as the complete route plans
         // them. A source that observes no tree reconciles no bases.
         let bases = if self.source.observes_tree() {
-            let observed_bases: BTreeSet<VaultPath> = observed_tree
-                .iter()
-                .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
-                .map(|entry| entry.path.clone())
-                .collect();
             crate::bases::plan(
                 self.source.as_ref(),
                 &self.store.stored_bases()?,
-                &observed_bases,
-                true,
+                &crate::bases::walk_candidates(&observed_tree, &tree),
                 verify,
             )?
         } else {
@@ -709,6 +705,15 @@ impl IndexService {
             .ok_or(IndexError::IndexUnavailable)?;
         self.republish_current(expected)?;
 
+        // Re-planned against the stored rows on every attempt, as the notes
+        // are below: a writer that won the last compare-and-swap with the
+        // same base change leaves nothing of it for this attempt to publish.
+        let bases = if batch.bases.is_empty() {
+            BaseDelta::default()
+        } else {
+            batch.bases.unapplied(&self.store.stored_bases()?)
+        };
+
         let mut replaced: Vec<(ParsedNote, FileFingerprint)> = Vec::new();
         let mut removed: Vec<VaultPath> = Vec::new();
         let mut fingerprint_updates: Vec<(VaultPath, FileFingerprint)> = Vec::new();
@@ -766,7 +771,7 @@ impl IndexService {
             && removed.is_empty()
             && !scan_diagnostics_changed
             && !batch.tree.is_generational()
-            && batch.bases.is_empty()
+            && bases.is_empty()
         {
             // Whatever tree rows moved here are the non-generational kind — a
             // note's or a folder's own metadata — so they ride the same
@@ -793,7 +798,7 @@ impl IndexService {
         let planning_start = Instant::now();
         let selection = {
             let graph = self.published_graph(expected)?;
-            self.select_impact(&graph, &replaced, &removed, &batch.bases)
+            self.select_impact(&graph, &replaced, &removed, &bases)
         };
         metrics.stages.impact_planning += planning_start.elapsed();
 
@@ -888,7 +893,7 @@ impl IndexService {
         // create, replace, or delete must still be in the state the plan
         // assumed. One point fingerprint each — no inventory.
         self.reach(crate::HookPoint::BeforePresenceCheck);
-        self.confirm_planned_presence(batch, &replaced, &removed)?;
+        self.confirm_planned_presence(batch, &replaced, &removed, &bases)?;
 
         let notes: Vec<NoteReplacement> = replaced
             .iter()
@@ -923,12 +928,12 @@ impl IndexService {
                 resolutions: &resolutions,
                 scan_diagnostics: scan_diagnostics_changed.then_some(scan_diagnostics.as_slice()),
                 tree: &batch.tree,
-                bases: &batch.bases,
+                bases: &bases,
             },
             &hydrated_notes,
             &removed,
             &graph_references,
-            &batch.bases,
+            &bases,
         )?;
 
         match outcome {
@@ -1087,6 +1092,7 @@ impl IndexService {
         batch: &DirtyBatch,
         replaced: &[(ParsedNote, FileFingerprint)],
         removed: &[VaultPath],
+        bases: &BaseDelta,
     ) -> Result<(), IndexError> {
         let mut expectations: BTreeMap<&VaultPath, bool> = BTreeMap::new();
         for (note, _) in replaced {
@@ -1105,15 +1111,21 @@ impl IndexService {
                 expectations.insert(path, expected);
             }
         }
-        for replacement in &batch.bases.replaced {
-            expectations.insert(&replacement.path, true);
-        }
-        for path in &batch.bases.removed {
-            expectations.insert(path, false);
-        }
         for (path, expected) in expectations {
             let present = self.source.fingerprint(path)?.is_some();
             if present != expected {
+                return Err(IndexError::VaultChangedDuringRefresh);
+            }
+        }
+        // A base is present when the walk would list it as a file: a folder
+        // or a symlink at a removed base's path is not one.
+        for replacement in &bases.replaced {
+            if !crate::bases::is_base_file(self.source.as_ref(), &replacement.path)? {
+                return Err(IndexError::VaultChangedDuringRefresh);
+            }
+        }
+        for path in &bases.removed {
+            if crate::bases::is_base_file(self.source.as_ref(), path)? {
                 return Err(IndexError::VaultChangedDuringRefresh);
             }
         }

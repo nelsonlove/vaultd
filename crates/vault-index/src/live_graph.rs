@@ -582,10 +582,12 @@ impl LiveGraph {
         self.generation = delta.generation;
     }
 
+    /// The record the graph holds for the base at `path`, if one is indexed.
     pub fn base(&self, path: &VaultPath) -> Option<&BaseRecord> {
         self.bases.get(path)
     }
 
+    /// Every indexed base's path, in path order.
     pub fn base_paths(&self) -> impl Iterator<Item = &VaultPath> {
         self.bases.keys()
     }

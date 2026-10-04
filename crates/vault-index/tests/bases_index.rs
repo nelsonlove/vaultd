@@ -476,3 +476,293 @@ fn renaming_a_base_onto_a_shared_name_keeps_the_embed_on_the_moved_base() {
     );
     fixture.assert_matches_a_cold_build("a rename onto a shared base name");
 }
+
+/// A folder named like a base is a folder: the walk never lists it as a base,
+/// so a hint naming it must not index one — and a stale row for a base that
+/// became a folder of that name is removed.
+#[test]
+fn a_hinted_folder_named_like_a_base_is_never_indexed() {
+    let mut fixture = fixture(&[
+        ("Projects.base/Inside.md", "inside\n"),
+        ("Views.base", VIEWS),
+        ("Home.md", "[[Projects.base]]\n![[Views.base#Table]]\n"),
+    ]);
+    assert!(fixture.base_row("Projects.base").is_none());
+    let start = fixture.generation();
+    assert_eq!(
+        fixture.touch(&["Projects.base", "Projects.base/Inside.md"]),
+        start,
+        "re-observing an unchanged folder publishes nothing"
+    );
+    assert!(fixture.base_row("Projects.base").is_none());
+    fixture.assert_matches_a_cold_build("a hinted folder named like a base");
+
+    fs::remove_file(fixture.root.join("Views.base")).unwrap();
+    fs::create_dir(fixture.root.join("Views.base")).unwrap();
+    fixture.write("Views.base/Note.md", "note\n");
+    fixture.touch(&["Views.base", "Views.base/Note.md"]);
+    assert!(
+        fixture.base_row("Views.base").is_none(),
+        "a base that became a folder leaves the bases table"
+    );
+    assert!(fixture.published_graph().base(&vp("Views.base")).is_none());
+    fixture.assert_matches_a_cold_build("a base replaced by a folder of its name");
+}
+
+/// A symlink is excluded from the walk; one whose target leaves the vault
+/// must not become a base through a hint either.
+#[cfg(unix)]
+#[test]
+fn a_hinted_symlink_base_is_never_indexed() {
+    let mut fixture = fixture(&[("Home.md", "![[Out.base#Table]]\n")]);
+    let outside = TempDir::new_in(common::scratch_root()).unwrap();
+    fs::write(outside.path().join("Target.base"), VIEWS).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("Target.base"),
+        fixture.root.join("Out.base"),
+    )
+    .unwrap();
+    fixture.touch(&["Out.base"]);
+    assert!(fixture.base_row("Out.base").is_none());
+    assert_eq!(fixture.outgoing("Home.md"), vec![Resolution::Unresolved]);
+    fixture.assert_matches_a_cold_build("a hinted symlink to a base outside the vault");
+}
+
+/// An unreadable base is stored with no bytes; its revision must still never
+/// equal an empty base's, or a change between the two would never publish.
+#[test]
+fn an_unreadable_base_never_shares_the_empty_bases_revision() {
+    let mut fixture = fixture(&[("Empty.base", "")]);
+    assert_eq!(
+        fixture.base_row("Empty.base"),
+        Some(("parsed".into(), "[]".into()))
+    );
+    let start = fixture.generation();
+
+    fs::write(fixture.root.join("Empty.base"), [0xff_u8, 0xfe, 0xfd]).unwrap();
+    assert_eq!(
+        fixture.touch(&["Empty.base"]),
+        start + 1,
+        "empty to non-UTF-8 publishes"
+    );
+    assert_eq!(fixture.base_row("Empty.base").unwrap().0, "parse_failed");
+    fixture.assert_matches_a_cold_build("an empty base turned non-UTF-8");
+
+    fixture.write("Empty.base", "");
+    assert_eq!(
+        fixture.touch(&["Empty.base"]),
+        start + 2,
+        "non-UTF-8 to empty publishes"
+    );
+    assert_eq!(fixture.base_row("Empty.base").unwrap().0, "parsed");
+    fixture.assert_matches_a_cold_build("a non-UTF-8 base emptied");
+}
+
+/// A row written by another parser generation is answered by this parser on
+/// hydration, whatever its stored status says, and re-read on the next
+/// refresh so the row itself catches up.
+#[test]
+fn a_row_from_another_parser_generation_is_reparsed() {
+    let fixture = fixture(&[
+        ("Views.base", VIEWS),
+        ("Home.md", "![[Views.base#Cards]]\n"),
+    ]);
+    fixture
+        .service
+        .connection_for_test()
+        .execute(
+            "UPDATE bases SET content_revision = 'vault-bases/0.0.0#0 blake3:old', \
+             parse_status = 'parse_failed', view_names_json = '[]', \
+             diagnostics_json = '[{\"code\":\"malformed_base\",\"severity\":\"warning\",\
+             \"message\":\"base failed to parse: old parser\",\"span_start\":null,\"span_end\":null}]' \
+             WHERE path = 'Views.base'",
+            [],
+        )
+        .unwrap();
+    let root = fixture.root.clone();
+    let index_path = fixture.index.path().join("index.sqlite3");
+    let Fixture {
+        service,
+        index,
+        _vault,
+        ..
+    } = fixture;
+    drop(service);
+
+    let config = IndexConfig::explicit(&root, &index_path).unwrap();
+    let mut reopened = IndexService::open(config).unwrap();
+    let graph = reopened
+        .reader()
+        .unwrap()
+        .published_state()
+        .unwrap()
+        .graph
+        .expect("a hydrated graph");
+    let record = graph.base(&vp("Views.base")).expect("hydrated base");
+    assert!(
+        record.error.is_none(),
+        "the current parser answers the stale row"
+    );
+    assert_eq!(record.views, vec!["Table".to_string(), "Cards".to_string()]);
+    drop(graph);
+
+    let before = reopened.current_generation().unwrap().unwrap().get();
+    let report = reopened.refresh(false).unwrap();
+    assert_eq!(
+        report.generation.get(),
+        before + 1,
+        "the stale row is re-read and rewritten"
+    );
+    let fixture = Fixture {
+        service: reopened,
+        root,
+        index,
+        _vault,
+    };
+    assert_eq!(
+        fixture.base_row("Views.base"),
+        Some(("parsed".into(), r#"["Table","Cards"]"#.into()))
+    );
+    fixture.assert_matches_a_cold_build("a stale parser generation re-read");
+}
+
+/// A writer that already published the same base change wins the
+/// compare-and-swap; the retry must find nothing left to publish rather than
+/// publish a generation that changes no row.
+#[test]
+fn a_lost_compare_and_swap_to_the_same_base_change_publishes_no_extra_generation() {
+    let mut fixture = fixture(&[("Views.base", VIEWS), ("Home.md", "![[Views.base#Only]]\n")]);
+    let start = fixture.generation();
+    let index_path = fixture.index.path().join("index.sqlite3");
+    // The foreign writer: a second service on the same cache, as another
+    // process would be (no lease, so the compare-and-swap is what decides).
+    let foreign = IndexService::open_unleased_for_cas_test(
+        IndexConfig::explicit(&fixture.root, &index_path).unwrap(),
+    )
+    .unwrap();
+    fixture.write("Views.base", "views:\n  - type: list\n    name: Only\n");
+
+    // The changed file's tree row lands first, copied from a cold build of
+    // the changed vault, so this cycle's own tree observation agrees with it
+    // and the base delta is the only thing this cycle has left to move.
+    let cold_dir = TempDir::new_in(common::scratch_root()).unwrap();
+    let cold_path = cold_dir.path().join("cold.sqlite3");
+    {
+        let config = IndexConfig::explicit(&fixture.root, &cold_path).unwrap();
+        let mut cold = IndexService::open(config).unwrap();
+        cold.refresh(false).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&index_path).unwrap();
+        connection
+            .execute("ATTACH DATABASE ?1 AS cold", [cold_path.to_str().unwrap()])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO main.tree_entries SELECT * FROM cold.tree_entries \
+                 WHERE path = 'Views.base'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let foreign = std::sync::Mutex::new(foreign);
+    let thefts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&thefts);
+    fixture.service.install_test_hook(common::once_at(
+        vault_index::HookPoint::BeforeDeltaPublication,
+        move || {
+            let paths: BTreeSet<VaultPath> = [vp("Views.base")].into_iter().collect();
+            foreign
+                .lock()
+                .unwrap()
+                .refresh_paths(paths, ChangeCause::Watcher)
+                .unwrap();
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    ));
+
+    let generation = fixture.touch(&["Views.base"]);
+    assert_eq!(
+        thefts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the race must have fired"
+    );
+    assert_eq!(
+        generation,
+        start + 1,
+        "the foreign writer's generation is the only one: the retry had nothing left"
+    );
+    assert_eq!(
+        fixture.outgoing("Home.md"),
+        vec![view("Views.base", "Only")]
+    );
+    fixture.assert_matches_a_cold_build("a compare-and-swap lost to the same base change");
+}
+
+/// A base is something the index parses, so a mutation that moves one is
+/// semantic; an attachment is not, and a base in a hidden folder is never
+/// indexed.
+#[test]
+fn a_mutation_that_moves_a_base_is_semantic() {
+    let mut fixture = fixture(&[
+        ("Views.base", VIEWS),
+        ("image.png", "png"),
+        (".hidden/keep.txt", ""),
+    ]);
+    let written = fixture
+        .service
+        .apply_mutation(&Mutation::WriteFile {
+            path: vp("New.base"),
+            content: VIEWS.as_bytes().to_vec(),
+            expected: Precondition::Absent,
+        })
+        .unwrap();
+    assert!(written.semantic, "writing a base is semantic");
+    let hidden = fixture
+        .service
+        .apply_mutation(&Mutation::WriteFile {
+            path: vp(".hidden/Secret.base"),
+            content: VIEWS.as_bytes().to_vec(),
+            expected: Precondition::Absent,
+        })
+        .unwrap();
+    assert!(!hidden.semantic, "a base the scan never lists is not");
+    let renamed = fixture
+        .service
+        .apply_mutation(&Mutation::RenameNote {
+            from: vp("Views.base"),
+            to: vp("Moved.base"),
+            expected: Precondition::Any,
+            rewrite_links: false,
+        })
+        .unwrap();
+    assert!(renamed.semantic, "renaming a base is semantic");
+    let deleted = fixture
+        .service
+        .apply_mutation(&Mutation::DeleteNote {
+            path: vp("Moved.base"),
+            mode: Some(vault_index::DeleteMode::Permanent),
+            expected: Precondition::Any,
+        })
+        .unwrap();
+    assert!(deleted.semantic, "deleting a base is semantic");
+    let attachment = fixture
+        .service
+        .apply_mutation(&Mutation::DeleteNote {
+            path: vp("image.png"),
+            mode: Some(vault_index::DeleteMode::Permanent),
+            expected: Precondition::Any,
+        })
+        .unwrap();
+    assert!(!attachment.semantic, "an attachment is still not semantic");
+    let mut changed: BTreeSet<VaultPath> = written.changed_paths;
+    changed.extend(renamed.changed_paths);
+    changed.extend(deleted.changed_paths);
+    changed.extend(attachment.changed_paths);
+    fixture
+        .service
+        .refresh_paths(changed, ChangeCause::Mutation)
+        .unwrap();
+    fixture.assert_matches_a_cold_build("base mutations");
+}
