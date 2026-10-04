@@ -614,12 +614,13 @@ pub struct RenameResponse {
 /// rule. Reporting a generation for either would name one that will never
 /// contain the write, which is a lie a client acts on.
 ///
-/// It deliberately does not answer "did this write change indexed rows", which
-/// for a raw write is always `false`: `write_file` reaches only attachments,
-/// the zone, and hidden paths, and *indexable* Markdown is refused so a note
-/// can never bypass its generation. An attachment inside the vault is the case
-/// where the two answers differ — `semantic: true` here, no semantic rows
-/// moved, and a real generation because the file tree moved.
+/// It deliberately does not answer "did this write change indexed rows":
+/// `write_file` reaches attachments, `.base` files, the zone, and hidden
+/// paths, and *indexable* Markdown is refused so a note can never bypass its
+/// generation. A `.base` inside the vault moves semantic rows (the base is an
+/// indexed file kind), and both answers are `true`. An attachment inside the
+/// vault is the case where the two answers differ — `semantic: true` here, no
+/// semantic rows moved, and a real generation because the file tree moved.
 ///
 /// Both fields answer about **where the bytes landed**, not about the path the
 /// request carried. The two differ whenever a symlink or a case-folded

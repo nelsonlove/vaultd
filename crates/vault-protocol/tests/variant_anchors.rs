@@ -6,7 +6,8 @@
 //! spelling and its own clients would silently degrade it to `Unknown`, suite
 //! green. These witnesses make variant addition a **compile error** in this
 //! file; the required fix is to extend the matching round-trip table (in
-//! `events.rs`, `schema.rs`, `wire_tolerance.rs`, or `snapshots.rs`) with the
+//! `events.rs`, `schema.rs`, `wire_tolerance.rs`, `snapshots.rs`, or
+//! `bases_wire.rs`) with the
 //! new variant — never just the match arm here — so the decoder arm and its
 //! test land in the same change.
 
@@ -45,6 +46,11 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
             | ErrorCode::ReadOnly
             | ErrorCode::SnapshotNotFound
             | ErrorCode::TooManySnapshots
+            // Round-tripped in `bases_wire.rs`.
+            | ErrorCode::BaseInvalid
+            | ErrorCode::ViewNotFound
+            | ErrorCode::ExpressionInvalid
+            | ErrorCode::UnsupportedFunction
             | ErrorCode::Unknown => {}
         }
     }

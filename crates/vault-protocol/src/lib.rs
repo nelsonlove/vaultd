@@ -1,3 +1,4 @@
+mod bases;
 mod envelope;
 mod error;
 mod events;
@@ -6,6 +7,10 @@ mod operations;
 mod semantic;
 mod snapshots;
 
+pub use bases::{
+    BaseStatusDto, BaseSummaryDto, CellDto, ColumnDto, EvaluateBaseParams, EvaluateBaseResponse,
+    ListBasesParams, ObjectEntryDto, RowDto, RowKindDto, ViewDto,
+};
 pub use envelope::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, ResponseOutcome, validate_version,
 };

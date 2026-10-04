@@ -44,6 +44,17 @@ pub enum ErrorCode {
     ReadOnly,
     SnapshotNotFound,
     TooManySnapshots,
+    /// The base exists but its YAML does not parse; the message carries the
+    /// position.
+    BaseInvalid,
+    /// The base declares no view of that name; the message names the views
+    /// it does declare.
+    ViewNotFound,
+    /// A filter, formula or summary expression the view reads does not
+    /// parse.
+    ExpressionInvalid,
+    /// The view calls a function this evaluator does not implement.
+    UnsupportedFunction,
     /// A code this build does not know. Never produced by this server.
     Unknown,
 }
@@ -80,6 +91,10 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "read_only" => Self::ReadOnly,
             "snapshot_not_found" => Self::SnapshotNotFound,
             "too_many_snapshots" => Self::TooManySnapshots,
+            "base_invalid" => Self::BaseInvalid,
+            "view_not_found" => Self::ViewNotFound,
+            "expression_invalid" => Self::ExpressionInvalid,
+            "unsupported_function" => Self::UnsupportedFunction,
             _ => Self::Unknown,
         })
     }

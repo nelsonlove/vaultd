@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::bases::{BaseSummaryDto, EvaluateBaseParams, EvaluateBaseResponse, ListBasesParams};
 use crate::events::LiveStateDto;
 use crate::mutations::{
     CopyFileParams, DeleteFolderParams, DeleteNoteParams, FolderParams, GenerationResponse,
@@ -50,6 +51,8 @@ pub enum Request {
     SnapshotTree(SnapshotTreeParams),
     SnapshotNotes(SnapshotNotesParams),
     CloseSnapshot(CloseSnapshotParams),
+    EvaluateBase(EvaluateBaseParams),
+    ListBases(ListBasesParams),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -187,6 +190,8 @@ pub enum Response {
     SnapshotTree(SnapshotTreeResponse),
     SnapshotNotes(SnapshotNotesResponse),
     CloseSnapshot(CloseSnapshotResponse),
+    EvaluateBase(EvaluateBaseResponse),
+    ListBases(PageResponse<BaseSummaryDto>),
 }
 
 impl Response {
