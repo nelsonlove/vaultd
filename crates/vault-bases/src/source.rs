@@ -57,14 +57,43 @@ pub enum ScalarLiteral {
 /// runs on every row the prefilter admits (see `view::compile_view`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prefilter {
-    /// `file.inFolder("…")`: the folder or any subfolder.
+    /// `file.inFolder("…")`: the folder or any subfolder. The folder is
+    /// already normalised (no leading or trailing `/`; `""` is the root).
     InFolder(String),
-    /// `file.hasTag("a", "b")`: any of these tags or a nested tag under one.
+    /// `file.hasTag("a", "b")`: any of these tags or a nested tag under one
+    /// (`a` admits `a/b`). The arguments are kept as written: a row source
+    /// must strip one leading `#` from each and compare case-insensitively,
+    /// as `file.hasTag` does (Obsidian's tags are case-insensitive).
+    /// **Provisional** with `hasTag` itself (`prefilter:has_tag_spelling`).
     HasTag(Vec<String>),
-    /// `file.ext == "…"`.
+    /// `file.ext == "…"`: the extension without its dot, compared exactly.
     Ext(String),
-    /// `key == literal` on a note property: notes that carry `key` at all.
+    /// `key == literal` on a note property, `literal` truthy (a non-empty
+    /// string, a non-zero number, `true`). A row source must admit every
+    /// note that carries `key` with a list or mapping value, and every note
+    /// whose scalar value is of another kind than `literal`: the full filter
+    /// decides those. It may skip a note that lacks `key`, holds `null`, or
+    /// holds a scalar of the literal's own kind that differs from it.
+    ///
+    /// Sound while `==` is never true between a string and a date or link
+    /// (a typed property or a frontmatter wikilink keeps its raw text in the
+    /// source): today those pairs are uncaptured errors. If a Task 13
+    /// capture makes one of them true, this rule must widen.
     PropertyEquals { key: String, value: ScalarLiteral },
+}
+
+/// Whether a note property holding `held` may satisfy `key == literal`, by
+/// the rule on [`Prefilter::PropertyEquals`].
+pub(crate) fn may_equal(held: &PropertyValue, literal: &ScalarLiteral) -> bool {
+    match (held, literal) {
+        (PropertyValue::Null, _) => false,
+        (PropertyValue::String(have), ScalarLiteral::String(want)) => have == want,
+        (PropertyValue::Integer(have), ScalarLiteral::Number(want)) => *have as f64 == *want,
+        (PropertyValue::Float(have), ScalarLiteral::Number(want)) => have == want,
+        (PropertyValue::Boolean(have), ScalarLiteral::Boolean(want)) => have == want,
+        // A list, a mapping, or a scalar of another kind: the filter decides.
+        _ => true,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -305,9 +334,10 @@ impl MemorySource {
                 })
             }),
             Prefilter::Ext(ext) => crate::source::extension(path) == ext.as_str(),
-            Prefilter::PropertyEquals { key, .. } => {
-                file.properties.iter().any(|(have, _)| have == key)
-            }
+            Prefilter::PropertyEquals { key, value } => file
+                .properties
+                .iter()
+                .any(|(have, held)| have == key && may_equal(held, value)),
         }
     }
 }

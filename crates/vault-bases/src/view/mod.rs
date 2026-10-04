@@ -595,8 +595,9 @@ fn directed(ordering: Ordering, direction: Direction) -> Ordering {
     }
 }
 
-/// An error cell sorts with the empty values, last ascending.
-/// **Provisional**, with the mixed-type order (`sort:mixed`).
+/// An error cell sorts with the empty values: last ascending, and first
+/// descending, since `DESC` reverses the whole total order. **Provisional**,
+/// with the mixed-type order (`sort:mixed`, `sort:empty_descending`).
 fn order(a: &Cell, b: &Cell) -> Ordering {
     sort_order(
         a.as_ref().unwrap_or(&Value::Null),

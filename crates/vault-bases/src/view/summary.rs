@@ -1,8 +1,11 @@
 //! The built-in summaries of the syntax page's "Default Summary Formulas"
 //! table.
 
+use std::collections::BTreeSet;
+use std::fmt::Write;
+
 use crate::eval::EvalError;
-use crate::eval::coerce::{sort_order, strict_equals};
+use crate::eval::coerce::{number_to_string, sort_order};
 use crate::value::{DateValue, Value};
 
 /// The syntax page's "Default Summary Formulas" table. `Range` appears there
@@ -54,6 +57,56 @@ fn is_empty(value: &Value) -> bool {
     }
 }
 
+/// A text key that two values share exactly when `Unique` counts them as
+/// one: a kind tag and the value. A number goes through JavaScript's
+/// `ToString`, so `-0` and `0` share a key and so does every NaN. Strings
+/// carry their length, so no string can mimic a list's key.
+fn cell_key(value: &Value) -> String {
+    let mut key = String::new();
+    write_key(value, &mut key);
+    key
+}
+
+/// One call per nesting level with a small frame; the depth is the
+/// property's YAML depth or an expression's, both bounded upstream.
+fn write_key(value: &Value, out: &mut String) {
+    // Writing to a `String` never fails.
+    let _ = match value {
+        Value::Null => write!(out, "null"),
+        Value::Boolean(flag) => write!(out, "b:{flag}"),
+        Value::Number(number) => write!(out, "n:{}", number_to_string(*number)),
+        Value::String(text) => write!(out, "s{}:{text}", text.len()),
+        Value::Date(date) => write!(out, "d:{}:{}", date.epoch_ms, date.has_time),
+        Value::Duration(duration) => write!(out, "u:{}:{}", duration.months, duration.ms),
+        Value::List(items) => {
+            out.push_str("l[");
+            for item in items {
+                write_key(item, out);
+                out.push(',');
+            }
+            write!(out, "]")
+        }
+        Value::Object(entries) => {
+            out.push_str("o{");
+            for (name, item) in entries {
+                let _ = write!(out, "{}:{name}=", name.len());
+                write_key(item, out);
+                out.push(',');
+            }
+            write!(out, "}}")
+        }
+        Value::Link(link) => match &link.resolved {
+            Some(path) => write!(out, "f{}:{}", path.as_str().len(), path.as_str()),
+            None => write!(out, "k{}:{}", link.target.len(), link.target),
+        },
+        Value::File(path) => write!(out, "f{}:{}", path.as_str().len(), path.as_str()),
+        Value::Regexp(regexp) => write!(out, "r:/{}/{}", regexp.source, regexp.flags),
+        Value::Image(text) => write!(out, "i{}:{text}", text.len()),
+        Value::Icon(text) => write!(out, "c{}:{text}", text.len()),
+        Value::Html(text) => write!(out, "h{}:{text}", text.len()),
+    };
+}
+
 fn count(values: &[Value], keep: impl Fn(&Value) -> bool) -> Value {
     Value::Number(values.iter().filter(|value| keep(value)).count() as f64)
 }
@@ -85,7 +138,9 @@ pub(crate) fn builtin(name: &str, values: &[Value]) -> Result<Value, EvalError> 
     };
     Ok(match name {
         "Average" => over_numbers(mean),
-        "Sum" => Value::Number(numbers.iter().sum()),
+        // JavaScript's `reduce((a, b) => a + b, 0)`: no numbers is `0`, never
+        // Rust's empty-sum `-0`. **Provisional** (`summary:sum_empty`).
+        "Sum" => Value::Number(numbers.iter().fold(0.0, |total, number| total + number)),
         "Min" => over_numbers(smallest),
         "Max" => over_numbers(largest),
         "Median" => over_numbers(|numbers| {
@@ -133,14 +188,13 @@ pub(crate) fn builtin(name: &str, values: &[Value]) -> Result<Value, EvalError> 
         "Unchecked" => count(values, |value| matches!(value, Value::Boolean(false))),
         "Empty" => count(values, is_empty),
         "Filled" => count(values, |value| !is_empty(value)),
+        // Distinct cell keys: SameValueZero over what the cell holds (NaN
+        // equals NaN, `-0` equals `0`), so two equal lists are one value and
+        // every empty cell is one `null`. **Uncaptured** (`summary:unique`):
+        // the capture settles whether empties count and how lists compare.
         "Unique" => {
-            let mut seen: Vec<&Value> = Vec::new();
-            for value in values {
-                if !seen.iter().any(|have| strict_equals(have, value)) {
-                    seen.push(value);
-                }
-            }
-            Value::Number(seen.len() as f64)
+            let keys: BTreeSet<String> = values.iter().map(cell_key).collect();
+            Value::Number(keys.len() as f64)
         }
         _ => return Err(EvalError::UnknownFunction(name.to_string())),
     })

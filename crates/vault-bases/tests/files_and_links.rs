@@ -380,9 +380,19 @@ fn links_to_resolves_a_string_from_the_linked_file_and_has_link_from_the_row() {
         on(&source, row, row, r#"link("Sub/A").linksTo("./B")"#),
         Value::Boolean(true)
     );
+    // Two `B` files, one beside `Sub/A.md` and one at the root, where the
+    // base is: `[[./B]]` names `Sub/B.md` only when it is read from the
+    // linked file, so ignoring `from` (or reading it from the base) gives
+    // the root `B.md`, which `Sub/A.md` does not link to.
+    let two_bs = relative_vault().with("B.md", MemoryFile::note());
     assert_eq!(
-        on(&source, row, row, r#"link("Sub/A").linksTo("[[./B]]")"#),
+        on(&two_bs, row, row, r#"link("Sub/A").linksTo("[[./B]]")"#),
         Value::Boolean(true)
+    );
+    assert_eq!(
+        on(&two_bs, row, row, r#"link("Sub/A").linksTo("[[B]]")"#),
+        Value::Boolean(false),
+        "a bare `B` is the root file, which Sub/A.md does not link to"
     );
     assert_eq!(
         on(&source, "Sub/A.md", row, r#"file.hasLink("./B")"#),
@@ -480,6 +490,16 @@ fn this_carries_the_embedding_files_properties_and_file() {
 fn as_link_shows_the_files_basename() {
     let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
     let link = on_row("Folder/Deep/Inner.md", "file.asLink()");
+    // Off the vault root, the link's own text is the basename: not the path
+    // (its target), not the name with its extension.
+    let Value::Link(parts) = &link else {
+        panic!("a link, not {link:?}")
+    };
+    assert_eq!(
+        parts.display.as_deref(),
+        Some(&Value::String("Inner".into()))
+    );
+    assert_eq!(parts.target, "Folder/Deep/Inner.md");
     assert_eq!(render_text(&link, &clock), "Inner");
     assert_eq!(
         on_row(

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use vault_bases::PropertyType;
 use vault_bases::eval::{EvalContext, EvalError};
 use vault_bases::expr::{MAX_DEPTH, parse_expression};
-use vault_bases::fixtures::{FIXTURE_NOW_MS, FIXTURE_ZONE};
+use vault_bases::fixtures::{FIXTURE_NOW_MS, FIXTURE_ZONE, render_text};
 use vault_bases::view::{CompileError, ViewResult, compile_view, evaluate_view};
 use vault_bases::{
     Clock, FileKind, MemoryFile, MemorySource, Prefilter, ScalarLiteral, Value, number, parse_base,
@@ -406,12 +406,11 @@ fn a_prefilter_narrows_what_the_source_is_asked_for() {
             },
         ]]
     );
+    // The source compares a scalar `status` of the literal's own kind, so
+    // only the note whose status is "done" is read.
     assert_eq!(
         read_paths(&source),
-        ["Books/Dune.md", "Books/Emma.md", "Books/Ulysses.md"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+        ["Books/Emma.md"].into_iter().map(String::from).collect()
     );
 
     let source = books();
@@ -1026,4 +1025,374 @@ fn a_view_at_every_depth_cap_fits_a_one_mebibyte_stack() {
             Err(EvalError::FormulaTooDeep { max: MAX_DEPTH })
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1: the view fixture rows, a sound PropertyEquals prefilter, and
+// one test for each mutation the review found surviving.
+// ---------------------------------------------------------------------------
+
+/// The vault every `view.jsonl` row runs against.
+fn view_vault() -> MemorySource {
+    let list = |items: &[&str]| {
+        vault_core::PropertyValue::Sequence(
+            items
+                .iter()
+                .map(|item| vault_bases::no_span(text(item)))
+                .collect(),
+        )
+    };
+    MemorySource::new()
+        .with(
+            "a.md",
+            MemoryFile::note()
+                .tag("book")
+                .property("list", list(&["x"]))
+                .property("status", text("p")),
+        )
+        .with(
+            "b.md",
+            MemoryFile::note()
+                .tag("Book/fiction")
+                .property("list", list(&["x"])),
+        )
+        .with(
+            "c.md",
+            MemoryFile::note()
+                .tag("other")
+                .property("list", list(&["x", "y"])),
+        )
+        .with("d.md", MemoryFile::note())
+}
+
+/// `tests/fixtures/captures/view.jsonl`: one view per row over
+/// [`view_vault`], with the rows it answers (in order), their group keys,
+/// or one summary's text. `provisional` rows are this crate's reading of a
+/// question no published page settles; `uncaptured` rows are an answer
+/// given only so the view has one, flagged for Task 13's probe base to
+/// replace. Both are checked here like published rows.
+#[test]
+fn the_view_family_holds() {
+    let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/captures/view.jsonl");
+    let mut failures = Vec::new();
+    for line in std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let case = row["case"].as_str().unwrap();
+        let source = view_vault();
+        let base = parse_base(row["base"].as_str().unwrap()).unwrap();
+        let compiled = compile_view(&base, None).unwrap();
+        let base_path = VaultPath::new("View.base").unwrap();
+        let ctx = EvalContext::new(&source, &clock, &base_path, &base_path);
+        let result = evaluate_view(&compiled, &ctx).unwrap();
+        let unfiltered = evaluate_view(&compiled.without_prefilters(), &ctx).unwrap();
+        if paths(&result) != paths(&unfiltered) {
+            failures.push(format!("{case}: the prefilters changed the rows"));
+        }
+        if let Some(expected) = row.get("rows") {
+            let expected: Vec<&str> = expected
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|path| path.as_str().unwrap())
+                .collect();
+            if paths(&result) != expected {
+                failures.push(format!(
+                    "{case}: rows {:?}, expected {expected:?}",
+                    paths(&result)
+                ));
+            }
+        }
+        if let Some(expected) = row.get("groups") {
+            let expected: Vec<&str> = expected
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key.as_str().unwrap())
+                .collect();
+            let groups: Vec<String> = result
+                .rows
+                .iter()
+                .map(|row| render_text(&row.group.clone().unwrap().unwrap(), &clock))
+                .collect();
+            if groups != expected {
+                failures.push(format!("{case}: groups {groups:?}, expected {expected:?}"));
+            }
+        }
+        if let Some(expected) = row.get("summary") {
+            let property = expected["property"].as_str().unwrap();
+            let summary = result
+                .summaries
+                .iter()
+                .find(|summary| summary.property == property)
+                .unwrap();
+            let text = render_text(summary.value.as_ref().unwrap(), &clock);
+            if text != expected["text"].as_str().unwrap() {
+                failures.push(format!(
+                    "{case}: summary {text:?}, expected {}",
+                    expected["text"]
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `summary:sum_empty`: `Sum` over no numbers is `0`, never `-0` (the wire
+/// would write `-0.0`; the row's text cannot see the sign).
+#[test]
+fn provisional_sum_over_no_numbers_is_positive_zero() {
+    let result = run(
+        &view_vault(),
+        "views:\n  - type: table\n    name: T\n    summaries:\n      missing: Sum\n",
+        None,
+    );
+    let Ok(Value::Number(sum)) = result.summaries[0].value else {
+        panic!("a number")
+    };
+    assert_eq!(sum, 0.0);
+    assert!(sum.is_sign_positive(), "{sum:?}");
+}
+
+/// `summary:unique` (**uncaptured**): equal lists are one value, every
+/// empty cell is one `null`, and numbers compare as SameValueZero.
+#[test]
+fn uncaptured_unique_counts_equal_values_once() {
+    let result = run(
+        &view_vault(),
+        "views:\n  - type: table\n    name: T\n    summaries:\n      list: Unique\n      missing: Unique\n",
+        None,
+    );
+    assert_eq!(
+        result.summaries[0].value,
+        Ok(Value::Number(3.0)),
+        "[x], [x], [x, y], null"
+    );
+    assert_eq!(
+        result.summaries[1].value,
+        Ok(Value::Number(1.0)),
+        "four empty cells are one null"
+    );
+    let yaml = "formulas:\n  z: 'if(file.name == \"a.md\", -0, if(file.name == \"b.md\", 0, \"0\"))'\nviews:\n  - type: table\n    name: T\n    summaries:\n      formula.z: Unique\n";
+    let result = run(&view_vault(), yaml, None);
+    assert_eq!(
+        result.summaries[0].value,
+        Ok(Value::Number(2.0)),
+        "-0 and 0 are one value; the string \"0\" is another"
+    );
+}
+
+/// `filter:empty_or`, `filter:empty_and`, `group:list`, `sort:empty_descending`
+/// as named tests beside their rows.
+#[test]
+fn provisional_empty_groups_list_groups_and_empty_values_descending() {
+    let source = view_vault();
+    assert!(
+        run(
+            &source,
+            "views:\n  - type: table\n    name: T\n    filters:\n      or: []\n",
+            None
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(
+        run(
+            &source,
+            "views:\n  - type: table\n    name: T\n    filters:\n      and: []\n",
+            None
+        )
+        .rows
+        .len(),
+        4
+    );
+    assert_eq!(
+        run(
+            &source,
+            "views:\n  - type: table\n    name: T\n    filters:\n      not: []\n",
+            None
+        )
+        .rows
+        .len(),
+        4
+    );
+    let grouped = run(
+        &source,
+        "views:\n  - type: table\n    name: T\n    groupBy:\n      property: list\n",
+        None,
+    );
+    let keys: Vec<Value> = grouped
+        .rows
+        .iter()
+        .map(|row| row.group.clone().unwrap().unwrap())
+        .collect();
+    assert_eq!(keys[0], keys[1], "two [x] lists are one group");
+    assert_ne!(keys[1], keys[2], "[x, y] is its own group, not also in [x]");
+    assert_eq!(
+        keys[3],
+        Value::Null,
+        "a missing property is the null group, last"
+    );
+    let sorted = run(
+        &source,
+        "views:\n  - type: table\n    name: T\n    sort:\n      - property: status\n        direction: DESC\n",
+        None,
+    );
+    assert_eq!(paths(&sorted), vec!["b.md", "c.md", "d.md", "a.md"]);
+}
+
+/// `prefilter:has_tag_spelling`: a `#`, the case and a nested tag do not
+/// change what `hasTag` and its prefilter admit.
+#[test]
+fn provisional_has_tag_ignores_the_hash_and_the_case() {
+    let source = view_vault();
+    let result = run(&source, &table(r##"file.hasTag("#BOOK")"##), None);
+    assert_eq!(paths(&result), vec!["a.md", "b.md"]);
+    assert_eq!(
+        source.log().candidates,
+        vec![vec![Prefilter::HasTag(vec!["#BOOK".into()])]]
+    );
+}
+
+/// The review's M1: a `status == "p"` prefilter must not skip a note whose
+/// `status` is a list or a mapping (or a scalar of another kind), whatever
+/// `==` answers for it today. The source must be asked about those notes.
+#[test]
+fn a_property_prefilter_never_skips_a_list_or_mapping_value() {
+    let list = vault_core::PropertyValue::Sequence(vec![vault_bases::no_span(text("p"))]);
+    let mapping = vault_core::PropertyValue::Mapping(vec![(
+        vault_bases::no_span("k".to_string()),
+        vault_bases::no_span(text("p")),
+    )]);
+    let source = MemorySource::new()
+        .with("list.md", MemoryFile::note().property("status", list))
+        .with("mapping.md", MemoryFile::note().property("status", mapping))
+        .with("match.md", MemoryFile::note().property("status", text("p")))
+        .with(
+            "null.md",
+            MemoryFile::note().property("status", vault_core::PropertyValue::Null),
+        )
+        .with(
+            "number.md",
+            MemoryFile::note().property("status", number(1.0)),
+        )
+        .with("other.md", MemoryFile::note().property("status", text("q")))
+        .with("plain.md", MemoryFile::note());
+    let base = parse_base(&table(r#"status == "p""#)).unwrap();
+    let compiled = compile_view(&base, None).unwrap();
+    assert_eq!(
+        compiled.prefilters(),
+        &[Prefilter::PropertyEquals {
+            key: "status".into(),
+            value: ScalarLiteral::String("p".into())
+        }]
+    );
+    let with = paths(&run(&source, &table(r#"status == "p""#), None))
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_paths(&source),
+        ["list.md", "mapping.md", "match.md", "number.md"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "every non-scalar and every other-kind scalar is asked about; null, a missing key and a differing string are not"
+    );
+    source.clear_log();
+    let without = ctx_paths(&source, &compiled.without_prefilters());
+    assert_eq!(with, without);
+    assert_eq!(with, vec!["match.md"]);
+}
+
+fn ctx_paths(source: &MemorySource, compiled: &vault_bases::view::CompiledView) -> Vec<String> {
+    let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
+    let base_path = VaultPath::new("Books.base").unwrap();
+    let ctx = EvalContext::new(source, &clock, &base_path, &base_path);
+    evaluate_view(compiled, &ctx)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|row| row.path.as_str().to_string())
+        .collect()
+}
+
+/// The review's R4: a negated statement lifts no prefilter.
+#[test]
+fn a_negated_statement_lifts_no_prefilter() {
+    for filter in [
+        r#"!file.inFolder("Books")"#,
+        r#"!(status == "done")"#,
+        r#"!file.hasTag("book")"#,
+        r#"!(file.ext == "md")"#,
+    ] {
+        let base = parse_base(&table(filter)).unwrap();
+        assert!(
+            compile_view(&base, None).unwrap().prefilters().is_empty(),
+            "{filter}"
+        );
+    }
+    let result = run(&books(), &table(r#"!file.inFolder("Books")"#), None);
+    assert_eq!(
+        paths(&result),
+        vec![
+            "Images/cover.png",
+            "Notes/Lecture.md",
+            "Notes/Textbook.md",
+            "Required Reading/Kafka.md"
+        ]
+    );
+}
+
+/// The review's R11: only `file.ext` is the row's extension. `this.file.ext`
+/// is the base's, the same for every row, and lifts no prefilter.
+#[test]
+fn an_ext_prefilter_comes_only_from_the_rows_file() {
+    for filter in [
+        r#"this.file.ext == "base""#,
+        r#"note.file.ext == "md""#,
+        r#"x.ext == "md""#,
+    ] {
+        let base = parse_base(&table(filter)).unwrap();
+        assert!(
+            compile_view(&base, None).unwrap().prefilters().is_empty(),
+            "{filter}"
+        );
+    }
+    let result = run(&books(), &table(r#"this.file.ext == "base""#), None);
+    assert_eq!(result.rows.len(), 7, "the attachment too");
+}
+
+/// The review's R6: summaries read only the rows left after `limit`.
+#[test]
+fn summaries_read_only_the_rows_left_after_the_limit() {
+    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    sort:\n      - property: price\n        direction: DESC\n    limit: 2\n    summaries:\n      price: Sum\n      status: Filled\n";
+    let result = run(&books(), yaml, None);
+    assert_eq!(paths(&result), vec!["Books/Ulysses.md", "Books/Dune.md"]);
+    assert_eq!(result.summaries[0].value, Ok(Value::Number(40.0)));
+    assert_eq!(result.summaries[1].value, Ok(Value::Number(2.0)));
+}
+
+/// The review's R7: the formula depth budget is restored after each
+/// formula, so a long table reading formulas never runs out of it. No
+/// filter reads the formulas: a filter statement resets the budget around
+/// itself, which would hide a leak from the column and sort reads.
+#[test]
+fn the_formula_depth_is_restored_after_each_formula() {
+    let yaml = "formulas:\n  inner: 'key + 1'\n  outer: 'formula.inner + formula.inner'\nviews:\n  - type: table\n    name: T\n    order: [formula.inner, formula.outer]\n    sort:\n      - property: formula.outer\n";
+    let result = run(&many(200), yaml, None);
+    assert_eq!(result.rows.len(), 200);
+    for row in &result.rows {
+        assert!(
+            row.cells.iter().all(Result::is_ok),
+            "{}: {:?}",
+            row.path.as_str(),
+            row.cells
+        );
+    }
 }

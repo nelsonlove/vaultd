@@ -1,0 +1,7 @@
+{"family":"view","case":"summary:sum_empty","source":"provisional","base":"views:\n  - type: table\n    name: T\n    summaries:\n      missing: Sum\n","summary":{"property":"missing","text":"0"}}
+{"family":"view","case":"summary:unique","source":"uncaptured","base":"views:\n  - type: table\n    name: T\n    summaries:\n      list: Unique\n","summary":{"property":"list","text":"3"}}
+{"family":"view","case":"filter:empty_or","source":"provisional","base":"views:\n  - type: table\n    name: T\n    filters:\n      or: []\n","rows":[]}
+{"family":"view","case":"filter:empty_and","source":"provisional","base":"views:\n  - type: table\n    name: T\n    filters:\n      and: []\n","rows":["a.md","b.md","c.md","d.md"]}
+{"family":"view","case":"group:list","source":"provisional","base":"views:\n  - type: table\n    name: T\n    groupBy:\n      property: list\n","rows":["a.md","b.md","c.md","d.md"],"groups":["x","x","x, y",""]}
+{"family":"view","case":"sort:empty_descending","source":"provisional","base":"views:\n  - type: table\n    name: T\n    sort:\n      - property: status\n        direction: DESC\n","rows":["b.md","c.md","d.md","a.md"]}
+{"family":"view","case":"prefilter:has_tag_spelling","source":"provisional","base":"views:\n  - type: table\n    name: T\n    filters: 'file.hasTag(\"#BOOK\")'\n","rows":["a.md","b.md"]}

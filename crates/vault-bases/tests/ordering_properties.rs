@@ -63,7 +63,9 @@ proptest! {
     #[test]
     fn a_prefilter_never_drops_a_row_its_conjunct_keeps(
         notes in prop::collection::vec(
-            ("[AB]", "[xy]", prop::option::of("[pq]"), prop::option::of(0i32..3), prop::bool::ANY),
+            // The status's text, then its shape: 0 absent, 1 text, 2 a
+            // list, 3 a mapping, 4 a number, 5 null.
+            ("[AB]", "[xy]", "[pq]", 0u8..6, prop::option::of(0i32..3)),
             1..12,
         ),
         filter in prop_oneof![
@@ -75,16 +77,27 @@ proptest! {
             Just(r#"status == "P""#),
             Just("rank == 1"),
             Just(r#"file.inFolder("A") && status == "q""#),
+            // Forms that must lift no prefilter (the review's R4 and R11).
+            Just(r#"!file.inFolder("A")"#),
+            Just(r#"!(status == "p")"#),
+            Just(r#"this.file.ext == "base""#),
+            Just(r#"file.inFolder("A") || status == "p""#),
+            Just(r#"status == "p" && !file.hasTag("x")"#),
         ],
     ) {
         let mut source = MemorySource::new();
-        for (index, (folder, tag, status, rank, list_status)) in notes.iter().enumerate() {
+        for (index, (folder, tag, status, shape, rank)) in notes.iter().enumerate() {
             let mut note = MemoryFile::note().tag(tag);
-            if let Some(status) = status {
-                note = note.property(
-                    "status",
-                    if *list_status { vault_core::PropertyValue::Sequence(vec![vault_bases::no_span(text(status))]) } else { text(status) },
-                );
+            let value = match shape {
+                1 => Some(text(status)),
+                2 => Some(vault_core::PropertyValue::Sequence(vec![vault_bases::no_span(text(status))])),
+                3 => Some(vault_core::PropertyValue::Mapping(vec![(vault_bases::no_span("k".to_string()), vault_bases::no_span(text(status)))])),
+                4 => Some(number(1.0)),
+                5 => Some(vault_core::PropertyValue::Null),
+                _ => None,
+            };
+            if let Some(value) = value {
+                note = note.property("status", value);
             }
             if let Some(rank) = rank {
                 note = note.property("rank", number(f64::from(*rank)));
