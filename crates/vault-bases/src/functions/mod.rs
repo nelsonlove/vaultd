@@ -34,10 +34,10 @@ fn links_in(ctx: &EvalContext<'_>, row: Option<&VaultPath>, value: Value) -> Val
                 .unwrap_or(Value::String(text)),
             _ => Value::String(text),
         },
-        Value::List(items) => Value::List(
+        Value::List(items) => Value::list(
             items
-                .into_iter()
-                .map(|item| links_in(ctx, row, item))
+                .iter()
+                .map(|item| links_in(ctx, row, item.clone()))
                 .collect(),
         ),
         other => other,
@@ -117,8 +117,8 @@ pub(crate) fn call_method(
         }
         Value::String(text) => string::call(&text, name, args, ctx, scope),
         Value::Number(number) => number::call(number, name, args, ctx, scope),
-        Value::List(items) => list::call(items, name, args, ctx, scope),
-        Value::Object(entries) => object::call(entries, name, args),
+        Value::List(items) => list::call(&items, name, args, ctx, scope),
+        Value::Object(entries) => object::call(&entries, name, args),
         Value::Regexp(regexp) => regexp::call(&regexp, name, args, ctx, scope),
         Value::Date(date) => date::call(date, name, args, ctx, scope),
         Value::File(path) => file::call(&path, name, args, ctx, scope),

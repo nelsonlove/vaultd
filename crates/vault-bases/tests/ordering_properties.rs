@@ -52,9 +52,9 @@ proptest! {
         let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
         let path = VaultPath::new("A.md").unwrap();
         let ctx = EvalContext::new(&source, &clock, &path, &path);
-        let scope = vault_bases::eval::Scope::default().bind("x", Value::List(items.clone()));
+        let scope = vault_bases::eval::Scope::default().bind("x", Value::list(items.clone()));
         let expr = vault_bases::expr::parse_expression("list(x)").unwrap();
-        prop_assert_eq!(vault_bases::eval::evaluate(&expr, &ctx, &scope).unwrap(), Value::List(items));
+        prop_assert_eq!(vault_bases::eval::evaluate(&expr, &ctx, &scope).unwrap(), Value::list(items));
     }
 
     /// Review Focus 1: a prefilter selects a superset of what its conjunct

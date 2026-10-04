@@ -93,7 +93,7 @@ fn list(args: &[Expr], ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value, Ev
     arity("list", args, 1, 1)?;
     Ok(match evaluate(&args[0], ctx, scope)? {
         list @ Value::List(_) => list,
-        other => Value::List(vec![other]),
+        other => crate::eval::built_list(vec![other])?,
     })
 }
 

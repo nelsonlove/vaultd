@@ -731,7 +731,7 @@ pub fn evaluate_view(
                 Some(expr) => evaluate(
                     expr,
                     &ctx,
-                    &Scope::default().bind("values", Value::List(values)),
+                    &Scope::default().bind("values", Value::list(values)),
                 ),
                 None => summary::builtin(&summary.name, &values),
             };

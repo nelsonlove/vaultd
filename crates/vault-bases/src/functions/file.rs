@@ -32,7 +32,7 @@ pub(crate) const FIELDS: &[&str] = &[
 ];
 
 fn link_values(facts: Vec<LinkFact>) -> Value {
-    Value::List(
+    Value::list(
         facts
             .into_iter()
             .map(|fact| {
@@ -97,7 +97,7 @@ pub(crate) fn field(
             epoch_ms: facts()?.mtime_ms,
             has_time: true,
         }),
-        "properties" => Value::Object(
+        "properties" => Value::object(
             ctx.source
                 .properties(path)?
                 .iter()
@@ -110,11 +110,11 @@ pub(crate) fn field(
             if !ctx.source.tags(path)?.is_empty() {
                 return Err(EvalError::Uncaptured("tags:spelling".into()));
             }
-            Value::List(Vec::new())
+            Value::list(Vec::new())
         }
         "links" => link_values(ctx.source.links(path)?),
         "embeds" => link_values(ctx.source.embeds(path)?),
-        "backlinks" => Value::List(
+        "backlinks" => Value::list(
             ctx.source
                 .backlinks(path)?
                 .into_iter()
@@ -168,6 +168,7 @@ pub(crate) fn call(
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| Value::String(basename(path).to_string()));
+            crate::eval::ensure_room(&display)?;
             Value::Link(LinkValue {
                 target: path.as_str().to_string(),
                 display: Some(Box::new(display)),

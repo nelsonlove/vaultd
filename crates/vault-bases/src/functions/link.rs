@@ -119,6 +119,9 @@ pub(crate) fn call_global(
         "link" => {
             arity(name, args, 1, 2)?;
             let display = values.get(1).cloned();
+            if let Some(display) = &display {
+                crate::eval::ensure_room(display)?;
+            }
             match &values[0] {
                 Value::String(target) => {
                     Ok(Value::Link(make_link(ctx, ctx.base_path, target, display)?))

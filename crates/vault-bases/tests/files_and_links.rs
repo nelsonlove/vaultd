@@ -108,7 +108,7 @@ fn an_attachment_is_a_row_with_file_facts_and_no_note_facts() {
         on_row(image, "file.properties.isEmpty()"),
         Value::Boolean(true)
     );
-    assert_eq!(on_row(image, "file.tags"), Value::List(vec![]));
+    assert_eq!(on_row(image, "file.tags"), Value::list(vec![]));
     assert_eq!(on_row(image, "file.backlinks.length"), Value::Number(1.0));
     assert_eq!(
         on_row(image, r#"file.hasTag("book")"#),
@@ -318,9 +318,9 @@ fn a_deeply_nested_frontmatter_list_fits_a_one_mebibyte_stack() {
         .spawn(move || {
             let mut value = on(&source, "Capture.md", "Capture.md", "deep");
             let mut depth = 0;
-            while let Value::List(mut items) = value {
+            while let Value::List(items) = value {
                 assert_eq!(items.len(), 1);
-                value = items.pop().unwrap();
+                value = items[0].clone();
                 depth += 1;
             }
             (depth, value)

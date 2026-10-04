@@ -427,7 +427,7 @@ pub(crate) fn call(
                 .map(|n| n as usize);
             if limit == Some(0) {
                 return match &values[0] {
-                    Value::String(_) | Value::Regexp(_) => Ok(Value::List(Vec::new())),
+                    Value::String(_) | Value::Regexp(_) => Ok(Value::list(Vec::new())),
                     other => Err(EvalError::Argument(format!(
                         "split takes a string or a regular expression, not {}",
                         other.type_name()
@@ -456,7 +456,7 @@ pub(crate) fn call(
                 }
             };
             let kept = limit.map_or(parts.len(), |limit| limit.min(parts.len()));
-            Value::List(parts.into_iter().take(kept).map(Value::String).collect())
+            Value::list(parts.into_iter().take(kept).map(Value::String).collect())
         }
         "replace" => {
             arity(name, args, 2, 2)?;

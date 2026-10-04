@@ -30,4 +30,4 @@ pub use source::{
     FileFacts, FileKind, LinkFact, MemoryFile, MemorySource, Prefilter, PropertyType, RowSource,
     ScalarLiteral, SourceError, SourceLog, extension, no_span, number, text,
 };
-pub use value::{DateValue, DurationValue, LinkValue, RegexpValue, Value};
+pub use value::{DateValue, DurationValue, LinkValue, MAX_VALUE_DEPTH, RegexpValue, Value};

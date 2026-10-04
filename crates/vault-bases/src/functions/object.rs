@@ -16,7 +16,7 @@ fn is_array_index(key: &str) -> bool {
 }
 
 pub(crate) fn call(
-    entries: Vec<(String, Value)>,
+    entries: &[(String, Value)],
     name: &str,
     args: &[Expr],
 ) -> Result<Value, EvalError> {
@@ -35,13 +35,13 @@ pub(crate) fn call(
     }
     Ok(match name {
         "isEmpty" => Value::Boolean(entries.is_empty()),
-        "keys" => Value::List(
+        "keys" => Value::list(
             entries
-                .into_iter()
-                .map(|(key, _)| Value::String(key))
+                .iter()
+                .map(|(key, _)| Value::String(key.clone()))
                 .collect(),
         ),
-        "values" => Value::List(entries.into_iter().map(|(_, value)| value).collect()),
+        "values" => Value::list(entries.iter().map(|(_, value)| value.clone()).collect()),
         _ => {
             return Err(EvalError::NoSuchMethod {
                 target: "object",

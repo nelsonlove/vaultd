@@ -15,7 +15,7 @@ use crate::clock::Clock;
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 use crate::functions;
 use crate::source::{RowSource, SourceError};
-use crate::value::{RegexpValue, Value};
+use crate::value::{MAX_VALUE_DEPTH, RegexpValue, Value};
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
@@ -37,6 +37,10 @@ pub enum EvalError {
     /// (the same [`crate::expr::MAX_DEPTH`] levels one expression may have).
     #[error("formulas nested too deeply (more than {max} levels)")]
     FormulaTooDeep { max: usize },
+    /// A list, an object or a link display would nest past
+    /// [`crate::value::MAX_VALUE_DEPTH`] levels.
+    #[error("value nested too deeply (more than {max} levels)")]
+    ValueTooDeep { max: usize },
     #[error("{0} is not captured yet")]
     Uncaptured(String),
     #[error("unsupported format token {0}")]
@@ -156,6 +160,35 @@ impl Scope {
     }
 }
 
+/// Refuse to wrap `value` one level deeper when that would pass
+/// [`MAX_VALUE_DEPTH`].
+pub(crate) fn ensure_room(value: &Value) -> Result<(), EvalError> {
+    if value.nests_deeper_than(MAX_VALUE_DEPTH - 1) {
+        Err(EvalError::ValueTooDeep {
+            max: MAX_VALUE_DEPTH,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// A list a program builds from `items`, refused past [`MAX_VALUE_DEPTH`].
+pub(crate) fn built_list(items: Vec<Value>) -> Result<Value, EvalError> {
+    for item in &items {
+        ensure_room(item)?;
+    }
+    Ok(Value::list(items))
+}
+
+/// An object a program builds from `entries`, refused past
+/// [`MAX_VALUE_DEPTH`].
+pub(crate) fn built_object(entries: Vec<(String, Value)>) -> Result<Value, EvalError> {
+    for (_, item) in &entries {
+        ensure_room(item)?;
+    }
+    Ok(Value::object(entries))
+}
+
 /// A YAML property value as a Bases value. A declared date type is applied
 /// and wikilinks in frontmatter become links in `functions::typed_property`.
 /// Here: the YAML types.
@@ -166,13 +199,15 @@ pub(crate) fn property_value(value: &PropertyValue) -> Value {
         PropertyValue::Integer(number) => Value::Number(*number as f64),
         PropertyValue::Float(number) => Value::Number(*number),
         PropertyValue::String(text) => Value::String(text.clone()),
-        PropertyValue::Sequence(items) => Value::List(
+        // Bounded by the YAML parser's own nesting limit, not by
+        // MAX_VALUE_DEPTH: a property is read, not built.
+        PropertyValue::Sequence(items) => Value::list(
             items
                 .iter()
                 .map(|item| property_value(&item.value))
                 .collect(),
         ),
-        PropertyValue::Mapping(entries) => Value::Object(
+        PropertyValue::Mapping(entries) => Value::object(
             entries
                 .iter()
                 .map(|(key, value)| (key.value.clone(), property_value(&value.value)))
@@ -421,12 +456,12 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>, scope: &Scope) -> Result<Val
 
 #[inline(never)]
 fn list(items: &[Expr], ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value, EvalError> {
-    Ok(Value::List(
+    built_list(
         items
             .iter()
             .map(|item| evaluate(item, ctx, scope))
             .collect::<Result<_, _>>()?,
-    ))
+    )
 }
 
 #[inline(never)]
@@ -435,12 +470,12 @@ fn object(
     ctx: &EvalContext<'_>,
     scope: &Scope,
 ) -> Result<Value, EvalError> {
-    Ok(Value::Object(
+    built_object(
         entries
             .iter()
             .map(|(key, value)| Ok((key.clone(), evaluate(value, ctx, scope)?)))
             .collect::<Result<_, EvalError>>()?,
-    ))
+    )
 }
 
 #[inline(never)]
@@ -455,7 +490,7 @@ fn identifier(name: &str, ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value,
             let Some(row) = &scope.row else {
                 return Ok(Value::Null);
             };
-            Ok(Value::Object(
+            Ok(Value::object(
                 ctx.source
                     .properties(row)?
                     .iter()
@@ -492,9 +527,9 @@ fn member(
     let value = evaluate(target, ctx, scope)?;
     match value {
         Value::Object(entries) => Ok(entries
-            .into_iter()
+            .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value)
+            .map(|(_, value)| value.clone())
             .unwrap_or(Value::Null)),
         other => functions::field(&other, name, ctx),
     }
@@ -524,9 +559,9 @@ fn index_of(
             Value::Null
         }),
         (Value::Object(entries), Value::String(key)) => Ok(entries
-            .into_iter()
+            .iter()
             .find(|(have, _)| *have == key)
-            .map(|(_, value)| value)
+            .map(|(_, value)| value.clone())
             .unwrap_or(Value::Null)),
         (Value::Null, _) => Ok(Value::Null),
         (Value::String(_), _) => Err(EvalError::Uncaptured("index:string".into())),

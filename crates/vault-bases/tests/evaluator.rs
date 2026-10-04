@@ -84,16 +84,16 @@ fn every_expression_form_evaluates_on_a_memory_source() {
         (r#"'it\'s' + "a""#, Ok(string("it'sa"))),
         (
             r#"[1, "a", null, [true]]"#,
-            Ok(Value::List(vec![
+            Ok(Value::list(vec![
                 Value::Number(1.0),
                 string("a"),
                 Value::Null,
-                Value::List(vec![Value::Boolean(true)]),
+                Value::list(vec![Value::Boolean(true)]),
             ])),
         ),
         (
             r#"{"a": 1, b: 2}"#,
-            Ok(Value::Object(vec![
+            Ok(Value::object(vec![
                 ("a".into(), Value::Number(1.0)),
                 ("b".into(), Value::Number(2.0)),
             ])),
@@ -107,7 +107,7 @@ fn every_expression_form_evaluates_on_a_memory_source() {
         ("note.price", Ok(Value::Number(2.5))),
         (
             r#"note["my prop"]"#,
-            Ok(Value::List(vec![string("x"), string("y")])),
+            Ok(Value::list(vec![string("x"), string("y")])),
         ),
         (r#"note["my prop"][1]"#, Ok(string("y"))),
         (r#"note["my prop"][-1]"#, Ok(Value::Null)),
@@ -198,7 +198,7 @@ fn formulas_and_locals_resolve_through_the_scope() {
     );
     let note = row.bind(
         "note",
-        Value::Object(vec![("price".into(), Value::Number(9.0))]),
+        Value::object(vec![("price".into(), Value::Number(9.0))]),
     );
     assert_eq!(
         run("note.price", &note, None),
@@ -564,8 +564,8 @@ mod sort_order_is_total {
         ];
         leaf.prop_recursive(2, 8, 3, |inner| {
             prop_oneof![
-                prop::collection::vec(inner.clone(), 0..3).prop_map(Value::List),
-                prop::collection::vec(("[ab]", inner), 0..2).prop_map(Value::Object),
+                prop::collection::vec(inner.clone(), 0..3).prop_map(Value::list),
+                prop::collection::vec(("[ab]", inner), 0..2).prop_map(Value::object),
             ]
         })
     }

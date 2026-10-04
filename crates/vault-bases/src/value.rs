@@ -61,8 +61,11 @@ pub enum Value {
     Boolean(bool),
     Date(DateValue),
     Duration(DurationValue),
-    List(Vec<Value>),
-    Object(Vec<(String, Value)>),
+    /// Shared storage: cloning a list (binding it to `acc`, reading a
+    /// local) is O(1), never a deep copy. Build one with [`Value::list`].
+    List(Arc<Vec<Value>>),
+    /// Shared like [`Value::List`]; build one with [`Value::object`].
+    Object(Arc<Vec<(String, Value)>>),
     Link(LinkValue),
     File(VaultPath),
     Regexp(RegexpValue),
@@ -71,7 +74,48 @@ pub enum Value {
     Html(String),
 }
 
+/// The deepest a value may nest: a list, an object or a link's display is
+/// one level. The same number as the expression cap
+/// ([`crate::expr::MAX_DEPTH`]): that cap bounds the syntax tree, this one
+/// bounds what a program builds (`xs.reduce([acc], [])` nests one level per
+/// element). Every recursive walk over a value (clone, drop, compare,
+/// render) stays within it; going past it is
+/// [`crate::eval::EvalError::ValueTooDeep`], an error cell.
+pub const MAX_VALUE_DEPTH: usize = 64;
+
 impl Value {
+    /// A list value.
+    pub fn list(items: Vec<Value>) -> Value {
+        Value::List(Arc::new(items))
+    }
+
+    /// An object value, its entries in order.
+    pub fn object(entries: Vec<(String, Value)>) -> Value {
+        Value::Object(Arc::new(entries))
+    }
+
+    /// Whether this value nests more than `levels` levels (a scalar nests
+    /// none). One call per level, stopping as soon as the answer is known,
+    /// so the walk never goes deeper than `levels + 1`.
+    pub fn nests_deeper_than(&self, levels: usize) -> bool {
+        match self {
+            Value::List(items) => {
+                levels == 0 || items.iter().any(|item| item.nests_deeper_than(levels - 1))
+            }
+            Value::Object(entries) => {
+                levels == 0
+                    || entries
+                        .iter()
+                        .any(|(_, item)| item.nests_deeper_than(levels - 1))
+            }
+            Value::Link(link) => match &link.display {
+                Some(display) => levels == 0 || display.nests_deeper_than(levels - 1),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The name `isType` compares against, and the `kind` a cell carries.
     pub fn type_name(&self) -> &'static str {
         match self {

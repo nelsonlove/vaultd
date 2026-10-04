@@ -537,7 +537,7 @@ fn equal_keys_keep_path_order_on_a_large_view() {
         None,
     );
     check(&both, &|row| {
-        Value::List(vec![
+        Value::list(vec![
             row.cells[0].clone().unwrap(),
             row.cells[1].clone().unwrap(),
         ])

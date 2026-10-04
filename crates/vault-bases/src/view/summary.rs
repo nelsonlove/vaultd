@@ -80,7 +80,7 @@ fn write_key(value: &Value, out: &mut String) {
         Value::Duration(duration) => write!(out, "u:{}:{}", duration.months, duration.ms),
         Value::List(items) => {
             out.push_str("l[");
-            for item in items {
+            for item in items.iter() {
                 write_key(item, out);
                 out.push(',');
             }
@@ -88,7 +88,7 @@ fn write_key(value: &Value, out: &mut String) {
         }
         Value::Object(entries) => {
             out.push_str("o{");
-            for (name, item) in entries {
+            for (name, item) in entries.iter() {
                 let _ = write!(out, "{}:{name}=", name.len());
                 write_key(item, out);
                 out.push(',');

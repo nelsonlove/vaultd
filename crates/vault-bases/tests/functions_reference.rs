@@ -198,10 +198,10 @@ fn nested_list_lambdas_fit_a_two_mebibyte_stack_at_the_nesting_cap() {
             assert!(levels > 1, "the parser accepts nesting");
             let mut at = run_on_empty_vault(&map).expect("nested maps");
             let mut depth = 0;
-            while let Value::List(mut items) = at {
+            while let Value::List(items) = at {
                 assert_eq!(items.len(), 1);
                 depth += 1;
-                at = items.remove(0);
+                at = items[0].clone();
             }
             assert_eq!((depth, at), (levels, Value::Number(1.0)));
             let (_, filter) = deepest("[1].filter(", "true", ")");
