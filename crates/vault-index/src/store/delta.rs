@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rusqlite::params;
 use vault_core::{DependencyKey, Diagnostic, ParsedNote, Resolution, VaultPath};
 
+use crate::bases::BaseDelta;
 use crate::codec;
 use crate::error::IndexError;
 use crate::model::{FileFingerprint, Generation};
@@ -65,6 +66,9 @@ pub struct DeltaPublication<'a> {
     /// tree at all; every statement it produces is scoped by an explicit
     /// `path` or that path's own subtree range, never table-wide.
     pub tree: &'a TreeDelta,
+    /// The bases this cycle read and planned: rows written and deleted in
+    /// the same transaction as the notes.
+    pub bases: &'a BaseDelta,
 }
 
 /// Structural work one delta publication did, in the same shape as
@@ -131,6 +135,7 @@ impl IndexStore {
             resolutions,
             scan_diagnostics,
             tree,
+            bases,
         } = publication;
 
         let transaction = self.connection.transaction()?;
@@ -306,6 +311,7 @@ impl IndexStore {
         }
 
         super::tree::apply(&transaction, tree)?;
+        super::apply_bases(&transaction, bases)?;
 
         let next = Generation::new(expected.get() + 1);
         transaction.execute(
@@ -346,6 +352,7 @@ mod tests {
     use super::{
         DeltaPublication, DeltaPublishOutcome, NoteReplacement, ResolutionReplacement, TreeDelta,
     };
+    use crate::bases::BaseDelta;
     use crate::config::IndexConfig;
     use crate::model::FileFingerprint;
     use crate::reconcile::IndexService;
@@ -441,6 +448,7 @@ mod tests {
                 resolutions: &resolutions,
                 scan_diagnostics: None,
                 tree: &TreeDelta::default(),
+                bases: &BaseDelta::default(),
             })
             .expect("publish delta");
         service.store.connection.trace(None);
@@ -533,6 +541,7 @@ mod tests {
                 resolutions: &[],
                 scan_diagnostics: Some(&diagnostics),
                 tree: &TreeDelta::default(),
+                bases: &BaseDelta::default(),
             })
             .expect("first scan-diagnostics publish");
         let second_expected = match first_outcome {
@@ -556,6 +565,7 @@ mod tests {
                 resolutions: &[],
                 scan_diagnostics: Some(&diagnostics),
                 tree: &TreeDelta::default(),
+                bases: &BaseDelta::default(),
             })
             .expect("second, identical scan-diagnostics publish");
         service.store.connection.trace(None);

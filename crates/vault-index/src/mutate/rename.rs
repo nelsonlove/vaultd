@@ -94,14 +94,14 @@ pub(crate) struct Repair {
     pub(crate) failures: Vec<LinkRewriteFailure>,
 }
 
-/// The note identity a path carries in `graph`, as resolution sees it, or a
-/// synthetic one for a path the graph does not track.
+/// The identity a path carries in `graph`, as resolution sees it: a note's
+/// headings and blocks, a base's views, or — for an attachment or a folder —
+/// a synthetic identity with neither, which is exactly what
+/// `changed_candidate_keys` needs to produce its lookup keys.
 ///
-/// A non-note — an attachment, a folder — has no headings and no block ids,
-/// and that is exactly the identity `changed_candidate_keys` needs to produce
-/// its exact-path, filename and stem lookup keys. The graph cannot supply one
-/// because it holds notes only; the reference rows still reach the path, so
-/// synthesizing it is what lets a moved attachment's embeds be found.
+/// The graph holds notes and bases only; an attachment's reference rows
+/// still reach its path, so synthesizing its identity is what lets a moved
+/// attachment's embeds be found.
 fn identity(graph: &LiveGraph, path: &VaultPath) -> ResolutionNote {
     graph
         .note(path)
@@ -111,6 +111,7 @@ fn identity(graph: &LiveGraph, path: &VaultPath) -> ResolutionNote {
             blocks: note.blocks,
             views: None,
         })
+        .or_else(|| graph.base_identity(path))
         .unwrap_or_else(|| ResolutionNote {
             path: path.clone(),
             headings: Vec::new(),
@@ -124,7 +125,7 @@ fn at_path(note: &ResolutionNote, destination: &VaultPath) -> ResolutionNote {
         path: destination.clone(),
         headings: note.headings.clone(),
         blocks: note.blocks.clone(),
-        views: None,
+        views: note.views.clone(),
     }
 }
 
@@ -182,8 +183,8 @@ pub(crate) fn plan_repair(
     }
 
     // The catalog the vault will have *after* the moves, so a preserved
-    // spelling is checked against the world it will actually live in. Notes
-    // only: a resolver answers about notes, and putting an attachment in it
+    // spelling is checked against the world it will actually live in: notes
+    // and bases, never attachments — putting an attachment in a resolver
     // would invent a note that does not exist.
     let mut catalog: BTreeMap<VaultPath, ResolutionNote> = BTreeMap::new();
     for path in graph.note_paths() {
@@ -191,6 +192,14 @@ pub(crate) fn plan_repair(
             continue;
         }
         catalog.insert(path.clone(), identity(graph, &path));
+    }
+    for path in graph.base_paths() {
+        if moves.contains_key(path) {
+            continue;
+        }
+        if let Some(base) = graph.base_identity(path) {
+            catalog.insert(path.clone(), base);
+        }
     }
     let mut note_destinations: BTreeSet<VaultPath> = BTreeSet::new();
     for (from, to) in moves {
@@ -207,6 +216,10 @@ pub(crate) fn plan_repair(
                     to,
                 ),
             );
+            note_destinations.insert(to.clone());
+        }
+        if graph.base(from).is_some() {
+            catalog.insert(to.clone(), at_path(&identity(graph, from), to));
             note_destinations.insert(to.clone());
         }
     }

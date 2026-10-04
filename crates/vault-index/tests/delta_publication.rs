@@ -94,6 +94,7 @@ fn a_replaced_note_missing_resolution_coverage_fails_and_rolls_back() {
             resolutions: &[],
             scan_diagnostics: None,
             tree: &vault_index::TreeDelta::default(),
+            bases: &vault_index::BaseDelta::default(),
         })
         .expect_err("missing resolution coverage must fail");
     match &error {
@@ -169,6 +170,7 @@ fn a_failure_during_resolution_replacement_rolls_back_the_note_replacement_too()
             resolutions: &resolutions,
             scan_diagnostics: None,
             tree: &vault_index::TreeDelta::default(),
+            bases: &vault_index::BaseDelta::default(),
         })
         .expect_err("missing ordinal must fail");
     assert!(matches!(error, vault_index::IndexError::Storage(_)));
@@ -238,6 +240,7 @@ fn a_later_failure_rolls_back_an_earlier_successful_resolution_replacement() {
             resolutions: &resolutions,
             scan_diagnostics: None,
             tree: &vault_index::TreeDelta::default(),
+            bases: &vault_index::BaseDelta::default(),
         })
         .expect_err("missing ordinal must fail");
     assert!(matches!(error, vault_index::IndexError::Storage(_)));
@@ -298,6 +301,7 @@ fn a_concurrent_generation_advance_yields_generation_changed_with_no_committed_r
             resolutions: &[],
             scan_diagnostics: None,
             tree: &vault_index::TreeDelta::default(),
+            bases: &vault_index::BaseDelta::default(),
         })
         .expect("publish_delta call itself must not error");
     assert!(matches!(outcome, DeltaPublishOutcome::GenerationChanged));

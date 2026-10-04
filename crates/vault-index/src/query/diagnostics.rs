@@ -1,5 +1,5 @@
 //! The deterministic diagnostic union: one ordering over note-local,
-//! resolution, and scan diagnostics, replacing the removed aggregate
+//! resolution, scan and base diagnostics, replacing the removed aggregate
 //! `diagnostics` table. `note_diagnostics.path` falls back to the owning
 //! note's path via `COALESCE` — a stored diagnostic with no explicit path
 //! belongs to the note it is attached to.
@@ -25,6 +25,12 @@ WITH all_diagnostics AS ( \
     SELECT path, span_start, span_end, code, severity, message, \
            'scan' AS owner_kind, ordinal AS owner_id \
       FROM scan_diagnostics \
+    UNION ALL \
+    SELECT b.path, json_extract(d.value, '$.span_start'), json_extract(d.value, '$.span_end'), \
+           json_extract(d.value, '$.code'), json_extract(d.value, '$.severity'), \
+           json_extract(d.value, '$.message'), 'base' AS owner_kind, \
+           CAST(d.key AS INTEGER) AS owner_id \
+      FROM bases b, json_each(b.diagnostics_json) d \
 )";
 
 const DIAGNOSTIC_COLUMNS: &str = "path, span_start, span_end, code, severity, message, \

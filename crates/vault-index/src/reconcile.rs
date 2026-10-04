@@ -1,12 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use vault_core::{
-    Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution, ScanError, ScanReport,
-    SemanticGraph, Severity, SourceDocument, SourceError, VaultPath, build_graph, parse_note,
+    Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution, ResolutionNote, ScanError,
+    ScanReport, SemanticGraph, Severity, SourceDocument, SourceError, TreeEntryKind, VaultPath,
+    build_graph_with_bases, parse_note,
 };
 
+use crate::bases::{BaseDelta, BaseRecord};
 use crate::config::IndexConfig;
 use crate::error::IndexError;
 use crate::inventory::{FileSystemIndexSource, InventorySnapshot, ReconcileSource};
@@ -644,6 +646,24 @@ impl IndexService {
         } else {
             TreeDelta::default()
         };
+        // The bases the walk saw. A source that observes no tree reconciles
+        // no bases (see `bases.rs`).
+        let base_delta = if self.source.observes_tree() {
+            let observed_bases: BTreeSet<VaultPath> = observed_tree
+                .iter()
+                .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
+                .map(|entry| entry.path.clone())
+                .collect();
+            crate::bases::plan(
+                self.source.as_ref(),
+                &self.store.stored_bases()?,
+                &observed_bases,
+                true,
+                verify,
+            )?
+        } else {
+            BaseDelta::default()
+        };
 
         let mut unchanged_paths = Vec::new();
         let mut to_read: Vec<VaultPath> = Vec::new();
@@ -763,6 +783,11 @@ impl IndexService {
         if tree_delta.is_generational() {
             semantic_change = true;
         }
+        // A base moving is a change a client can only learn from a new
+        // generation, exactly like a note's.
+        if !base_delta.is_empty() {
+            semantic_change = true;
+        }
 
         let Some(previous_generation) = previous else {
             return self.publish_snapshot(
@@ -773,6 +798,7 @@ impl IndexService {
                 fingerprint_updates,
                 diagnostics,
                 tree_delta,
+                base_delta,
                 RefreshCounts {
                     added,
                     changed,
@@ -811,6 +837,7 @@ impl IndexService {
             fingerprint_updates,
             diagnostics,
             tree_delta,
+            base_delta,
             RefreshCounts {
                 added,
                 changed,
@@ -833,6 +860,7 @@ impl IndexService {
         fingerprint_updates: Vec<(VaultPath, FileFingerprint)>,
         scan_diagnostics: Vec<Diagnostic>,
         tree_delta: TreeDelta,
+        base_delta: BaseDelta,
         counts: RefreshCounts,
         metrics: &mut ReconcileMetrics,
     ) -> Result<TryOutcome, IndexError> {
@@ -853,8 +881,25 @@ impl IndexService {
             }
         }
 
+        // Every base the new snapshot holds: the stored ones this walk did
+        // not remove, overlaid with the ones it replaced. Their identities
+        // join the resolution catalog; their records join the live graph.
+        let removed_bases: BTreeSet<&VaultPath> = base_delta.removed.iter().collect();
+        let mut base_records: BTreeMap<VaultPath, BaseRecord> =
+            crate::store::load_base_records(self.store.connection())?
+                .into_iter()
+                .filter(|(path, _)| !removed_bases.contains(path))
+                .collect();
+        for replacement in &base_delta.replaced {
+            base_records.insert(replacement.path.clone(), replacement.record.clone());
+        }
+        let base_identities: Vec<ResolutionNote> = base_records
+            .iter()
+            .map(|(path, record)| record.identity(path))
+            .collect();
+
         let resolution_start = Instant::now();
-        let report = build_graph(all_notes, scan_diagnostics.clone());
+        let report = build_graph_with_bases(all_notes, base_identities, scan_diagnostics.clone());
         metrics.stages.resolution += resolution_start.elapsed();
         metrics.work.references_resolved += report
             .graph
@@ -891,6 +936,7 @@ impl IndexService {
             graph: &report.graph,
             scan_diagnostics: &scan_diagnostics,
             tree: &tree_delta,
+            bases: &base_delta,
         })? {
             BeginOutcome::Prepared(pending) => pending,
             BeginOutcome::GenerationChanged => return Ok(TryOutcome::Retry),
@@ -905,7 +951,11 @@ impl IndexService {
         // can be built — and can fail — before the guard is taken.
         let next_generation = pending.generation();
         let prepare_start = Instant::now();
-        let prepared = Arc::new(live_graph_from_semantic(next_generation, &report.graph)?);
+        let prepared = Arc::new(live_graph_from_semantic(
+            next_generation,
+            &report.graph,
+            base_records.into_iter().collect(),
+        )?);
         metrics.stages.live_install += prepare_start.elapsed();
 
         // Only now the barrier, and only for the commit plus the install.
@@ -1012,6 +1062,7 @@ impl IndexService {
         replacement_notes: &[HydratedNote],
         removed_paths: &[VaultPath],
         replacement_references: &[HydratedReference],
+        bases: &BaseDelta,
     ) -> Result<DeltaPublishOutcome, IndexError> {
         let expected = publication.expected;
         // The two halves must describe the same change. A caller that fills
@@ -1035,6 +1086,10 @@ impl IndexService {
                 .collect::<BTreeSet<VaultPath>>(),
             "the row delta and the graph delta must describe the same paths"
         );
+        debug_assert!(
+            std::ptr::eq(publication.bases, bases),
+            "the row delta and the graph delta must carry the same base delta"
+        );
 
         // Prepared outside the barrier. The borrowed handle is released
         // again before the guard is taken, so the writer is once more the
@@ -1046,12 +1101,14 @@ impl IndexService {
         let prepare_start = Instant::now();
         let delta = {
             let graph = self.published_graph(expected)?;
-            graph.prepare_delta(
-                expected,
-                replacement_notes,
-                removed_paths,
-                replacement_references,
-            )?
+            graph
+                .prepare_delta(
+                    expected,
+                    replacement_notes,
+                    removed_paths,
+                    replacement_references,
+                )?
+                .with_bases(bases)
         };
         let prepare = prepare_start.elapsed();
         // Everything fallible is prepared and nothing is committed: the last
@@ -1242,6 +1299,7 @@ fn seed_published(store: &IndexStore, published: &PublicationBarrier) -> Result<
 fn live_graph_from_semantic(
     generation: Generation,
     graph: &SemanticGraph,
+    bases: Vec<(VaultPath, BaseRecord)>,
 ) -> Result<LiveGraph, IndexError> {
     let mut notes = Vec::new();
     let mut references = Vec::new();
@@ -1276,5 +1334,7 @@ fn live_graph_from_semantic(
             });
         }
     }
-    LiveGraph::from_hydrated(generation, notes, references)
+    let mut live = LiveGraph::from_hydrated(generation, notes, references)?;
+    live.install_bases(bases, &[]);
+    Ok(live)
 }

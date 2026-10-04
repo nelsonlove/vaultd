@@ -530,4 +530,5 @@ fn assert_graphs_equivalent(left: &vault_index::LiveGraph, right: &vault_index::
             );
         }
     }
+    common::assert_base_graphs_equal(left, right);
 }

@@ -2,6 +2,12 @@
 //! reference target columns, stored resolution columns, and ambiguous
 //! candidates. Never `source_bytes`, `properties`, `aliases`, or `tags` —
 //! enforced below by `hydration_never_selects_full_note_bodies_or_metadata`.
+//!
+//! One stated exception: `bases.source_bytes`, read by
+//! `crate::store::BASE_RECORDS_SQL`. A base's bytes are its whole state (a
+//! few hundred bytes of YAML), and re-parsing them is what keeps a restart
+//! from reading the vault while still giving the live graph the parsed
+//! `BaseFile` that evaluation needs. Note bodies are never read.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +65,10 @@ pub(crate) fn hydrate_live_graph(connection: &Connection) -> Result<LiveGraph, I
 
     // Read-only: no commit needed, and dropping the transaction here rolls
     // back (a no-op against an unmodified database) rather than panicking.
-    LiveGraph::from_hydrated(generation, notes, references)
+    let bases = crate::store::load_base_records(&transaction)?;
+    let mut graph = LiveGraph::from_hydrated(generation, notes, references)?;
+    graph.install_bases(bases, &[]);
+    Ok(graph)
 }
 
 fn load_generation(connection: &Connection) -> Result<Option<Generation>, IndexError> {
@@ -206,6 +215,21 @@ mod tests {
                 "hydration SQL touched aliases: {sql}"
             );
             assert!(!lower.contains("tags"), "hydration SQL touched tags: {sql}");
+        }
+    }
+
+    /// The one hydration statement allowed to read `source_bytes`: a base's
+    /// bytes are its whole state, and re-parsing them is what keeps a restart
+    /// from reading the vault. It reads `bases` and nothing else.
+    #[test]
+    fn the_base_hydration_query_reads_only_the_bases_table() {
+        let lower = crate::store::BASE_RECORDS_SQL.to_lowercase();
+        assert!(lower.contains("from bases "), "{lower}");
+        for table in ["notes", "properties", "aliases", "tags", "join"] {
+            assert!(
+                !lower.contains(table),
+                "base hydration SQL touched {table}: {lower}"
+            );
         }
     }
 }

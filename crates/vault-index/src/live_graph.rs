@@ -14,6 +14,7 @@ use vault_core::{
     changed_candidate_keys, reference_dependencies,
 };
 
+use crate::bases::{BaseDelta, BaseRecord};
 use crate::error::IndexError;
 use crate::model::Generation;
 
@@ -131,6 +132,8 @@ pub struct PreparedGraphDelta {
     removed_paths: Vec<VaultPath>,
     candidate_additions: BTreeMap<NoteId, Vec<DependencyKey>>,
     candidate_removals: BTreeMap<NoteId, Vec<DependencyKey>>,
+    base_updates: Vec<(VaultPath, BaseRecord)>,
+    base_removals: Vec<VaultPath>,
 }
 
 /// The compact live resolution graph: path interning in both directions
@@ -148,6 +151,24 @@ pub struct LiveGraph {
     references: BTreeMap<ReferenceKey, ReferenceRecord>,
     dependents: BTreeMap<DependencyKey, BTreeSet<ReferenceKey>>,
     candidates: BTreeMap<DependencyKey, BTreeSet<NoteId>>,
+    /// Every indexed base, by path: the parsed file and its view names.
+    bases: BTreeMap<VaultPath, BaseRecord>,
+    /// The base counterpart of `candidates`: dependency key -> bases that
+    /// could satisfy a reference using that key.
+    base_candidates: BTreeMap<DependencyKey, BTreeSet<VaultPath>>,
+}
+
+impl PreparedGraphDelta {
+    /// This delta plus a base delta, installed together by `install`.
+    pub(crate) fn with_bases(mut self, delta: &BaseDelta) -> Self {
+        self.base_updates = delta
+            .replaced
+            .iter()
+            .map(|replacement| (replacement.path.clone(), replacement.record.clone()))
+            .collect();
+        self.base_removals = delta.removed.clone();
+        self
+    }
 }
 
 impl LiveGraph {
@@ -161,6 +182,8 @@ impl LiveGraph {
             references: BTreeMap::new(),
             dependents: BTreeMap::new(),
             candidates: BTreeMap::new(),
+            bases: BTreeMap::new(),
+            base_candidates: BTreeMap::new(),
         }
     }
 
@@ -471,6 +494,8 @@ impl LiveGraph {
             removed_paths: removed_paths.to_vec(),
             candidate_additions,
             candidate_removals,
+            base_updates: Vec::new(),
+            base_removals: Vec::new(),
         })
     }
 
@@ -552,7 +577,69 @@ impl LiveGraph {
             }
         }
 
+        self.install_bases(delta.base_updates, &delta.base_removals);
+
         self.generation = delta.generation;
+    }
+
+    pub fn base(&self, path: &VaultPath) -> Option<&BaseRecord> {
+        self.bases.get(path)
+    }
+
+    pub fn base_paths(&self) -> impl Iterator<Item = &VaultPath> {
+        self.bases.keys()
+    }
+
+    /// A base's identity as resolution sees it: its path and its views.
+    pub fn base_identity(&self, path: &VaultPath) -> Option<ResolutionNote> {
+        self.bases.get(path).map(|record| record.identity(path))
+    }
+
+    /// The bases a reference looked up under `key` could reach — the base
+    /// counterpart of `candidate_notes`.
+    pub fn candidate_bases(&self, key: &DependencyKey) -> BTreeSet<VaultPath> {
+        self.base_candidates.get(key).cloned().unwrap_or_default()
+    }
+
+    /// Replace and remove base records, keeping the candidate index exact.
+    pub(crate) fn install_bases(
+        &mut self,
+        replaced: Vec<(VaultPath, BaseRecord)>,
+        removed: &[VaultPath],
+    ) {
+        for path in removed {
+            self.retire_base(path);
+        }
+        for (path, record) in replaced {
+            self.retire_base(&path);
+            for key in changed_candidate_keys(&ResolutionIdentityChange {
+                old: None,
+                new: Some(record.identity(&path)),
+            }) {
+                self.base_candidates
+                    .entry(key)
+                    .or_default()
+                    .insert(path.clone());
+            }
+            self.bases.insert(path, record);
+        }
+    }
+
+    fn retire_base(&mut self, path: &VaultPath) {
+        let Some(old) = self.bases.remove(path) else {
+            return;
+        };
+        for key in changed_candidate_keys(&ResolutionIdentityChange {
+            old: Some(old.identity(path)),
+            new: None,
+        }) {
+            if let Some(set) = self.base_candidates.get_mut(&key) {
+                set.remove(path);
+                if set.is_empty() {
+                    self.base_candidates.remove(&key);
+                }
+            }
+        }
     }
 
     fn outgoing_keys(&self, note_id: NoteId) -> impl Iterator<Item = ReferenceKey> + '_ {

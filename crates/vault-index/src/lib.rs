@@ -1,3 +1,4 @@
+mod bases;
 mod codec;
 mod config;
 mod cursor;
@@ -17,6 +18,7 @@ mod snapshot;
 mod store;
 mod test_hook;
 
+pub use bases::{BaseDelta, BaseRecord, BaseReplacement};
 pub use config::{IndexConfig, IndexLocation};
 pub use error::IndexError;
 pub use inventory::{FileSystemIndexSource, InventoryEntry, InventorySnapshot, ReconcileSource};

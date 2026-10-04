@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use vault_core::{
     Alias, BlockId, Diagnostic, Heading, LinkTarget, ParsedNote, Reference, ResolvedReference,
-    ScanReport, SemanticGraph, SourceDocument, Tag, VaultPath, build_graph, reference_dependencies,
-    resolution_diagnostic,
+    ScanReport, SemanticGraph, SourceDocument, Tag, VaultPath, build_graph_with_bases,
+    reference_dependencies, resolution_diagnostic,
 };
 
 mod delta;
@@ -17,6 +17,7 @@ pub use delta::{
 };
 pub use tree::{StoredTreeEntry, TreeDelta};
 
+use crate::bases::{BaseDelta, BaseRecord};
 use crate::codec;
 use crate::config::IndexConfig;
 use crate::error::IndexError;
@@ -103,6 +104,9 @@ pub(crate) struct Publication<'a> {
     /// What the same walk observed about the file tree. Empty when the tree
     /// did not move, and always empty for a source that observes no tree.
     pub tree: &'a TreeDelta,
+    /// The bases the same walk replaced and removed, written in the same
+    /// transaction.
+    pub bases: &'a BaseDelta,
 }
 
 /// One note's stored content revision, or `None` when no note row exists at
@@ -125,6 +129,125 @@ pub(crate) fn note_revision_with(
             |row| row.get(0),
         )
         .optional()?)
+}
+
+const BASE_DIAGNOSTIC_PREFIX: &str = "base failed to parse: ";
+
+/// The stored `diagnostics_json` for one base: empty when it parsed, one
+/// `malformed_base` warning carrying the YAML position when it did not.
+fn base_diagnostics_json(record: &BaseRecord) -> String {
+    match &record.error {
+        None => "[]".to_string(),
+        Some(error) => serde_json::json!([{
+            "code": codec::encode_diagnostic_code(vault_core::DiagnosticCode::MalformedBase),
+            "severity": codec::encode_severity(vault_core::Severity::Warning),
+            "message": format!("{BASE_DIAGNOSTIC_PREFIX}{}", error.message),
+            "span_start": error.span.map(|span| span.start()),
+            "span_end": error.span.map(|span| span.end()),
+        }])
+        .to_string(),
+    }
+}
+
+/// Apply one base delta inside a publication's transaction. The `bases`
+/// table has no foreign key, so a removed base's row is deleted here, on
+/// every route.
+pub(crate) fn apply_bases(
+    transaction: &Transaction<'_>,
+    delta: &BaseDelta,
+) -> Result<(), IndexError> {
+    for path in &delta.removed {
+        transaction.execute("DELETE FROM bases WHERE path = ?1", params![path.as_str()])?;
+    }
+    for base in &delta.replaced {
+        transaction.execute(
+            "INSERT OR REPLACE INTO bases (path, content_revision, source_bytes, observed_size, \
+             observed_mtime_seconds, observed_mtime_nanos, parse_status, view_names_json, \
+             diagnostics_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                base.path.as_str(),
+                base.revision,
+                base.source.as_bytes(),
+                u64_to_i64(base.fingerprint.size, "observed size")?,
+                base.fingerprint.modified_seconds,
+                i64::from(base.fingerprint.modified_nanos),
+                if base.record.error.is_some() {
+                    "parse_failed"
+                } else {
+                    "parsed"
+                },
+                serde_json::to_string(&base.record.views)?,
+                base_diagnostics_json(&base.record),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The one hydration statement that reads `source_bytes`, and only from
+/// `bases`: a base's bytes are its whole state, and re-parsing them is what
+/// keeps a restart from reading the vault.
+pub(crate) const BASE_RECORDS_SQL: &str =
+    "SELECT path, source_bytes, parse_status, diagnostics_json FROM bases ORDER BY path";
+
+/// Every stored base, re-parsed from its stored bytes — hydration and the
+/// complete route both read this, so neither reads the vault for a base it
+/// already knows. A base stored as `parse_failed` stays failed even when
+/// its stored bytes re-parse (an unreadable file is stored with no bytes),
+/// with the message its stored diagnostic carries, so the graph and the row
+/// always agree.
+pub(crate) fn load_base_records(
+    connection: &Connection,
+) -> Result<Vec<(VaultPath, BaseRecord)>, IndexError> {
+    let mut statement = connection.prepare(BASE_RECORDS_SQL)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(path, bytes, status, diagnostics)| {
+            let path = codec::decode_path(&path)?;
+            let text = String::from_utf8_lossy(&bytes);
+            let record = BaseRecord::parse(&text);
+            let record = match status.as_str() {
+                "parsed" => record,
+                "parse_failed" if record.error.is_some() => record,
+                "parse_failed" => BaseRecord::unreadable(stored_base_message(&diagnostics)),
+                other => {
+                    return Err(IndexError::IncompatibleIndex(format!(
+                        "unknown base parse status {other}"
+                    )));
+                }
+            };
+            Ok((path, record))
+        })
+        .collect()
+}
+
+/// The parse-failure message a stored base diagnostic carries, without the
+/// prefix `base_diagnostics_json` adds.
+fn stored_base_message(diagnostics_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(diagnostics_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(0)
+                .and_then(|diagnostic| diagnostic.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(|message| {
+                    message
+                        .strip_prefix(BASE_DIAGNOSTIC_PREFIX)
+                        .unwrap_or(message)
+                        .to_string()
+                })
+        })
+        .unwrap_or_else(|| "unreadable when indexed".to_string())
 }
 
 pub(crate) fn usize_to_i64(value: usize, field: &str) -> Result<i64, IndexError> {
@@ -651,6 +774,7 @@ impl IndexStore {
             graph,
             scan_diagnostics,
             tree,
+            bases,
         } = publication;
         let transaction = self.connection.transaction()?;
         let current: Option<i64> = transaction.query_row(
@@ -676,6 +800,7 @@ impl IndexStore {
         let write_start = Instant::now();
         let graph_write = Self::replace_graph_rows(&transaction, graph, scan_diagnostics)?;
         tree::apply(&transaction, tree)?;
+        apply_bases(&transaction, bases)?;
         let sqlite_write = write_start.elapsed();
 
         let next = Generation::new(expected.map_or(0, Generation::get) + 1);
@@ -693,6 +818,53 @@ impl IndexStore {
             graph_write,
             sqlite_write,
         }))
+    }
+
+    /// Every stored base's revision and observed fingerprint, for planning
+    /// a base delta against what is on disk.
+    pub(crate) fn stored_bases(
+        &self,
+    ) -> Result<std::collections::BTreeMap<VaultPath, (String, FileFingerprint)>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, content_revision, observed_size, observed_mtime_seconds, \
+             observed_mtime_nanos FROM bases",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(path, revision, size, seconds, nanos)| {
+                Ok((
+                    codec::decode_path(&path)?,
+                    (
+                        revision,
+                        FileFingerprint {
+                            size: u64::try_from(size).map_err(|_| {
+                                IndexError::IncompatibleIndex("negative observed size".into())
+                            })?,
+                            modified_seconds: seconds,
+                            modified_nanos: u32::try_from(nanos).map_err(|_| {
+                                IndexError::IncompatibleIndex("mtime nanos out of range".into())
+                            })?,
+                        },
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    /// The writer's own connection, for the reads a publication makes between
+    /// its plan and its write (the stored base records).
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     pub(crate) fn stored_fingerprints(
@@ -872,9 +1044,39 @@ impl IndexStore {
     pub fn load_graph_for_test(&self) -> Result<ScanReport, IndexError> {
         let notes = self.load_all_notes()?;
         let scan_diagnostics = self.load_scan_diagnostics()?;
-        let report = build_graph(notes, scan_diagnostics);
+        let bases = load_base_records(&self.connection)?;
+        let base_identities = bases
+            .iter()
+            .map(|(path, record)| record.identity(path))
+            .collect();
+        let report = build_graph_with_bases(notes, base_identities, scan_diagnostics);
 
-        let stored_diagnostics = diagnostic_union::all_diagnostics(&self.connection)?;
+        // A base's own diagnostic is stored on its `bases` row, not produced
+        // by the graph build: split it out and check it against the records.
+        let (stored_base_diagnostics, stored_diagnostics): (Vec<Diagnostic>, Vec<Diagnostic>) =
+            diagnostic_union::all_diagnostics(&self.connection)?
+                .into_iter()
+                .partition(|diagnostic| {
+                    diagnostic.code == vault_core::DiagnosticCode::MalformedBase
+                        && diagnostic
+                            .path
+                            .as_ref()
+                            .is_some_and(|path| bases.iter().any(|(base, _)| base == path))
+                });
+        let failed_bases: Vec<&VaultPath> = bases
+            .iter()
+            .filter(|(_, record)| record.error.is_some())
+            .map(|(path, _)| path)
+            .collect();
+        let diagnosed_bases: Vec<&VaultPath> = stored_base_diagnostics
+            .iter()
+            .filter_map(|diagnostic| diagnostic.path.as_ref())
+            .collect();
+        if failed_bases != diagnosed_bases {
+            return Err(IndexError::IncompatibleIndex(
+                "stored base diagnostics do not match the stored base records".into(),
+            ));
+        }
         if stored_diagnostics != report.diagnostics {
             return Err(IndexError::IncompatibleIndex(
                 "stored diagnostics do not match the rebuilt graph".into(),

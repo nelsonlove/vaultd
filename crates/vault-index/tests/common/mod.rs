@@ -311,6 +311,7 @@ impl FixtureService {
                 // observes no filesystem, so it has nothing to say about the
                 // tree and leaves those rows exactly as they are.
                 tree: &vault_index::TreeDelta::default(),
+                bases: &vault_index::BaseDelta::default(),
             })
             .expect("publish delta");
         drop(store);
@@ -986,5 +987,94 @@ pub fn property_scalars_mirror(connection: &rusqlite::Connection) -> Result<(), 
         Err(format!(
             "{missing} properties rows without a matching scalar, {stray} scalars without a property"
         ))
+    }
+}
+
+/// One `bases` row as the drift oracle compares it: path, content revision,
+/// parse status, view names (in order, as stored JSON) and diagnostics.
+pub type BaseCatalogRow = (String, String, String, String, String);
+
+/// The whole stored base catalog, ordered by path.
+pub fn base_catalog(connection: &rusqlite::Connection) -> Vec<BaseCatalogRow> {
+    let mut statement = connection
+        .prepare(
+            "SELECT path, content_revision, parse_status, view_names_json, diagnostics_json \
+             FROM bases ORDER BY path",
+        )
+        .expect("prepare base catalog");
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query base catalog")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read base catalog")
+}
+
+/// Two live graphs hold the same bases: the same paths, the same records
+/// (parsed file, views in order, parse error), and the same base candidate
+/// index for every key a base's identity contributes.
+pub fn assert_base_graphs_equal(left: &vault_index::LiveGraph, right: &vault_index::LiveGraph) {
+    let left_paths: Vec<_> = left.base_paths().cloned().collect();
+    let right_paths: Vec<_> = right.base_paths().cloned().collect();
+    assert_eq!(left_paths, right_paths, "base paths differ");
+    for path in &left_paths {
+        assert_eq!(
+            left.base(path),
+            right.base(path),
+            "base record for {path:?} differs"
+        );
+        let identity = left.base_identity(path).expect("left tracks this base");
+        for key in vault_core::changed_candidate_keys(&vault_core::ResolutionIdentityChange {
+            old: None,
+            new: Some(identity),
+        }) {
+            assert_eq!(
+                left.candidate_bases(&key),
+                right.candidate_bases(&key),
+                "base candidates for {key:?} differ"
+            );
+        }
+    }
+}
+
+/// The live graph's bases agree with the stored rows: one record per row,
+/// and the row's views and parse status are the record's.
+pub fn assert_base_graph_matches_rows(graph: &vault_index::LiveGraph, rows: &[BaseCatalogRow]) {
+    let graph_paths: Vec<String> = graph
+        .base_paths()
+        .map(|path| path.as_str().to_string())
+        .collect();
+    let row_paths: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
+    assert_eq!(
+        graph_paths, row_paths,
+        "live graph bases and stored rows differ"
+    );
+    for (path, _, status, views, _) in rows {
+        let record = graph
+            .base(&vault_core::VaultPath::new(path.as_str()).expect("stored base path"))
+            .expect("stored base is in the graph");
+        assert_eq!(
+            &serde_json::to_string(&record.views).expect("views json"),
+            views,
+            "views of {path}"
+        );
+        let graph_status = if record.error.is_some() {
+            "parse_failed"
+        } else {
+            "parsed"
+        };
+        assert_eq!(graph_status, status, "parse status of {path}");
+        assert_eq!(
+            record.file.is_some(),
+            record.error.is_none(),
+            "file and error of {path}"
+        );
     }
 }

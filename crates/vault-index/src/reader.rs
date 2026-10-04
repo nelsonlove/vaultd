@@ -205,7 +205,7 @@ impl IndexReader {
                 generation.get()
             )));
         }
-        let catalog = graph.note_paths().into_iter().filter_map(|path| {
+        let notes = graph.note_paths().into_iter().filter_map(|path| {
             graph.note(&path).map(|note| vault_core::ResolutionNote {
                 path,
                 headings: note.headings,
@@ -213,7 +213,11 @@ impl IndexReader {
                 views: None,
             })
         });
-        let resolver = Arc::new(Resolver::from_catalog(catalog));
+        let bases: Vec<vault_core::ResolutionNote> = graph
+            .base_paths()
+            .filter_map(|path| graph.base_identity(path))
+            .collect();
+        let resolver = Arc::new(Resolver::from_catalog(notes.chain(bases)));
         *cache = Some((generation, Arc::clone(&resolver)));
         Ok((generation, resolver))
     }

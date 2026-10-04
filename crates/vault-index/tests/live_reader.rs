@@ -363,6 +363,7 @@ fn a_delta_publication_advances_rows_and_live_graph_together() {
         (_, Resolution::Unresolved)
     ));
 
+    let no_bases = vault_index::BaseDelta::default();
     let outcome = fixture
         .service()
         .publish_delta(
@@ -374,10 +375,12 @@ fn a_delta_publication_advances_rows_and_live_graph_together() {
                 resolutions: &[],
                 scan_diagnostics: None,
                 tree: &vault_index::TreeDelta::default(),
+                bases: &no_bases,
             },
             &graph_notes,
             &[],
             &[],
+            &no_bases,
         )
         .expect("publish delta");
     let generation = match outcome {
@@ -443,6 +446,7 @@ fn a_held_published_state_handle_trips_the_whole_graph_copy_tripwire() {
         blocks: Vec::new(),
     }];
 
+    let no_bases = vault_index::BaseDelta::default();
     let published = fixture.service().publish_delta(
         vault_index::DeltaPublication {
             expected,
@@ -452,10 +456,12 @@ fn a_held_published_state_handle_trips_the_whole_graph_copy_tripwire() {
             resolutions: &[],
             scan_diagnostics: None,
             tree: &vault_index::TreeDelta::default(),
+            bases: &no_bases,
         },
         &graph_notes,
         &[],
         &[],
+        &no_bases,
     );
     drop(held);
     published.expect("publish delta");
@@ -502,6 +508,7 @@ fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
         blocks: Vec::new(),
     }];
 
+    let no_bases = vault_index::BaseDelta::default();
     let outcome = fixture
         .service()
         .publish_delta(
@@ -513,10 +520,12 @@ fn a_lost_delta_compare_and_swap_leaves_the_published_state_untouched() {
                 resolutions: &[],
                 scan_diagnostics: None,
                 tree: &vault_index::TreeDelta::default(),
+                bases: &no_bases,
             },
             &graph_notes,
             &[],
             &[],
+            &no_bases,
         )
         .expect("publish delta");
     assert!(matches!(

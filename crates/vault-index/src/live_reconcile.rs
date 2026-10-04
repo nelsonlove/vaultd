@@ -23,10 +23,11 @@ use std::time::Instant;
 use vault_core::{
     DependencyKey, Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution,
     ResolutionIdentityChange, ResolutionNote, ResolvedReference, Resolver, ScanError, Severity,
-    SourceDocument, SourceError, VaultPath, changed_candidate_keys, parse_note,
+    SourceDocument, SourceError, TreeEntryKind, VaultPath, changed_candidate_keys, parse_note,
     reference_dependencies, resolution_diagnostic,
 };
 
+use crate::bases::BaseDelta;
 use crate::error::IndexError;
 use crate::live_graph::{HydratedNote, HydratedReference, LiveGraph, ReferenceKey};
 use crate::metrics::ReconcileMetrics;
@@ -157,6 +158,9 @@ struct DirtyBatch {
     /// What the same observation said about the file tree. Read once, with
     /// the bodies, so a re-planned attempt re-stats nothing.
     tree: TreeDelta,
+    /// The bases this cycle read, planned against the stored ones. Read once,
+    /// with the bodies, so a re-planned attempt re-reads no base.
+    bases: BaseDelta,
 }
 
 /// The shape both `LiveRefreshReport` and the compatibility `RefreshReport`
@@ -242,14 +246,18 @@ fn identity_keys(identity: &ResolutionNote) -> BTreeSet<DependencyKey> {
     })
 }
 
-/// The graph's current identity for `path`, as resolution sees it.
+/// The graph's current identity for `path`, as resolution sees it: a note's
+/// headings and blocks, or a base's views.
 fn graph_identity(graph: &LiveGraph, path: &VaultPath) -> Option<ResolutionNote> {
-    graph.note(path).map(|note| ResolutionNote {
-        path: note.path,
-        headings: note.headings,
-        blocks: note.blocks,
-        views: None,
-    })
+    graph
+        .note(path)
+        .map(|note| ResolutionNote {
+            path: note.path,
+            headings: note.headings,
+            blocks: note.blocks,
+            views: None,
+        })
+        .or_else(|| graph.base_identity(path))
 }
 
 fn reference_ordinal(path: &VaultPath, ordinal: usize) -> Result<u32, IndexError> {
@@ -399,10 +407,28 @@ impl IndexService {
             states.insert(path.clone(), state);
         }
 
+        // The `.base` paths the hint named, read and planned beside the notes.
+        let hinted_bases: BTreeSet<VaultPath> = paths
+            .iter()
+            .filter(|path| path.is_base() && !path.is_hidden())
+            .cloned()
+            .collect();
+        let bases = if self.source.observes_tree() && !hinted_bases.is_empty() {
+            crate::bases::plan(
+                self.source.as_ref(),
+                &self.store.stored_bases()?,
+                &hinted_bases,
+                false,
+                false,
+            )?
+        } else {
+            BaseDelta::default()
+        };
         let batch = DirtyBatch {
             states,
             scan_diagnostics: ScanDiagnostics::Patch(diagnostics),
             tree: self.observe_tree_paths(paths)?,
+            bases,
         };
         self.reconcile_batch(&batch, metrics)
     }
@@ -463,10 +489,29 @@ impl IndexService {
             states.insert(path.clone(), state);
         }
 
+        // The bases the walk saw, planned exactly as the complete route plans
+        // them. A source that observes no tree reconciles no bases.
+        let bases = if self.source.observes_tree() {
+            let observed_bases: BTreeSet<VaultPath> = observed_tree
+                .iter()
+                .filter(|entry| entry.kind == TreeEntryKind::File && entry.path.is_base())
+                .map(|entry| entry.path.clone())
+                .collect();
+            crate::bases::plan(
+                self.source.as_ref(),
+                &self.store.stored_bases()?,
+                &observed_bases,
+                true,
+                verify,
+            )?
+        } else {
+            BaseDelta::default()
+        };
         let batch = DirtyBatch {
             states,
             scan_diagnostics: ScanDiagnostics::Complete(diagnostics),
             tree,
+            bases,
         };
         let mut outcome = self.reconcile_batch(&batch, metrics)?;
         outcome.unchanged += unchanged;
@@ -721,6 +766,7 @@ impl IndexService {
             && removed.is_empty()
             && !scan_diagnostics_changed
             && !batch.tree.is_generational()
+            && batch.bases.is_empty()
         {
             // Whatever tree rows moved here are the non-generational kind — a
             // note's or a folder's own metadata — so they ride the same
@@ -747,7 +793,7 @@ impl IndexService {
         let planning_start = Instant::now();
         let selection = {
             let graph = self.published_graph(expected)?;
-            self.select_impact(&graph, &replaced, &removed)
+            self.select_impact(&graph, &replaced, &removed, &batch.bases)
         };
         metrics.stages.impact_planning += planning_start.elapsed();
 
@@ -877,10 +923,12 @@ impl IndexService {
                 resolutions: &resolutions,
                 scan_diagnostics: scan_diagnostics_changed.then_some(scan_diagnostics.as_slice()),
                 tree: &batch.tree,
+                bases: &batch.bases,
             },
             &hydrated_notes,
             &removed,
             &graph_references,
+            &batch.bases,
         )?;
 
         match outcome {
@@ -919,17 +967,28 @@ impl IndexService {
         graph: &LiveGraph,
         replaced: &[(ParsedNote, FileFingerprint)],
         removed: &[VaultPath],
+        bases: &BaseDelta,
     ) -> ImpactSelection {
         let changed_sources: BTreeSet<VaultPath> = replaced
             .iter()
             .map(|(note, _)| note.source.path().clone())
             .collect();
-        let removed_set: BTreeSet<VaultPath> = removed.iter().cloned().collect();
+        // A removed base leaves the catalog like a removed note; a replaced
+        // base enters it with its new views. Bases carry no references, so they
+        // are never changed sources.
+        let mut removed_set: BTreeSet<VaultPath> = removed.iter().cloned().collect();
+        removed_set.extend(bases.removed.iter().cloned());
 
-        let new_identities: BTreeMap<VaultPath, ResolutionNote> = replaced
+        let mut new_identities: BTreeMap<VaultPath, ResolutionNote> = replaced
             .iter()
             .map(|(note, _)| (note.source.path().clone(), ResolutionNote::from(note)))
             .collect();
+        new_identities.extend(bases.replaced.iter().map(|replacement| {
+            (
+                replacement.path.clone(),
+                replacement.record.identity(&replacement.path),
+            )
+        }));
 
         let mut identity_changes: Vec<ResolutionIdentityChange> = Vec::new();
         for (path, identity) in &new_identities {
@@ -990,6 +1049,14 @@ impl IndexService {
                     catalog.insert(path, identity);
                 }
             }
+            for path in graph.base_paths() {
+                if removed_set.contains(path) || new_identities.contains_key(path) {
+                    continue;
+                }
+                if let Some(identity) = graph.base_identity(path) {
+                    catalog.insert(path.clone(), identity);
+                }
+            }
             catalog.extend(new_identities);
             catalog
         } else {
@@ -1037,6 +1104,12 @@ impl IndexService {
             if let Some(expected) = expected {
                 expectations.insert(path, expected);
             }
+        }
+        for replacement in &batch.bases.replaced {
+            expectations.insert(&replacement.path, true);
+        }
+        for path in &batch.bases.removed {
+            expectations.insert(path, false);
         }
         for (path, expected) in expectations {
             let present = self.source.fingerprint(path)?.is_some();
@@ -1145,6 +1218,11 @@ fn bounded_catalog(
                     if !removed_set.contains(path) && !changed_sources.contains(path) {
                         wanted.insert(path.clone());
                     }
+                }
+            }
+            for path in graph.candidate_bases(&key) {
+                if !removed_set.contains(&path) {
+                    wanted.insert(path);
                 }
             }
             if let Some(paths) = added_by_key.get(&key) {

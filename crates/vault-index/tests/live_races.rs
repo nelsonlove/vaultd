@@ -504,6 +504,7 @@ fn publish_out_of_band(config: &IndexConfig, root: &Path, name: &str, expected: 
             // A foreign writer publishing one note's rows: it took no walk,
             // so it says nothing about the tree and leaves those rows alone.
             tree: &vault_index::TreeDelta::default(),
+            bases: &vault_index::BaseDelta::default(),
         })
         .expect("out-of-band delta");
     match outcome {
