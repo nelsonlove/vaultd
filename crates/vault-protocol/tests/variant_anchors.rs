@@ -108,6 +108,7 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
             | RuntimeEventDto::RuntimeStateChanged(_)
             | RuntimeEventDto::ResyncRequired(_)
             | RuntimeEventDto::ConfigChanged(_)
+            | RuntimeEventDto::ViewsInvalidated(_)
             | RuntimeEventDto::Unknown => {}
         }
     }

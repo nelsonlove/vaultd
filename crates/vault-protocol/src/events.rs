@@ -207,6 +207,16 @@ pub struct ConfigChangedEventDto {
     pub path: String,
 }
 
+/// A view may have changed at `generation`: re-ask `evaluate_base` for it.
+/// Coarse by design — false positives happen, false negatives do not. One
+/// event per view, whichever embeddings (`this_path`) a client holds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ViewsInvalidatedEventDto {
+    pub base: String,
+    pub view: String,
+    pub generation: u64,
+}
+
 /// One event delivered to a subscription.
 ///
 /// Open-ended on its own tag: an event kind a later `vaultd` introduces
@@ -219,6 +229,7 @@ pub enum RuntimeEventDto {
     RuntimeStateChanged(RuntimeStateChangedEventDto),
     ResyncRequired(ResyncRequiredEventDto),
     ConfigChanged(ConfigChangedEventDto),
+    ViewsInvalidated(ViewsInvalidatedEventDto),
     /// An event kind this build does not know. Never produced by this server.
     Unknown,
 }
@@ -277,6 +288,7 @@ impl<'de> serde::de::Visitor<'de> for RuntimeEventVisitor {
                         }
                         "resync_required" => RuntimeEventDto::ResyncRequired(map.next_value()?),
                         "config_changed" => RuntimeEventDto::ConfigChanged(map.next_value()?),
+                        "views_invalidated" => RuntimeEventDto::ViewsInvalidated(map.next_value()?),
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                             RuntimeEventDto::Unknown
@@ -295,7 +307,8 @@ impl<'de> serde::de::Visitor<'de> for RuntimeEventVisitor {
                     "generation_committed"
                     | "runtime_state_changed"
                     | "resync_required"
-                    | "config_changed",
+                    | "config_changed"
+                    | "views_invalidated",
                 ) => Err(serde::de::Error::missing_field("value")),
                 Some(_) => Ok(RuntimeEventDto::Unknown),
                 None => Err(serde::de::Error::missing_field("type")),

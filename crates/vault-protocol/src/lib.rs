@@ -18,7 +18,7 @@ pub use error::{ErrorCode, ProtocolError};
 pub use events::{
     ChangeSetDto, ConfigChangedEventDto, EventEnvelope, GenerationCauseDto,
     GenerationCommittedEventDto, LiveStateDto, ResyncReasonDto, ResyncRequiredEventDto,
-    RuntimeEventDto, RuntimeStateChangedEventDto,
+    RuntimeEventDto, RuntimeStateChangedEventDto, ViewsInvalidatedEventDto,
 };
 pub use mutations::{
     CopyConflictDto, CopyFileParams, DeleteFolderParams, DeleteModeDto, DeleteNoteParams,

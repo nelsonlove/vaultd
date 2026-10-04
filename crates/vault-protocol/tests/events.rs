@@ -2,7 +2,7 @@ use vault_protocol::{
     ChangeSetDto, ConfigChangedEventDto, EventEnvelope, GenerationCauseDto,
     GenerationCommittedEventDto, LiveStateDto, Request, RequestEnvelope, ResyncReasonDto,
     ResyncRequiredEventDto, RuntimeEventDto, RuntimeStateChangedEventDto, SubscribeEventsParams,
-    SubscribeEventsResponse, UnsubscribeParams, UnsubscribeResponse,
+    SubscribeEventsResponse, UnsubscribeParams, UnsubscribeResponse, ViewsInvalidatedEventDto,
 };
 
 #[test]
@@ -320,6 +320,38 @@ fn config_changed_event_round_trips_as_exact_json() {
 #[test]
 fn a_config_changed_event_with_no_value_is_a_decode_failure() {
     let line = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"config_changed"}}"#;
+    serde_json::from_str::<EventEnvelope>(line)
+        .expect_err("a known type with no payload is malformed, not unknown");
+}
+
+/// One view a committed generation may have changed: the base, the view and
+/// the generation, in that exact shape. An older client decodes the line as
+/// `Unknown` (the unknown-type tolerance in `wire_tolerance.rs`), so the
+/// event is additive.
+#[test]
+fn views_invalidated_event_round_trips_as_exact_json() {
+    let envelope = EventEnvelope::new(
+        "sub-1",
+        RuntimeEventDto::ViewsInvalidated(ViewsInvalidatedEventDto {
+            base: "Books.base".into(),
+            view: "Table".into(),
+            generation: 7,
+        }),
+    );
+    let json = serde_json::to_string(&envelope).expect("serialize event");
+    assert_eq!(
+        json,
+        r#"{"version":1,"subscription_id":"sub-1","event":{"type":"views_invalidated","value":{"base":"Books.base","view":"Table","generation":7}}}"#
+    );
+    let decoded: EventEnvelope = serde_json::from_str(&json).expect("deserialize event");
+    assert_eq!(decoded, envelope);
+}
+
+/// A truncated `views_invalidated` is malformed, not unknown: its arm is in
+/// the visitor's missing-value list.
+#[test]
+fn a_views_invalidated_event_with_no_value_is_a_decode_failure() {
+    let line = r#"{"version":1,"subscription_id":"sub-1","event":{"type":"views_invalidated"}}"#;
     serde_json::from_str::<EventEnvelope>(line)
         .expect_err("a known type with no payload is malformed, not unknown");
 }
