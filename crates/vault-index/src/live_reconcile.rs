@@ -104,6 +104,10 @@ pub struct LiveRefreshReport {
     /// References selected for re-resolution: the changed sources' own
     /// outgoing references plus the dependency-selected incoming ones.
     pub affected_reference_count: u64,
+    /// Notes whose own bytes did not change but at least one of whose
+    /// references now resolves differently, sorted. The staleness rule treats
+    /// them as changed (a frontmatter link's target appeared or vanished).
+    pub reresolved: Vec<VaultPath>,
     /// Whether the selective plan was abandoned for a complete re-resolution
     /// of every reference the compact graph holds (still with no body read and
     /// no re-parse of unchanged source).
@@ -176,6 +180,8 @@ pub(crate) struct BatchOutcome {
     pub(crate) reparsed: u64,
     pub(crate) affected_reference_count: u64,
     pub(crate) complete_resolution: bool,
+    /// Sources of the selected incoming references whose answer moved.
+    pub(crate) reresolved: Vec<VaultPath>,
 }
 
 /// How one dirty path's stored row must move.
@@ -370,6 +376,7 @@ impl IndexService {
             changes: batch.changes,
             note_changes: batch.note_changes,
             affected_reference_count: batch.affected_reference_count,
+            reresolved: batch.reresolved,
             complete_resolution: batch.complete_resolution,
             metrics,
         })
@@ -787,6 +794,7 @@ impl IndexService {
                 reparsed: 0,
                 affected_reference_count: 0,
                 complete_resolution: false,
+                reresolved: Vec::new(),
             }));
         }
 
@@ -847,6 +855,9 @@ impl IndexService {
                 .or_default()
                 .push(reference.ordinal);
         }
+        // A source whose own bytes changed is in `replaced`, never here, so
+        // this is exactly the notes the change set does not already name.
+        let mut reresolved: BTreeSet<VaultPath> = BTreeSet::new();
         for (path, ordinals) in &by_source {
             // Keyed by stored ordinal, never by position: the loader's join to
             // `resolutions` is an INNER JOIN, so a reference missing its
@@ -871,6 +882,11 @@ impl IndexService {
                 };
                 let target = LinkTarget::from(&existing.reference);
                 let resolution = resolver.resolve_target(path, &target);
+                // `existing` is the stored `ResolvedReference`: its resolution
+                // is the answer the index held before this cycle.
+                if resolution != existing.resolution {
+                    reresolved.insert(path.clone());
+                }
                 let resolved = ResolvedReference {
                     source: path.clone(),
                     source_span: existing.source_span,
@@ -959,6 +975,7 @@ impl IndexService {
                     reparsed,
                     affected_reference_count,
                     complete_resolution: selection.complete_resolution,
+                    reresolved: reresolved.into_iter().collect(),
                 }))
             }
             DeltaPublishOutcome::GenerationChanged => Ok(None),

@@ -679,3 +679,94 @@ fn evaluate_in(
         result,
     })
 }
+
+/// What prefilter matching needs to know about one changed path at the
+/// current generation: its tags (as the `tags` table folds them) and its
+/// property keys (as `property_scalars` folds them).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrefilterFacts {
+    pub tags: Vec<String>,
+    pub keys: Vec<String>,
+}
+
+/// One base's views and what each reads: `None` for a view that does not
+/// compile, and no views at all for a base that does not parse.
+pub type BaseViewDependencies = Vec<(String, Option<ViewDependencies>)>;
+
+impl IndexReader {
+    /// Facts for the paths that exist as files or notes at the published
+    /// generation, read in one generation-consistent read; a deleted path or
+    /// a folder has no entry.
+    pub fn prefilter_facts(
+        &self,
+        paths: &std::collections::BTreeSet<VaultPath>,
+    ) -> Result<(Generation, BTreeMap<VaultPath, PrefilterFacts>), IndexError> {
+        self.read(|transaction, generation| {
+            let mut facts = BTreeMap::new();
+            let mut exists = transaction.prepare_cached(
+                "SELECT kind FROM tree_entries WHERE path = ?1 AND kind != 'folder'",
+            )?;
+            let mut tags = transaction
+                .prepare_cached("SELECT comparison_key FROM tags WHERE note_path = ?1")?;
+            let mut keys = transaction
+                .prepare_cached("SELECT key_fold FROM property_scalars WHERE note_path = ?1")?;
+            for path in paths {
+                let kind: Option<String> = exists
+                    .query_row(params![path.as_str()], |row| row.get(0))
+                    .optional()?;
+                if kind.is_none() {
+                    continue;
+                }
+                let tags = tags
+                    .query_map(params![path.as_str()], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = keys
+                    .query_map(params![path.as_str()], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                facts.insert(path.clone(), PrefilterFacts { tags, keys });
+            }
+            Ok((generation, facts))
+        })
+    }
+
+    /// Every view of every base (or of `bases` only) with its dependencies,
+    /// at the published generation. The parsed bases are copied out of the
+    /// live graph under the guard (`Arc` clones); the views compile with no
+    /// lock held.
+    pub fn base_dependencies(
+        &self,
+        bases: Option<&std::collections::BTreeSet<VaultPath>>,
+    ) -> Result<(Generation, BTreeMap<VaultPath, BaseViewDependencies>), IndexError> {
+        let (generation, files) = self.copy_from_graph(|graph| {
+            graph
+                .base_paths()
+                .filter(|path| bases.is_none_or(|wanted| wanted.contains(*path)))
+                .filter_map(|path| {
+                    graph
+                        .base(path)
+                        .map(|record| (path.clone(), record.file.clone()))
+                })
+                .collect::<Vec<_>>()
+        })?;
+        let out = files
+            .into_iter()
+            .map(|(path, file)| {
+                let views = match file {
+                    Some(file) => file
+                        .view_names()
+                        .into_iter()
+                        .map(|name| {
+                            let dependencies = compile_view(&file, Some(&name))
+                                .ok()
+                                .map(|view| view.dependencies().clone());
+                            (name, dependencies)
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                (path, views)
+            })
+            .collect();
+        Ok((generation, out))
+    }
+}

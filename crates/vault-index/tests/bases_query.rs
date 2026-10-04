@@ -581,3 +581,223 @@ fn an_evaluation_never_blocks_another_read() {
     assert_eq!(notes.unwrap(), 1);
     assert_eq!(evaluation.join().unwrap().1, vec!["A.md"]);
 }
+
+/// A hook that counts its visits, reports each on `visits`, and parks until
+/// `release` (at most 30 s, so a failed test cannot wedge).
+fn reporting_hook(
+    label: &'static str,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    visits: mpsc::Sender<&'static str>,
+    release: Arc<Mutex<mpsc::Receiver<()>>>,
+) -> vault_index::PauseHook {
+    let visits = Mutex::new(visits);
+    Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = visits.lock().unwrap().send(label);
+        let _ = release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    })
+}
+
+/// The Task 11 carry: the first resolving read of a generation used to build
+/// the whole-vault resolver under the publication guard, so a publication
+/// landing then waited for it. Now the writer prebuilds it after each
+/// publication, so that read builds nothing, and a publication made while
+/// it is in flight completes. Under the old shape the read parks in the
+/// build hook while holding the guard, and the publication's hang detector
+/// fires.
+#[test]
+fn a_publication_never_waits_for_the_first_resolving_read_of_a_generation() {
+    let (mut service, vault, _index) = service(&PARKED_VAULT);
+    // A reader has resolved once, so the writer prebuilds from now on.
+    evaluate_rows(&service.reader().unwrap());
+
+    fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
+    service
+        .refresh_paths(BTreeSet::from([vp("B.md")]), ChangeCause::Watcher)
+        .unwrap();
+
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (visits_tx, visits) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let mut reader = service.reader().unwrap();
+    reader.pause_resolver_builds_for_test(reporting_hook(
+        "a resolver build under the guard",
+        Arc::clone(&builds),
+        visits_tx.clone(),
+        Arc::clone(&release_rx),
+    ));
+    reader.pause_evaluations_for_test(reporting_hook(
+        "the evaluation, guard released",
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        visits_tx,
+        release_rx,
+    ));
+    let evaluation = thread::spawn(move || evaluate_rows(&reader));
+    let parked_in = visits
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the first resolving read of the generation parks somewhere");
+
+    fs::write(vault.path().join("C.md"), "---\nn: 3\n---\n").unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let publisher = thread::spawn(move || {
+        let report = service.refresh_paths(BTreeSet::from([vp("C.md")]), ChangeCause::Watcher);
+        let _ = done_tx.send(());
+        (service, report)
+    });
+    let published = done_rx.recv_timeout(Duration::from_secs(10));
+    let _ = release_tx.send(());
+    let _ = release_tx.send(());
+    let (service, report) = publisher.join().unwrap();
+    published.unwrap_or_else(|_| {
+        panic!("a publication completes during the first resolving read (parked in {parked_in})")
+    });
+    report.unwrap();
+    let (generation, rows) = evaluation.join().unwrap();
+    assert_eq!(
+        rows,
+        vec!["A.md", "B.md"],
+        "the read answers at its generation"
+    );
+    let current = service
+        .reader()
+        .unwrap()
+        .published_status()
+        .unwrap()
+        .generation;
+    assert_eq!(
+        current.unwrap().get(),
+        generation + 1,
+        "C landed after the read's generation"
+    );
+    assert_eq!(
+        builds.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the read used the writer's prebuilt resolver"
+    );
+}
+
+/// A read that arrives while the writer is still prebuilding the resolver
+/// for the generation it sees waits for that prebuild, with no lock held,
+/// rather than building a second one under the guard.
+#[test]
+fn a_read_that_meets_a_prebuild_in_flight_waits_for_it() {
+    let (mut service, vault, _index) = service(&PARKED_VAULT);
+    evaluate_rows(&service.reader().unwrap());
+    let before = service
+        .reader()
+        .unwrap()
+        .published_status()
+        .unwrap()
+        .generation
+        .unwrap()
+        .get();
+    let (prebuild, hook) = common::rendezvous("resolver prebuild");
+    service.pause_resolver_prebuilds_for_test(hook);
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    let mut reader = service.reader().unwrap();
+    reader.pause_resolver_builds_for_test(Arc::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
+    let publisher = thread::spawn(move || {
+        let report = service.refresh_paths(BTreeSet::from([vp("B.md")]), ChangeCause::Watcher);
+        (service, report)
+    });
+    prebuild.arrived();
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let evaluation = thread::spawn(move || {
+        let answer = evaluate_rows(&reader);
+        let _ = done_tx.send(());
+        answer
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the read waits while the prebuild for its generation is in flight"
+    );
+    prebuild.release();
+    let (generation, rows) = evaluation.join().unwrap();
+    let (_service, report) = publisher.join().unwrap();
+    report.unwrap();
+    assert_eq!(generation, before + 1);
+    assert_eq!(rows, vec!["A.md", "B.md"]);
+    assert_eq!(
+        builds.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the read used the prebuild it waited for"
+    );
+}
+
+/// The Task 11 re-review carry: the pooled evaluation connection goes back
+/// to the pool on every path, the refusals included.
+#[test]
+fn every_evaluation_path_returns_its_pooled_connection() {
+    let (mut service, vault, _index) = service(&PARKED_VAULT);
+    let reader = service.reader().unwrap();
+    evaluate_rows(&reader);
+    let idle = reader.evaluation_pool_len_for_test();
+    assert_eq!(idle, 1, "one evaluation leaves one idle connection");
+
+    let types = BTreeMap::new();
+    let ask = |path: &str, view: Option<&str>| {
+        reader.evaluate_base(
+            &BaseQuery {
+                path: &vp(path),
+                view,
+                this_path: None,
+                types: &types,
+            },
+            &Clock::fixed(NOW, "UTC"),
+        )
+    };
+    assert!(matches!(
+        ask("Q.base", Some("Nope")),
+        Err(BaseQueryError::Compile(_))
+    ));
+    assert_eq!(
+        reader.evaluation_pool_len_for_test(),
+        idle,
+        "after a compile error"
+    );
+    assert!(matches!(
+        ask("Nowhere.base", None),
+        Err(BaseQueryError::NotFound(_))
+    ));
+    assert_eq!(
+        reader.evaluation_pool_len_for_test(),
+        idle,
+        "after not found"
+    );
+
+    let stale = reader.published_status().unwrap().generation.unwrap().get();
+    fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
+    service
+        .refresh_paths(BTreeSet::from([vp("B.md")]), ChangeCause::Watcher)
+        .unwrap();
+    assert!(matches!(
+        reader.open_evaluation_for_test(stale),
+        Err(vault_index::IndexError::LiveStateStale(_))
+    ));
+    assert_eq!(
+        reader.evaluation_pool_len_for_test(),
+        idle,
+        "after a refusal at a generation the writer moved past"
+    );
+    assert_eq!(
+        reader.open_evaluation_for_test(stale + 1).unwrap(),
+        stale + 1
+    );
+    assert_eq!(
+        reader.evaluation_pool_len_for_test(),
+        idle,
+        "after a pinned read"
+    );
+    evaluate_rows(&reader);
+    assert_eq!(reader.evaluation_pool_len_for_test(), idle);
+}

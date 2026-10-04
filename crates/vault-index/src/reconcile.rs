@@ -18,7 +18,7 @@ use crate::metrics::ReconcileMetrics;
 use crate::model::{
     FileFingerprint, Generation, IndexState, LiveState, PublicationBarrier, PublishedState,
 };
-use crate::reader::{IndexReader, PauseHook, write_published};
+use crate::reader::{IndexReader, PauseHook, ResolverSlot, write_published};
 use crate::store::{
     BeginOutcome, DeltaPublication, DeltaPublishOutcome, IndexStore, Publication, TreeDelta, tree,
 };
@@ -60,6 +60,11 @@ pub struct IndexService {
     /// Test-only pause after a full publication has written every row but
     /// before it takes the barrier, invoked with NO guard held.
     row_write_pause: Option<PauseHook>,
+    /// The whole-vault resolver every reader of this service shares, which
+    /// this writer prebuilds after each publication once a reader wants one.
+    resolvers: Arc<ResolverSlot>,
+    /// Test-only pause inside a resolver prebuild, with no guard held.
+    prebuild_pause: Option<PauseHook>,
     pub(crate) last_metrics: Option<ReconcileMetrics>,
     /// Test-only override for `complete_resolution_threshold`, so the
     /// fallback branch can be exercised without a ten-thousand-reference
@@ -133,7 +138,8 @@ impl IndexService {
         let store = IndexStore::open(&config)?;
         let published: PublicationBarrier = Arc::new(RwLock::new(PublishedState::starting()));
         seed_published(&store, &published)?;
-        let reader = IndexReader::open(&config, Arc::clone(&published))?;
+        let resolvers = Arc::new(ResolverSlot::default());
+        let reader = IndexReader::open(&config, Arc::clone(&published), Arc::clone(&resolvers))?;
         // Built before the struct literal because `config` is moved into it.
         let engine = crate::mutate::MutationEngine::new(&config.canonical_vault_root);
         Ok(Self {
@@ -145,6 +151,8 @@ impl IndexService {
             reader,
             publication_pause: None,
             row_write_pause: None,
+            resolvers,
+            prebuild_pause: None,
             last_metrics: None,
             live_threshold_override: None,
             test_hook: None,
@@ -457,7 +465,39 @@ impl IndexService {
     /// own query-only connection, so readers never contend with the writer
     /// for a connection lock.
     pub fn reader(&self) -> Result<IndexReader, IndexError> {
-        IndexReader::open(&self.config, Arc::clone(&self.published))
+        IndexReader::open(
+            &self.config,
+            Arc::clone(&self.published),
+            Arc::clone(&self.resolvers),
+        )
+    }
+
+    /// Pause every resolver prebuild after it has taken its handle on the
+    /// graph and released every guard, before it builds. Test-only: it is
+    /// what lets a test prove a reader meeting a prebuild in flight waits for
+    /// it rather than building under the guard.
+    #[doc(hidden)]
+    pub fn pause_resolver_prebuilds_for_test(&mut self, hook: PauseHook) {
+        self.prebuild_pause = Some(hook);
+    }
+
+    /// Build the resolver for `generation`, which this writer just published,
+    /// if [`ResolverSlot::claim_prebuild`] said one is owed. Runs on the
+    /// writer's own thread after the guard is released, from a handle on the
+    /// graph that is dropped before this returns: the next install is again
+    /// in place, and no publication can wait for this build, because only
+    /// this thread publishes.
+    fn prebuild_resolver(&self, owed: bool, generation: Generation) {
+        if !owed {
+            return;
+        }
+        let resolver = self.published_graph(generation).ok().map(|graph| {
+            if let Some(hook) = &self.prebuild_pause {
+                hook();
+            }
+            Arc::new(crate::reader::whole_vault_resolver(&graph))
+        });
+        self.resolvers.settle(generation, resolver);
     }
 
     pub(crate) fn reader_handle(&self) -> &IndexReader {
@@ -1013,8 +1053,10 @@ impl IndexService {
         let install_start = Instant::now();
         published.generation = Some(generation);
         published.graph = Some(prepared);
+        let owed = self.resolvers.claim_prebuild(generation);
         metrics.stages.live_install += install_start.elapsed();
         drop(published);
+        self.prebuild_resolver(owed, generation);
 
         metrics.stages.sqlite_write += publish_metrics.sqlite_write;
         metrics.stages.sqlite_commit += publish_metrics.sqlite_commit;
@@ -1160,7 +1202,9 @@ impl IndexService {
                 Arc::make_mut(graph).install(delta);
                 timings.live_install = prepare + install_start.elapsed();
                 published.generation = Some(generation);
+                let owed = self.resolvers.claim_prebuild(generation);
                 drop(published);
+                self.prebuild_resolver(owed, generation);
                 Ok(DeltaPublishOutcome::Committed {
                     generation,
                     counts,
@@ -1234,6 +1278,9 @@ impl IndexService {
         let mut published = write_published(&self.published)?;
         published.generation = Some(generation);
         published.graph = Some(graph);
+        let owed = self.resolvers.claim_prebuild(generation);
+        drop(published);
+        self.prebuild_resolver(owed, generation);
         Ok(())
     }
 
