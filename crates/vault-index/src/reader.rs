@@ -133,6 +133,37 @@ impl IndexReader {
         &self,
         query: impl FnOnce(&Transaction<'_>, Generation) -> Result<T, IndexError>,
     ) -> Result<T, IndexError> {
+        self.read_state(|transaction, generation, _| query(transaction, generation))
+    }
+
+    /// `read`, with the published live graph lent for the length of the
+    /// query. The graph is borrowed from under the same publication guard
+    /// `read` holds for the query, never cloned out of it, so the writer's
+    /// next install can still mutate it in place; and its generation is
+    /// checked against the read's, so no answer mixes two generations.
+    pub(crate) fn read_with_graph<T>(
+        &self,
+        query: impl FnOnce(&Transaction<'_>, Generation, &crate::LiveGraph) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
+        self.read_state(|transaction, generation, state| {
+            let graph = state.graph.as_deref().ok_or(IndexError::IndexUnavailable)?;
+            if graph.generation() != generation {
+                return Err(IndexError::LiveStateStale(format!(
+                    "the published graph is at {} but the read is at {}",
+                    graph.generation().get(),
+                    generation.get()
+                )));
+            }
+            query(transaction, generation, graph)
+        })
+    }
+
+    /// The seven steps, with the publication state the guard protects lent
+    /// to `query` for exactly as long as the guard is held.
+    fn read_state<T>(
+        &self,
+        query: impl FnOnce(&Transaction<'_>, Generation, &PublishedState) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
         let published = read_published(&self.published)?;
         let generation = published.generation.ok_or(IndexError::IndexUnavailable)?;
         if let Some(hook) = &self.pause {
@@ -161,7 +192,7 @@ impl IndexReader {
             )));
         }
 
-        let answer = query(&transaction, generation);
+        let answer = query(&transaction, generation, &published);
         // Read-only: nothing to commit, and dropping rolls back a
         // transaction that wrote nothing.
         drop(transaction);

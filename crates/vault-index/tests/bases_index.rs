@@ -701,14 +701,18 @@ fn a_lost_compare_and_swap_to_the_same_base_change_publishes_no_extra_generation
 }
 
 /// A base is something the index parses, so a mutation that moves one is
-/// semantic; an attachment is not, and a base in a hidden folder is never
-/// indexed.
+/// semantic, through every verb that can (write, rename, delete, copy, and a
+/// folder rename or delete over a folder that holds one); an attachment is
+/// not, and a base in a hidden folder is never indexed.
 #[test]
 fn a_mutation_that_moves_a_base_is_semantic() {
     let mut fixture = fixture(&[
         ("Views.base", VIEWS),
         ("image.png", "png"),
         (".hidden/keep.txt", ""),
+        ("Kept/Inner.base", VIEWS),
+        ("Kept/pic.png", "png"),
+        ("Pics/a.png", "png"),
     ]);
     let written = fixture
         .service
@@ -756,10 +760,84 @@ fn a_mutation_that_moves_a_base_is_semantic() {
         })
         .unwrap();
     assert!(!attachment.semantic, "an attachment is still not semantic");
+    let copied = fixture
+        .service
+        .apply_mutation(&Mutation::CopyFile {
+            from: vp("New.base"),
+            to: vp("Copy.base"),
+            expected_source: Precondition::Any,
+            if_exists: vault_index::CopyConflict::Error,
+        })
+        .unwrap();
+    assert!(copied.semantic, "copying a base is semantic");
+    let copied_attachment = fixture
+        .service
+        .apply_mutation(&Mutation::CopyFile {
+            from: vp("Pics/a.png"),
+            to: vp("Pics/b.png"),
+            expected_source: Precondition::Any,
+            if_exists: vault_index::CopyConflict::Error,
+        })
+        .unwrap();
+    assert!(!copied_attachment.semantic, "copying an attachment is not");
+    let moved_folder = fixture
+        .service
+        .apply_mutation(&Mutation::RenameFolder {
+            from: vp("Kept"),
+            to: vp("Shelf"),
+            rewrite_links: false,
+        })
+        .unwrap();
+    assert!(
+        moved_folder.semantic,
+        "renaming a folder that holds a base is semantic"
+    );
+    let moved_pictures = fixture
+        .service
+        .apply_mutation(&Mutation::RenameFolder {
+            from: vp("Pics"),
+            to: vp("Pictures"),
+            rewrite_links: false,
+        })
+        .unwrap();
+    assert!(
+        !moved_pictures.semantic,
+        "renaming a folder of attachments is not"
+    );
+    let dropped_folder = fixture
+        .service
+        .apply_mutation(&Mutation::DeleteFolder {
+            path: vp("Shelf"),
+            mode: Some(vault_index::DeleteMode::Permanent),
+            recursive: true,
+        })
+        .unwrap();
+    assert!(
+        dropped_folder.semantic,
+        "deleting a folder that holds a base is semantic"
+    );
+    let dropped_pictures = fixture
+        .service
+        .apply_mutation(&Mutation::DeleteFolder {
+            path: vp("Pictures"),
+            mode: Some(vault_index::DeleteMode::Permanent),
+            recursive: true,
+        })
+        .unwrap();
+    assert!(
+        !dropped_pictures.semantic,
+        "deleting a folder of attachments is not"
+    );
     let mut changed: BTreeSet<VaultPath> = written.changed_paths;
     changed.extend(renamed.changed_paths);
     changed.extend(deleted.changed_paths);
     changed.extend(attachment.changed_paths);
+    changed.extend(copied.changed_paths);
+    changed.extend(copied_attachment.changed_paths);
+    changed.extend(moved_folder.changed_paths);
+    changed.extend(moved_pictures.changed_paths);
+    changed.extend(dropped_folder.changed_paths);
+    changed.extend(dropped_pictures.changed_paths);
     fixture
         .service
         .refresh_paths(changed, ChangeCause::Mutation)

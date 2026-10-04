@@ -2172,9 +2172,9 @@ impl MutationEngine {
             &resolved,
             mode.unwrap_or_else(|| self.configured_delete_mode()),
         )?;
-        // Read off the Markdown subset, not off `changed_paths`, per the
-        // `MutationOutcome::semantic` table: a folder of attachments moves
-        // every tree row under it and no semantic row at all.
+        // Read off the semantic subset (notes and bases), not off
+        // `changed_paths`, per the `MutationOutcome::semantic` table: a folder
+        // of attachments moves every tree row under it and no semantic row.
         let semantic = removed.iter().any(indexes_semantics);
         let mut changed_paths: BTreeSet<VaultPath> = removed.into_iter().collect();
         // The folder itself is a tree row too, and an empty folder's delete
@@ -2711,9 +2711,9 @@ impl MutationEngine {
         }
         let changed_paths = self.rename_paths_onto(from, to, reservation)?;
         Ok(MutationOutcome {
-            // Read off the Markdown subset, not off `changed_paths`, per the
-            // `MutationOutcome::semantic` table: a folder of attachments moves
-            // every tree row under it and no semantic row at all.
+            // Read off the semantic subset (notes and bases), not off
+            // `changed_paths`, per the `MutationOutcome::semantic` table: a folder
+            // of attachments moves every tree row under it and no semantic row.
             semantic: changed_paths.iter().any(indexes_semantics),
             changed_paths,
             written: None,

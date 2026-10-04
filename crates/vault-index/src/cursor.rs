@@ -45,6 +45,12 @@ pub(crate) enum CursorPosition {
         owner_kind: String,
         owner_id: i64,
     },
+    /// The last base a `list_bases` page served. `bases.path` is that
+    /// table's primary key, so the path alone is unique and is the order the
+    /// page walks.
+    Base {
+        path: String,
+    },
 }
 
 pub(crate) fn encode_cursor(

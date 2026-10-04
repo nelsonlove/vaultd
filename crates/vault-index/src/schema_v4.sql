@@ -237,9 +237,13 @@ CREATE INDEX scan_diagnostics_severity ON scan_diagnostics(severity, ordinal);
 -- each field in its calendar or clock range (month lengths unchecked) —
 -- because the index knows no property types (those
 -- live in `.obsidian/types.json`); the row source applies the declared type
--- at evaluation, and the prefilter only ever narrows to "notes that carry
--- this key", so the kind column is a read optimisation and never a
--- correctness input.
+-- at evaluation. The `key == literal` prefilter (`query/bases.rs`) reads
+-- `kind`, `string_value` and `number_value`, and skips a note only when the
+-- key is missing, `null`, or a scalar of the literal's own kind that differs
+-- (`string` and `date` both count as text); every other row reaches the full
+-- filter, so a coarse kind never drops a row the filter would keep.
+-- The two value indexes below were added after the first v4 build on the
+-- unshipped bases branch; no v4 cache ever shipped, so v4 keeps its number.
 CREATE TABLE property_scalars (
     note_path    TEXT    NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
     ordinal      INTEGER NOT NULL,
@@ -252,6 +256,8 @@ CREATE TABLE property_scalars (
     PRIMARY KEY (note_path, ordinal)
 );
 CREATE INDEX property_scalars_by_key ON property_scalars (key_fold, note_path);
+CREATE INDEX property_scalars_by_string ON property_scalars (key_fold, string_value);
+CREATE INDEX property_scalars_by_number ON property_scalars (key_fold, number_value);
 
 -- bases: one row per `.base` file the scan sees, reconciled in the same
 -- generation as any other change. `source_bytes` lets hydration re-parse a

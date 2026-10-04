@@ -6,6 +6,7 @@ use vault_core::{
     VaultPath,
 };
 
+pub(crate) mod bases;
 pub(crate) mod diagnostics;
 
 use crate::codec;
@@ -82,7 +83,7 @@ pub struct VaultInfo {
     pub refreshed_at_unix_ms: Option<u64>,
 }
 
-fn effective_limit(limit: Option<u32>) -> Result<u32, IndexError> {
+pub(crate) fn effective_limit(limit: Option<u32>) -> Result<u32, IndexError> {
     let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
     if limit == 0 || limit > MAX_PAGE_LIMIT {
         return Err(IndexError::InvalidCursor(format!(

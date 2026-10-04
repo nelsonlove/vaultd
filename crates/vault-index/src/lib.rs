@@ -39,6 +39,9 @@ pub use mutate::{
     MutationEngine, MutationError, MutationOutcome, PatchValue, Precondition, Reservation,
     in_config_zone, is_unindexable, is_unindexable_folder, patch_source, revision_of,
 };
+pub use query::bases::{
+    BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, BaseSummary, parse_property_types,
+};
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus,
     StructuralFacets, VaultInfo,
