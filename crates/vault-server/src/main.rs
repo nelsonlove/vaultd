@@ -51,6 +51,15 @@ struct Cli {
     /// is set, else `<XDG cache dir>/vaultd/run`.
     #[arg(long, value_name = "PATH", num_args = 0..=1, requires = "vault")]
     listen: Option<Option<PathBuf>>,
+    /// How many evaluated views to keep for the current generation. Older
+    /// generations are always dropped; this bounds one generation's worth.
+    #[arg(
+        long,
+        default_value_t = vault_server::DEFAULT_BASE_CACHE_ENTRIES as u64,
+        requires = "vault",
+        value_parser = clap::value_parser!(u64).range(1..=4096),
+    )]
+    bases_cache_entries: u64,
 }
 
 impl Cli {
@@ -109,7 +118,9 @@ fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
         (None, Some(_)) => unreachable!("clap enforces --index requires --vault"),
     };
     let canonical_vault_root = config.canonical_vault_root.clone();
-    let (server, notices) = Server::start(config, cli.runtime_options())?;
+    let (mut server, notices) = Server::start(config, cli.runtime_options())?;
+    // In range by the parser (1 to 4096), so the conversion cannot fail.
+    server.set_base_cache_entries(usize::try_from(cli.bases_cache_entries)?);
     Ok((server, Some(notices), Some(canonical_vault_root)))
 }
 

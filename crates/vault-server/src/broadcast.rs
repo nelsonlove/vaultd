@@ -487,6 +487,7 @@ mod tests {
                 deleted: 0,
             },
             affected_reference_count: 0,
+            reresolved: Vec::new(),
             complete_resolution: false,
             metrics: ReconcileMetrics::default(),
         }))

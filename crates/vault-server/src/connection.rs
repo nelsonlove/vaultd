@@ -499,7 +499,30 @@ pub(crate) fn dispatch(
                 subscriptions.activate_new();
             }
             ServerInput::Notice(notice) => {
+                // Computed for every committed generation, whether or not this
+                // connection has a subscription: the tracker must see each
+                // generation to keep its base catalog current, and the answer
+                // is memoized per generation, so N connections pay once. The
+                // invalidations are queued right behind the generation's own
+                // event; a resync carries none (its client re-reads views
+                // with everything else).
+                let stale = match notice.as_ref() {
+                    RuntimeNotice::Generation(report) => server.stale_views(report),
+                    _ => Vec::new(),
+                };
                 subscriptions.enqueue_notice(*notice);
+                // One generation can stale more views than a subscriber queue
+                // holds, so they are queued a half-queue at a time and drained
+                // in between: the bound is still the number of (base, view)
+                // pairs, delivered with the output channel's backpressure,
+                // rather than collapsing every such generation onto a lag
+                // marker.
+                for chunk in stale.chunks(crate::subscriptions::SUBSCRIBER_CAPACITY / 2) {
+                    if !drain(&mut subscriptions, outputs) {
+                        return Ok(());
+                    }
+                    subscriptions.enqueue_views_invalidated(chunk);
+                }
                 if !drain(&mut subscriptions, outputs) {
                     return Ok(());
                 }

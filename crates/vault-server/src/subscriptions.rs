@@ -55,7 +55,7 @@ use vault_protocol::{
     ChangeSetDto, ConfigChangedEventDto, ErrorCode, EventEnvelope, GenerationCauseDto,
     GenerationCommittedEventDto, LiveStateDto, ProtocolError, ResyncReasonDto,
     ResyncRequiredEventDto, RuntimeEventDto, RuntimeStateChangedEventDto, SubscribeEventsResponse,
-    UnsubscribeResponse,
+    UnsubscribeResponse, ViewsInvalidatedEventDto,
 };
 
 use crate::runtime::{ResyncReason, RuntimeNotice};
@@ -193,6 +193,7 @@ fn event_generation(event: &RuntimeEventDto) -> Option<u64> {
     match event {
         RuntimeEventDto::GenerationCommitted(committed) => Some(committed.generation),
         RuntimeEventDto::ResyncRequired(resync) => resync.current_generation,
+        RuntimeEventDto::ViewsInvalidated(event) => Some(event.generation),
         // Semantically inert: an event kind this build has never heard of
         // names no generation, and neither does a configuration-zone write —
         // the zone is not indexed, so no generation contains it. Ruling B2
@@ -478,6 +479,22 @@ impl SubscriptionRegistry {
             }
             for event in &events {
                 subscription.push(event.clone());
+            }
+        }
+    }
+
+    /// Offer the views one generation invalidated to every active
+    /// subscription, through the same bounded queue as every other event: a
+    /// lagging subscriber's marker absorbs them like any generation detail.
+    /// Not filtered by a subscription's start point (like `resync_required`,
+    /// it is news whatever the start).
+    pub fn enqueue_views_invalidated(&mut self, events: &[ViewsInvalidatedEventDto]) {
+        for subscription in self.subscriptions.values_mut() {
+            if !subscription.active {
+                continue;
+            }
+            for event in events {
+                subscription.push(RuntimeEventDto::ViewsInvalidated(event.clone()));
             }
         }
     }

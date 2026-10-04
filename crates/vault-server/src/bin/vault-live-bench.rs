@@ -698,6 +698,7 @@ fn synthetic_generation_notice(generation: u64, previous: Option<u64>) -> Runtim
             deleted: 0,
         },
         affected_reference_count: 1,
+        reresolved: Vec::new(),
         complete_resolution: false,
         metrics: ReconcileMetrics::default(),
     }))

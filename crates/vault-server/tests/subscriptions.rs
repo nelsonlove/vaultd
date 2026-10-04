@@ -63,6 +63,7 @@ fn generation_notice(generation: u64, modified: Vec<VaultPath>) -> RuntimeNotice
             deleted: 0,
         },
         affected_reference_count: 7,
+        reresolved: Vec::new(),
         complete_resolution: false,
         metrics: ReconcileMetrics::default(),
     }))
@@ -567,6 +568,55 @@ fn a_state_change_arriving_at_capacity_survives_the_collapse() {
             );
         }
         other => panic!("expected a subscriber_lag marker last, got {other:?}"),
+    }
+}
+
+fn invalidated(view: usize, generation: u64) -> vault_protocol::ViewsInvalidatedEventDto {
+    vault_protocol::ViewsInvalidatedEventDto {
+        base: "V.base".into(),
+        view: format!("View{view}"),
+        generation,
+    }
+}
+
+/// `views_invalidated` rides the same bounded queue as every event: it is
+/// not filtered by a subscription's start point, it reaches only active
+/// subscriptions, and past the queue's capacity it collapses onto the lag
+/// marker naming its generation.
+#[test]
+fn views_invalidated_rides_the_bounded_queue_and_its_lag_marker() {
+    let mut registry = SubscriptionRegistry::new();
+    registry.subscribe(&status(Some(5), LiveState::Watching));
+    registry.enqueue_views_invalidated(&[invalidated(0, 4)]);
+    assert!(drain(&mut registry).is_empty(), "inactive: nothing");
+
+    registry.activate_new();
+    registry.enqueue_views_invalidated(&[invalidated(0, 4), invalidated(1, 4)]);
+    let events = drain(&mut registry);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            RuntimeEventDto::ViewsInvalidated(invalidated(0, 4)),
+            RuntimeEventDto::ViewsInvalidated(invalidated(1, 4)),
+        ],
+        "an old generation's invalidation is still news"
+    );
+
+    let many: Vec<_> = (0..=SUBSCRIBER_CAPACITY)
+        .map(|view| invalidated(view, 9))
+        .collect();
+    registry.enqueue_views_invalidated(&many);
+    let events = drain(&mut registry);
+    assert_eq!(events.len(), 1, "collapsed: {events:?}");
+    match &events[0].event {
+        RuntimeEventDto::ResyncRequired(resync) => {
+            assert_eq!(resync.reason, ResyncReasonDto::SubscriberLag);
+            assert_eq!(resync.current_generation, Some(9));
+        }
+        other => panic!("expected the lag marker, got {other:?}"),
     }
 }
 

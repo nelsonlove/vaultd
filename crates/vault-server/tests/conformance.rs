@@ -8,7 +8,10 @@
 //! `vault_identity` (a different scratch directory), `refreshed_at_unix_ms`
 //! (a different instant), `ctime_unix_ms` and `mtime_unix_ms` (the same files,
 //! created and written at two different instants), and `socket_path` (one run
-//! has one and the other does not, which is the point of the field).
+//! has one and the other does not, which is the point of the field). One more
+//! value sits inside a cursor rather than beside it: an `evaluate_base`
+//! cursor's `instant` (the clock reading its result was computed at), which
+//! [`settle_cursor_instants`] sets to `0` and nothing else.
 //!
 //! Everything else is compared as **bytes**, key order included. The
 //! normalizer edits the raw line in place rather than re-serializing it
@@ -236,6 +239,65 @@ fn normalize(line: &str) -> String {
     out
 }
 
+/// The one environmental value inside a cursor: an `evaluate_base` cursor
+/// carries the instant its result was computed at (so an evicted page is
+/// recomputed at it), and the two runs compute at two different instants.
+/// Every `next_cursor` is decoded, `"instant":<n>` is set to `0` in place,
+/// and the cursor is re-encoded, so every other byte of every cursor is still
+/// compared.
+fn settle_cursor_instants(line: &str) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    const KEY: &str = r#""next_cursor":""#;
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find(KEY) {
+        let value_start = start + KEY.len();
+        let Some(length) = rest[value_start..].find('"') else {
+            break;
+        };
+        let cursor = &rest[value_start..value_start + length];
+        out.push_str(&rest[..value_start]);
+        let settled = URL_SAFE_NO_PAD
+            .decode(cursor)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|payload| {
+                let at = payload.find(r#""instant":"#)? + r#""instant":"#.len();
+                let digits = payload[at..]
+                    .find(|c: char| !c.is_ascii_digit() && c != '-')
+                    .unwrap_or(payload.len() - at);
+                let payload = format!("{}0{}", &payload[..at], &payload[at + digits..]);
+                Some(URL_SAFE_NO_PAD.encode(payload))
+            });
+        out.push_str(settled.as_deref().unwrap_or(cursor));
+        rest = &rest[value_start + length..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn only_an_evaluation_cursors_instant_is_settled() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let cursor = |payload: &str| URL_SAFE_NO_PAD.encode(payload);
+    let evaluation =
+        cursor(r#"{"generation":1,"base":"V.base","offset":1,"instant":1791114952359}"#);
+    let settled = cursor(r#"{"generation":1,"base":"V.base","offset":1,"instant":0}"#);
+    let other = cursor(r#"{"generation":1,"position":"One.md"}"#);
+    assert_eq!(
+        settle_cursor_instants(&format!(r#"{{"next_cursor":"{evaluation}","x":1}}"#)),
+        format!(r#"{{"next_cursor":"{settled}","x":1}}"#)
+    );
+    let untouched = format!(r#"{{"next_cursor":"{other}","n":"next_cursor"}}"#);
+    assert_eq!(settle_cursor_instants(&untouched), untouched);
+    assert_eq!(
+        settle_cursor_instants(r#"{"next_cursor":null}"#),
+        r#"{"next_cursor":null}"#
+    );
+}
+
 /// The `next_cursor` a response carries, when it carries one that is not null.
 fn next_cursor(line: &str) -> Option<String> {
     fn find(value: &serde_json::Value) -> Option<String> {
@@ -382,7 +444,10 @@ fn assert_same(what: &str, over_stdio: &[String], over_socket: &[String]) {
 fn normalized(transport: Transport, lines: &[String]) -> (Vec<String>, usize) {
     let run = run_through(transport, lines);
     (
-        run.lines.iter().map(|line| normalize(line)).collect(),
+        run.lines
+            .iter()
+            .map(|line| settle_cursor_instants(&normalize(line)))
+            .collect(),
         run.cursors_followed,
     )
 }
@@ -440,6 +505,19 @@ fn the_socket_answers_the_fixture_set_exactly_as_stdio_does() {
         )),
         "the non-finite row is in the transcript"
     );
+
+    // The Bases fixtures and the mutations after them produce
+    // `views_invalidated` lines (`Views.base` has views with no prefilter, so
+    // every mutation stales them), or "both transports carry the same ones"
+    // would pass vacuously over a transcript that carries none.
+    for (door, transcript) in [("stdio", &over_stdio), ("socket", &over_socket)] {
+        assert!(
+            transcript
+                .iter()
+                .any(|line| line.contains(r#""type":"views_invalidated""#)),
+            "{door}: no views_invalidated line in the transcript"
+        );
+    }
 
     assert_events_are_where_they_arrived(&over_stdio, "stdio");
     assert_events_are_where_they_arrived(&over_socket, "socket");

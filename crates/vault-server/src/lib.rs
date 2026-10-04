@@ -9,6 +9,9 @@ pub mod service;
 pub mod signals;
 pub mod stdio;
 pub mod subscriptions;
+mod views;
+
+pub use bases::DEFAULT_BASE_CACHE_ENTRIES;
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -73,8 +76,12 @@ pub struct Server {
     /// silently bypassing it.
     engine: Option<vault_index::MutationEngine>,
     /// Evaluated views at the current generation, so the pages of one
-    /// `evaluate_base` result are cut from one computation.
+    /// `evaluate_base` result are cut from one computation. Bounded by
+    /// `--bases-cache-entries`.
     base_cache: bases::BaseCache,
+    /// What each view last answered and every base's views, for the
+    /// `views_invalidated` staleness rule each dispatcher runs.
+    views: views::ViewTracker,
 }
 
 struct Live {
@@ -264,6 +271,7 @@ impl Server {
             socket_path: None,
             engine: None,
             base_cache: bases::BaseCache::default(),
+            views: views::ViewTracker::default(),
         }
     }
 
@@ -291,6 +299,7 @@ impl Server {
             socket_path: None,
             engine: Some(engine),
             base_cache: bases::BaseCache::default(),
+            views: views::ViewTracker::default(),
         }
     }
 
@@ -382,6 +391,36 @@ impl Server {
     /// when it has no socket.
     pub fn set_socket_path(&mut self, path: Option<String>) {
         self.socket_path = path;
+    }
+
+    /// Bound the evaluated-view cache to `entries` results (at least one),
+    /// dropping whatever it held.
+    pub fn set_base_cache_entries(&mut self, entries: usize) {
+        self.base_cache = bases::BaseCache::with_capacity(entries);
+    }
+
+    /// The views one committed generation may have changed, one event each,
+    /// memoized per generation so every dispatcher shares one answer.
+    ///
+    /// Empty when the generation's change set is too large to carry
+    /// (`generation_committed` then arrives as counts with a
+    /// `resync_required`, and a client that re-reads everything re-reads its
+    /// views too), but the rule still runs, so the tracker never misses a
+    /// generation's bases.
+    pub(crate) fn stale_views(
+        &self,
+        report: &vault_index::LiveRefreshReport,
+    ) -> Vec<vault_protocol::ViewsInvalidatedEventDto> {
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        let stale = self.views.stale_views(&live.reader, report);
+        let changes = &report.changes;
+        let total = changes.created.len() + changes.modified.len() + changes.deleted.len();
+        if total > subscriptions::DETAILED_PATH_LIMIT {
+            return Vec::new();
+        }
+        stale
     }
 
     /// Where this daemon is listening, or `None` when it has no socket.
@@ -1338,6 +1377,7 @@ impl Server {
                 Some(reader) => match bases::evaluate_base(
                     reader,
                     &self.base_cache,
+                    &self.views,
                     || self.property_types(),
                     params,
                 ) {

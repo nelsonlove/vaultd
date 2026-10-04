@@ -252,7 +252,9 @@ fn a_subscription_streams_post_commit_generations_and_stops_on_unsubscribe() {
                     // A configuration-zone write names no generation either
                     // — the zone is not indexed — so it is not the marker
                     // this loop is waiting for.
-                    RuntimeEventDto::RuntimeStateChanged(_) | RuntimeEventDto::ConfigChanged(_) => {
+                    RuntimeEventDto::RuntimeStateChanged(_)
+                    | RuntimeEventDto::ConfigChanged(_)
+                    | RuntimeEventDto::ViewsInvalidated(_) => {
                         continue;
                     }
                     // Ruling B2 (task 1): an event kind this build has never
@@ -409,7 +411,9 @@ fn get_vault_info_reports_the_runtimes_live_state() {
             Line::Event(event) => match event.event {
                 RuntimeEventDto::ResyncRequired(_) => break,
                 RuntimeEventDto::GenerationCommitted(_) => break,
-                RuntimeEventDto::RuntimeStateChanged(_) | RuntimeEventDto::ConfigChanged(_) => {
+                RuntimeEventDto::RuntimeStateChanged(_)
+                | RuntimeEventDto::ConfigChanged(_)
+                | RuntimeEventDto::ViewsInvalidated(_) => {
                     continue;
                 }
                 // Ruling B2 (task 1): an event kind this build has never
