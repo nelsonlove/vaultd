@@ -869,3 +869,171 @@ pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
+
+/// JavaScript's text for a number JSON cannot carry.
+fn non_finite_text(value: f64) -> &'static str {
+    if value.is_nan() {
+        "NaN"
+    } else if value > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    }
+}
+
+/// A YAML value as plain JSON, for a view's open options and a column's
+/// settings. A non-finite float has no JSON number, so it travels as
+/// JavaScript's text for it.
+pub(crate) fn json_of(value: &PropertyValue) -> serde_json::Value {
+    match value {
+        PropertyValue::Null => serde_json::Value::Null,
+        PropertyValue::Boolean(flag) => serde_json::Value::Bool(*flag),
+        PropertyValue::Integer(number) => serde_json::Value::from(*number),
+        PropertyValue::Float(number) => match serde_json::Number::from_f64(*number) {
+            Some(number) => serde_json::Value::Number(number),
+            None => serde_json::Value::String(non_finite_text(*number).to_string()),
+        },
+        PropertyValue::String(text) => serde_json::Value::String(text.clone()),
+        PropertyValue::Sequence(items) => {
+            serde_json::Value::Array(items.iter().map(|item| json_of(&item.value)).collect())
+        }
+        PropertyValue::Mapping(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.value.clone(), json_of(&value.value)))
+                .collect(),
+        ),
+    }
+}
+
+/// Declared key-value pairs as one JSON object.
+pub(crate) fn options(entries: &[(String, PropertyValue)]) -> serde_json::Value {
+    serde_json::Value::Object(
+        entries
+            .iter()
+            .map(|(key, value)| (key.clone(), json_of(value)))
+            .collect(),
+    )
+}
+
+/// A date as ISO 8601 in the clock's zone: `YYYY-MM-DD` without a time,
+/// `YYYY-MM-DDTHH:mm:ss.SSS±HH:MM` with one.
+fn iso_date(date: vault_bases::DateValue, clock: &vault_bases::Clock) -> String {
+    let format = if date.has_time {
+        "YYYY-MM-DD[T]HH:mm:ss.SSSZ"
+    } else {
+        "YYYY-MM-DD"
+    };
+    vault_bases::format_date(date, format, clock)
+        .expect("every token in the ISO format is implemented")
+}
+
+/// 2^53: below it, every whole `f64` is an exact `i64` and a JavaScript
+/// client prints it as an integer.
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
+/// One evaluated cell on the wire. An error cell keeps its row; the daemon
+/// renders nothing. A non-finite number has no JSON number, so it travels as
+/// a `string` cell holding JavaScript's text (`NaN`, `Infinity`,
+/// `-Infinity`).
+pub(crate) fn cell(
+    value: &vault_bases::view::Cell,
+    clock: &vault_bases::Clock,
+) -> vault_protocol::CellDto {
+    match value {
+        Ok(value) => value_cell(value, clock, 0),
+        Err(error) => vault_protocol::CellDto::Error {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// How deep a cell may nest. A formula can build a list as deep as the view
+/// has rows (`values.reduce([acc], [])`), and both this conversion and the
+/// JSON writer recurse once per level; the value at the cap becomes an error
+/// cell (the levels above it are kept) rather than a stack overflow on the
+/// dispatcher thread. Each cell level is
+/// two JSON levels, so 32 keeps a whole response inside `serde_json`'s
+/// default reading limit of 128 for every client.
+const MAX_CELL_DEPTH: usize = 32;
+
+fn value_cell(
+    value: &vault_bases::Value,
+    clock: &vault_bases::Clock,
+    depth: usize,
+) -> vault_protocol::CellDto {
+    use vault_bases::Value as V;
+    use vault_protocol::CellDto as C;
+    if depth >= MAX_CELL_DEPTH {
+        return C::Error {
+            message: format!("value nested too deeply (more than {MAX_CELL_DEPTH} levels)"),
+        };
+    }
+    let depth = depth + 1;
+    match value {
+        V::Null => C::Null,
+        V::String(text) => C::String {
+            value: text.clone(),
+        },
+        // A whole number goes on the wire as an integer (`60`, not `60.0`),
+        // which is what a JavaScript client prints for it.
+        V::Number(number) if number.fract() == 0.0 && number.abs() < EXACT_INTEGER_LIMIT => {
+            C::Number {
+                value: serde_json::Number::from(*number as i64),
+            }
+        }
+        V::Number(number) => match serde_json::Number::from_f64(*number) {
+            Some(number) => C::Number { value: number },
+            None => C::String {
+                value: non_finite_text(*number).to_string(),
+            },
+        },
+        V::Boolean(flag) => C::Boolean { value: *flag },
+        V::Date(date) => C::Date {
+            value: iso_date(*date, clock),
+            has_time: date.has_time,
+        },
+        V::Duration(duration) => C::Duration {
+            value: duration.ms,
+            months: duration.months,
+        },
+        V::List(items) => C::List {
+            value: items
+                .iter()
+                .map(|item| value_cell(item, clock, depth))
+                .collect(),
+        },
+        V::Object(entries) => C::Object {
+            value: entries
+                .iter()
+                .map(|(key, value)| vault_protocol::ObjectEntryDto {
+                    key: key.clone(),
+                    value: value_cell(value, clock, depth),
+                })
+                .collect(),
+        },
+        V::Link(link) => C::Link {
+            target: link.target.clone(),
+            display: link
+                .display
+                .as_ref()
+                .map(|display| Box::new(value_cell(display, clock, depth))),
+            resolved: link.resolved.as_ref().map(|path| path.as_str().to_string()),
+        },
+        V::File(path) => C::File {
+            path: path.as_str().to_string(),
+        },
+        V::Regexp(regexp) => C::String {
+            value: format!("/{}/{}", regexp.source, regexp.flags),
+        },
+        V::Image(text) => C::Image {
+            value: text.clone(),
+        },
+        V::Icon(text) => C::Icon {
+            value: text.clone(),
+        },
+        V::Html(text) => C::Html {
+            value: text.clone(),
+        },
+    }
+}

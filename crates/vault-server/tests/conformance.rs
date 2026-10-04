@@ -105,6 +105,15 @@ fn build_vault() -> (TempDir, TempDir, TempDir) {
         "# Nested\n\n[[One]]\n",
     )
     .expect("write Nested");
+    // The fixture base reads no `file.ctime`/`file.mtime` and no `now()`:
+    // those differ between the two runs for reasons the normalizer does not
+    // (and must not) blank.
+    std::fs::write(
+        vault.path().join("Views.base"),
+        "formulas:\n  bad: 'title +'\nviews:\n  - type: table\n    name: Table\n    order: [file.name, title]\n  - type: cards\n    name: Cards\n  - type: table\n    name: Bad\n    order: [formula.bad]\n",
+    )
+    .expect("write Views.base");
+    std::fs::write(vault.path().join("Broken.base"), "views: [\n").expect("write Broken.base");
     (vault, index, run)
 }
 
@@ -402,8 +411,8 @@ fn the_socket_answers_the_fixture_set_exactly_as_stdio_does() {
     // The paging is real on both doors: a cursor was offered and followed.
     assert_eq!(
         (stdio_cursors, socket_cursors),
-        (2, 2),
-        "both doors must have followed the two cursors the fixture set asks for"
+        (3, 3),
+        "both doors must have followed the three cursors the fixture set asks for"
     );
     assert!(
         over_stdio

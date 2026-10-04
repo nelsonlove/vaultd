@@ -611,7 +611,8 @@ impl std::error::Error for RefreshFailure {}
 /// `None` only when nothing has ever been committed. `revision` is the
 /// content revision the mutation wrote, and is `None` for everything with no
 /// bytes to hash: a folder operation, or a delete. `semantic` is the engine's
-/// own statement about whether the Markdown half of the index moved, never a
+/// own statement about whether the semantic half of the index (notes and
+/// bases) moved, never a
 /// fact derived from `generation` — a folder creation moves the generation
 /// through the file tree while nothing semantic happened at all.
 ///

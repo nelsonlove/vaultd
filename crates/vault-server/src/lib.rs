@@ -1,3 +1,4 @@
+mod bases;
 pub mod broadcast;
 pub mod connection;
 mod convert;
@@ -71,6 +72,9 @@ pub struct Server {
     /// `--read-only` exactly as the coordinator path does, rather than
     /// silently bypassing it.
     engine: Option<vault_index::MutationEngine>,
+    /// Evaluated views at the current generation, so the pages of one
+    /// `evaluate_base` result are cut from one computation.
+    base_cache: bases::BaseCache,
 }
 
 struct Live {
@@ -205,7 +209,7 @@ fn runtime_not_ready(message: &str) -> ProtocolError {
 /// A NUL is `invalid_path` — "a parameter is not a valid vault-relative path" —
 /// rather than the `zone_violation` the engine answers, which was always an
 /// overload of the one refusal the engine had a variant for.
-fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
+pub(crate) fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
     let invalid = |value: &str| ProtocolError {
         code: ErrorCode::InvalidPath,
         message: format!("invalid vault path: {value:?}"),
@@ -259,6 +263,7 @@ impl Server {
             sessions: None,
             socket_path: None,
             engine: None,
+            base_cache: bases::BaseCache::default(),
         }
     }
 
@@ -285,6 +290,7 @@ impl Server {
             sessions: Some(sessions),
             socket_path: None,
             engine: Some(engine),
+            base_cache: bases::BaseCache::default(),
         }
     }
 
@@ -540,6 +546,20 @@ impl Server {
         engine.read_file(path).map_err(convert::mutation_error)
     }
 
+    /// The vault's declared property types, read fresh through the same
+    /// engine `read_file` uses: Obsidian rewrites `.obsidian/types.json`
+    /// itself, and the configuration zone is not indexed. A missing,
+    /// unreadable or malformed file is no declared types, never an error.
+    fn property_types(&self) -> std::collections::BTreeMap<String, vault_bases::PropertyType> {
+        let Ok(path) = VaultPath::new(format!("{}/types.json", vault_index::CONFIG_ZONE)) else {
+            return Default::default();
+        };
+        match self.read_file(&path) {
+            Ok((bytes, _)) => vault_index::parse_property_types(&String::from_utf8_lossy(&bytes)),
+            Err(_) => Default::default(),
+        }
+    }
+
     /// List one directory's immediate entries, off the coordinator thread for
     /// [`Server::read_file`]'s reasons and through the engine for the same one:
     /// `resolve` is where containment lives.
@@ -596,7 +616,8 @@ impl Server {
     /// `WriteFileResponse::semantic` answers "is this path inside the indexed
     /// universe" — a question about a path, and deliberately not the same
     /// question as `MutationOutcome::semantic` ("did indexed rows move", which
-    /// is always `false` for a raw write). The path it is about is the one the
+    /// for a raw write is `true` only for an indexable `.base`, and then this
+    /// answer is `true` too). The path it is about is the one the
     /// engine resolved and canonicalized, never the one the request carried:
     ///
     /// * an alias anywhere in the vault can resolve **into** `.obsidian/`, and
@@ -1312,6 +1333,25 @@ impl Server {
                     }
                 }
             }
+            Request::EvaluateBase(params) => match reader {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(reader) => match bases::evaluate_base(
+                    reader,
+                    &self.base_cache,
+                    || self.property_types(),
+                    params,
+                ) {
+                    Ok(answer) => ResponseEnvelope::success(id, Response::EvaluateBase(answer)),
+                    Err(error) => ResponseEnvelope::error(id, error),
+                },
+            },
+            Request::ListBases(params) => match reader {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(reader) => match bases::list_bases(reader, params) {
+                    Ok(page) => ResponseEnvelope::success(id, Response::ListBases(page)),
+                    Err(error) => ResponseEnvelope::error(id, error),
+                },
+            },
             Request::SnapshotNotes(params) => {
                 if !self.may_use_session(connection, &params.snapshot_id) {
                     return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));

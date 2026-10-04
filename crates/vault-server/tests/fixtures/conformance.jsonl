@@ -23,6 +23,19 @@
 {"version":1,"id":"c27","request":{"method":"get_backlinks","params":{"path":"One.md","cursor":null,"limit":100}}}
 {"version":1,"id":"c28","request":{"method":"list_references","params":{"source_path":"Folder/Nested.md","status":null,"cursor":null,"limit":100}}}
 {"version":1,"id":"c29","request":{"method":"get_diagnostics","params":{"path":null,"severity":null,"cursor":null,"limit":100}}}
+# Bases: the listing, a view and its pages, a view embed, and every refusal.
+{"version":1,"id":"c40","request":{"method":"list_bases","params":{}}}
+{"version":1,"id":"c41","request":{"method":"evaluate_base","params":{"path":"Views.base"}}}
+{"version":1,"id":"c42","request":{"method":"evaluate_base","params":{"path":"Views.base","limit":1}}}
+{"version":1,"id":"c43","request":{"method":"evaluate_base","params":{"path":"Views.base","limit":1,"cursor":"{{next_cursor}}"}}}
+{"version":1,"id":"c44","request":{"method":"evaluate_base","params":{"path":"Views.base","view":"Cards"}}}
+{"version":1,"id":"c45","request":{"method":"resolve_link","params":{"source_path":"One.md","destination":"Views.base#Table"}}}
+{"version":1,"id":"c46","request":{"method":"evaluate_base","params":{"path":"Views.base","view":"Nope"}}}
+{"version":1,"id":"c47","request":{"method":"evaluate_base","params":{"path":"Broken.base"}}}
+{"version":1,"id":"c48","request":{"method":"evaluate_base","params":{"path":"Views.base","view":"Bad"}}}
+{"version":1,"id":"c49","request":{"method":"evaluate_base","params":{"path":"Views.base","this_path":"Gone.md"}}}
+{"version":1,"id":"c50","request":{"method":"evaluate_base","params":{"path":"Views.base","limit":0}}}
+{"version":1,"id":"c51","request":{"method":"evaluate_base","params":{"path":"Nowhere.base"}}}
 # Refusals, each of which must read identically through either door.
 {"version":1,"id":"c10","request":{"method":"get_note","params":{"path":"Nowhere.md"}}}
 {"version":1,"id":"c11","request":{"method":"get_note","params":{"path":"../escape.md"}}}
