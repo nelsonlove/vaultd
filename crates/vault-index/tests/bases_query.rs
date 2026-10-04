@@ -1,7 +1,11 @@
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use tempfile::TempDir;
 use vault_bases::eval::EvalContext;
@@ -11,7 +15,7 @@ use vault_bases::{
     parse_base, text,
 };
 use vault_core::{PropertyValue, VaultPath};
-use vault_index::{BaseQuery, BaseQueryError, IndexConfig, IndexService};
+use vault_index::{BaseQuery, BaseQueryError, ChangeCause, IndexConfig, IndexReader, IndexService};
 
 const NOW: i64 = 1_768_491_000_000;
 
@@ -414,4 +418,166 @@ fn folder_tag_and_extension_prefilters_narrow_exactly() {
         5,
         "no prefilter is every file"
     );
+}
+
+/// The equal-value probe of each `PropertyEquals` literal is served by its
+/// value index, not by the `key_fold` prefix alone.
+#[test]
+fn the_value_indexes_serve_the_property_prefilter() {
+    let (service, _vault, _index) = service(&[
+        ("a.md", "---\nstatus: p\nn: 1\n---\n"),
+        ("b.md", "---\nstatus: q\nn: 2\n---\n"),
+    ]);
+    let none = BTreeMap::new();
+    let plan = |prefilter: Prefilter| -> String {
+        service
+            .reader()
+            .unwrap()
+            .base_candidates_plan_for_test(&[prefilter], &none)
+            .unwrap()
+            .join("\n")
+    };
+    let text = plan(equals("status", ScalarLiteral::String("p".into())));
+    assert!(
+        text.contains("property_scalars_by_string (key_fold=? AND string_value=?)"),
+        "{text}"
+    );
+    let number = plan(equals("n", ScalarLiteral::Number(1.0)));
+    assert!(
+        number.contains("property_scalars_by_number (key_fold=? AND number_value=?)"),
+        "{number}"
+    );
+    let flag = plan(equals("n", ScalarLiteral::Boolean(true)));
+    assert!(
+        flag.contains("property_scalars_by_number (key_fold=? AND number_value=?)"),
+        "{flag}"
+    );
+}
+
+/// A parking hook for an evaluation: it reports that the evaluation is
+/// parked (after the publication guard is released, before evaluating) and
+/// waits for a release, at most 30 s so a failed test cannot wedge.
+fn parking(reader: &mut IndexReader) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let parked_tx = Mutex::new(parked_tx);
+    let release_rx = Mutex::new(release_rx);
+    reader.pause_evaluations_for_test(Arc::new(move || {
+        let _ = parked_tx.lock().unwrap().send(());
+        let _ = release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }));
+    (parked_rx, release_tx)
+}
+
+const PARKED_VAULT: [(&str, &str); 2] = [
+    ("A.md", "---\nn: 1\n---\n"),
+    (
+        "Q.base",
+        "views:\n  - type: table\n    name: T\n    filters: 'file.ext == \"md\"'\n    order: [n]\n",
+    ),
+];
+
+fn evaluate_rows(reader: &IndexReader) -> (u64, Vec<String>) {
+    let types = BTreeMap::new();
+    let answer = reader
+        .evaluate_base(
+            &BaseQuery {
+                path: &vp("Q.base"),
+                view: None,
+                this_path: None,
+                types: &types,
+            },
+            &Clock::fixed(NOW, "UTC"),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    (
+        answer.generation.get(),
+        answer
+            .result
+            .rows
+            .iter()
+            .map(|row| row.path.as_str().to_string())
+            .collect(),
+    )
+}
+
+/// H1: a publication completes while an evaluation is in flight, and the
+/// evaluation still answers at the generation it started on (snapshot
+/// isolation). The `recv_timeout` is a hang detector, not a timing bound.
+#[test]
+fn a_publication_never_waits_for_an_evaluation() {
+    let (mut service, vault, _index) = service(&PARKED_VAULT);
+    let mut reader = service.reader().unwrap();
+    let (parked, release) = parking(&mut reader);
+    let before = reader.published_status().unwrap().generation.unwrap().get();
+    let evaluation = thread::spawn(move || evaluate_rows(&reader));
+    parked
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the evaluation parks after releasing the guard");
+
+    fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let publisher = thread::spawn(move || {
+        let report = service.refresh_paths(BTreeSet::from([vp("B.md")]), ChangeCause::Watcher);
+        let _ = done_tx.send(());
+        (service, report)
+    });
+    let published = done_rx.recv_timeout(Duration::from_secs(10));
+    let _ = release.send(());
+    let (service, report) = publisher.join().unwrap();
+    published.expect("a publication completes while an evaluation is parked");
+    report.unwrap();
+    let after = service
+        .reader()
+        .unwrap()
+        .published_status()
+        .unwrap()
+        .generation
+        .unwrap()
+        .get();
+    assert_eq!(after, before + 1, "the publication landed");
+
+    let (generation, rows) = evaluation.join().unwrap();
+    assert_eq!(
+        generation, before,
+        "the parked evaluation keeps its generation"
+    );
+    assert_eq!(rows, vec!["A.md"], "and that generation's rows");
+    assert_eq!(
+        evaluate_rows(&service.reader().unwrap()),
+        (after, vec!["A.md".to_string(), "B.md".to_string()]),
+        "a new evaluation sees the publication"
+    );
+}
+
+/// H1: another read on the same reader answers while an evaluation is in
+/// flight, so one evaluation never blocks every other connection's reads.
+#[test]
+fn an_evaluation_never_blocks_another_read() {
+    let (service, _vault, _index) = service(&PARKED_VAULT);
+    let mut reader = service.reader().unwrap();
+    let (parked, release) = parking(&mut reader);
+    let reader = Arc::new(reader);
+    let evaluating = Arc::clone(&reader);
+    let evaluation = thread::spawn(move || evaluate_rows(&evaluating));
+    parked
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the evaluation parks after releasing the guard");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let listing = Arc::clone(&reader);
+    let other = thread::spawn(move || {
+        let notes = listing.list_notes(None, None).map(|page| page.items.len());
+        let _ = done_tx.send(());
+        notes
+    });
+    let answered = done_rx.recv_timeout(Duration::from_secs(10));
+    let _ = release.send(());
+    let notes = other.join().unwrap();
+    answered.expect("another read answers while an evaluation is parked");
+    assert_eq!(notes.unwrap(), 1);
+    assert_eq!(evaluation.join().unwrap().1, vec!["A.md"]);
 }

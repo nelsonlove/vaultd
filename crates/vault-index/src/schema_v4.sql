@@ -242,7 +242,9 @@ CREATE INDEX scan_diagnostics_severity ON scan_diagnostics(severity, ordinal);
 -- key is missing, `null`, or a scalar of the literal's own kind that differs
 -- (`string` and `date` both count as text); every other row reaches the full
 -- filter, so a coarse kind never drops a row the filter would keep.
--- The two value indexes below were added after the first v4 build on the
+-- The two value indexes below serve that prefilter's equal-value probe
+-- (pinned by `EXPLAIN QUERY PLAN` in `tests/bases_query.rs`); they were
+-- added after the first v4 build on the
 -- unshipped bases branch; no v4 cache ever shipped, so v4 keeps its number.
 CREATE TABLE property_scalars (
     note_path    TEXT    NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
