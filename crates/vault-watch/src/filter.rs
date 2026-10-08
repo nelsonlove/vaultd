@@ -36,7 +36,9 @@ pub fn normalize_included_markdown(
 
 /// Normalize a raw watcher event path into an included [`VaultPath`] of any
 /// kind — a folder, an attachment, or a note — or `Ok(None)` if the path is
-/// outside the vault or under a hidden directory.
+/// outside the vault or under a hidden directory. One exception passes:
+/// `.obsidian/types.json` (see [`property_types_path`]), which the runtime
+/// announces as a configuration change and never indexes.
 ///
 /// The tree counterpart of [`normalize_included_markdown`]: same root, hidden,
 /// and `..` rules, no extension filter. A directory and a file are
@@ -54,6 +56,10 @@ pub fn normalize_included_path(
         Ok(relative) => relative,
         Err(_) => return Ok(None),
     };
+
+    if let Some(types) = property_types_path(relative) {
+        return Ok(VaultPath::new(types).ok());
+    }
 
     let mut parts: Vec<String> = Vec::new();
     let mut components = relative.components().peekable();
@@ -79,6 +85,25 @@ pub fn normalize_included_path(
         Ok(vault_path) => Ok(Some(vault_path)),
         Err(_) => Ok(None),
     }
+}
+
+/// The one path under a hidden directory the watcher passes through:
+/// `.obsidian/types.json`, the vault's declared property types, which
+/// Obsidian writes itself and which retypes every Bases view's cells. Matched
+/// without regard to ASCII case (a case-folding filesystem reports whatever
+/// spelling it stores), and answered in the spelling the event carried.
+/// Nothing else under `.obsidian/` passes: not a sibling file, not anything
+/// deeper.
+fn property_types_path(relative: &Path) -> Option<String> {
+    let mut components = relative.components();
+    let (Some(Component::Normal(zone)), Some(Component::Normal(file)), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return None;
+    };
+    let (zone, file) = (zone.to_str()?, file.to_str()?);
+    (zone.eq_ignore_ascii_case(".obsidian") && file.eq_ignore_ascii_case("types.json"))
+        .then(|| format!("{zone}/{file}"))
 }
 
 /// Classifies whether an event path is confined entirely under a hidden

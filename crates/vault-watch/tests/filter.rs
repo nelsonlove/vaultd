@@ -4,7 +4,44 @@
 
 use std::path::PathBuf;
 
-use vault_watch::{WatchError, normalize_included_markdown};
+use vault_watch::{WatchError, normalize_included_markdown, normalize_included_path};
+
+/// The one configuration file the watcher passes through: the declared
+/// property types, which Obsidian writes itself and which retype Bases
+/// views. Its siblings and anything deeper under `.obsidian/` stay dropped,
+/// and the Markdown view still drops it (it is not a note).
+#[test]
+fn passes_only_the_property_types_file_out_of_the_config_directory() {
+    let path = |relative: &str| {
+        normalize_included_path(&root(), &root().join(relative))
+            .expect("no error")
+            .map(|hint| hint.as_str().to_string())
+    };
+    assert_eq!(
+        path(".obsidian/types.json").as_deref(),
+        Some(".obsidian/types.json")
+    );
+    assert_eq!(
+        path(".Obsidian/Types.JSON").as_deref(),
+        Some(".Obsidian/Types.JSON"),
+        "matched without regard to case, in the spelling the event carried"
+    );
+    for dropped in [
+        ".obsidian/app.json",
+        ".obsidian/types.json.tmp",
+        ".obsidian/plugins/x/data.json",
+        ".obsidian/plugins/types.json",
+        ".hidden/types.json",
+        "Notes/.obsidian/types.json",
+    ] {
+        assert_eq!(path(dropped), None, "{dropped} stays dropped");
+    }
+    assert_eq!(
+        normalize_included_markdown(&root(), &root().join(".obsidian/types.json"))
+            .expect("no error"),
+        None
+    );
+}
 
 fn root() -> PathBuf {
     PathBuf::from("/vault")
