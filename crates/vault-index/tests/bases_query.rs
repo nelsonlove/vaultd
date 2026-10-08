@@ -601,17 +601,18 @@ fn reporting_hook(
     })
 }
 
-/// The Task 11 carry: the first resolving read of a generation used to build
-/// the whole-vault resolver under the publication guard, so a publication
-/// landing then waited for it. Now the writer prebuilds it after each
-/// publication, so that read builds nothing, and a publication made while
-/// it is in flight completes. Under the old shape the read parks in the
-/// build hook while holding the guard, and the publication's hang detector
-/// fires.
+/// The Task 11 carry, and the Task 12 review's H3: the first resolving read
+/// of a generation builds the whole-vault resolver, and a publication landing
+/// then must not wait for it. The read copies the catalog under the guard and
+/// builds outside it, so a publication made while it is parked in the build
+/// completes; the writer never builds one (a publication's cost does not
+/// depend on whether anyone resolves). Under the Task 11 shape the read parks
+/// in the build hook while holding the guard, and the publication's hang
+/// detector fires.
 #[test]
 fn a_publication_never_waits_for_the_first_resolving_read_of_a_generation() {
     let (mut service, vault, _index) = service(&PARKED_VAULT);
-    // A reader has resolved once, so the writer prebuilds from now on.
+    // A reader has resolved once already.
     evaluate_rows(&service.reader().unwrap());
 
     fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
@@ -625,7 +626,7 @@ fn a_publication_never_waits_for_the_first_resolving_read_of_a_generation() {
     let release_rx = Arc::new(Mutex::new(release_rx));
     let mut reader = service.reader().unwrap();
     reader.pause_resolver_builds_for_test(reporting_hook(
-        "a resolver build under the guard",
+        "the resolver build, guard released",
         Arc::clone(&builds),
         visits_tx.clone(),
         Arc::clone(&release_rx),
@@ -640,6 +641,10 @@ fn a_publication_never_waits_for_the_first_resolving_read_of_a_generation() {
     let parked_in = visits
         .recv_timeout(Duration::from_secs(10))
         .expect("the first resolving read of the generation parks somewhere");
+    assert_eq!(
+        parked_in, "the resolver build, guard released",
+        "nothing built this generation's resolver before its first resolving read"
+    );
 
     fs::write(vault.path().join("C.md"), "---\nn: 3\n---\n").unwrap();
     let (done_tx, done_rx) = mpsc::channel();
@@ -649,45 +654,18 @@ fn a_publication_never_waits_for_the_first_resolving_read_of_a_generation() {
         (service, report)
     });
     let published = done_rx.recv_timeout(Duration::from_secs(10));
-    let _ = release_tx.send(());
-    let _ = release_tx.send(());
+    // One release per park: the build and the evaluation, twice if the read
+    // retries at C's generation.
+    for _ in 0..4 {
+        let _ = release_tx.send(());
+    }
     let (service, report) = publisher.join().unwrap();
     published.unwrap_or_else(|_| {
         panic!("a publication completes during the first resolving read (parked in {parked_in})")
     });
     report.unwrap();
     let (generation, rows) = evaluation.join().unwrap();
-    assert_eq!(
-        rows,
-        vec!["A.md", "B.md"],
-        "the read answers at its generation"
-    );
     let current = service
-        .reader()
-        .unwrap()
-        .published_status()
-        .unwrap()
-        .generation;
-    assert_eq!(
-        current.unwrap().get(),
-        generation + 1,
-        "C landed after the read's generation"
-    );
-    assert_eq!(
-        builds.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the read used the writer's prebuilt resolver"
-    );
-}
-
-/// A read that arrives while the writer is still prebuilding the resolver
-/// for the generation it sees waits for that prebuild, with no lock held,
-/// rather than building a second one under the guard.
-#[test]
-fn a_read_that_meets_a_prebuild_in_flight_waits_for_it() {
-    let (mut service, vault, _index) = service(&PARKED_VAULT);
-    evaluate_rows(&service.reader().unwrap());
-    let before = service
         .reader()
         .unwrap()
         .published_status()
@@ -695,42 +673,77 @@ fn a_read_that_meets_a_prebuild_in_flight_waits_for_it() {
         .generation
         .unwrap()
         .get();
-    let (prebuild, hook) = common::rendezvous("resolver prebuild");
-    service.pause_resolver_prebuilds_for_test(hook);
+    // The read built the resolver for the generation it first saw, which C
+    // then moved past, so its evaluation refused that generation and retried
+    // at C's (building once more): either way it answers one generation's
+    // rows whole.
+    let expected: &[&str] = if generation == current {
+        &["A.md", "B.md", "C.md"]
+    } else {
+        assert_eq!(
+            generation + 1,
+            current,
+            "C landed after the read's generation"
+        );
+        &["A.md", "B.md"]
+    };
+    assert_eq!(rows, expected, "the read answers at its generation");
+    let built = builds.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&built),
+        "the read built a resolver per generation it read at: {built}"
+    );
+}
+
+/// A second resolving read of a generation whose resolver another read is
+/// building waits for that build, with no lock held, rather than building a
+/// second one; then it uses the one built.
+#[test]
+fn a_read_that_meets_a_build_in_flight_waits_for_it() {
+    let (mut service, vault, _index) = service(&PARKED_VAULT);
+    evaluate_rows(&service.reader().unwrap());
+    fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
+    service
+        .refresh_paths(BTreeSet::from([vp("B.md")]), ChangeCause::Watcher)
+        .unwrap();
+    let current = service
+        .reader()
+        .unwrap()
+        .published_status()
+        .unwrap()
+        .generation
+        .unwrap()
+        .get();
+
+    let (build, hook) = common::rendezvous("the first read's resolver build");
+    let mut first = service.reader().unwrap();
+    first.pause_resolver_builds_for_test(hook);
     let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&builds);
-    let mut reader = service.reader().unwrap();
-    reader.pause_resolver_builds_for_test(Arc::new(move || {
+    let mut second = service.reader().unwrap();
+    second.pause_resolver_builds_for_test(Arc::new(move || {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
 
-    fs::write(vault.path().join("B.md"), "---\nn: 2\n---\n").unwrap();
-    let publisher = thread::spawn(move || {
-        let report = service.refresh_paths(BTreeSet::from([vp("B.md")]), ChangeCause::Watcher);
-        (service, report)
-    });
-    prebuild.arrived();
-
+    let building = thread::spawn(move || evaluate_rows(&first));
+    build.arrived();
     let (done_tx, done_rx) = mpsc::channel();
-    let evaluation = thread::spawn(move || {
-        let answer = evaluate_rows(&reader);
+    let waiting = thread::spawn(move || {
+        let answer = evaluate_rows(&second);
         let _ = done_tx.send(());
         answer
     });
     assert!(
         done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-        "the read waits while the prebuild for its generation is in flight"
+        "the second read waits while the build for its generation is in flight"
     );
-    prebuild.release();
-    let (generation, rows) = evaluation.join().unwrap();
-    let (_service, report) = publisher.join().unwrap();
-    report.unwrap();
-    assert_eq!(generation, before + 1);
-    assert_eq!(rows, vec!["A.md", "B.md"]);
+    build.release();
+    assert_eq!(building.join().unwrap().0, current);
+    assert_eq!(waiting.join().unwrap().0, current);
     assert_eq!(
         builds.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "the read used the prebuild it waited for"
+        "the second read used the build it waited for"
     );
 }
 

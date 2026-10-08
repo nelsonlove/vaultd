@@ -32,19 +32,19 @@
 //! newer ones; roll back and return the connection to the pool.
 //!
 //! The whole-vault resolver a resolving read needs is shared by every reader
-//! of one service ([`ResolverSlot`]). Once any reader has asked for one, the
-//! writer prebuilds it after each publication, from its own handle on the
-//! graph and outside the guard, so a publication never waits for a resolver
-//! build. A reader that meets a prebuild in flight waits for it with no lock
-//! held; only a reader that finds none (the first resolving read after
-//! startup) builds one itself, under the guard.
+//! of one service ([`ResolverSlot`]) and built lazily, once per generation,
+//! by the first resolving read of that generation: it copies the resolution
+//! catalog out of the live graph under the guard, releases the guard, and
+//! builds and installs the resolver outside it. The writer never builds one,
+//! so a publication's cost does not depend on whether anyone resolves, and a
+//! publication never waits for a build. A second read of the same generation
+//! that meets the build in flight waits for it with no lock held.
 //!
 //! Lock order is always `publication barrier -> reader connection`,
 //! `publication barrier -> resolver slot` and
 //! `evaluation pool` (taken alone, before the barrier). The connection,
 //! resolver slot and pool locks are leaves: none is ever held while acquiring
-//! anything else. The writer takes only the resolver slot, alone or under its
-//! own write guard. Poisoning surfaces as `IndexError::Storage`; nothing here
+//! anything else. The writer never takes the resolver slot. Poisoning surfaces as `IndexError::Storage`; nothing here
 //! unwraps a lock.
 
 use std::sync::{Arc, Condvar, Mutex, RwLockReadGuard, RwLockWriteGuard};
@@ -80,41 +80,46 @@ pub(crate) fn write_published(
 
 const GENERATION_SQL: &str = "SELECT generation FROM index_metadata WHERE singleton = 1";
 
-/// How long a reader waits for a prebuild in flight before it builds its own
-/// resolver. A prebuild of a 10k-note vault takes tens of milliseconds; this
-/// bound only matters if the writer died mid-build.
-const PREBUILD_PATIENCE: Duration = Duration::from_secs(2);
+/// How long a reader waits for another read's build in flight before it
+/// builds its own resolver. A build for a 10k-note vault takes milliseconds
+/// in release; this bound only matters if the building thread died.
+const BUILD_PATIENCE: Duration = Duration::from_secs(2);
 
-/// The resolver over every note and base in the published live graph.
-pub(crate) fn whole_vault_resolver(graph: &crate::LiveGraph) -> Resolver {
-    let notes = graph.note_paths().into_iter().filter_map(|path| {
-        graph.note(&path).map(|note| vault_core::ResolutionNote {
-            path,
-            headings: note.headings,
-            blocks: note.blocks,
-            views: None,
+/// What the resolver over every note and base in the published live graph is
+/// built from: copied under the guard, so the build itself can run outside
+/// it.
+fn resolution_catalog(graph: &crate::LiveGraph) -> Vec<vault_core::ResolutionNote> {
+    let mut catalog: Vec<vault_core::ResolutionNote> = graph
+        .note_paths()
+        .into_iter()
+        .filter_map(|path| {
+            graph.note(&path).map(|note| vault_core::ResolutionNote {
+                path,
+                headings: note.headings,
+                blocks: note.blocks,
+                views: None,
+            })
         })
-    });
-    let bases: Vec<vault_core::ResolutionNote> = graph
-        .base_paths()
-        .filter_map(|path| graph.base_identity(path))
         .collect();
-    Resolver::from_catalog(notes.chain(bases))
+    catalog.extend(
+        graph
+            .base_paths()
+            .filter_map(|path| graph.base_identity(path)),
+    );
+    catalog
 }
 
 #[derive(Default)]
 struct SlotState {
-    /// Whether any reader has asked for a resolver. Until one has, the writer
-    /// builds nothing, so a daemon nobody resolves against pays nothing.
-    wanted: bool,
-    /// The generation the writer is prebuilding for, set under its write
-    /// guard so a reader can never see that generation without seeing it.
+    /// The generation a read is building the resolver for, set by that read
+    /// under the publication guard.
     building: Option<Generation>,
     resolver: Option<(Generation, Arc<Resolver>)>,
 }
 
 /// The resolver for the published generation, shared by every reader of one
-/// service and prebuilt by its writer: see the module comment.
+/// service and built by the first resolving read of each generation: see the
+/// module comment.
 #[derive(Default)]
 pub(crate) struct ResolverSlot {
     state: Mutex<SlotState>,
@@ -128,23 +133,9 @@ impl ResolverSlot {
             .map_err(|error| IndexError::Storage(format!("resolver slot is poisoned: {error}")))
     }
 
-    /// Called by the writer under its write guard, right after it publishes
-    /// `generation`: whether it owes a prebuild. Readers that see the
-    /// generation from now on wait for that prebuild instead of building.
-    pub(crate) fn claim_prebuild(&self, generation: Generation) -> bool {
-        let Ok(mut state) = self.lock() else {
-            return false;
-        };
-        if !state.wanted {
-            return false;
-        }
-        state.building = Some(generation);
-        true
-    }
-
     /// Install a resolver built for `generation` (unless a newer one is
-    /// already there) and end any prebuild for it.
-    pub(crate) fn settle(&self, generation: Generation, resolver: Option<Arc<Resolver>>) {
+    /// already there) and end any build for it.
+    fn settle(&self, generation: Generation, resolver: Option<Arc<Resolver>>) {
         if let Ok(mut state) = self.lock() {
             if let Some(resolver) = resolver {
                 let newer_present = state
@@ -177,7 +168,8 @@ pub struct IndexReader {
     connection: Mutex<Connection>,
     published: PublicationBarrier,
     /// The resolver for the published generation, shared with every other
-    /// reader of the service and prebuilt by its writer.
+    /// reader of the service and built by the first resolving read of each
+    /// generation.
     resolvers: Arc<ResolverSlot>,
     pause: Option<PauseHook>,
     resolver_build_pause: Option<PauseHook>,
@@ -466,72 +458,89 @@ impl IndexReader {
             .map(|(read, ())| read.generation.get())
     }
 
-    /// Pause a resolving read that has to build its own resolver, under the
-    /// publication guard, just before it builds. Test-only: a read that finds
-    /// the writer's prebuilt resolver never reaches it, which is what a test
-    /// of "a publication never waits for a resolver build" pins.
+    /// Pause a resolving read that builds the resolver for its generation,
+    /// after it has copied the catalog and released the publication guard,
+    /// just before it builds. Test-only: it is what lets a test prove that a
+    /// publication, and a second read of the same generation, do not need the
+    /// build to finish (the publication) or wait for it rather than build
+    /// again (the read).
     #[doc(hidden)]
     pub fn pause_resolver_builds_for_test(&mut self, hook: PauseHook) {
         self.resolver_build_pause = Some(hook);
     }
 
-    /// The resolver for the published generation.
+    /// The resolver for the published generation, shared by every reader of
+    /// the service (see the module comment).
     ///
-    /// Ordinarily the writer's prebuilt one (see the module comment), taken
-    /// under the guard with no build at all; while a prebuild for the
-    /// published generation is in flight, the read waits for it with no lock
-    /// held. Only when there is none (the first resolving read after startup,
-    /// or a prebuild that never settled) does the read build one itself,
-    /// under the guard: the graph `Arc` never escapes the guard, because the
-    /// writer installs a delta by mutating the graph in place while it is
-    /// the sole owner, and a handle kept alive past the guard would force a
-    /// whole-graph copy.
+    /// Taken under the guard when it is already built for the published
+    /// generation. Otherwise the first resolving read of that generation
+    /// claims the build, copies the resolution catalog out of the live graph
+    /// under the guard, releases the guard, builds the resolver from the copy
+    /// and installs it for that generation; the writer never builds one, so
+    /// a publication never waits for a build. A second read of the same
+    /// generation meeting that build waits for it with no lock held, once per
+    /// generation (it remembers the generation it waited for, so a build
+    /// that never settles makes it build its own rather than wait again).
     pub(crate) fn resolver(&self) -> Result<(Generation, Arc<Resolver>), IndexError> {
-        let mut waited = false;
+        let mut waited_for: Option<Generation> = None;
         loop {
             let published = read_published(&self.published)?;
             let generation = published.generation.ok_or(IndexError::IndexUnavailable)?;
             let mut state = self.resolvers.lock()?;
-            state.wanted = true;
             if let Some((built, resolver)) = state.resolver.as_ref() {
                 if *built == generation {
                     return Ok((generation, Arc::clone(resolver)));
                 }
             }
-            if !waited && state.building == Some(generation) {
-                // Never wait under the guard: the prebuild needs no guard to
+            if state.building == Some(generation) && waited_for != Some(generation) {
+                // Never wait under the guard: the build needs no guard to
                 // finish, but the next publication does.
                 drop(published);
                 let _settled = self
                     .resolvers
                     .settled
-                    .wait_timeout_while(state, PREBUILD_PATIENCE, |state| {
+                    .wait_timeout_while(state, BUILD_PATIENCE, |state| {
                         state.building == Some(generation)
                     })
                     .map_err(|error| {
                         IndexError::Storage(format!("resolver slot is poisoned: {error}"))
                     })?;
-                waited = true;
+                waited_for = Some(generation);
                 continue;
             }
+            state.building = Some(generation);
             drop(state);
 
+            // Copy under the guard (the graph `Arc` never escapes it: the
+            // writer installs a delta by mutating the graph in place while it
+            // is the sole owner), build outside it.
+            let catalog = published
+                .graph
+                .as_deref()
+                .ok_or(IndexError::IndexUnavailable)
+                .and_then(|graph| {
+                    if graph.generation() == generation {
+                        Ok(resolution_catalog(graph))
+                    } else {
+                        Err(IndexError::Storage(format!(
+                            "published live graph is at generation {} but the published generation is {}",
+                            graph.generation().get(),
+                            generation.get()
+                        )))
+                    }
+                });
+            drop(published);
+            let catalog = match catalog {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    self.resolvers.settle(generation, None);
+                    return Err(error);
+                }
+            };
             if let Some(hook) = &self.resolver_build_pause {
                 hook();
             }
-            let graph = published
-                .graph
-                .as_ref()
-                .ok_or(IndexError::IndexUnavailable)?;
-            if graph.generation() != generation {
-                return Err(IndexError::Storage(format!(
-                    "published live graph is at generation {} but the published generation is {}",
-                    graph.generation().get(),
-                    generation.get()
-                )));
-            }
-            let resolver = Arc::new(whole_vault_resolver(graph));
-            drop(published);
+            let resolver = Arc::new(Resolver::from_catalog(catalog));
             self.resolvers
                 .settle(generation, Some(Arc::clone(&resolver)));
             return Ok((generation, resolver));
@@ -553,12 +562,12 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_prebuilt_until_a_reader_wants_it() {
+    fn settling_ends_only_the_build_for_its_own_generation() {
         let slot = ResolverSlot::default();
-        assert!(!slot.claim_prebuild(Generation::new(1)));
-        slot.lock().unwrap().wanted = true;
-        assert!(slot.claim_prebuild(Generation::new(2)));
+        slot.lock().unwrap().building = Some(Generation::new(3));
         slot.settle(Generation::new(2), None);
+        assert_eq!(slot.lock().unwrap().building, Some(Generation::new(3)));
+        slot.settle(Generation::new(3), None);
         assert_eq!(slot.lock().unwrap().building, None);
     }
 }
