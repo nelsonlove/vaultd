@@ -505,9 +505,12 @@ pub(crate) fn dispatch(
                 // is memoized per generation, so N connections pay once. The
                 // invalidations are queued right behind the generation's own
                 // event; a resync carries none (its client re-reads views
-                // with everything else).
+                // with everything else). A change to the declared property
+                // types is no generation but retypes every view, so every
+                // known view is named behind its `config_changed`.
                 let stale = match notice.as_ref() {
                     RuntimeNotice::Generation(report) => server.stale_views(report),
+                    RuntimeNotice::ConfigChanged { path } => server.config_invalidated_views(path),
                     _ => Vec::new(),
                 };
                 subscriptions.enqueue_notice(*notice);

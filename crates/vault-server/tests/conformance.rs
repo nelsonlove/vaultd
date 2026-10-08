@@ -11,7 +11,9 @@
 //! has one and the other does not, which is the point of the field). One more
 //! value sits inside a cursor rather than beside it: an `evaluate_base`
 //! cursor's `instant` (the clock reading its result was computed at), which
-//! [`settle_cursor_instants`] sets to `0` and nothing else.
+//! [`settle_cursor_instants`] replaces with its first-seen ordinal in the
+//! transcript and nothing else, so the two doors must still agree on which
+//! cursors share an instant.
 //!
 //! Everything else is compared as **bytes**, key order included. The
 //! normalizer edits the raw line in place rather than re-serializing it
@@ -242,10 +244,12 @@ fn normalize(line: &str) -> String {
 /// The one environmental value inside a cursor: an `evaluate_base` cursor
 /// carries the instant its result was computed at (so an evicted page is
 /// recomputed at it), and the two runs compute at two different instants.
-/// Every `next_cursor` is decoded, `"instant":<n>` is set to `0` in place,
-/// and the cursor is re-encoded, so every other byte of every cursor is still
-/// compared.
-fn settle_cursor_instants(line: &str) -> String {
+/// Every `next_cursor` is decoded, `"instant":<n>` is replaced in place by the
+/// ordinal of `<n>` among the distinct instants `seen` so far in this
+/// transcript (0, 1, 2 …), and the cursor is re-encoded: every other byte of
+/// every cursor is still compared, and so is which cursors share an instant
+/// (every page of one result does).
+fn settle_cursor_instants(line: &str, seen: &mut Vec<String>) -> String {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     const KEY: &str = r#""next_cursor":""#;
@@ -267,7 +271,15 @@ fn settle_cursor_instants(line: &str) -> String {
                 let digits = payload[at..]
                     .find(|c: char| !c.is_ascii_digit() && c != '-')
                     .unwrap_or(payload.len() - at);
-                let payload = format!("{}0{}", &payload[..at], &payload[at + digits..]);
+                let instant = &payload[at..at + digits];
+                let ordinal = match seen.iter().position(|have| have == instant) {
+                    Some(ordinal) => ordinal,
+                    None => {
+                        seen.push(instant.to_string());
+                        seen.len() - 1
+                    }
+                };
+                let payload = format!("{}{ordinal}{}", &payload[..at], &payload[at + digits..]);
                 Some(URL_SAFE_NO_PAD.encode(payload))
             });
         out.push_str(settled.as_deref().unwrap_or(cursor));
@@ -282,18 +294,31 @@ fn only_an_evaluation_cursors_instant_is_settled() {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let cursor = |payload: &str| URL_SAFE_NO_PAD.encode(payload);
-    let evaluation =
-        cursor(r#"{"generation":1,"base":"V.base","offset":1,"instant":1791114952359}"#);
-    let settled = cursor(r#"{"generation":1,"base":"V.base","offset":1,"instant":0}"#);
+    let page = |offset: u32, instant: u64| {
+        cursor(&format!(
+            r#"{{"generation":1,"base":"V.base","offset":{offset},"instant":{instant}}}"#
+        ))
+    };
+    let line = |cursor: &str| format!(r#"{{"next_cursor":"{cursor}","x":1}}"#);
     let other = cursor(r#"{"generation":1,"position":"One.md"}"#);
+    let mut seen = Vec::new();
+    // Two pages of one result share an instant; a second result has its own.
     assert_eq!(
-        settle_cursor_instants(&format!(r#"{{"next_cursor":"{evaluation}","x":1}}"#)),
-        format!(r#"{{"next_cursor":"{settled}","x":1}}"#)
+        settle_cursor_instants(&line(&page(1, 1791114952359)), &mut seen),
+        line(&page(1, 0))
+    );
+    assert_eq!(
+        settle_cursor_instants(&line(&page(2, 1791114952359)), &mut seen),
+        line(&page(2, 0))
+    );
+    assert_eq!(
+        settle_cursor_instants(&line(&page(1, 1791114952400)), &mut seen),
+        line(&page(1, 1))
     );
     let untouched = format!(r#"{{"next_cursor":"{other}","n":"next_cursor"}}"#);
-    assert_eq!(settle_cursor_instants(&untouched), untouched);
+    assert_eq!(settle_cursor_instants(&untouched, &mut seen), untouched);
     assert_eq!(
-        settle_cursor_instants(r#"{"next_cursor":null}"#),
+        settle_cursor_instants(r#"{"next_cursor":null}"#, &mut seen),
         r#"{"next_cursor":null}"#
     );
 }
@@ -443,10 +468,11 @@ fn assert_same(what: &str, over_stdio: &[String], over_socket: &[String]) {
 /// One door's run, normalized.
 fn normalized(transport: Transport, lines: &[String]) -> (Vec<String>, usize) {
     let run = run_through(transport, lines);
+    let mut seen = Vec::new();
     (
         run.lines
             .iter()
-            .map(|line| settle_cursor_instants(&normalize(line)))
+            .map(|line| settle_cursor_instants(&normalize(line), &mut seen))
             .collect(),
         run.cursors_followed,
     )

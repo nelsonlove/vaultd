@@ -33,7 +33,7 @@
 //! writer moved the cache underneath this process.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -172,6 +172,15 @@ pub enum RuntimeNotice {
     ConfigChanged { path: VaultPath },
 }
 
+/// Whether `path` is the vault's declared property types,
+/// `.obsidian/types.json`, in any case (a case-folding filesystem reaches it
+/// under any spelling). A change to it retypes every view's cells without a
+/// generation, so the runtime bumps its types epoch before announcing it.
+pub fn is_property_types(path: &VaultPath) -> bool {
+    path.as_str()
+        .eq_ignore_ascii_case(&format!("{}/types.json", vault_index::CONFIG_ZONE))
+}
+
 /// How specific a resync reason is, for merging two outstanding escalations.
 /// A named cause outranks the generic one, and a vault whose root moved
 /// outranks lost events.
@@ -271,6 +280,7 @@ impl Runtime {
         let (commands, mailbox) = sync_channel(capacity);
         let overflow = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        let types_epoch = Arc::new(AtomicU64::new(0));
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
 
         // The watcher is installed *before* catch-up so that a change made
@@ -348,6 +358,7 @@ impl Runtime {
             state: LiveState::Starting,
             published_error: None,
             notices_dropped: false,
+            types_epoch: Arc::clone(&types_epoch),
         };
         let coordinator_alive = Arc::new(AtomicBool::new(true));
         match std::thread::Builder::new()
@@ -381,6 +392,7 @@ impl Runtime {
                 watch_alive,
                 coordinator_alive,
                 read_only: options.read_only,
+                types_epoch,
             }),
         })
     }
@@ -721,6 +733,9 @@ struct RuntimeInner {
     /// have no way to ask whether the runtime it serves is read-only, and
     /// could build one that silently is not.
     read_only: bool,
+    /// Bumped by the coordinator, before it announces the change, each time
+    /// `.obsidian/types.json` changes: see [`RuntimeHandle::types_epoch`].
+    types_epoch: Arc<AtomicU64>,
 }
 
 impl RuntimeInner {
@@ -888,6 +903,15 @@ impl RuntimeHandle {
         self.inner.read_only
     }
 
+    /// How many times `.obsidian/types.json` has changed (through a write or
+    /// the watcher) since this runtime started. Bumped before the change's
+    /// `ConfigChanged` notice is sent, so a reader that sees the notice and
+    /// asks again sees the new epoch; a cached evaluation keyed by an older
+    /// epoch was computed with older declared types.
+    pub fn types_epoch(&self) -> u64 {
+        self.inner.types_epoch.load(Ordering::Acquire)
+    }
+
     /// Whether a filesystem watcher is installed *and* its forwarder thread
     /// is still running. Goes false if the backend dies, because at that
     /// point nothing is watching regardless of how startup went.
@@ -975,6 +999,8 @@ struct Coordinator {
     state: LiveState,
     published_error: Option<String>,
     notices_dropped: bool,
+    /// Shared with [`RuntimeHandle::types_epoch`].
+    types_epoch: Arc<AtomicU64>,
 }
 
 impl Coordinator {
@@ -1084,6 +1110,16 @@ impl Coordinator {
             ChangeHint::Paths(paths) => {
                 let now = Instant::now();
                 for path in paths {
+                    // The watcher passes exactly one configuration file
+                    // through, the declared property types, which Obsidian
+                    // writes itself. The zone is not indexed: announce it as
+                    // a daemon write to it is announced, and nothing else.
+                    if vault_index::in_config_zone(&path) || is_property_types(&path) {
+                        if is_property_types(&path) {
+                            self.announce_config(path);
+                        }
+                        continue;
+                    }
                     match self.source.fingerprint(&path) {
                         // Present: reconcile it now, and cancel any grace
                         // window it was waiting out — this is the coalescing
@@ -1355,9 +1391,7 @@ impl Coordinator {
             if announces_config {
                 if let Some(written) = &outcome.written {
                     if vault_index::in_config_zone(written) {
-                        self.emit(RuntimeNotice::ConfigChanged {
-                            path: written.clone(),
-                        });
+                        self.announce_config(written.clone());
                     }
                 }
             }
@@ -1722,6 +1756,17 @@ impl Coordinator {
     /// either side, reachable from an ordinary slow subscriber. Dropping a
     /// notice and announcing the gap is always the correct trade, because a
     /// gap is recoverable and a wedged writer is not.
+    /// Announce a change to one configuration file: bump the types epoch
+    /// first when it is the declared property types (so a reader acting on
+    /// the notice never meets an answer cached under the old types), then
+    /// emit `ConfigChanged`.
+    fn announce_config(&mut self, path: VaultPath) {
+        if is_property_types(&path) {
+            self.types_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        self.emit(RuntimeNotice::ConfigChanged { path });
+    }
+
     fn emit(&mut self, notice: RuntimeNotice) {
         if self.notices_dropped {
             let generation = self.committed_generation();

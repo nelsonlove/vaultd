@@ -110,6 +110,7 @@ Measured on the 10k-note fixture, warm, with the phase 7 harness extended by a `
 3. Approach C: evaluate on request, cache per generation, coarse invalidation with a `views_invalidated` event (over on-request-only and materialized views).
 4. The eight design sections as presented.
 5. Standing from earlier phases and unchanged: the live vault is never read by a daemon, test or fixture; parity comes from runtime captures and published documents, never from `app.asar`; the spec lives repo-local in `docs/design/`.
+6. Clause 4 of the staleness rule: any changed file, not any changed note, for a view that reads links or `this` (`file()`, `link()` and `asFile()` reach attachments); the published rule left a false negative (Task 12 review finding M1, ruled in its fix round on 2026-10-08).
 
 ## Deferred follow-on
 

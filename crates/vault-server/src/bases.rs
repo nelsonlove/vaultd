@@ -1,7 +1,7 @@
 //! `evaluate_base` and `list_bases`.
 //!
 //! A view's result is computed once per (base, view, `this_path`,
-//! generation) and its pages are cut from that one computation, so a page
+//! generation, types epoch) and its pages are cut from that one computation, so a page
 //! never disagrees with its neighbour about `now()` or `random()`. The store
 //! is a least-recently-used cache of at most `--bases-cache-entries`
 //! results, and the first request at a newer generation drops every older
@@ -35,6 +35,10 @@ pub(crate) struct CacheKey {
     pub view: Option<String>,
     pub this_path: Option<VaultPath>,
     pub generation: u64,
+    /// The runtime's types epoch the answer was computed under: a change to
+    /// `.obsidian/types.json` is no generation, but it retypes cells, so an
+    /// answer cached under an older epoch is never served again.
+    pub types_epoch: u64,
 }
 
 /// One evaluation, with the clock it ran under so every page renders its
@@ -230,6 +234,7 @@ pub(crate) fn evaluate_base(
     reader: &IndexReader,
     cache: &BaseCache,
     tracker: &ViewTracker,
+    types_epoch: u64,
     types: impl FnOnce() -> BTreeMap<String, vault_bases::PropertyType>,
     params: EvaluateBaseParams,
 ) -> Result<EvaluateBaseResponse, ProtocolError> {
@@ -271,6 +276,10 @@ pub(crate) fn evaluate_base(
         view: params.view.clone(),
         this_path: this_path.clone(),
         generation: current,
+        // Read before the types are (on a miss): an answer computed with
+        // newer types under an older epoch is only ever a needless miss,
+        // never a stale hit.
+        types_epoch,
     };
     // A page is cut only from a result computed at its cursor's instant.
     let hit = cache
@@ -436,6 +445,7 @@ mod tests {
             view: None,
             this_path: None,
             generation,
+            types_epoch: 0,
         }
     }
 
@@ -557,6 +567,7 @@ mod tests {
                 &self.reader,
                 &self.cache,
                 &self.tracker,
+                0,
                 BTreeMap::new,
                 EvaluateBaseParams {
                     path: "R.base".into(),

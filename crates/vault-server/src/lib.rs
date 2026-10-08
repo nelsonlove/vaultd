@@ -423,6 +423,37 @@ impl Server {
         stale
     }
 
+    /// The runtime's types epoch (0 with no runtime): see
+    /// [`runtime::RuntimeHandle::types_epoch`].
+    fn types_epoch(&self) -> u64 {
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.handle.types_epoch())
+    }
+
+    /// The views a configuration change invalidates: for
+    /// `.obsidian/types.json`, every view the tracker knows, at the current
+    /// published generation (declared types retype cells without a
+    /// generation); for any other configuration file, none.
+    pub(crate) fn config_invalidated_views(
+        &self,
+        path: &VaultPath,
+    ) -> Vec<vault_protocol::ViewsInvalidatedEventDto> {
+        if !runtime::is_property_types(path) {
+            return Vec::new();
+        }
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        match live.reader.published_status() {
+            Ok(status) => match status.generation {
+                Some(generation) => self.views.every_known_view(generation.get()),
+                None => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Where this daemon is listening, or `None` when it has no socket.
     pub fn socket_path(&self) -> Option<&str> {
         self.socket_path.as_deref()
@@ -1378,6 +1409,7 @@ impl Server {
                     reader,
                     &self.base_cache,
                     &self.views,
+                    self.types_epoch(),
                     || self.property_types(),
                     params,
                 ) {

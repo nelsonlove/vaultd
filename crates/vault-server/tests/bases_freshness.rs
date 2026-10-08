@@ -329,15 +329,23 @@ fn clause_five_a_view_reading_this_is_stale_when_any_note_changes() {
     daemon.call(
         r#"{"version":1,"id":"e","request":{"method":"evaluate_base","params":{"path":"This.base"}}}"#,
     );
+    let formulas = write_base(
+        &mut daemon,
+        "F.base",
+        "formulas:\n  double: 'price * 2'\nviews:\n  - type: table\n    name: Doubled\n    filters: 'file.inFolder(\"Books\")'\n    order: [formula.double]\n",
+    );
+    let _ = invalidated_at(&mut daemon, formulas);
+    evaluate(&mut daemon, "F.base");
     let unrelated = generation_of(
         &mut daemon,
         r#"{"version":1,"id":"w","request":{"method":"write_note","params":{"path":"Other/U.md","content":"plain\n","expected":{"absent":true}}}}"#,
     );
-    // Other/U.md is outside the prefilter and was never a row: only clause 5
-    // can name ThisView, and the other two views stay quiet.
+    // Other/U.md is outside the prefilters and was never a row: only clause
+    // 5 can name ThisView (and clause 4 Doubled), and V.base's two views stay
+    // quiet.
     assert_eq!(
         invalidated_at(&mut daemon, unrelated),
-        set(&["This.base#ThisView"])
+        set(&["This.base#ThisView", "F.base#Doubled"])
     );
 
     let attachment = generation_of(
@@ -347,10 +355,13 @@ fn clause_five_a_view_reading_this_is_stale_when_any_note_changes() {
             base64_of("png")
         ),
     );
+    // `this.file.links[…].asFile()` reaches attachments, so a view reading
+    // `this` is named for any changed file (the M1 ruling); the sibling is a
+    // view reading formulas without links, which an attachment cannot move.
     assert_eq!(
         invalidated_at(&mut daemon, attachment),
-        BTreeSet::new(),
-        "the sibling: no note changed, so `this` cannot have"
+        set(&["This.base#ThisView"]),
+        "a view reading `this` is named for an attachment; one reading formulas without links is not"
     );
 }
 
@@ -461,6 +472,14 @@ fn a_base_created_while_nobody_listened_is_tracked_once_someone_does() {
 #[test]
 fn a_resync_is_never_accompanied_by_views_invalidated() {
     let (vault, _index, mut daemon) = setup();
+    // A view with no prefilter, which every one of the oversized
+    // generation's paths passes: without it the rule would name nothing
+    // there, and the oversized half of this test would be vacuous.
+    std::fs::write(
+        vault.path().join("All.base"),
+        "views:\n  - type: table\n    name: Everything\n    filters: 'file.size >= 0'\n",
+    )
+    .unwrap();
     std::fs::write(vault.path().join("Books/D.md"), "---\nprice: 4\n---\n").unwrap();
     let refreshed = generation_of(
         &mut daemon,
@@ -491,6 +510,212 @@ fn a_resync_is_never_accompanied_by_views_invalidated() {
     assert!(
         views.is_empty(),
         "no views_invalidated beside a resync: {views:?}"
+    );
+}
+
+/// The first cell of the first row of `path`'s first view, as JSON.
+fn first_cell(daemon: &mut Daemon, path: &str) -> String {
+    match daemon
+        .call(&format!(
+            r#"{{"version":1,"id":"c","request":{{"method":"evaluate_base","params":{{"path":"{path}"}}}}}}"#
+        ))
+        .outcome
+    {
+        ResponseOutcome::Ok(Response::EvaluateBase(answer)) => {
+            serde_json::to_string(&answer.rows[0].cells[0]).unwrap()
+        }
+        other => panic!("evaluate {path}: {other:?}"),
+    }
+}
+
+/// Write `.obsidian/types.json` through the daemon (a `config_changed`, no
+/// generation), and wait for its event.
+fn write_types(daemon: &mut Daemon, text: &str) {
+    match daemon
+        .call(&format!(
+            r#"{{"version":1,"id":"y","request":{{"method":"write_file","params":{{"path":".obsidian/types.json","content_base64":"{}","expected":{{"any":true}}}}}}}}"#,
+            base64_of(text)
+        ))
+        .outcome
+    {
+        ResponseOutcome::Ok(_) => {}
+        ResponseOutcome::Err(error) => panic!("write types.json: {error:?}"),
+    }
+    daemon.wait_for_event(|event| {
+        matches!(&event.event, RuntimeEventDto::ConfigChanged(c) if c.path == ".obsidian/types.json")
+    });
+}
+
+/// `setup()` plus a note with a date-shaped `due` and a base showing it.
+fn dated() -> (TempDir, TempDir, Daemon) {
+    let (vault, index, mut daemon) = setup();
+    std::fs::create_dir_all(vault.path().join("Dates")).unwrap();
+    std::fs::create_dir_all(vault.path().join(".obsidian")).unwrap();
+    std::fs::write(
+        vault.path().join("Dates/D.md"),
+        "---\ndue: 2024-01-02\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault.path().join("Due.base"),
+        "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Dates\")'\n    order: [due]\n",
+    )
+    .unwrap();
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    daemon.drain_events();
+    (vault, index, daemon)
+}
+
+const UNTYPED: &str = r#"{"kind":"string","value":"2024-01-02"}"#;
+
+/// H1: a `types.json` write is a `config_changed` with no generation, and
+/// the cached answer must not outlive it: a client that re-asks on
+/// `config_changed` gets the newly typed cell.
+#[test]
+fn a_types_change_reaches_a_re_asked_answer() {
+    let (_vault, _index, mut daemon) = dated();
+    assert_eq!(first_cell(&mut daemon, "Due.base"), UNTYPED);
+    write_types(&mut daemon, r#"{"types":{"due":"date"}}"#);
+    let typed = first_cell(&mut daemon, "Due.base");
+    assert!(
+        typed.contains(r#""kind":"date""#),
+        "still {typed} after config_changed"
+    );
+}
+
+/// H1: the same write names every view the tracker knows, right behind the
+/// `config_changed` event, at the current generation.
+#[test]
+fn a_types_change_invalidates_the_views_it_retypes() {
+    let (_vault, _index, mut daemon) = dated();
+    assert_eq!(first_cell(&mut daemon, "Due.base"), UNTYPED);
+    let current = generation_of(
+        &mut daemon,
+        r#"{"version":1,"id":"g","request":{"method":"evaluate_base","params":{"path":"Due.base"}}}"#,
+    );
+    write_types(&mut daemon, r#"{"types":{"due":"date"}}"#);
+    let named: BTreeSet<String> = daemon
+        .drain_events()
+        .iter()
+        .filter_map(|raw| {
+            let event: EventEnvelope = serde_json::from_str(raw).unwrap();
+            match event.event {
+                RuntimeEventDto::ViewsInvalidated(v) => {
+                    assert_eq!(v.generation, current, "named at the current generation");
+                    Some(format!("{}#{}", v.base, v.view))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    assert!(named.contains("Due.base#T"), "named {named:?}");
+    assert!(named.contains("V.base#InBooks"), "named {named:?}");
+}
+
+/// H1 for an external edit: Obsidian writes `.obsidian/types.json` itself,
+/// straight to disk. A watching daemon announces it as `config_changed`,
+/// names every view it knows behind it, and a re-ask gets the new type.
+#[test]
+fn a_types_change_written_straight_to_disk_is_announced_and_reaches_a_re_ask() {
+    let vault = TempDir::new_in(scratch()).unwrap();
+    let index = TempDir::new_in(scratch()).unwrap();
+    std::fs::create_dir_all(vault.path().join("Dates")).unwrap();
+    std::fs::create_dir_all(vault.path().join(".obsidian")).unwrap();
+    std::fs::write(
+        vault.path().join("Dates/D.md"),
+        "---\ndue: 2024-01-02\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault.path().join("Due.base"),
+        "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Dates\")'\n    order: [due]\n",
+    )
+    .unwrap();
+    let mut daemon = Daemon::start(&[
+        "--vault",
+        vault.path().to_str().unwrap(),
+        "--index",
+        index.path().join("index.sqlite3").to_str().unwrap(),
+        "--reconcile-interval-seconds",
+        "0",
+    ]);
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    daemon.call(r#"{"version":1,"id":"s","request":{"method":"subscribe_events","params":{}}}"#);
+    assert_eq!(first_cell(&mut daemon, "Due.base"), UNTYPED);
+    daemon.drain_events();
+
+    std::fs::write(
+        vault.path().join(".obsidian/types.json"),
+        r#"{"types":{"due":"date"}}"#,
+    )
+    .unwrap();
+    daemon.wait_for_event(|event| {
+        matches!(&event.event, RuntimeEventDto::ConfigChanged(c) if c.path == ".obsidian/types.json")
+    });
+    let named: BTreeSet<String> = daemon
+        .drain_events()
+        .iter()
+        .filter_map(|raw| {
+            let event: EventEnvelope = serde_json::from_str(raw).unwrap();
+            match event.event {
+                RuntimeEventDto::ViewsInvalidated(v) => Some(format!("{}#{}", v.base, v.view)),
+                _ => None,
+            }
+        })
+        .collect();
+    assert!(named.contains("Due.base#T"), "named {named:?}");
+    let typed = first_cell(&mut daemon, "Due.base");
+    assert!(typed.contains(r#""kind":"date""#), "still {typed}");
+}
+
+/// H1's control: one unrelated generation later the same request answers
+/// the new type, so the stale answer above is the cache's, not the
+/// evaluator's.
+#[test]
+fn a_new_generation_shows_the_new_type() {
+    let (vault, _index, mut daemon) = dated();
+    assert_eq!(first_cell(&mut daemon, "Due.base"), UNTYPED);
+    std::fs::write(
+        vault.path().join(".obsidian/types.json"),
+        r#"{"types":{"due":"date"}}"#,
+    )
+    .unwrap();
+    write_note(&mut daemon, "Other/U.md", "plain\n");
+    let typed = first_cell(&mut daemon, "Due.base");
+    assert!(typed.contains(r#""kind":"date""#), "{typed}");
+}
+
+/// M1: a view that reads an attachment through `file()` reads its size and
+/// existence, so a change to the attachment (not a note) stales it.
+#[test]
+fn a_view_reading_an_attachment_through_file_is_stale_when_it_changes() {
+    let (_vault, _index, mut daemon) = setup();
+    let write_png = |daemon: &mut Daemon, bytes: &str| {
+        generation_of(
+            daemon,
+            &format!(
+                r#"{{"version":1,"id":"a","request":{{"method":"write_file","params":{{"path":"Other/x.png","content_base64":"{}","expected":{{"any":true}}}}}}}}"#,
+                base64_of(bytes)
+            ),
+        )
+    };
+    let first = write_png(&mut daemon, "png");
+    let _ = invalidated_at(&mut daemon, first);
+    let created = write_base(
+        &mut daemon,
+        "Att.base",
+        "formulas:\n  size: 'file(\"Other/x.png\").size'\nviews:\n  - type: table\n    name: Sized\n    filters: 'file.inFolder(\"Books\")'\n    order: [formula.size]\n",
+    );
+    let _ = invalidated_at(&mut daemon, created);
+    let before = first_cell(&mut daemon, "Att.base");
+    assert_eq!(before, r#"{"kind":"number","value":3}"#);
+
+    let grown = write_png(&mut daemon, "a longer png...");
+    let after = first_cell(&mut daemon, "Att.base");
+    assert_eq!(after, r#"{"kind":"number","value":15}"#, "the cell moved");
+    assert!(
+        invalidated_at(&mut daemon, grown).contains("Att.base#Sized"),
+        "the cell moved {before} -> {after} and the view was not named"
     );
 }
 
