@@ -147,3 +147,34 @@ fn time_reduce_and_unique() {
         println!("n={count} nest={nest:?} keep_shared={keep:?} unique={unique:?}");
     }
 }
+
+/// Task 14's carry from the Task 7 fix round: `ensure_room` walks the whole
+/// item it is asked to wrap, so a wide item wrapped again on every step of a
+/// fold costs (width × steps). Timed at three sizes, each three times, in
+/// release (`--release --ignored --nocapture`), beside the deep fold that
+/// the depth cap ends early.
+#[test]
+#[ignore = "a timing measurement, run by Task 14"]
+fn time_deep_reduce_and_wide_rewrap() {
+    for count in [1_000usize, 5_000, 20_000] {
+        let source = note_with(count);
+        let time = |expr: &str| {
+            let mut samples: Vec<f64> = (0..3)
+                .map(|_| {
+                    let started = Instant::now();
+                    let _ = eval(&source, expr);
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            (samples[1], samples[0])
+        };
+        // Deep: one level per step, refused at the cap.
+        let (deep, deep_min) = time("xs.reduce([acc], [])");
+        // Wide: the whole `xs` re-wrapped on every step.
+        let (wide, wide_min) = time("xs.reduce([xs], []).length");
+        println!(
+            "n={count} deep reduce p50 {deep:.3} ms (min {deep_min:.3}); wide re-wrap p50 {wide:.3} ms (min {wide_min:.3})"
+        );
+    }
+}

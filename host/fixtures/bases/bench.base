@@ -1,0 +1,27 @@
+views:
+  - type: table
+    name: Filtered
+    filters:
+      and:
+        - file.hasTag("group-3")
+        - 'rank < 50'
+    order: [file.name, rank, title]
+    sort:
+      - property: rank
+        direction: DESC
+  - type: table
+    name: Filtered2
+    filters:
+      and:
+        - file.hasTag("group-3")
+        - 'rank < 50'
+    order: [file.name, rank, title]
+    sort:
+      - property: rank
+        direction: DESC
+  - type: table
+    name: All
+    order: [file.name, title]
+  - type: table
+    name: All2
+    order: [file.name, title]

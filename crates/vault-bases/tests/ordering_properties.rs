@@ -236,3 +236,56 @@ fn one_boolean_in_a_text_column_sorts_in_about_the_time_of_a_plain_sort() {
         "with one false {mixed:?}, without {plain:?}"
     );
 }
+
+/// Task 14's carry: the number behind the bound above. Ten thousand rows of
+/// reversed text with and without one `false`, five evaluations each,
+/// interleaved; run in release with `--ignored --nocapture`.
+#[test]
+#[ignore = "a timing measurement, run by Task 14"]
+fn time_one_boolean_in_a_text_column() {
+    let source = |with_false: bool| {
+        let mut source = MemorySource::new();
+        for index in 0..10_000 {
+            let value = if with_false && index == 5_000 {
+                vault_core::PropertyValue::Boolean(false)
+            } else {
+                text(&format!("t{:05}", 10_000 - index))
+            };
+            source = source.with(
+                &format!("N{index:05}.md"),
+                MemoryFile::note().property("k", value),
+            );
+        }
+        source
+    };
+    let (plain_source, mixed_source) = (source(false), source(true));
+    let base = parse_base(
+        "views:\n  - type: table\n    name: T\n    order: [k]\n    sort:\n      - property: k\n",
+    )
+    .unwrap();
+    let compiled = compile_view(&base, None).unwrap();
+    let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
+    let base_path = VaultPath::new("T.base").unwrap();
+    let time = |source: &MemorySource| {
+        let ctx = EvalContext::new(source, &clock, &base_path, &base_path);
+        let started = std::time::Instant::now();
+        let rows = evaluate_view(&compiled, &ctx).unwrap().rows;
+        assert_eq!(rows.len(), 10_000);
+        started.elapsed().as_secs_f64() * 1_000.0
+    };
+    let (mut plain, mut mixed) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        plain.push(time(&plain_source));
+        mixed.push(time(&mixed_source));
+    }
+    for (name, samples) in [("plain text", &mut plain), ("one false", &mut mixed)] {
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "{name}: 10,000-row sorted view p50 {:.3} ms, max {:.3}, min {:.3}, n {}",
+            samples[2],
+            samples[4],
+            samples[0],
+            samples.len()
+        );
+    }
+}

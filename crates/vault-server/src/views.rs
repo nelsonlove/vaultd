@@ -726,4 +726,92 @@ mod tests {
             &facts
         ));
     }
+
+    /// The spec's bound: the per-commit rule under 1 ms with 50 bases. Ignored
+    /// by default (it builds a vault); run with `--ignored --nocapture` and
+    /// read the printed p50.
+    ///
+    /// Two dispatchers decide the same 200 commits: `continuous` sees every
+    /// generation, so its catalog is patched in place (the steady state the
+    /// spec bounds, asserted); `gapped` sees every other one, so each of its
+    /// decisions follows a gap and reloads the whole catalog with a full
+    /// `base_dependencies` compile of all 50 bases (reported, not asserted).
+    #[test]
+    #[ignore = "a timing measurement, run by Task 14"]
+    fn the_rule_with_fifty_bases_is_under_a_millisecond() {
+        let vault = scratch();
+        let index = scratch();
+        for at in 0..1000 {
+            std::fs::write(
+                vault.path().join(format!("N{at:04}.md")),
+                format!("---\nrank: {}\n---\n#g{}\n", at % 100, at % 10),
+            )
+            .unwrap();
+        }
+        for at in 0..50 {
+            std::fs::write(
+                vault.path().join(format!("B{at:02}.base")),
+                format!(
+                    "views:\n  - type: table\n    name: T\n    filters: 'file.hasTag(\"g{}\")'\n  - type: table\n    name: U\n    filters: 'rank == {}'\n",
+                    at % 10,
+                    at + 1
+                ),
+            )
+            .unwrap();
+        }
+        let config =
+            vault_index::IndexConfig::explicit(vault.path(), index.path().join("i.sqlite3"))
+                .unwrap();
+        let mut service = vault_index::IndexService::open(config).unwrap();
+        service.refresh(false).unwrap();
+        let reader = service.reader().unwrap();
+        let continuous = ViewTracker::default();
+        let gapped = ViewTracker::default();
+        let mut samples = Vec::new();
+        let mut reloads = Vec::new();
+        for at in 0..200u32 {
+            let path = VaultPath::new(format!("N{:04}.md", at % 1000)).unwrap();
+            // `rank` past 100, so every write changes the note's bytes (the
+            // brief's `rank: {at}` repeats the original note for at < 100,
+            // which publishes nothing and times a memo hit).
+            std::fs::write(
+                vault.path().join(path.as_str()),
+                format!("---\nrank: {}\n---\n#g{}\n", at + 100, at % 10),
+            )
+            .unwrap();
+            let report = service
+                .refresh_paths([path].into(), vault_index::ChangeCause::Watcher)
+                .unwrap();
+            assert_eq!(
+                report.previous_generation.map(|g| g.get() + 1),
+                Some(report.generation.get()),
+                "every commit publishes one generation"
+            );
+            let started = std::time::Instant::now();
+            let _ = continuous.stale_views(&reader, &report);
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            if at % 2 == 1 {
+                let started = std::time::Instant::now();
+                let _ = gapped.stale_views(&reader, &report);
+                reloads.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        let summary = |samples: &mut Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            let at =
+                |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];
+            (at(0.5), at(0.95), samples[0])
+        };
+        let (p50, p95, min) = summary(&mut samples);
+        let (reload_p50, reload_p95, reload_min) = summary(&mut reloads);
+        println!(
+            "staleness rule p50 over 50 bases: {p50:.3} ms (continuous, n={}; p95 {p95:.3}, min {min:.3})",
+            samples.len()
+        );
+        println!(
+            "staleness rule after a gap (full base_dependencies compile): p50 {reload_p50:.3} ms (n={}; p95 {reload_p95:.3}, min {reload_min:.3})",
+            reloads.len()
+        );
+        assert!(p50 < 1.0, "p50 {p50:.3} ms is over the 1 ms bound");
+    }
 }

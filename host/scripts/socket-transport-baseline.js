@@ -46,6 +46,14 @@
  *   --notes N        fixture size when it has to be built (default 1000)
  *   --out PATH       where the report lands
  *   --binary PATH    the vaultd to measure (default target/release/vaultd)
+ *   --base PATH      also measure Bases over this fixture base (copied into the vault as
+ *                    bench.base); the default --vault becomes target/tmp/bases-baseline/vault,
+ *                    a fixture built with the Bases fields (`rank`, a `#group-N` tag), never
+ *                    mixed with the plain one. The five Bases cases: base_filtered_ms (a
+ *                    filtered, sorted 100-row page), base_whole_vault_ms (the unfiltered page),
+ *                    base_cache_hit_ms, base_change_ms and note_change_ms. The daemon runs with
+ *                    --bases-cache-entries 1 and the harness alternates twin views, so every
+ *                    filtered and whole-vault sample evaluates rather than hits.
  *   --keep-vault     measure an existing non-empty --vault outside target/ instead
  *                    of refusing it. **Not read-only**: the `write_note` case
  *                    creates `--samples` notes named `Bench-<label>-<run>-NNNNNN.md`
@@ -55,11 +63,13 @@
  *   --json           print the summary as JSON instead of a table
  */
 
+const { Buffer } = require("node:buffer");
 const { spawn } = require("node:child_process");
 const { connect } = require("node:net");
 const {
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -74,6 +84,7 @@ const { VaultdClient } = require("../packages/host/dist/client/client.js");
 const REPO = resolve(__dirname, "..", "..");
 const DIST = join(REPO, "host", "packages", "host", "dist");
 const DEFAULT_ROOT = join(REPO, "target", "tmp", "socket-baseline");
+const BASES_ROOT = join(REPO, "target", "tmp", "bases-baseline");
 
 // --- Flags -------------------------------------------------------------------
 
@@ -111,6 +122,7 @@ function parseArgs(argv) {
       case "--notes": out.notes = numeric(next(), "--notes"); break;
       case "--out": out.out = resolve(next()); break;
       case "--binary": out.binary = resolve(next()); break;
+      case "--base": out.base = resolve(next()); break;
       case "--keep-vault": out.keepVault = true; break;
       case "--json": out.json = true; break;
       case "--help": case "-h": out.help = true; break;
@@ -125,9 +137,13 @@ function parseArgs(argv) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(out.label)) {
     throw new Error(`--label must be a plain file-name fragment, got ${out.label}`);
   }
-  out.vault ??= join(DEFAULT_ROOT, "vault");
-  out.index ??= join(DEFAULT_ROOT, `${out.transport}.sqlite3`);
-  out.out ??= join(DEFAULT_ROOT, `${out.transport}.json`);
+  // A Bases run measures its own fixture (the plain notes plus `rank` and a
+  // tag), so its vault, index and report never share a directory with the
+  // plain run's.
+  const root = out.base ? BASES_ROOT : DEFAULT_ROOT;
+  out.vault ??= join(root, "vault");
+  out.index ??= join(root, `${out.transport}.sqlite3`);
+  out.out ??= join(root, `${out.transport}.json`);
   out.binary ??= join(REPO, "target", "release", "vaultd");
   // **Short, and under the repository's own `target/`.** A Unix socket path is
   // capped near 104 bytes on macOS, and the daemon refuses a longer one by
@@ -191,15 +207,21 @@ function assertSafeToBuild(root) {
  * The same synthetic vault `headless-host-baseline.js` builds — `Note-NNNNNN.md`
  * with a `title` property, one heading and a wikilink to its successor — so the
  * two documents' fixtures are the same shape at different sizes.
+ *
+ * `withBaseFields` adds what the Bases fixture base reads: a `rank` property
+ * (`i % 100`) and a `#group-N` tag line (`i % 10`) in the body. Callers that
+ * pass two arguments get the plain shape, byte for byte.
  */
-function buildVault(root, count) {
+function buildVault(root, count, withBaseFields = false) {
   mkdirSync(root, { recursive: true });
   const pad = (n) => String(n).padStart(6, "0");
   for (let i = 0; i < count; i += 1) {
     const index = pad(i);
+    const rank = withBaseFields ? `rank: ${String(i % 100)}\n` : "";
+    const tag = withBaseFields ? `#group-${String(i % 10)}\n\n` : "";
     writeFileSync(
       join(root, `Note-${index}.md`),
-      `---\ntitle: Note ${index}\n---\n\n# Note ${index}\n\n[[Note-${pad((i + 1) % count)}]]\n`,
+      `---\ntitle: Note ${index}\n${rank}---\n\n# Note ${index}\n\n${tag}[[Note-${pad((i + 1) % count)}]]\n`,
     );
   }
 }
@@ -270,6 +292,9 @@ function spawnDaemon(options, socketPath, indexPath) {
     "--reconcile-interval-seconds", "0",
   ];
   if (options.transport === "socket") args.push("--listen", socketPath);
+  // One entry: the twin views alternate, so every measured evaluation is a
+  // miss, while the cache-hit case asks one view again and again.
+  if (options.base) args.push("--bases-cache-entries", "1");
   return track(spawn(options.binary, args, { stdio: ["pipe", "pipe", "inherit"] }));
 }
 
@@ -428,6 +453,49 @@ async function measureRun(options, run) {
       written.push(path);
     }
 
+    const cases = { connect_ms: connectMs, get_note_ms: getNoteMs, write_note_ms: writeNoteMs };
+    if (options.base) {
+      const baseText = readFileSync(options.base);
+      await client.request("write_file", {
+        path: "bench.base", content_base64: baseText.toString("base64"), expected: { any: true },
+      });
+      written.push("bench.base");
+      const timed = async (into, count, request) => {
+        for (let at = 0; at < count; at += 1) {
+          const started = hrtime.bigint();
+          await request(at);
+          into.push(ms(started));
+        }
+      };
+      const evaluate = (view) => client.request("evaluate_base", { path: "bench.base", view, limit: 100 });
+      for (let at = 0; at < 10; at += 1) await evaluate(at % 2 ? "Filtered" : "Filtered2");
+      cases.base_filtered_ms = [];
+      await timed(cases.base_filtered_ms, options.samples, (at) => evaluate(at % 2 ? "Filtered" : "Filtered2"));
+      cases.base_whole_vault_ms = [];
+      await timed(cases.base_whole_vault_ms, Math.min(options.samples, 50), (at) => evaluate(at % 2 ? "All" : "All2"));
+      // One view, asked again and again at one generation: every answer after
+      // the first is the cached one (capacity 1 holds exactly it).
+      await evaluate("Filtered");
+      cases.base_cache_hit_ms = [];
+      await timed(cases.base_cache_hit_ms, options.samples, () => evaluate("Filtered"));
+      // A base change and a note change, alternated so neither runs warmer.
+      cases.base_change_ms = [];
+      cases.note_change_ms = [];
+      const variants = [baseText, Buffer.concat([baseText, Buffer.from("\n")])];
+      for (let at = 0; at < options.samples; at += 1) {
+        let started = hrtime.bigint();
+        await client.request("write_file", {
+          path: "bench.base", content_base64: variants[at % 2].toString("base64"), expected: { any: true },
+        });
+        cases.base_change_ms.push(ms(started));
+        const path = `${prefix}-change.md`;
+        started = hrtime.bigint();
+        await client.request("write_note", { path, content: `# Change ${String(at)}\n`, expected: { any: true } });
+        cases.note_change_ms.push(ms(started));
+        if (at === 0) written.push(path);
+      }
+    }
+
     if (options.transport === "socket") await measureConnects(socketPath, options.samples, connectMs);
 
     return {
@@ -435,7 +503,7 @@ async function measureRun(options, run) {
       run,
       socket_path: info.socket_path ?? null,
       note_count: info.note_count,
-      cases: { connect_ms: connectMs, get_note_ms: getNoteMs, write_note_ms: writeNoteMs },
+      cases,
       environment: {
         node: process.version,
         platform: `${process.platform} ${process.arch}`,
@@ -500,7 +568,7 @@ async function main() {
   } else {
     assertSafeToBuild(options.vault);
     process.stdout.write(`baseline: building a ${String(options.notes)}-note fixture at ${options.vault}\n`);
-    buildVault(options.vault, options.notes);
+    buildVault(options.vault, options.notes, Boolean(options.base));
   }
   mkdirSync(dirname(options.out), { recursive: true });
   mkdirSync(dirname(options.index), { recursive: true });
@@ -523,32 +591,36 @@ async function main() {
     writeFileSync(options.out, `${JSON.stringify(reports[0], null, 2)}\n`);
   } else {
     const p50s = (name) => reports.map((report) => median(report.cases[name]));
+    // Every case the runs carry: the three transport cases, plus the five
+    // Bases cases when `--base` is given.
+    const names = Object.keys(reports[0].cases);
     const summary = {
       transport: options.transport,
       label: options.label,
       repeat: options.repeat,
       runs: reports.map((report) => report.report_path),
-      p50_ms: {
-        connect_ms: p50s("connect_ms"),
-        get_note_ms: p50s("get_note_ms"),
-        write_note_ms: p50s("write_note_ms"),
-      },
-      median_p50_ms: {
-        connect_ms: median(p50s("connect_ms").filter((value) => value !== null)),
-        get_note_ms: median(p50s("get_note_ms")),
-        write_note_ms: median(p50s("write_note_ms")),
-      },
+      p50_ms: Object.fromEntries(names.map((name) => [name, p50s(name)])),
+      median_p50_ms: Object.fromEntries(
+        names.map((name) => [name, median(p50s(name).filter((value) => value !== null))]),
+      ),
       environment: reports.map((report) => report.environment),
     };
     writeFileSync(options.out, `${JSON.stringify(summary, null, 2)}\n`);
   }
 
+  const BASE_CASES = [
+    "base_filtered_ms", "base_whole_vault_ms", "base_cache_hit_ms", "base_change_ms", "note_change_ms",
+  ];
   if (options.json) {
     process.stdout.write(`${JSON.stringify(reports.map((report) => ({
       run: report.run,
       connect_p50_ms: median(report.cases.connect_ms),
       get_note_p50_ms: median(report.cases.get_note_ms),
       write_note_p50_ms: median(report.cases.write_note_ms),
+      ...Object.fromEntries(
+        BASE_CASES.filter((name) => name in report.cases)
+          .map((name) => [name.replace(/_ms$/, "_p50_ms"), median(report.cases[name])]),
+      ),
     })), null, 2)}\n`);
   } else {
     const show = (value) => (value === null ? "—" : `${value.toFixed(3)} ms`);
@@ -559,6 +631,9 @@ async function main() {
           `  write_note p50 ${show(median(report.cases.write_note_ms))}` +
           `  load ${report.environment.load_average_after[0].toFixed(2)}\n`,
       );
+      for (const name of BASE_CASES.filter((name) => name in report.cases)) {
+        process.stdout.write(`    ${name.replace(/_ms$/, "")} p50 ${show(median(report.cases[name]))}\n`);
+      }
     }
   }
   process.stdout.write(`${options.out}\n`);
