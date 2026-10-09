@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-tostring-obj.base",
+  "view": "s_tostring_obj",
+  "captured_at_ms": 1791522453593,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_tostring_obj\": \"{\\\"a\\\":\\\"1, 2\\\",\\\"b\\\":\\\"{\\\\\\\"c\\\\\\\":\\\\\\\"true\\\\\\\"}\\\",\\\"d\\\":\\\"null\\\"}\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "{\"a\":\"1, 2\",\"b\":\"{\\\"c\\\":\\\"true\\\"}\",\"d\":\"null\"}"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

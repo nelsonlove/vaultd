@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-date-lt-str.base",
+  "view": "s_date_lt_str",
+  "captured_at_ms": 1791522410858,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_date_lt_str\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

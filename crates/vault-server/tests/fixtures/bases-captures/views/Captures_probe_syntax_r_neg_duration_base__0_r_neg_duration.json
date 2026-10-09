@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-neg-duration.base",
+  "view": "r_neg_duration",
+  "captured_at_ms": 1791522396192,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_neg_duration\": \"a day\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a day"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

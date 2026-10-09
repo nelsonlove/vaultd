@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r32",
+  "captured_at_ms": 1791522531424,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r32.md\",\n    \"f32\": \"Error: Cannot call function \\\"lower\\\", too many arguments.\",\n    \"t13_now\": \"1791522531432\"\n  }\n]\n",
+  "stderr": ""
+}

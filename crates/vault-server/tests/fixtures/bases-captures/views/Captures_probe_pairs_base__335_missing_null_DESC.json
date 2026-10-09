@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "missing~null~DESC",
+  "captured_at_ms": 1791522378419,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/missing~null-1.md\",\n    \"mix\": null\n  },\n  {\n    \"path\": \"Captures/pairs/missing~null-2.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

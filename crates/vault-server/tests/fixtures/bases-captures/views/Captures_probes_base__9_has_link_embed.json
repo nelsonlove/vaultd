@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "has_link_embed",
+  "captured_at_ms": 1791522496318,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/has_link_embed-e.md\",\n    \"has_embed\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

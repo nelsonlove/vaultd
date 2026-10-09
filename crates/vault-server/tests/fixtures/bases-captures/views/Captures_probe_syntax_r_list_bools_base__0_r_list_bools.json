@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-list-bools.base",
+  "view": "r_list_bools",
+  "captured_at_ms": 1791522392520,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_list_bools\": \"true, false, 1.5\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

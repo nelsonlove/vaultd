@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-num-paren-method.base",
+  "view": "x_num_paren_method",
+  "captured_at_ms": 1791522469455,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_num_paren_method\": \"false\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

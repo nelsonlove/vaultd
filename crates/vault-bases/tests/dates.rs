@@ -32,7 +32,7 @@ fn run(source: &MemorySource, expression: &str) -> Value {
 }
 
 #[test]
-fn a_date_typed_property_is_a_date_and_an_untyped_one_stays_text() {
+fn a_date_typed_property_is_a_date_and_so_is_untyped_date_text() {
     let source = MemorySource::new()
         .with(
             "Task.md",
@@ -52,10 +52,9 @@ fn a_date_typed_property_is_a_date_and_an_untyped_one_stays_text() {
         run(&source, "stamp.format(\"HH:mm\")"),
         Value::String("10:15".into())
     );
-    assert_eq!(
-        run(&source, "memo.isType(\"string\")"),
-        Value::Boolean(true)
-    );
+    // Captured (Task 13): text that reads as a date is a date, declared or
+    // not.
+    assert_eq!(run(&source, "memo.isType(\"date\")"), Value::Boolean(true));
     assert_eq!(run(&source, "due < today()"), Value::Boolean(true));
 }
 
@@ -191,28 +190,29 @@ fn the_offset_tokens_follow_the_injected_zone() {
 }
 
 #[test]
-fn any_other_format_letter_is_an_unsupported_token_named() {
-    for (format, token) in [
-        ("W", "W"),
-        ("WW", "WW"),
-        ("YYYY-ww", "ww"),
-        ("k", "k"),
-        ("E", "E"),
-        // A run of a listed letter at a length the list does not name is
-        // refused whole, never split into two listed tokens.
-        ("SSSS", "SSSS"),
-        ("MMMMM", "MMMMM"),
-        ("YYYYY", "YYYYY"),
-        ("Y", "Y"),
-        ("HHH", "HHH"),
-        ("Mo", "o"),
-        ("DDDo", "o"),
-        // An unclosed `[` is a literal `[`, so `t` is then read as a token.
-        ("[at", "t"),
+fn format_reads_tokens_as_moment_does() {
+    // Captured (Task 13): `W` is the ISO week, `SSSS` pads the fraction,
+    // and a letter Moment has no token for is copied (`[at` is `[amt`).
+    // The fixture instant is Thursday 2026-01-15 10:30:00.000 in New York.
+    for (format, shown) in [
+        ("W", "3"),
+        ("WW", "03"),
+        ("YYYY-ww", "2026-03"),
+        ("k", "10"),
+        ("E", "4"),
+        ("SSSS", "0000"),
+        ("MMMMM", "January1"),
+        ("Y", "2026"),
+        ("HHH", "1010"),
+        ("Mo", "1st"),
+        ("DDDo", "15th"),
+        ("[at", "[amt"),
+        ("LL", "January 15, 2026"),
+        ("t", "t"),
     ] {
         assert_eq!(
-            eval(&format!("now().format({format:?})")),
-            Err(EvalError::UnsupportedFormatToken(token.into())),
+            string(&format!("now().format({format:?})")),
+            shown,
             "format {format}"
         );
     }
@@ -278,12 +278,16 @@ fn the_has_time_flag_is_set_by_parsing_and_kept_by_calendar_arithmetic() {
     assert!(!has_time("today() + \"1M\""));
     assert!(!has_time("today() - \"2w\""));
     assert!(has_time("today() + \"36h\""));
+    // Captured: a span written in hours gives a time even when it is whole
+    // days.
+    assert!(has_time("today() + \"24h\""));
+    assert!(!has_time("today() + \"1d\""));
     assert!(has_time("now() + \"1d\""));
     let rendered = |expression: &str| render_text(&eval(expression).unwrap(), &clock);
     assert_eq!(rendered("date(\"2025-01-01\")"), "2025-01-01");
     assert_eq!(
         rendered("date(\"2025-01-01 00:00:00\")"),
-        "2025-01-01 00:00"
+        "2025-01-01T00:00:00"
     );
     // An explicit format shows what it names, flag or not.
     let without_time = DateValue {
@@ -321,7 +325,13 @@ fn date_fields_read_the_local_calendar() {
 
 #[test]
 fn durations_add_subtract_and_scale() {
-    let duration = |months: i64, ms: i64| Ok(Value::Duration(DurationValue { months, ms }));
+    let duration = |months: i64, ms: i64| {
+        Ok(Value::Duration(DurationValue {
+            months,
+            ms,
+            timed: ms % 86_400_000 != 0,
+        }))
+    };
     assert_eq!(
         string(
             "(date(\"2024-01-31\") + (duration(\"1M\") + duration(\"1d\"))).format(\"YYYY-MM-DD\")"
@@ -392,17 +402,22 @@ fn relative_turns_at_moments_default_thresholds() {
 
 #[test]
 fn bad_dates_durations_and_overflows_are_typed_errors_never_panics() {
+    // Captured (Task 13): text that is not a date or a duration is empty.
     for expression in [
         "date(\"not a date\")",
         "date(\"2025-02-30\")",
         "date(\"2025-01-01 25:00\")",
         "date(\"2025-01-01 10:00:00.é\")",
         "date(\"2025-01-01 10:00:00.1x\")",
-        "date(1)",
-        "date()",
         "duration(\"soon\")",
         "duration(\"1.5M\")",
         "duration(\"99999999999999999999y\")",
+    ] {
+        assert_eq!(eval(expression), Ok(Value::Null), "{expression}");
+    }
+    for expression in [
+        "date(1)",
+        "date()",
         "duration(5)",
         "2 * duration(\"5h\")",
         "now() + \"soon\"",
@@ -441,4 +456,56 @@ fn bad_dates_durations_and_overflows_are_typed_errors_never_panics() {
 #[should_panic(expected = "not a representable instant")]
 fn a_fixed_clock_outside_the_representable_range_is_refused() {
     let _ = Clock::fixed(i64::MAX, FIXTURE_ZONE);
+}
+
+/// The review's H2: formatting a date at either end of the calendar never
+/// panics, with or without a week token (year 9999's last week reaches into
+/// year 10000, which no `jiff` date holds).
+#[test]
+fn formatting_at_the_calendar_ends_never_panics() {
+    let source = MemorySource::new()
+        .with(
+            "Far.md",
+            MemoryFile::note().property("due", text("9999-12-30")),
+        )
+        .with(
+            "Early.md",
+            MemoryFile::note().property("due", text("0001-01-01")),
+        );
+    let on = |row: &str, expression: &str| {
+        let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
+        let row = VaultPath::new(row).unwrap();
+        let ctx = EvalContext::new(&source, &clock, &row, &row);
+        evaluate(
+            &parse_expression(expression).unwrap(),
+            &ctx,
+            &Scope::row(&row),
+        )
+    };
+    assert_eq!(
+        on("Far.md", r#"due.format("YYYY-MM-DD")"#),
+        Ok(Value::String("9999-12-30".into()))
+    );
+    assert_eq!(
+        on("Far.md", r#"due.format("GGGG-[W]WW gggg-ww")"#),
+        Ok(Value::String("9999-W52 10000-01".into()))
+    );
+    assert_eq!(
+        on("Early.md", r#"due.format("YYYY GGGG-[W]WW gggg-ww")"#),
+        Ok(Value::String("0001 0001-W01 0001-01".into()))
+    );
+    // The far ends of the timestamp range, in UTC and in a zone.
+    for zone in ["UTC", FIXTURE_ZONE] {
+        let clock = Clock::fixed(0, zone);
+        for epoch_ms in [
+            jiff::Timestamp::MIN.as_millisecond(),
+            jiff::Timestamp::MAX.as_millisecond(),
+        ] {
+            let date = DateValue {
+                epoch_ms,
+                has_time: true,
+            };
+            assert!(format_date(date, "YYYY-MM-DD W w GGGG gggg Do", &clock).is_ok());
+        }
+    }
 }

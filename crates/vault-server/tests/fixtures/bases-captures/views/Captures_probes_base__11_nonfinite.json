@@ -1,0 +1,31 @@
+{
+  "base": "Captures/probes.base",
+  "view": "nonfinite",
+  "captured_at_ms": 1791522498761,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/nonfinite-i.md\",\n    \"n\": \"Infinity\",\n    \"n_text\": \"Infinity\"\n  },\n  {\n    \"path\": \"Captures/probes/nonfinite-m.md\",\n    \"n\": \"-Infinity\",\n    \"n_text\": \"-Infinity\"\n  },\n  {\n    \"path\": \"Captures/probes/nonfinite-q.md\",\n    \"n\": \"NaN\",\n    \"n_text\": \"NaN\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "",
+            "Infinity"
+          ],
+          [
+            "",
+            "-Infinity"
+          ],
+          [
+            "",
+            "NaN"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/list.base",
+  "view": "r34",
+  "captured_at_ms": 1791522184231,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/list/r34.md\",\n    \"f34\": \"Error: Cannot find \\\"length\\\" on type Number\",\n    \"t13_now\": \"1791522184237\"\n  }\n]\n",
+  "stderr": ""
+}

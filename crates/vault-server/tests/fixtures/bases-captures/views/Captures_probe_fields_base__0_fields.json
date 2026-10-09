@@ -1,0 +1,51 @@
+{
+  "base": "Captures/probe-fields.base",
+  "view": "fields",
+  "captured_at_ms": 1791522188136,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/view/a.md\",\n    \"file name\": \"a\",\n    \"file base name\": \"a\",\n    \"file extension\": \"md\",\n    \"file path\": \"Captures/view/a.md\",\n    \"folder\": \"Captures/view\",\n    \"file size\": \"42\",\n    \"created time\": \"2026-10-08T23:55:29\",\n    \"modified time\": \"2026-10-09T01:00:47\",\n    \"file tags\": \"#book\",\n    \"file links\": null,\n    \"file embeds\": null,\n    \"file backlinks\": null,\n    \"properties\": \"{\\\"list\\\":\\\"x\\\",\\\"status\\\":\\\"p\\\"}\",\n    \"file\": \"Captures/view/a.md\"\n  },\n  {\n    \"path\": \"Capture.md\",\n    \"file name\": \"Capture\",\n    \"file base name\": \"Capture\",\n    \"file extension\": \"md\",\n    \"file path\": \"Capture.md\",\n    \"folder\": \"/\",\n    \"file size\": \"66\",\n    \"created time\": \"2026-10-08T23:55:29\",\n    \"modified time\": \"2026-10-09T01:00:47\",\n    \"file tags\": \"#book, #Project/Active\",\n    \"file links\": \"[[Other|Other]], [[Missing|Missing]], [[Folder/image.png|Folder/image.png]]\",\n    \"file embeds\": \"[[Folder/image.png|Folder/image.png]]\",\n    \"file backlinks\": \"[[Other.md|Other]]\",\n    \"properties\": \"{}\",\n    \"file\": \"Capture.md\"\n  },\n  {\n    \"path\": \"Root-probe.md\",\n    \"file name\": \"Root-probe\",\n    \"file base name\": \"Root-probe\",\n    \"file extension\": \"md\",\n    \"file path\": \"Root-probe.md\",\n    \"folder\": \"/\",\n    \"file size\": \"5\",\n    \"created time\": \"2026-10-08T23:55:29\",\n    \"modified time\": \"2026-10-09T01:00:47\",\n    \"file tags\": null,\n    \"file links\": null,\n    \"file embeds\": null,\n    \"file backlinks\": null,\n    \"properties\": \"{}\",\n    \"file\": \"Root-probe.md\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a",
+            "a",
+            "md",
+            "Captures/view/a.md",
+            "Captures/view",
+            "42"
+          ],
+          [
+            "Capture",
+            "Capture",
+            "md",
+            "Capture.md",
+            "/",
+            "66"
+          ],
+          [
+            "image.png",
+            "image",
+            "png",
+            "Folder/image.png",
+            "Folder",
+            "1000"
+          ],
+          [
+            "Root-probe",
+            "Root-probe",
+            "md",
+            "Root-probe.md",
+            "/",
+            "5"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-date-minus-number.base",
+  "view": "s_date_minus_number",
+  "captured_at_ms": 1791522412079,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_date_minus_number\": \"Error: Invalid operator between Date and Number\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Invalid operator between Date and Number"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

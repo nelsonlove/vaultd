@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "unique_nan",
+  "captured_at_ms": 1791522499985,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/unique_nan-u.md\",\n    \"unique_nan\": \"3\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "3"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/list.base",
+  "view": "r30",
+  "captured_at_ms": 1791522184205,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/list/r30.md\",\n    \"f30\": \"Error: Cannot call function \\\"reduce\\\", not enough arguments.\",\n    \"t13_now\": \"1791522184211\"\n  }\n]\n",
+  "stderr": ""
+}

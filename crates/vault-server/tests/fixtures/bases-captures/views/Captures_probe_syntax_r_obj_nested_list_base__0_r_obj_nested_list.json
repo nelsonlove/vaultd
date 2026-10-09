@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-obj-nested-list.base",
+  "view": "r_obj_nested_list",
+  "captured_at_ms": 1791522397411,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_obj_nested_list\": \"1, 2\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1 2"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

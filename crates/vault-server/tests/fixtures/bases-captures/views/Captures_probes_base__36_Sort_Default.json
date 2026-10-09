@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "Sort_Default",
+  "captured_at_ms": 1791522529300,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Root-probe.md\",\n    \"file name\": \"Root-probe\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Root-probe"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-list-eq-coerce.base",
+  "view": "s_list_eq_coerce",
+  "captured_at_ms": 1791522423089,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_list_eq_coerce\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

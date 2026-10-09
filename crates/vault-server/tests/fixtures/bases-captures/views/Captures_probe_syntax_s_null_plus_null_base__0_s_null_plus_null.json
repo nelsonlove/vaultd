@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-null-plus-null.base",
+  "view": "s_null_plus_null",
+  "captured_at_ms": 1791522430412,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_null_plus_null\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "sabc~lba~ASC",
+  "captured_at_ms": 1791522252163,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/sabc~lba-1.md\",\n    \"mix\": \"abc\"\n  },\n  {\n    \"path\": \"Captures/pairs/sabc~lba-2.md\",\n    \"mix\": \"b, a\"\n  }\n]\n",
+  "stderr": ""
+}

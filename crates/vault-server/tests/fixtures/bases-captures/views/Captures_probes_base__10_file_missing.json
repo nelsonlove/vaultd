@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "file_missing",
+  "captured_at_ms": 1791522497539,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/file_missing-f.md\",\n    \"missing_file\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

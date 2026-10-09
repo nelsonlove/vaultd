@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-mean-mixed.base",
+  "view": "s_mean_mixed",
+  "captured_at_ms": 1791522425532,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_mean_mixed\": \"1.3333333333333333\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1.3333333333333333"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

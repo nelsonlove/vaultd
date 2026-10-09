@@ -1,54 +1,54 @@
-{"family":"coercion","case":"truthy:empty_string","expr":"\"\".isTruthy()","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"truthy:string","expr":"\"a\".isTruthy()","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"truthy:zero","expr":"0.isTruthy()","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"truthy:null","expr":"missing.isTruthy()","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"truthy:empty_list","expr":"[].isTruthy()","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"not:empty_string","expr":"!\"\"","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"and:boolean","expr":"1 && \"x\"","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"or:boolean","expr":"0 || \"\"","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"eq:number","expr":"1 == 1.0","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"eq:string_case","expr":"\"a\" == \"A\"","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"eq:null_null","expr":"missing == null","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"eq:number_null","expr":"5 == null","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"ne:number","expr":"1 != 2","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"eq:number:string","expr":"5 == \"5\"","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"eq:boolean:number","expr":"true == 1","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"eq:list:list","expr":"[1] == [1]","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"eq:object:object","expr":"{} == {}","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"cmp:number","expr":"1 < 2","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"cmp:string","expr":"\"apple\" < \"banana\"","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"cmp:string_utf16","expr":"\"Z\" < \"a\"","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"cmp:mixed","expr":"1 < \"2\"","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"add:number","expr":"1 + 2","kind":"number","text":"3","source":"published"}
-{"family":"coercion","case":"add:float","expr":"0.1 + 0.2","kind":"number","text":"0.30000000000000004","source":"published"}
-{"family":"coercion","case":"add:string","expr":"\"a\" + \"b\"","kind":"string","text":"ab","source":"published"}
-{"family":"coercion","case":"add:string_number","expr":"\"a\" + 1","kind":"string","text":"a1","source":"published"}
-{"family":"coercion","case":"add:number_string","expr":"1 + \"a\"","kind":"string","text":"1a","source":"published"}
-{"family":"coercion","case":"add:string_boolean","expr":"\"is \" + true","kind":"string","text":"is true","source":"published"}
-{"family":"coercion","case":"add:string:null","expr":"\"a\" + missing","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"arith:null","expr":"1 + missing","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"sub:number","expr":"5 - 7","kind":"number","text":"-2","source":"published"}
-{"family":"coercion","case":"mul:number","expr":"radius * (2 * 3.14)","props":{"radius":2},"kind":"number","text":"12.56","source":"published"}
-{"family":"coercion","case":"rem:number","expr":"7 % 3","kind":"number","text":"1","source":"published"}
-{"family":"coercion","case":"div:zero","expr":"1 / 0","kind":"error","source":"published"}
-{"family":"coercion","case":"rem:zero","expr":"1 % 0","kind":"error","source":"published"}
-{"family":"coercion","case":"negate:number","expr":"-(2.5)","kind":"number","text":"-2.5","source":"published"}
-{"family":"coercion","case":"number_text:exponent","expr":"(1e21).toString()","kind":"string","text":"1e+21","source":"published"}
-{"family":"coercion","case":"number_text:small","expr":"(0.00000015).toString()","kind":"string","text":"1.5e-7","source":"published"}
-{"family":"coercion","case":"property:bare","expr":"price","props":{"price":2.5},"kind":"number","text":"2.5","source":"published"}
-{"family":"coercion","case":"property:note_prefix","expr":"note.price","props":{"price":2.5},"kind":"number","text":"2.5","source":"published"}
-{"family":"coercion","case":"property:note_index","expr":"note[\"my prop\"]","props":{"my prop":"x"},"kind":"string","text":"x","source":"published"}
-{"family":"coercion","case":"property:missing","expr":"missing","kind":"null","text":"","source":"published"}
-{"family":"coercion","case":"property:object_member","expr":"property.subprop","props":{"property":{"subprop":"s"}},"kind":"string","text":"s","source":"published"}
-{"family":"coercion","case":"property:object_index","expr":"property[\"subprop\"]","props":{"property":{"subprop":"s"}},"kind":"string","text":"s","source":"published"}
-{"family":"coercion","case":"property:list_index","expr":"property[0]","props":{"property":["a","b"]},"kind":"string","text":"a","source":"published"}
-{"family":"coercion","case":"property:list_index_out_of_range","expr":"property[5]","props":{"property":["a"]},"kind":"null","text":"","source":"published"}
-{"family":"coercion","case":"index:string","expr":"\"abc\"[0]","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"cmp:boolean","expr":"false < true","kind":"boolean","text":"true","source":"published"}
-{"family":"coercion","case":"cmp:boolean_reversed","expr":"true < false","kind":"boolean","text":"false","source":"published"}
-{"family":"coercion","case":"number_text:infinity","expr":"(1e400).toString()","kind":"string","text":"Infinity","source":"provisional"}
-{"family":"coercion","case":"number_text:negative_infinity","expr":"(-1e400).toString()","kind":"string","text":"-Infinity","source":"provisional"}
-{"family":"coercion","case":"number_cell:infinity","expr":"1e400","kind":"number","text":"Infinity","source":"provisional"}
-{"family":"coercion","case":"arith:mixed_bool","expr":"1 + true","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"arith:list_plus_list","expr":"[1] + [2]","kind":"error","source":"uncaptured"}
-{"family":"coercion","case":"arith:nonfinite","expr":"1e308 * 10","kind":"error","source":"uncaptured"}
+{"family": "coercion", "case": "truthy:empty_string", "expr": "\"\".isTruthy()", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "truthy:string", "expr": "\"a\".isTruthy()", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "truthy:zero", "expr": "0.isTruthy()", "kind": "boolean", "text": "false", "source": "provisional"}
+{"family": "coercion", "case": "truthy:null", "expr": "missing.isTruthy()", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "truthy:empty_list", "expr": "[].isTruthy()", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "not:empty_string", "expr": "!\"\"", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "and:boolean", "expr": "1 && \"x\"", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "or:boolean", "expr": "0 || \"\"", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "eq:number", "expr": "1 == 1.0", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "eq:string_case", "expr": "\"a\" == \"A\"", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "eq:null_null", "expr": "missing == null", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "eq:number_null", "expr": "5 == null", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "ne:number", "expr": "1 != 2", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "eq:number:string", "expr": "5 == \"5\"", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "eq:boolean:number", "expr": "true == 1", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "eq:list:list", "expr": "[1] == [1]", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "eq:object:object", "expr": "{} == {}", "kind": "boolean", "text": "true", "source": "provisional"}
+{"family": "coercion", "case": "cmp:number", "expr": "1 < 2", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "cmp:string", "expr": "\"apple\" < \"banana\"", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "cmp:string_utf16", "expr": "\"Z\" < \"a\"", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "cmp:mixed", "expr": "1 < \"2\"", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "add:number", "expr": "1 + 2", "kind": "number", "text": "3", "source": "captured"}
+{"family": "coercion", "case": "add:float", "expr": "0.1 + 0.2", "kind": "number", "text": "0.30000000000000004", "source": "captured"}
+{"family": "coercion", "case": "add:string", "expr": "\"a\" + \"b\"", "kind": "string", "text": "ab", "source": "captured"}
+{"family": "coercion", "case": "add:string_number", "expr": "\"a\" + 1", "kind": "string", "text": "a1", "source": "captured"}
+{"family": "coercion", "case": "add:number_string", "expr": "1 + \"a\"", "kind": "string", "text": "1a", "source": "captured"}
+{"family": "coercion", "case": "add:string_boolean", "expr": "\"is \" + true", "kind": "string", "text": "is true", "source": "captured"}
+{"family": "coercion", "case": "add:string:null", "expr": "\"a\" + missing", "kind": "string", "text": "a", "source": "captured"}
+{"family": "coercion", "case": "arith:null", "expr": "1 + missing", "kind": "null", "text": "", "source": "captured"}
+{"family": "coercion", "case": "sub:number", "expr": "5 - 7", "kind": "number", "text": "-2", "source": "captured"}
+{"family": "coercion", "case": "mul:number", "expr": "radius * (2 * 3.14)", "props": {"radius": 2}, "kind": "number", "text": "12.56", "source": "captured"}
+{"family": "coercion", "case": "rem:number", "expr": "7 % 3", "kind": "number", "text": "1", "source": "captured"}
+{"family": "coercion", "case": "div:zero", "expr": "1 / 0", "kind": "number", "text": "Infinity", "source": "captured"}
+{"family": "coercion", "case": "rem:zero", "expr": "1 % 0", "kind": "number", "text": "NaN", "source": "captured"}
+{"family": "coercion", "case": "negate:number", "expr": "-(2.5)", "kind": "number", "text": "-2.5", "source": "captured"}
+{"family": "coercion", "case": "number_text:exponent", "expr": "(1e21).toString()", "kind": "string", "text": "1e+21", "source": "provisional"}
+{"family": "coercion", "case": "number_text:small", "expr": "(0.00000015).toString()", "kind": "string", "text": "1.5e-7", "source": "captured"}
+{"family": "coercion", "case": "property:bare", "expr": "price", "props": {"price": 2.5}, "kind": "number", "text": "2.5", "source": "captured"}
+{"family": "coercion", "case": "property:note_prefix", "expr": "note.price", "props": {"price": 2.5}, "kind": "number", "text": "2.5", "source": "captured"}
+{"family": "coercion", "case": "property:note_index", "expr": "note[\"my prop\"]", "props": {"my prop": "x"}, "kind": "string", "text": "x", "source": "captured"}
+{"family": "coercion", "case": "property:missing", "expr": "missing", "kind": "null", "text": "", "source": "captured"}
+{"family": "coercion", "case": "property:object_member", "expr": "property.subprop", "props": {"property": {"subprop": "s"}}, "kind": "string", "text": "s", "source": "captured"}
+{"family": "coercion", "case": "property:object_index", "expr": "property[\"subprop\"]", "props": {"property": {"subprop": "s"}}, "kind": "string", "text": "s", "source": "captured"}
+{"family": "coercion", "case": "property:list_index", "expr": "property[0]", "props": {"property": ["a", "b"]}, "kind": "string", "text": "a", "source": "captured"}
+{"family": "coercion", "case": "property:list_index_out_of_range", "expr": "property[5]", "props": {"property": ["a"]}, "kind": "null", "text": "", "source": "captured"}
+{"family": "coercion", "case": "index:string", "expr": "\"abc\"[0]", "kind": "string", "text": "a", "source": "captured"}
+{"family": "coercion", "case": "cmp:boolean", "expr": "false < true", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "coercion", "case": "cmp:boolean_reversed", "expr": "true < false", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "coercion", "case": "number_text:infinity", "expr": "(1e400).toString()", "kind": "string", "text": "Infinity", "source": "provisional"}
+{"family": "coercion", "case": "number_text:negative_infinity", "expr": "(-1e400).toString()", "kind": "string", "text": "-Infinity", "source": "provisional"}
+{"family": "coercion", "case": "number_cell:infinity", "expr": "1e400", "kind": "number", "text": "Infinity", "source": "provisional"}
+{"family": "coercion", "case": "arith:mixed_bool", "expr": "1 + true", "kind": "error", "source": "captured"}
+{"family": "coercion", "case": "arith:list_plus_list", "expr": "[1] + [2]", "kind": "list", "text": "1, 2", "source": "captured"}
+{"family": "coercion", "case": "arith:nonfinite", "expr": "1e308 * 10", "kind": "number", "text": "Infinity", "source": "provisional"}

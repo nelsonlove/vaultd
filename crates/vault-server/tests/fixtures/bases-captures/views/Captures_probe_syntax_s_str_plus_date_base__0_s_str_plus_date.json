@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-str-plus-date.base",
+  "view": "s_str_plus_date",
+  "captured_at_ms": 1791522438952,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_str_plus_date\": \"d:2025-01-01\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "d:2025-01-01"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

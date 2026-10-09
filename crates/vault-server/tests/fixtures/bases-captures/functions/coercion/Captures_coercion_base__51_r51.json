@@ -1,0 +1,8 @@
+{
+  "base": "Captures/coercion.base",
+  "view": "r51",
+  "captured_at_ms": 1791522183063,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/coercion/r51.md\",\n    \"f51\": \"Error: Invalid operator between Number and Boolean\",\n    \"t13_now\": \"1791522183070\"\n  }\n]\n",
+  "stderr": ""
+}

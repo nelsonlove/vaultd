@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-cmp-null.base",
+  "view": "s_cmp_null",
+  "captured_at_ms": 1791522407189,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_cmp_null\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

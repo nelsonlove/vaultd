@@ -49,7 +49,7 @@ pub(crate) fn resolve_spelling(
 
 /// `scheme://…` with a URL scheme (RFC 3986: a letter, then letters, digits,
 /// `+`, `-`, `.`).
-fn is_url(text: &str) -> bool {
+pub(crate) fn is_url(text: &str) -> bool {
     text.split_once("://").is_some_and(|(scheme, _)| {
         scheme.starts_with(|c: char| c.is_ascii_alphabetic())
             && scheme
@@ -78,25 +78,22 @@ pub(crate) fn make_link(
     })
 }
 
-/// Whether `from` links to `wanted`, the one rule `file.hasLink` and
-/// `link.linksTo` share. **Provisional** (cases `hasLink:embed` and
-/// `linksTo:embed`, settled by Task 13's capture): an embed counts as a
-/// link, as it counts as a backlink.
+/// Whether `from` links to `wanted`. Captured (Task 13): for
+/// `file.hasLink` an embed counts as a link (a note embedding an image
+/// `hasLink` it), for `link.linksTo` it does not (`linksTo` an embedded
+/// image is false), so `embeds` says which.
 pub(crate) fn reaches(
     ctx: &EvalContext<'_>,
     from: &VaultPath,
     wanted: &VaultPath,
+    embeds: bool,
 ) -> Result<bool, EvalError> {
     let hits = |facts: Vec<crate::source::LinkFact>| {
         facts
             .iter()
             .any(|fact| fact.resolved.as_ref() == Some(wanted))
     };
-    Ok(hits(ctx.source.links(from)?) || hits(ctx.source.embeds(from)?))
-}
-
-fn missing() -> EvalError {
-    EvalError::Uncaptured("file:missing".into())
+    Ok(hits(ctx.source.links(from)?) || (embeds && hits(ctx.source.embeds(from)?)))
 }
 
 pub(crate) fn call_global(
@@ -105,15 +102,7 @@ pub(crate) fn call_global(
     ctx: &EvalContext<'_>,
     scope: &Scope,
 ) -> Result<Value, EvalError> {
-    let values = match eager(args, ctx, scope) {
-        // The functions page's daily-note example,
-        // `link(file.ctime.date().toString())`, needs a date's text, which
-        // is not captured yet; the link it builds is uncaptured by name.
-        Err(EvalError::Uncaptured(case)) if name == "link" && case == "tostring:date" => {
-            return Err(EvalError::Uncaptured("link:from_date_string".into()));
-        }
-        other => other?,
-    };
+    let values = eager(args, ctx, scope)?;
     match name {
         // Resolved from the base file: a formula's link has no note of its own.
         "link" => {
@@ -126,6 +115,14 @@ pub(crate) fn call_global(
                 Value::String(target) => {
                     Ok(Value::Link(make_link(ctx, ctx.base_path, target, display)?))
                 }
+                // A link given a link is that link (seen in a corpus view:
+                // `link(x)` over a frontmatter link), its display replaced
+                // when one is given.
+                Value::Link(link) => Ok(Value::Link(LinkValue {
+                    display: display.map(Box::new).or_else(|| link.display.clone()),
+                    ..link.clone()
+                })),
+                Value::Null => Ok(Value::Null),
                 Value::File(path) => Ok(Value::Link(LinkValue {
                     target: path.as_str().to_string(),
                     display: display.map(Box::new),
@@ -137,23 +134,17 @@ pub(crate) fn call_global(
                 ))),
             }
         }
+        // A name that finds no file is an empty cell (captured:
+        // `file("path to file")`), found by the link rules alone (captured:
+        // `file("Folder/README")`, a file with no extension, is empty).
         "file" => {
             arity(name, args, 1, 1)?;
             match &values[0] {
                 Value::File(path) => Ok(Value::File(path.clone())),
-                Value::Link(link) => link.resolved.clone().map(Value::File).ok_or_else(missing),
-                Value::String(spelling) => {
-                    // An exact vault path first, then the link rules.
-                    let exact = match VaultPath::new(spelling.as_str()) {
-                        Ok(path) if ctx.source.facts(&path)?.is_some() => Some(path),
-                        _ => None,
-                    };
-                    let found = match exact {
-                        Some(path) => Some(path),
-                        None => make_link(ctx, ctx.base_path, spelling, None)?.resolved,
-                    };
-                    found.map(Value::File).ok_or_else(missing)
-                }
+                Value::Link(link) => Ok(link.resolved.clone().map_or(Value::Null, Value::File)),
+                Value::String(spelling) => Ok(make_link(ctx, ctx.base_path, spelling, None)?
+                    .resolved
+                    .map_or(Value::Null, Value::File)),
                 other => Err(EvalError::Argument(format!(
                     "file takes a path, a link or a file, not {}",
                     other.type_name()
@@ -172,6 +163,12 @@ pub(crate) fn call(
     scope: &Scope,
 ) -> Result<Value, EvalError> {
     match name {
+        // Captured: a URL link has no `asFile` ("Cannot find function
+        // \"asFile\" on type URL").
+        "asFile" if is_url(&link.target) => Err(EvalError::NoSuchMethod {
+            target: "url",
+            name: name.to_string(),
+        }),
         "asFile" => {
             arity(name, args, 0, 0)?;
             Ok(link
@@ -197,7 +194,13 @@ pub(crate) fn call(
             let Some(wanted) = wanted else {
                 return Ok(Value::Boolean(false));
             };
-            Ok(Value::Boolean(reaches(ctx, from, &wanted)?))
+            Ok(Value::Boolean(reaches(ctx, from, &wanted, false)?))
+        }
+        // A text method reads the link's target (seen in a corpus view:
+        // `file.embeds[0].containsAny("png")` picks the notes with an image
+        // embed).
+        _ if super::string::METHODS.contains(&name) => {
+            super::string::call(&link.target, name, args, ctx, scope)
         }
         _ => Err(EvalError::NoSuchMethod {
             target: "link",

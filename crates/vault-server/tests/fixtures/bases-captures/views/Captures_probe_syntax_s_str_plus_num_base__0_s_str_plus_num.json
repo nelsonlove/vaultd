@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-str-plus-num.base",
+  "view": "s_str_plus_num",
+  "captured_at_ms": 1791522440177,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_str_plus_num\": \"a1\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a1"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

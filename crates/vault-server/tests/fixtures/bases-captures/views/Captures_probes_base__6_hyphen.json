@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "hyphen",
+  "captured_at_ms": 1791522492659,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/hyphen-h.md\",\n    \"hyphen\": \"7\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "7"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

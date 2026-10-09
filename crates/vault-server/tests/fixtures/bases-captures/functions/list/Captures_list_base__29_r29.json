@@ -1,0 +1,8 @@
+{
+  "base": "Captures/list.base",
+  "view": "r29",
+  "captured_at_ms": 1791522184199,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/list/r29.md\",\n    \"f29\": \"Error: Cannot call function \\\"filter\\\", not enough arguments.\",\n    \"t13_now\": \"1791522184204\"\n  }\n]\n",
+  "stderr": ""
+}

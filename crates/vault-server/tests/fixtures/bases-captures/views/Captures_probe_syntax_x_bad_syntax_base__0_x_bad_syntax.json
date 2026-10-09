@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-bad-syntax.base",
+  "view": "x_bad_syntax",
+  "captured_at_ms": 1791522458474,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_bad_syntax\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

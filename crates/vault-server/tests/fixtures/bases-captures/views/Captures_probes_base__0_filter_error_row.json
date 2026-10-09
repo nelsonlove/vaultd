@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "filter_error_row",
+  "captured_at_ms": 1791522485310,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/filter_error_row-a.md\",\n    \"file name\": \"filter_error_row-a\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "filter_error_row-a"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

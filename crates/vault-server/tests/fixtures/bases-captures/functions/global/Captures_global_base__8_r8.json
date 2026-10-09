@@ -1,0 +1,8 @@
+{
+  "base": "Captures/global.base",
+  "view": "r8",
+  "captured_at_ms": 1791522183851,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/global/r8.md\",\n    \"f8\": \"Error: Unable to parse \\\"abc\\\" as a number.\",\n    \"t13_now\": \"1791522183856\"\n  }\n]\n",
+  "stderr": ""
+}

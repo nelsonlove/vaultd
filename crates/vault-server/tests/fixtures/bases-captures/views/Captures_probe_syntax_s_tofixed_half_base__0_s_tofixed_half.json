@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-tofixed-half.base",
+  "view": "s_tofixed_half",
+  "captured_at_ms": 1791522445057,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_tofixed_half\": \"1.00\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1.00"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

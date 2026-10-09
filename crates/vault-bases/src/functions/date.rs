@@ -41,18 +41,24 @@ pub(crate) fn call_global(
             arity(name, args, 0, 0)?;
             Ok(Value::Date(start_of_day(ctx.clock.now_ms, ctx.clock)))
         }
+        // Text that is not a date, or not a duration, is an empty cell
+        // (captured, Task 13: `date("not a date")`, `duration("soon")`).
         "date" => match eager(args, ctx, scope)?.as_slice() {
-            [Value::String(text)] => parse_date_text(text, ctx.clock)
+            [Value::String(text)] => Ok(parse_date_text(text, ctx.clock)
                 .map(Value::Date)
-                .ok_or_else(|| EvalError::Argument(format!("{text:?} is not a date"))),
+                .unwrap_or(Value::Null)),
             [Value::Date(date)] => Ok(Value::Date(*date)),
+            // An empty property gives an empty date (captured:
+            // `date(missing)` is empty and `date(missing).isEmpty()` true).
+            [Value::Null] => Ok(Value::Null),
             _ => Err(EvalError::Argument("date takes one string".into())),
         },
         "duration" => match eager(args, ctx, scope)?.as_slice() {
-            [Value::String(text)] => parse_duration_text(text)
+            [Value::String(text)] => Ok(parse_duration_text(text)
                 .map(Value::Duration)
-                .ok_or_else(|| EvalError::Argument(format!("{text:?} is not a duration"))),
+                .unwrap_or(Value::Null)),
             [Value::Duration(duration)] => Ok(Value::Duration(*duration)),
+            [Value::Null] => Ok(Value::Null),
             _ => Err(EvalError::Argument("duration takes one string".into())),
         },
         _ => Err(EvalError::UnknownFunction(name.to_string())),
@@ -117,6 +123,31 @@ pub(crate) fn call(
     }
 }
 
+/// A duration's fields. Captured (Task 13): `duration("1d").days` is 1, a
+/// one-day span's `milliseconds` is 86400000, and in a corpus view a span's
+/// `days.round(0)` rounds a fraction of a day, so each field is
+/// the whole span in that unit, with its fraction, and months and years
+/// come from the calendar part. Provisional beyond those.
+pub(crate) fn duration_field(duration: DurationValue, name: &str) -> Result<Value, EvalError> {
+    let ms = duration.ms as f64;
+    Ok(Value::Number(match name {
+        "years" => duration.months as f64 / 12.0,
+        "months" => duration.months as f64,
+        "weeks" => ms / (7.0 * 86_400_000.0),
+        "days" => ms / 86_400_000.0,
+        "hours" => ms / 3_600_000.0,
+        "minutes" => ms / 60_000.0,
+        "seconds" => ms / 1_000.0,
+        "milliseconds" => ms,
+        _ => {
+            return Err(EvalError::NoSuchField {
+                target: "duration",
+                name: name.to_string(),
+            });
+        }
+    }))
+}
+
 fn as_duration(value: &Value) -> Option<DurationValue> {
     match value {
         Value::Duration(duration) => Some(*duration),
@@ -151,29 +182,51 @@ pub(crate) fn arithmetic(
     let too_long = || EvalError::Argument("the duration is out of range".into());
     match (op, left, right) {
         (BinaryOp::Add, Value::Date(date), other) => date_plus(*date, other, 1),
-        // The syntax page: "the millisecond difference between the two" — a
-        // number, so `(a - b) / 86400000` and `a - b > n` work. Whole
-        // milliseconds, so there is nothing to round.
+        // A duration, as captured (Task 13: one day apart shows `a day`,
+        // and its `milliseconds` is 86400000), not the number of
+        // milliseconds the syntax page describes.
         (BinaryOp::Sub, Value::Date(a), Value::Date(b)) => {
-            Ok(Some(Value::Number((a.epoch_ms - b.epoch_ms) as f64)))
+            Ok(Some(Value::Duration(DurationValue {
+                months: 0,
+                ms: a.epoch_ms.checked_sub(b.epoch_ms).ok_or_else(too_long)?,
+                timed: true,
+            })))
         }
         (BinaryOp::Sub, Value::Date(date), other) => date_plus(*date, other, -1),
         (BinaryOp::Add, Value::Duration(a), Value::Duration(b)) => {
             Ok(Some(Value::Duration(DurationValue {
                 months: a.months.checked_add(b.months).ok_or_else(too_long)?,
                 ms: a.ms.checked_add(b.ms).ok_or_else(too_long)?,
+                timed: a.timed || b.timed,
             })))
         }
         (BinaryOp::Sub, Value::Duration(a), Value::Duration(b)) => {
             Ok(Some(Value::Duration(DurationValue {
                 months: a.months.checked_sub(b.months).ok_or_else(too_long)?,
                 ms: a.ms.checked_sub(b.ms).ok_or_else(too_long)?,
+                timed: a.timed || b.timed,
             })))
         }
-        (BinaryOp::Mul, Value::Duration(duration), Value::Number(factor)) => {
+        // A duration scaled by a number stays a duration (captured, Task 13:
+        // `duration('5h') * 2` shows `10 hours`; a day divided by 86400000
+        // shows `a few seconds`).
+        (BinaryOp::Mul | BinaryOp::Div, Value::Duration(duration), Value::Number(factor)) => {
+            let factor = if op == BinaryOp::Div {
+                1.0 / factor
+            } else {
+                *factor
+            };
+            let scale = |amount: i64| {
+                let scaled = (amount as f64 * factor).round();
+                (scaled.is_finite() && scaled.abs() < i64::MAX as f64)
+                    .then_some(scaled as i64)
+                    .ok_or_else(too_long)
+            };
+            let ms = scale(duration.ms)?;
             Ok(Some(Value::Duration(DurationValue {
-                months: (duration.months as f64 * factor).round() as i64,
-                ms: (duration.ms as f64 * factor).round() as i64,
+                months: scale(duration.months)?,
+                ms,
+                timed: duration.timed || ms % 86_400_000 != 0,
             })))
         }
         // The functions page: "the duration must be on the left".

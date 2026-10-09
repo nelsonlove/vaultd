@@ -1,0 +1,8 @@
+{
+  "base": "Captures/global.base",
+  "view": "r20",
+  "captured_at_ms": 1791522183916,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/global/r20.md\",\n    \"f20\": \"Infinity\",\n    \"t13_now\": \"1791522183921\"\n  }\n]\n",
+  "stderr": ""
+}

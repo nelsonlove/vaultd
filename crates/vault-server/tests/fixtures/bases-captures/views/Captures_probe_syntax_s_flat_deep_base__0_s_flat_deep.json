@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-flat-deep.base",
+  "view": "s_flat_deep",
+  "captured_at_ms": 1791522419408,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_flat_deep\": \"1, 2, 3, 4\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1 2 3 4"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

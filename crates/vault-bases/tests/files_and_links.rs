@@ -119,7 +119,8 @@ fn an_attachment_is_a_row_with_file_facts_and_no_note_facts() {
 #[test]
 fn every_file_field_reads_the_row_files_own_facts() {
     let row = "Folder/Deep/Inner.md";
-    assert_eq!(on_row(row, "file.name"), Value::String("Inner.md".into()));
+    // Captured (Task 13): a note's name drops `.md`.
+    assert_eq!(on_row(row, "file.name"), Value::String("Inner".into()));
     assert_eq!(on_row(row, "file.basename"), Value::String("Inner".into()));
     assert_eq!(on_row(row, "file.path"), Value::String(row.into()));
     assert_eq!(on_row(row, "file.ext"), Value::String("md".into()));
@@ -140,7 +141,7 @@ fn every_file_field_reads_the_row_files_own_facts() {
     );
     assert_eq!(on_row("Other.md", "file.embeds.length"), Value::Number(0.0));
     assert_eq!(
-        on_row("Other.md", "file.backlinks[0].path"),
+        on_row("Other.md", "file.backlinks[0].asFile().path"),
         Value::String(capture.into())
     );
     assert_eq!(on_row(capture, "file.links[1].asFile()"), Value::Null);
@@ -232,7 +233,7 @@ fn this_is_the_embedding_file_when_one_is_given() {
     let row = "Folder/Deep/Inner.md";
     assert_eq!(
         on(&source, row, "Other.md", "this.file.name"),
-        Value::String("Other.md".into())
+        Value::String("Other".into())
     );
     assert_eq!(
         on(&source, row, "Other.md", "this.file.properties.status"),
@@ -403,7 +404,7 @@ fn links_to_resolves_a_string_from_the_linked_file_and_has_link_from_the_row() {
         Value::String("Sub/B.md".into())
     );
     assert_eq!(
-        on(&source, "Sub/B.md", row, "file.backlinks[0].path"),
+        on(&source, "Sub/B.md", row, "file.backlinks[0].asFile().path"),
         Value::String("Sub/A.md".into())
     );
     // From the root, `./B` names nothing.
@@ -487,20 +488,17 @@ fn this_carries_the_embedding_files_properties_and_file() {
 }
 
 #[test]
-fn as_link_shows_the_files_basename() {
+fn as_link_is_a_link_to_the_files_path() {
     let clock = Clock::fixed(FIXTURE_NOW_MS, FIXTURE_ZONE);
     let link = on_row("Folder/Deep/Inner.md", "file.asLink()");
-    // Off the vault root, the link's own text is the basename: not the path
-    // (its target), not the name with its extension.
+    // Captured (Task 13): with no display given, the link has none and shows
+    // its target, the file's path.
     let Value::Link(parts) = &link else {
         panic!("a link, not {link:?}")
     };
-    assert_eq!(
-        parts.display.as_deref(),
-        Some(&Value::String("Inner".into()))
-    );
+    assert_eq!(parts.display, None);
     assert_eq!(parts.target, "Folder/Deep/Inner.md");
-    assert_eq!(render_text(&link, &clock), "Inner");
+    assert_eq!(render_text(&link, &clock), "[[Folder/Deep/Inner.md]]");
     assert_eq!(
         on_row(
             "Folder/Deep/Inner.md",
@@ -509,7 +507,10 @@ fn as_link_shows_the_files_basename() {
         Value::Boolean(true)
     );
     let named = on_row("Folder/Deep/Inner.md", r#"file.asLink("Named")"#);
-    assert_eq!(render_text(&named, &clock), "Named");
+    assert_eq!(
+        render_text(&named, &clock),
+        "[[Folder/Deep/Inner.md|Named]]"
+    );
 }
 
 #[test]

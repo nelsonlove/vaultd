@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-div-zero.base",
+  "view": "x_div_zero",
+  "captured_at_ms": 1791522462137,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_div_zero\": \"Infinity\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Infinity"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

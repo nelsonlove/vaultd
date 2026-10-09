@@ -1,0 +1,30 @@
+{
+  "base": "Captures/probes.base",
+  "view": "limit_group",
+  "captured_at_ms": 1791522491437,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/limit_group-d.md\",\n    \"k\": \"4\"\n  },\n  {\n    \"path\": \"Captures/probes/limit_group-c.md\",\n    \"k\": \"3\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": "1",
+        "rows": [
+          [
+            "3"
+          ]
+        ]
+      },
+      {
+        "value": "2",
+        "rows": [
+          [
+            "4"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-regexp.base",
+  "view": "r_regexp",
+  "captured_at_ms": 1791522403510,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_regexp\": \"/a+/i\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "/a+/i"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

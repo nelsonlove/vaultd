@@ -214,27 +214,13 @@ fn replace_regexp(text: &str, regexp: &RegexpValue, template: &str) -> String {
     out
 }
 
-/// A string pattern replaces every occurrence (the functions page), the way
-/// `replaceAll` does, `$` patterns included.
-#[inline(never)]
-fn replace_string(text: &str, pattern: &str, template: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut copied = 0;
-    for (start, found) in text.match_indices(pattern) {
-        out.push_str(&text[copied..start]);
-        let end = start + found.len();
-        substitute(template, text, (start, end), None, false, &mut out);
-        copied = end;
-    }
-    out.push_str(&text[copied..]);
-    out
-}
-
 /// `String.prototype.split` with a regular expression, as ECMA-262's
 /// `RegExp.prototype[@@split]` walks it: no split at an empty match where
 /// the last piece ended, so `"abc".split(/x*/)` is `a, b, c` with no empty
-/// ends (the `regex` crate's `split` answers `, a, b, c, `). `limit` is
-/// already applied by the caller when it is 0.
+/// ends (the `regex` crate's `split` answers `, a, b, c, `). Each group's
+/// text follows the piece before its match, as in JavaScript (a group that
+/// took no part is empty text). `limit` is already applied by the caller
+/// when it is 0.
 #[inline(never)]
 fn split_regexp(text: &str, regex: &regex::Regex, limit: Option<usize>) -> Vec<String> {
     if text.is_empty() {
@@ -248,9 +234,10 @@ fn split_regexp(text: &str, regex: &regex::Regex, limit: Option<usize>) -> Vec<S
     let mut piece = 0;
     let mut at = 0;
     while at < text.len() {
-        let Some(found) = regex.find_at(text, at) else {
+        let Some(groups) = regex.captures_at(text, at) else {
             break;
         };
+        let found = groups.get(0).expect("group 0 is the whole match");
         if found.start() >= text.len() {
             break;
         }
@@ -261,6 +248,12 @@ fn split_regexp(text: &str, regex: &regex::Regex, limit: Option<usize>) -> Vec<S
         parts.push(text[piece..found.start()].to_string());
         if Some(parts.len()) == limit {
             return parts;
+        }
+        for group in groups.iter().skip(1) {
+            parts.push(group.map_or_else(String::new, |group| group.as_str().to_string()));
+            if Some(parts.len()) == limit {
+                return parts;
+            }
         }
         piece = found.end();
         at = piece;
@@ -284,33 +277,27 @@ fn is_js_whitespace(c: char) -> bool {
     )
 }
 
-/// Uppercase the first letter of each word. **Uncaptured corners**: a word
-/// here starts only after whitespace, and the rest of a word keeps its case;
-/// neither is published, so a letter after punctuation or a digit
-/// (`"hello-world"`, `"o'neil"`) and an uppercase letter inside a word
-/// (`"hELLO"`) answer `Uncaptured` until a capture settles them.
+/// Title case, as captured: a word starts after whitespace only, its first
+/// character upper case and the rest lower (`"hello-world"` is
+/// `Hello-world`, `"hELLO"` is `Hello`).
 #[inline(never)]
-fn title(text: &str) -> Result<String, EvalError> {
+fn title(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut previous: Option<char> = None;
     for c in text.chars() {
-        let at_word_start = previous.is_none_or(char::is_whitespace);
-        if c.is_alphabetic() && !at_word_start {
-            if previous.is_some_and(|p| !p.is_alphabetic()) {
-                return Err(EvalError::Uncaptured("title:word_boundary".into()));
-            }
-            if c.is_uppercase() {
-                return Err(EvalError::Uncaptured("title:inner_case".into()));
-            }
-        }
-        if at_word_start && c.is_alphabetic() {
+        if previous.is_none_or(char::is_whitespace) {
             out.extend(c.to_uppercase());
         } else {
-            out.push(c);
+            out.extend(c.to_lowercase());
         }
         previous = Some(c);
     }
-    Ok(out)
+    out
+}
+
+/// Whether `text` holds `wanted`, letters compared without case.
+fn contains_folded(text: &str, wanted: &str) -> bool {
+    text.to_lowercase().contains(&wanted.to_lowercase())
 }
 
 pub(crate) fn field(text: &str, name: &str) -> Result<Value, EvalError> {
@@ -332,16 +319,19 @@ pub(crate) fn call(
 ) -> Result<Value, EvalError> {
     let values = eager(args, ctx, scope)?;
     Ok(match name {
+        // Without case. Provisional: inferred from one corpus view; the
+        // probes `t_contains_case` and `t_contains_any_case` in `generate`
+        // settle it, and the fixture row `contains:case` tracks it.
         "contains" => {
             arity(name, args, 1, 1)?;
-            Value::Boolean(text.contains(strings(name, values)?[0].as_str()))
+            Value::Boolean(contains_folded(text, &strings(name, values)?[0]))
         }
         "containsAll" => {
             arity(name, args, 1, usize::MAX)?;
             Value::Boolean(
                 strings(name, values)?
                     .iter()
-                    .all(|wanted| text.contains(wanted.as_str())),
+                    .all(|wanted| contains_folded(text, wanted)),
             )
         }
         "containsAny" => {
@@ -349,7 +339,7 @@ pub(crate) fn call(
             Value::Boolean(
                 strings(name, values)?
                     .iter()
-                    .any(|wanted| text.contains(wanted.as_str())),
+                    .any(|wanted| contains_folded(text, wanted)),
             )
         }
         "startsWith" => {
@@ -369,19 +359,13 @@ pub(crate) fn call(
             Value::String(text.to_lowercase())
         }
         "trim" => {
+            // JavaScript's set (captured: a leading U+FEFF is trimmed).
             arity(name, args, 0, 0)?;
-            // JavaScript's set and Rust's differ in two characters (U+FEFF
-            // only in JavaScript, U+0085 only in Rust). Uncaptured where
-            // they would answer differently.
-            let trimmed = text.trim();
-            if text.trim_matches(is_js_whitespace) != trimmed {
-                return Err(EvalError::Uncaptured("trim:whitespace_set".into()));
-            }
-            Value::String(trimmed.to_string())
+            Value::String(text.trim_matches(is_js_whitespace).to_string())
         }
         "title" => {
             arity(name, args, 0, 0)?;
-            Value::String(title(text)?)
+            Value::String(title(text))
         }
         "repeat" => {
             arity(name, args, 1, 1)?;
@@ -406,11 +390,13 @@ pub(crate) fn call(
             }
         }
         "reverse" => {
+            // By UTF-16 unit, as JavaScript reverses (captured: `"a🙂"` gives
+            // the two halves of the emoji swapped, then `a`); a half that is
+            // left alone is U+FFFD, the only way a Rust string can hold it.
             arity(name, args, 0, 0)?;
-            if text.chars().any(|c| c.len_utf16() == 2) {
-                return Err(EvalError::Uncaptured("reverse:astral".into()));
-            }
-            Value::String(text.chars().rev().collect())
+            let mut units: Vec<u16> = text.encode_utf16().collect();
+            units.reverse();
+            Value::String(String::from_utf16_lossy(&units))
         }
         "slice" => {
             arity(name, args, 1, 2)?;
@@ -442,12 +428,9 @@ pub(crate) fn call(
                 Value::String(separator) => {
                     text.split(separator.as_str()).map(str::to_string).collect()
                 }
-                Value::Regexp(regexp) => {
-                    if regexp.regex.captures_len() > 1 {
-                        return Err(EvalError::Uncaptured("split:regexp_groups".into()));
-                    }
-                    split_regexp(text, &regexp.regex, limit)
-                }
+                // A group's text joins the pieces, as in JavaScript
+                // (captured: `"a1b".split(/(\d)/)` is `a, 1, b`).
+                Value::Regexp(regexp) => split_regexp(text, &regexp.regex, limit),
                 other => {
                     return Err(EvalError::Argument(format!(
                         "split takes a string or a regular expression, not {}",
@@ -462,10 +445,12 @@ pub(crate) fn call(
             arity(name, args, 2, 2)?;
             let with = match &values[1] {
                 Value::String(with) => with.clone(),
-                other => to_display_string(other)?,
+                other => to_display_string(other, ctx.clock),
             };
             match &values[0] {
-                Value::String(pattern) => Value::String(replace_string(text, pattern, &with)),
+                // A text pattern's replacement is literal (captured:
+                // `"a.b".replace(".", "$&$&")` is `a$&$&b`).
+                Value::String(pattern) => Value::String(text.replace(pattern.as_str(), &with)),
                 // A regular expression replaces all only with the `g` flag.
                 Value::Regexp(regexp) => Value::String(replace_regexp(text, regexp, &with)),
                 other => {

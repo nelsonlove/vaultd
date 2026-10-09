@@ -1,0 +1,8 @@
+{
+  "base": "Captures/coercion.base",
+  "view": "r32",
+  "captured_at_ms": 1791522182940,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/coercion/r32.md\",\n    \"f32\": \"Infinity\",\n    \"t13_now\": \"1791522182946\"\n  }\n]\n",
+  "stderr": ""
+}

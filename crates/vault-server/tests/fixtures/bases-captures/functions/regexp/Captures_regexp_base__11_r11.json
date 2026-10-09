@@ -1,0 +1,8 @@
+{
+  "base": "Captures/regexp.base",
+  "view": "r11",
+  "captured_at_ms": 1791522530619,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/regexp/r11.md\",\n    \"f11\": \"false\",\n    \"t13_now\": \"1791522530627\"\n  }\n]\n",
+  "stderr": ""
+}

@@ -137,7 +137,11 @@ pub(crate) fn builtin(name: &str, values: &[Value]) -> Result<Value, EvalError> 
         }
     };
     Ok(match name {
-        "Average" => over_numbers(mean),
+        // The numbers' total over every row's count, empty cells included
+        // (captured, Task 13: 3, 1, 10 and an empty cell average 3.5), as
+        // `mean()` does.
+        "Average" if numbers.is_empty() => Value::Null,
+        "Average" => Value::Number(numbers.iter().sum::<f64>() / values.len() as f64),
         // JavaScript's `reduce((a, b) => a + b, 0)`: no numbers is `0`, never
         // Rust's empty-sum `-0`. **Provisional** (`summary:sum_empty`).
         "Sum" => Value::Number(numbers.iter().fold(0.0, |total, number| total + number)),
@@ -153,23 +157,27 @@ pub(crate) fn builtin(name: &str, values: &[Value]) -> Result<Value, EvalError> 
                 (sorted[half - 1] + sorted[half]) / 2.0
             }
         }),
-        // Population standard deviation, the reading of the syntax page's
-        // "standard deviation of all numbers". **Provisional**:
-        // `summary:stddev` (Task 13) confirms the divisor.
+        // Population standard deviation over the numbers (captured, Task 13:
+        // 2, 4, 4, 4, 5, 5, 7, 9 give 2; 3, 1, 10 and an empty cell give
+        // 3.86).
         "Stddev" => over_numbers(|numbers| {
             let mean = mean(numbers);
             let squares: f64 = numbers.iter().map(|x| (x - mean).powi(2)).sum();
             (squares / numbers.len() as f64).sqrt()
         }),
-        // Over dates, the span in milliseconds: the same number `latest -
-        // earliest` answers (date minus date is a number of milliseconds).
-        // **Provisional** until a capture shows how Obsidian presents it.
+        // Over dates, the span: the duration `latest - earliest` answers
+        // (date minus date is a duration, captured). **Provisional**: no
+        // capture shows a date summary (the rendered table showed none).
         "Range" => {
             let dates = dates(values);
             if numbers.is_empty() && !dates.is_empty() {
                 let earliest = dates.iter().map(|d| d.epoch_ms).min().unwrap_or(0);
                 let latest = dates.iter().map(|d| d.epoch_ms).max().unwrap_or(0);
-                Value::Number((latest - earliest) as f64)
+                Value::Duration(crate::value::DurationValue {
+                    months: 0,
+                    ms: latest.saturating_sub(earliest),
+                    timed: true,
+                })
             } else {
                 over_numbers(|numbers| largest(numbers) - smallest(numbers))
             }
@@ -190,8 +198,8 @@ pub(crate) fn builtin(name: &str, values: &[Value]) -> Result<Value, EvalError> 
         "Filled" => count(values, |value| !is_empty(value)),
         // Distinct cell keys: SameValueZero over what the cell holds (NaN
         // equals NaN, `-0` equals `0`), so two equal lists are one value and
-        // every empty cell is one `null`. **Uncaptured** (`summary:unique`):
-        // the capture settles whether empties count and how lists compare.
+        // every empty cell is one `null` (captured, Task 13: `[x]`, `[x]`,
+        // `[x, y]` and an empty cell count 3).
         "Unique" => {
             let keys: BTreeSet<String> = values.iter().map(cell_key).collect();
             Value::Number(keys.len() as f64)

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/link.base",
+  "view": "r7",
+  "captured_at_ms": 1791522183962,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/link/r7.md\",\n    \"f7\": \"Error: Cannot find function \\\"asFile\\\" on type URL\",\n    \"t13_now\": \"1791522183966\"\n  }\n]\n",
+  "stderr": ""
+}

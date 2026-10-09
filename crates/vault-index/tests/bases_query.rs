@@ -61,6 +61,35 @@ fn rows(service: &IndexService, base: &str, view: Option<&str>, this: Option<&st
         .collect()
 }
 
+/// The Task 13 review's M5: an attachment a note links to is found from
+/// both ends. The note `hasLink` it and lists it in `file.embeds`, and the
+/// attachment's `file.backlinks` names the note, though the note-only link
+/// resolver leaves the embed unresolved. A name with no extension names no
+/// attachment (captured).
+#[test]
+fn an_attachment_a_note_links_to_is_found_from_both_ends() {
+    let files = [
+        ("Notes/N.md", "![[pic.png]] [[README]]\n"),
+        ("Notes/Other.md", "nothing here\n"),
+        ("Images/pic.png", "png"),
+        ("Images/README", "readme"),
+        (
+            "Q.base",
+            "views:\n  - type: table\n    name: Linking\n    filters: 'file.hasLink(\"Images/pic.png\")'\n  - type: table\n    name: Linked\n    filters: 'file.backlinks.length > 0'\n  - type: table\n    name: Readme\n    filters: 'file.hasLink(\"Images/README\")'\n",
+        ),
+    ];
+    let (service, _vault, _index) = service(&files);
+    assert_eq!(
+        rows(&service, "Q.base", Some("Linking"), None),
+        vec!["Notes/N.md"]
+    );
+    assert_eq!(
+        rows(&service, "Q.base", Some("Linked"), None),
+        vec!["Images/pic.png"]
+    );
+    assert!(rows(&service, "Q.base", Some("Readme"), None).is_empty());
+}
+
 #[test]
 fn the_sqlite_source_answers_what_the_memory_source_answers() {
     let files = [
@@ -132,10 +161,12 @@ fn the_sqlite_source_answers_what_the_memory_source_answers() {
             "view {view}"
         );
     }
+    // Captured (Task 13): a one-item list equals its item's text, so
+    // `status: [done]` matches; the key's and the value's case still do not.
     assert_eq!(
         rows(&service, "Q.base", Some("Done"), None),
-        vec!["Books/A.md"],
-        "list, key case and value case never match"
+        vec!["Books/A.md", "Books/B.md"],
+        "key case and value case never match"
     );
 }
 

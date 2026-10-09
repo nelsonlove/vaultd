@@ -1,0 +1,10 @@
+{
+  "captured_at_ms": 1791522058135,
+  "zone": "America/New_York",
+  "obsidian_version": "1.13.7",
+  "corpus": "target/tmp/bases-corpus",
+  "embeds_resolved": {
+    "Captures/stem.md": 3,
+    "Captures/probes.base": 2
+  }
+}

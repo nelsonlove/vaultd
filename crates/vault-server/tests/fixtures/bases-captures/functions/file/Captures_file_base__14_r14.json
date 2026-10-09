@@ -1,0 +1,8 @@
+{
+  "base": "Captures/file.base",
+  "view": "r14",
+  "captured_at_ms": 1791522183655,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/file/r14.md\",\n    \"f14\": \"1\",\n    \"t13_now\": \"1791522183661\"\n  }\n]\n",
+  "stderr": ""
+}

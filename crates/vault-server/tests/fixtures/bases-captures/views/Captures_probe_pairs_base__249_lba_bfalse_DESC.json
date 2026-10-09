@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "lba~bfalse~DESC",
+  "captured_at_ms": 1791522316341,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/lba~bfalse-1.md\",\n    \"mix\": \"b, a\"\n  },\n  {\n    \"path\": \"Captures/pairs/lba~bfalse-2.md\",\n    \"mix\": \"false\"\n  }\n]\n",
+  "stderr": ""
+}

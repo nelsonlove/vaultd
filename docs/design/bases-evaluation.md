@@ -76,7 +76,7 @@ After each committed generation the daemon marks views as possibly stale by a co
 
 - A `.base` that does not parse: the index row carries `parse_failed` with the YAML position; `evaluate_base` answers `base_invalid` with the same; `list_bases` shows it; a diagnostic appears in `get_diagnostics` under the base's path.
 - A view name that does not exist: `view_not_found`, naming the declared views.
-- An expression that fails to compile (syntax, unknown function or method): the base still indexes; the view answers `expression_invalid` naming the expression and position; an unknown function is `unsupported_function` naming it.
+- A filter that fails to compile (syntax, unknown function or method): the base still indexes; the view answers `expression_invalid` naming the expression and position; an unknown function is `unsupported_function` naming it. A formula or a base summary that fails to compile does not refuse the view: its column is an error cell in every row, and the summary an error, naming the parse or lookup failure (ruling 7).
 - An expression that fails on one row (a type error, a division by zero, a missing property in a method call): the cell is `{"kind":"error","message":…}` and the row stays, as Obsidian renders an error cell rather than dropping the row (confirmed by capture).
 - A `this_path` that is not a note or does not exist: `invalid_request`.
 - A `limit` of 0 or above 1000: `invalid_cursor`, as for every collection operation.
@@ -111,6 +111,8 @@ Measured on the 10k-note fixture, warm, with the phase 7 harness extended by a `
 4. The eight design sections as presented.
 5. Standing from earlier phases and unchanged: the live vault is never read by a daemon, test or fixture; parity comes from runtime captures and published documents, never from `app.asar`; the spec lives repo-local in `docs/design/`.
 6. Clause 4 of the staleness rule: any changed file, not any changed note, for a view that reads links or `this` (`file()`, `link()` and `asFile()` reach attachments); the published rule left a false negative (Task 12 review finding M1, ruled in its fix round on 2026-10-08).
+7. R1, formula errors (2026-10-09; the project picked Obsidian's behaviour): a formula that cannot be parsed, or a call to an unknown function or method, no longer refuses the request; the view answers and that formula's column carries an error cell in every row with the parse or lookup message as its text, while a base whose filters cannot be parsed still answers `base_invalid` / `expression_invalid` at request level, because there are no rows to show.
+8. R2, sort order (2026-10-09; the project picked a total order): a view's sort is a transitive total order over every cell kind (booleans, then numbers, then dates, then text by collation, empty values last), not Obsidian's comparator, which ties a boolean with every truthy value and orders a number against text by its text; views that mix kinds where Obsidian's order differs are listed in the replay's `deviations.json` as "R2: total order by ruling".
 
 ## Deferred follow-on
 

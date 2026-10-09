@@ -1,0 +1,8 @@
+{
+  "base": "Captures/coercion.base",
+  "view": "r8",
+  "captured_at_ms": 1791522182779,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/coercion/r8.md\",\n    \"f8\": \"true\",\n    \"t13_now\": \"1791522182785\"\n  }\n]\n",
+  "stderr": ""
+}

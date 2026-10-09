@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-date-minus-ms.base",
+  "view": "x_date_minus_ms",
+  "captured_at_ms": 1791522459695,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_date_minus_ms\": \"86400000\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "86400000"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

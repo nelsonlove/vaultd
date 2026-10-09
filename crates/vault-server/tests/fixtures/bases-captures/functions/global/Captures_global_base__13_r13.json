@@ -1,0 +1,8 @@
+{
+  "base": "Captures/global.base",
+  "view": "r13",
+  "captured_at_ms": 1791522183878,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/global/r13.md\",\n    \"f13\": \"Error: Type error in \\\"max\\\", parameter \\\"inputs\\\". Expected Number, given String.\",\n    \"t13_now\": \"1791522183883\"\n  }\n]\n",
+  "stderr": ""
+}

@@ -1,48 +1,44 @@
 //! The value semantics every operator and function leans on.
 //!
-//! The functions page says "Bases functions follow JavaScript behavior", so
-//! where a JavaScript rule answers the question (truthiness of primitives,
-//! number-to-string, string concatenation, UTF-16 string comparison) it is
-//! followed and cited. Where no published rule answers it (`5 == "5"`, the
-//! order of a number against a string) the answer is
-//! [`EvalError::Uncaptured`] naming the case, until a runtime capture fixes
-//! it (Task 13 of the implementation plan).
+//! The functions page says "Bases functions follow JavaScript behavior";
+//! where it and Obsidian differ, Obsidian wins: every rule here was settled
+//! by the Task 13 runtime captures (Obsidian 1.13.7, the `Captures/`
+//! bases), and the comment on each rule names what was seen.
 
 use std::cmp::Ordering;
 
-use crate::eval::EvalError;
+use crate::clock::Clock;
+use crate::collate::collate;
+use crate::dates::{humanize, parse_date_text};
 use crate::value::{LinkValue, Value};
 
-/// JavaScript truthiness: `null`, `false`, `0`, `NaN` and `""` are falsy;
-/// every other primitive is truthy, and every object (a list, an object, a
-/// date, a link, a file) is truthy.
+/// Truthiness: `null`, `false`, `0`, `NaN`, `""`, an empty list and an
+/// empty object are false; everything else is true. Captured: `[].isTruthy()`
+/// and `![]` say an empty list is false, and an empty frontmatter mapping's
+/// `isTruthy()` is false — JavaScript would call both true.
 pub fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Boolean(flag) => *flag,
         Value::Number(number) => *number != 0.0 && !number.is_nan(),
         Value::String(text) => !text.is_empty(),
+        Value::List(items) => !items.is_empty(),
+        Value::Object(entries) => !entries.is_empty(),
         _ => true,
     }
 }
 
-fn case(prefix: &str, left: &Value, right: &Value) -> EvalError {
-    let (a, b) = if left.type_name() <= right.type_name() {
-        (left.type_name(), right.type_name())
-    } else {
-        (right.type_name(), left.type_name())
-    };
-    EvalError::Uncaptured(format!("{prefix}:{a}:{b}"))
+/// A link's target as written, without wikilink brackets.
+fn link_target(link: &LinkValue) -> &str {
+    link.target
+        .strip_prefix("[[")
+        .and_then(|inner| inner.strip_suffix("]]"))
+        .unwrap_or(&link.target)
 }
 
 /// The syntax page: links "are equivalent as long as they point to the same
 /// file, or if the file does not exist when looked up, their link text must be
-/// identical."
-///
-/// Provisional reading, for the capture to settle: link text is compared
-/// only when *neither* link resolves. A resolved link never equals an
-/// unresolved one, so `==` stays transitive across links and the files they
-/// resolve to.
+/// identical." Link text is compared only when *neither* link resolves.
 fn link_equals(left: &LinkValue, right: &LinkValue) -> bool {
     match (&left.resolved, &right.resolved) {
         (Some(a), Some(b)) => a == b,
@@ -51,92 +47,207 @@ fn link_equals(left: &LinkValue, right: &LinkValue) -> bool {
     }
 }
 
-/// `==`. Same-type values compare by value; `null` equals only `null` (the
-/// published `reduce` example relies on `acc == null` being true for the
-/// initial `null` and false for a number); a link equals a file it resolves to
-/// (the syntax page: `author == this`). Every other pairing is uncaptured.
-pub fn loose_equals(left: &Value, right: &Value) -> Result<bool, EvalError> {
+/// JavaScript's `StringToNumber`, total: `""` is 0, text that is not a
+/// number is NaN, and `Infinity` reads (captured: `number("Infinity")` is
+/// `Infinity`).
+pub fn js_to_number(text: &str) -> f64 {
+    let trimmed = text.trim_matches(is_js_space);
+    match trimmed {
+        "" => 0.0,
+        "Infinity" | "+Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => parse_js_number(trimmed).unwrap_or(f64::NAN),
+    }
+}
+
+/// JavaScript's `WhiteSpace` and `LineTerminator` (what `trim` removes).
+pub fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+}
+
+/// `==`, as captured: values of one kind compare by value (lists item by
+/// item, `[1, 2] == [2, 1]` false); a number, a boolean or numeric text
+/// compare as numbers (`5 == "5"`, `true == 1`, `[1] == ["1"]`); a date
+/// equals text naming the same instant (`date("2025-01-01") ==
+/// "2025-01-01"`); a link equals its target text or the file it resolves to,
+/// and a file equals its path (`link("Other") == "Other"`, `file("Other.md")
+/// == "Other.md"`); `null` equals only `null`. Every other pairing is
+/// `false`, never an error.
+pub fn loose_equals(left: &Value, right: &Value, clock: &Clock) -> bool {
     use Value::*;
-    Ok(match (left, right) {
+    match (left, right) {
         (Null, Null) => true,
         (Null, _) | (_, Null) => false,
         (Number(a), Number(b)) => a == b,
         (String(a), String(b)) => a == b,
         (Boolean(a), Boolean(b)) => a == b,
+        (Number(n), String(s)) | (String(s), Number(n)) => js_to_number(s) == *n,
+        (Boolean(b), Number(n)) | (Number(n), Boolean(b)) => f64::from(u8::from(*b)) == *n,
+        (Boolean(b), String(s)) | (String(s), Boolean(b)) => {
+            js_to_number(s) == f64::from(u8::from(*b))
+        }
         (Date(a), Date(b)) => a.epoch_ms == b.epoch_ms,
-        (Duration(a), Duration(b)) => a == b,
+        (Date(date), String(text)) | (String(text), Date(date)) => {
+            parse_date_text(text, clock).is_some_and(|parsed| parsed.epoch_ms == date.epoch_ms)
+        }
+        (Duration(a), Duration(b)) => a.months == b.months && a.ms == b.ms,
         (Link(a), Link(b)) => link_equals(a, b),
         (Link(link), File(path)) | (File(path), Link(link)) => link.resolved.as_ref() == Some(path),
+        (Link(link), String(text)) | (String(text), Link(link)) => {
+            link_target(link) == text
+                || link
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|path| path.as_str() == text)
+        }
+        (File(path), String(text)) | (String(text), File(path)) => path.as_str() == text,
         (File(a), File(b)) => a == b,
+        (List(a), List(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| loose_equals(x, y, clock))
+        }
+        (Object(a), Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.iter()
+                        .find(|(other, _)| other == key)
+                        .is_some_and(|(_, other)| loose_equals(value, other, clock))
+                })
+        }
         (Image(a), Image(b)) | (Icon(a), Icon(b)) | (Html(a), Html(b)) => a == b,
         (Regexp(a), Regexp(b)) => a == b,
-        // `case` sorts the two kind names, so `5 == "5"` and `"5" == 5` are
-        // both `eq:number:string`.
-        _ => return Err(case("eq", left, right)),
-    })
+        // A list against text, a number or a boolean compares as its items'
+        // texts joined by commas, as JavaScript's `==` does (seen in a corpus
+        // view: `type == "Some/Type"` holds for `type: [Some/Type]`).
+        (List(items), other @ (String(_) | Number(_) | Boolean(_)))
+        | (other @ (String(_) | Number(_) | Boolean(_)), List(items)) => {
+            let text = items
+                .iter()
+                .map(|item| match item {
+                    Null => std::string::String::new(),
+                    item => to_display_string(item, clock),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            loose_equals(&String(text), other, clock)
+        }
+        _ => false,
+    }
 }
 
-/// JavaScript compares strings by UTF-16 code unit, which is why `"Z" < "a"`.
+/// JavaScript compares strings by UTF-16 code unit, which is why `"Z" < "a"`
+/// and, captured, `"10" < "9"`.
 fn utf16_order(left: &str, right: &str) -> Ordering {
     left.encode_utf16().cmp(right.encode_utf16())
 }
 
-/// `<`, `<=`, `>`, `>=`: numbers, strings, dates, durations without months,
-/// and booleans (`false < true`). Every other pairing is uncaptured.
-pub fn compare(left: &Value, right: &Value) -> Result<Ordering, EvalError> {
+/// A duration's length for comparison: months at the Gregorian average.
+fn duration_ms(months: i64, ms: i64) -> f64 {
+    months as f64 * 30.436_875 * 86_400_000.0 + ms as f64
+}
+
+/// `<`, `<=`, `>`, `>=` between two values that are not `null` (a
+/// comparison with `null` is an empty cell, captured: `missing < 1`).
+/// `None` means every one of the four is false. As captured: numbers,
+/// booleans and numeric text compare as numbers (`1 < "2"`, `false <
+/// true`); two strings by UTF-16 code unit (`"10" < "9"`); a date against a
+/// date or text naming one by instant (`date("2025-01-01") <
+/// "2025-01-02"`); two lists by their text (`[1] < [2]`).
+pub fn compare(left: &Value, right: &Value, clock: &Clock) -> Option<Ordering> {
     use Value::*;
+    let number = |value: &Value| match value {
+        Number(n) => Some(*n),
+        Boolean(b) => Some(f64::from(u8::from(*b))),
+        String(s) => Some(js_to_number(s)),
+        _ => None,
+    };
     match (left, right) {
-        (Number(a), Number(b)) => a
-            .partial_cmp(b)
-            .ok_or_else(|| EvalError::Type("cannot compare NaN".into())),
-        (String(a), String(b)) => Ok(utf16_order(a, b)),
-        (Date(a), Date(b)) => Ok(a.epoch_ms.cmp(&b.epoch_ms)),
-        (Duration(a), Duration(b)) if a.months == 0 && b.months == 0 => Ok(a.ms.cmp(&b.ms)),
-        (Boolean(a), Boolean(b)) => Ok(a.cmp(b)),
-        _ => Err(EvalError::Uncaptured("cmp:mixed".into())),
+        (String(a), String(b)) => Some(utf16_order(a, b)),
+        (Number(_) | Boolean(_) | String(_), Number(_) | Boolean(_) | String(_)) => {
+            number(left)?.partial_cmp(&number(right)?)
+        }
+        (Date(a), Date(b)) => Some(a.epoch_ms.cmp(&b.epoch_ms)),
+        (Date(date), String(text)) => {
+            parse_date_text(text, clock).map(|parsed| date.epoch_ms.cmp(&parsed.epoch_ms))
+        }
+        (String(text), Date(date)) => {
+            parse_date_text(text, clock).map(|parsed| parsed.epoch_ms.cmp(&date.epoch_ms))
+        }
+        (Duration(a), Duration(b)) => {
+            duration_ms(a.months, a.ms).partial_cmp(&duration_ms(b.months, b.ms))
+        }
+        // A duration against a number is its milliseconds (captured:
+        // `(now() - today()) > 1000`).
+        (Duration(d), Number(n)) => duration_ms(d.months, d.ms).partial_cmp(n),
+        (Number(n), Duration(d)) => n.partial_cmp(&duration_ms(d.months, d.ms)),
+        (List(_), List(_)) => Some(utf16_order(
+            &to_display_string(left, clock),
+            &to_display_string(right, clock),
+        )),
+        _ => None,
     }
 }
 
-/// The provisional order of value kinds when a sort meets two different
-/// kinds. **Not evidence**: it exists so `sort` is total and deterministic
-/// (the spec's property tests demand transitivity) until the `sort:mixed`
-/// capture fixes Obsidian's real order; `null` is last because an empty cell
-/// sorting after every value is the one placement the views page implies
-/// ("sort … by any property"). Task 13 replaces this table.
-pub const MIXED_TYPE_RANK: [&str; 14] = [
-    "number", "date", "string", "boolean", "duration", "link", "file", "list", "object", "regexp",
-    "image", "icon", "html", "null",
-];
-
-fn rank(value: &Value) -> usize {
-    MIXED_TYPE_RANK
-        .iter()
-        .position(|name| *name == value.type_name())
-        .expect("every type name is ranked")
-}
-
-/// A total order for `sort`: same-kind values by [`compare`] (falling back to
-/// equal where that is uncaptured, so a stable sort keeps their input order),
-/// different kinds by [`MIXED_TYPE_RANK`].
+/// The comparator a view's `sort` applies to two values, ascending, and the
+/// order `list.sort()`, `unique()` and the date summaries use: a total order
+/// by ruling R2 (2026-10-09; the project
+/// picked a total order). Values first order by kind: booleans (`false`
+/// before `true`), then numbers by value, then dates by instant, then every
+/// other value by the collation of its text ([`crate::collate`]), and `null`
+/// last.
 ///
-/// Numbers order numerically, with every NaN after every other number and
-/// equal to any other NaN, and `-0` equal to `0`. The order must be total:
-/// since Rust 1.81 `slice::sort_by` may panic on a comparator that is not.
-pub fn sort_order(left: &Value, right: &Value) -> Ordering {
-    let by_rank = rank(left).cmp(&rank(right));
-    if by_rank != Ordering::Equal {
-        return by_rank;
-    }
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => number_order(*a, *b),
-        (Value::Link(a), Value::Link(b)) => utf16_order(&a.target, &b.target),
-        (Value::File(a), Value::File(b)) => utf16_order(a.as_str(), b.as_str()),
-        (Value::Duration(a), Value::Duration(b)) => (a.months, a.ms).cmp(&(b.months, b.ms)),
-        _ => compare(left, right).unwrap_or(Ordering::Equal),
-    }
+/// Within the captured cases that do not mix kinds it gives Obsidian's
+/// answer (the pairwise probes under `Captures/pairs/`: two numbers by
+/// value, two dates by instant, texts by collation, `5` before `"abc"`).
+/// Obsidian's own comparator is not transitive where a boolean meets another
+/// kind (`true` ties with both `5` and `"abc"`, which do not tie), and a
+/// number against text compares there by text (`-10 < -5`, `-5 < "-7"`,
+/// `"-7" < -10`); a kind rank orders both, so the sort is O(n log n) and
+/// `slice::sort_by` never meets a comparator that is not total (it may panic
+/// on one since Rust 1.81). Numbers order numerically, with every NaN after
+/// every other number and equal to any other NaN, and `-0` equal to `0`.
+pub fn sort_compare(left: &Value, right: &Value, clock: &Clock) -> Ordering {
+    let rank = |value: &Value| match value {
+        Value::Boolean(_) => 0,
+        Value::Number(_) => 1,
+        Value::Date(_) => 2,
+        Value::Null => 4,
+        _ => 3,
+    };
+    rank(left)
+        .cmp(&rank(right))
+        .then_with(|| match (left, right) {
+            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Number(a), Value::Number(b)) => number_order(*a, *b),
+            (Value::Date(a), Value::Date(b)) => a.epoch_ms.cmp(&b.epoch_ms),
+            (Value::Null, Value::Null) => Ordering::Equal,
+            _ => collate(
+                &to_display_string(left, clock),
+                &to_display_string(right, clock),
+            ),
+        })
 }
 
-/// Numbers for [`sort_order`]: NaN last and equal to NaN, the rest by value.
+/// [`sort_compare`] where no view's clock is at hand (`list.sort()`,
+/// `unique()`, the date summaries): a date's text, the only clock-dependent
+/// one, is read in UTC.
+pub fn sort_order(left: &Value, right: &Value) -> Ordering {
+    sort_compare(left, right, &Clock::fixed(0, "UTC"))
+}
+
+/// Numbers for sorting: NaN last and equal to NaN, the rest by value.
 fn number_order(left: f64, right: f64) -> Ordering {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => Ordering::Equal,
@@ -152,9 +263,7 @@ fn number_order(left: f64, right: f64) -> Ordering {
 /// round-trip digits, which are the digits that algorithm specifies.
 ///
 /// Total: NaN is `NaN` and the infinities are `Infinity` and `-Infinity`, as
-/// in JavaScript. Non-finite numbers reach here from a literal (`1e400`), a
-/// YAML property (`.inf`, `.nan`) or `number()`; how a Bases cell shows them
-/// is provisional until the capture settles it.
+/// in JavaScript and as a cell shows them (captured).
 pub fn number_to_string(value: f64) -> String {
     if value.is_nan() {
         return "NaN".into();
@@ -195,17 +304,14 @@ pub fn number_to_string(value: f64) -> String {
     }
 }
 
-/// JavaScript's `StringToNumber` grammar, minus `Infinity` (refused here,
-/// provisionally) and minus the empty string (JavaScript says 0; whether
-/// Bases does is the uncaptured `number:empty_string`).
+/// JavaScript's `StringToNumber` grammar for non-empty numeric text, minus
+/// `Infinity` (see [`js_to_number`] for the total form).
 ///
 /// Known corners that still differ from JavaScript: `0b…` and `0o…` are
-/// refused (JavaScript: binary and octal), a hex string over 64 bits is
-/// refused (JavaScript: a rounded number), and the trimmed whitespace is
-/// Rust's `char::is_whitespace` (it trims U+0085, which JavaScript keeps,
-/// and keeps U+FEFF, which JavaScript trims).
+/// refused (JavaScript: binary and octal), and a hex string over 64 bits is
+/// refused (JavaScript: a rounded number).
 pub fn parse_js_number(text: &str) -> Option<f64> {
-    let trimmed = text.trim();
+    let trimmed = text.trim_matches(is_js_space);
     if trimmed.is_empty() {
         return None;
     }
@@ -244,39 +350,85 @@ pub fn parse_js_number(text: &str) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
-/// JavaScript `ToString`, for concatenation and `toString()`, on the kinds
-/// where that is the published rule. Dates, links, files, objects and null
-/// are uncaptured: JavaScript's answers there (`"[object Object]"`, a long
-/// `Date` string) are not what a Bases cell shows.
-pub fn to_display_string(value: &Value) -> Result<String, EvalError> {
-    Ok(match value {
+/// A value's text, as `toString()`, concatenation and a cell show it
+/// (captured, Task 13): `null` is `null`; a number is JavaScript's text; a
+/// date is `YYYY-MM-DDTHH:mm:ss` in the clock's zone, or `YYYY-MM-DD`
+/// without a time; a duration is Moment's `humanize` (`a day`); a list is
+/// its items' texts joined by `", "` (nested lists flatten: `[1, [2, 3]]` is
+/// `1, 2, 3`); an object is JSON whose values are their items' texts; a
+/// link is `[[target]]` or `[[target|display]]`, a URL link its URL; a file
+/// is its path; an image is `![](url)`.
+pub fn to_display_string(value: &Value, clock: &Clock) -> String {
+    match value {
+        Value::Null => "null".into(),
         Value::String(text) => text.clone(),
         Value::Number(number) => number_to_string(*number),
         Value::Boolean(flag) => flag.to_string(),
+        Value::Date(date) => {
+            let zoned = crate::dates::zoned(*date, clock);
+            if date.has_time {
+                zoned.strftime("%Y-%m-%dT%H:%M:%S").to_string()
+            } else {
+                zoned.strftime("%Y-%m-%d").to_string()
+            }
+        }
+        Value::Duration(duration) => humanize(*duration),
         Value::List(items) => items
             .iter()
-            .map(|item| match item {
-                Value::Null => Ok(String::new()),
-                other => to_display_string(other),
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
-        Value::Icon(name) | Value::Image(name) | Value::Html(name) => name.clone(),
-        Value::Regexp(regexp) => format!("/{}/{}", regexp.source, regexp.flags),
-        other => {
-            return Err(EvalError::Uncaptured(format!(
-                "tostring:{}",
-                other.type_name()
-            )));
+            .map(|item| to_display_string(item, clock))
+            .collect::<Vec<_>>()
+            .join(", "),
+        // Written by hand to keep the entries' order (a `serde_json::Map`
+        // sorts its keys in this workspace).
+        Value::Object(entries) => {
+            let body: Vec<String> = entries
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        json_string(key),
+                        json_string(&to_display_string(value, clock))
+                    )
+                })
+                .collect();
+            format!("{{{}}}", body.join(","))
         }
-    })
+        Value::Link(link) => {
+            let target = link_target(link);
+            if crate::functions::is_url(target) {
+                return target.to_string();
+            }
+            // An empty display shows no display (seen in a corpus view:
+            // `file.asLink(x)` for a note with no `x`).
+            match link.display.as_deref() {
+                Some(Value::Null) | None => format!("[[{target}]]"),
+                Some(display) => format!("[[{target}|{}]]", to_display_string(display, clock)),
+            }
+        }
+        Value::File(path) => path.as_str().to_string(),
+        Value::Regexp(regexp) => format!("/{}/{}", regexp.source, regexp.flags),
+        Value::Image(url) => format!("![]({url})"),
+        Value::Icon(text) | Value::Html(text) => text.clone(),
+    }
 }
 
-/// Equality without coercion, for `contains`, `containsAll`, `containsAny`
-/// and `unique`. JavaScript's `Array.prototype.includes` uses SameValueZero,
-/// so a number never equals a string there; pairings `==` leaves uncaptured
-/// are simply unequal here. A link still equals the file it resolves to (the
-/// syntax page: `authors.contains(this)`).
-pub fn strict_equals(left: &Value, right: &Value) -> bool {
-    loose_equals(left, right).unwrap_or(false)
+/// `text` as a JSON string literal.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

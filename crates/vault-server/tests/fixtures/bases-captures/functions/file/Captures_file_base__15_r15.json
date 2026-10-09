@@ -1,0 +1,8 @@
+{
+  "base": "Captures/file.base",
+  "view": "r15",
+  "captured_at_ms": 1791522183662,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/file/r15.md\",\n    \"f15\": \"Error: Cannot find \\\"name\\\" on type Link\",\n    \"t13_now\": \"1791522183668\"\n  }\n]\n",
+  "stderr": ""
+}

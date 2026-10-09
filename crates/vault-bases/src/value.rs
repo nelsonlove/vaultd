@@ -15,10 +15,16 @@ pub struct DateValue {
 /// A span of time. Months are kept apart from milliseconds because `+ "1M"`
 /// is calendar arithmetic — `2024-12-01 + 1M` is `2025-01-01`, not 30 days on —
 /// and only a date can resolve a month into milliseconds.
+///
+/// `timed` is whether the span was written with a time unit (hours,
+/// minutes, seconds) or carries a part of a day: added to a date without a
+/// time it gives a date with one (captured, Task 13: `date("2025-01-01") +
+/// "24h"` shows `2025-01-02T00:00:00`, `+ "1d"` shows `2025-01-02`).
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct DurationValue {
     pub months: i64,
     pub ms: i64,
+    pub timed: bool,
 }
 
 /// A link value: what it points at as written, an optional display value

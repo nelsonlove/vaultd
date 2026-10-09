@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-dur.base",
+  "view": "x_dur",
+  "captured_at_ms": 1791522463355,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_dur\": \"a day\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a day"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

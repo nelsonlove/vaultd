@@ -124,7 +124,7 @@ fn the_syntax_page_example_evaluates() {
     // the attachment has no price, so `price > 2.1` compares null and errors,
     // and an erroring filter excludes the row (`filter:error_row`).
     assert_eq!(paths(&result), vec!["Notes/Lecture.md"]);
-    assert_eq!(cell(&result, 0, 0), Value::String("Lecture.md".into()));
+    assert_eq!(cell(&result, 0, 0), Value::String("Lecture".into()));
     assert_eq!(cell(&result, 0, 1), Value::String("md".into()));
     assert_eq!(cell(&result, 0, 2), Value::Number(1.0));
     assert_eq!(cell(&result, 0, 3), Value::String("5.00".into()));
@@ -141,7 +141,7 @@ fn the_syntax_page_example_evaluates() {
 
 #[test]
 fn sort_is_stable_multi_key_and_directional_and_limit_applies_before_grouping() {
-    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.hasTag(\"book\")'\n    order: [file.name, price]\n    sort:\n      - property: note.age\n        direction: DESC\n      - property: price\n        direction: ASC\n    limit: 3\n    groupBy:\n      property: note.age\n      direction: ASC\n";
+    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.hasTag(\"book\")'\n    order: [file.name, price, note.age]\n    sort:\n      - property: note.age\n        direction: DESC\n      - property: price\n        direction: ASC\n    limit: 3\n    groupBy:\n      property: note.age\n      direction: ASC\n";
     let result = run(&books(), yaml, None);
     // Sorted by age desc then price asc: Ulysses(3,30), Kafka(2,8), Dune(2,10),
     // Emma(1,3), Lecture(1,5). Limit 3 keeps the first three; grouping by age
@@ -183,11 +183,11 @@ fn not_means_none_of_the_following() {
 
 #[test]
 fn an_error_inside_not_excludes_the_row() {
-    // `price > 2` errors on the two files with no price; `not` must not turn
-    // that error into an admitted row, and every priced note is over 2.
+    // `file.nosuch` errors on every row (a file has no such field); `not`
+    // must not turn that error into an admitted row.
     let result = run(
         &books(),
-        "views:\n  - type: table\n    name: T\n    filters:\n      not:\n        - 'price > 2'\n",
+        "views:\n  - type: table\n    name: T\n    filters:\n      not:\n        - 'file.nosuch > 2'\n",
         None,
     );
     assert_eq!(paths(&result), Vec::<&str>::new());
@@ -231,12 +231,15 @@ fn every_builtin_summary_has_a_definition() {
 
 #[test]
 fn a_cell_that_fails_is_an_error_cell_and_its_row_stays() {
-    let yaml = "formulas:\n  broken: 'price / 0'\nviews:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, formula.broken]\n";
+    let yaml = "formulas:\n  broken: 'price + true'\nviews:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, formula.broken]\n";
     let result = run(&books(), yaml, None);
     assert_eq!(result.rows.len(), 3);
     for row in &result.rows {
         assert!(row.cells[0].is_ok());
-        assert!(row.cells[1].is_err(), "division by zero is an error cell");
+        assert!(
+            row.cells[1].is_err(),
+            "a number plus a boolean is an error cell"
+        );
     }
 }
 
@@ -259,7 +262,10 @@ fn compile_errors_name_what_is_wrong() {
             declared: vec!["A".into(), "B".into()]
         }
     );
-    let base = parse_base("formulas:\n  bad: 'price +'\nviews:\n  - type: table\n    name: T\n    order: [formula.bad]\n").unwrap();
+    // Filters that do not compile still refuse the request (ruling R1:
+    // there are no rows to show).
+    let base =
+        parse_base("views:\n  - type: table\n    name: T\n    filters: 'price +'\n").unwrap();
     assert!(matches!(
         compile_view(&base, None).unwrap_err(),
         CompileError::ExpressionInvalid { expression, position: 7, .. } if expression == "price +"
@@ -284,10 +290,39 @@ fn compile_errors_name_what_is_wrong() {
     );
 }
 
+/// Ruling R1 (2026-10-09; the project
+/// picked Obsidian's behaviour): a formula that does not parse, or that
+/// calls an unknown function or method, does not refuse the view. Its column
+/// is an error cell in every row, naming the parse or lookup failure, and
+/// every other column answers.
 #[test]
-fn a_broken_formula_fails_only_the_views_that_read_it() {
+fn a_broken_formula_is_an_error_cell_in_every_row_that_reads_it() {
+    use vault_bases::eval::EvalError;
+    let yaml = "formulas:\n  bad: 'price +'\n  unknown: 'frobnicate(price)'\n  method: 'price.frobnicate()'\nviews:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    order: [formula.bad, formula.unknown, formula.method, price]\n    summaries:\n      price: Broken\nsummaries:\n  Broken: 'values.frobnicate()'\n";
+    let result = run(&books(), yaml, None);
+    assert_eq!(result.rows.len(), 3);
+    for row in &result.rows {
+        assert!(
+            matches!(&row.cells[0], Err(EvalError::FormulaInvalid { name, message }) if name == "bad" && message.ends_with("at 7")),
+            "{:?}",
+            row.cells[0]
+        );
+        assert_eq!(
+            row.cells[1],
+            Err(EvalError::UnknownFunction("frobnicate".into()))
+        );
+        assert_eq!(
+            row.cells[2],
+            Err(EvalError::UnknownFunction("frobnicate".into()))
+        );
+        assert!(row.cells[3].is_ok());
+    }
+    assert_eq!(
+        result.summaries[0].value,
+        Err(EvalError::UnknownFunction("frobnicate".into()))
+    );
     let base = parse_base("formulas:\n  bad: 'price +'\nviews:\n  - type: table\n    name: Reads\n    order: [formula.bad]\n  - type: table\n    name: Ignores\n    order: [file.name]\n").unwrap();
-    assert!(compile_view(&base, Some("Reads")).is_err());
+    assert!(compile_view(&base, Some("Reads")).is_ok());
     assert!(compile_view(&base, Some("Ignores")).is_ok());
 }
 
@@ -533,7 +568,7 @@ fn equal_keys_keep_path_order_on_a_large_view() {
     // holds, and within equal `other` the path order.
     let both = run(
         &source,
-        "views:\n  - type: table\n    name: T\n    order: [key, other]\n    sort:\n      - property: other\n    groupBy:\n      property: key\n",
+        "views:\n  - type: table\n    name: T\n    order: [key, other]\n    sort:\n      - property: other\n    groupBy:\n      property: key\n      direction: ASC\n",
         None,
     );
     check(&both, &|row| {
@@ -553,13 +588,13 @@ fn order_le(a: &vault_bases::view::Cell, b: &vault_bases::view::Cell) -> bool {
     vault_bases::eval::coerce::sort_order(a.as_ref().unwrap(), b.as_ref().unwrap()).is_le()
 }
 
-/// `limit:before_group` (**provisional**; the spec's stated order, the
-/// capture settles it): the limit keeps the first rows of the sorted order,
-/// then the kept rows are grouped. Grouping first would keep Emma and
-/// Lecture (age 1), which this answer does not hold.
+/// `limit:before_group` (captured, Task 13: the probe `limit_group` keeps
+/// one row in each of its two groups): the limit keeps the first rows of the
+/// sorted order, then the kept rows are grouped. Grouping first would keep
+/// Emma and Lecture (age 1), which this answer does not hold.
 #[test]
-fn provisional_limit_counts_sorted_rows_before_grouping() {
-    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.hasTag(\"book\")'\n    sort:\n      - property: price\n        direction: DESC\n    limit: 2\n    groupBy:\n      property: age\n      direction: ASC\n";
+fn captured_limit_counts_sorted_rows_before_grouping() {
+    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.hasTag(\"book\")'\n    order: [price]\n    sort:\n      - property: price\n        direction: DESC\n    limit: 2\n    groupBy:\n      property: age\n      direction: ASC\n";
     let result = run(&books(), yaml, None);
     // Sorted by price desc: Ulysses(30, age 3), Dune(10, age 2), Kafka, ...
     // Limit 2, then grouped by age ascending: Dune before Ulysses.
@@ -574,24 +609,26 @@ fn provisional_limit_counts_sorted_rows_before_grouping() {
     assert_eq!(paths(&result), vec!["Books/Ulysses.md", "Books/Dune.md"]);
 }
 
-/// `sort:default` (**provisional**): with no `sort`, rows keep path order,
-/// whatever order the notes were added in.
+/// `sort:default` (captured, Task 13): with no `sort`, rows are in file
+/// name order, whatever order the notes were added in and whatever folder
+/// they are in.
 #[test]
-fn provisional_without_a_sort_rows_keep_path_order() {
+fn captured_without_a_sort_rows_are_in_name_order() {
     let source = MemorySource::new()
         .with("b.md", MemoryFile::note())
         .with("C.md", MemoryFile::note())
         .with("a.md", MemoryFile::note())
         .with("A/z.md", MemoryFile::note());
     let result = run(&source, "views:\n  - type: list\n    name: L\n", None);
-    assert_eq!(paths(&result), vec!["A/z.md", "C.md", "a.md", "b.md"]);
+    assert_eq!(paths(&result), vec!["a.md", "b.md", "C.md", "A/z.md"]);
 }
 
-/// `filter:error_row` (**provisional**): a statement that errors is unknown;
+/// `filter:error_row` (captured, Task 13: the probe `filter_error_row` shows
+/// only the note whose `price > 2` holds): a statement that errors is unknown;
 /// `and` with a false child is false, `or` with a true child is true, and an
 /// unknown verdict excludes the row, at the top and inside `not`.
 #[test]
-fn provisional_an_erroring_statement_is_unknown_and_excludes_the_row() {
+fn captured_an_erroring_statement_is_unknown_and_excludes_the_row() {
     let source = MemorySource::new()
         .with(
             "priced.md",
@@ -605,13 +642,14 @@ fn provisional_an_erroring_statement_is_unknown_and_excludes_the_row() {
             .map(|p| p.to_string())
             .collect()
     };
-    // `price > 1` errors on plain.md (null compared with a number).
+    // `price > 1` is empty on plain.md (null compared with a number), which
+    // a filter reads as false.
     assert_eq!(
         view("      and:\n        - 'price > 1'\n"),
         vec!["priced.md"]
     );
     assert_eq!(
-        view("      or:\n        - 'price > 1'\n        - 'file.name == \"plain.md\"'\n"),
+        view("      or:\n        - 'price > 1'\n        - 'file.name == \"plain\"'\n"),
         vec!["plain.md", "priced.md"]
     );
     assert_eq!(
@@ -622,9 +660,11 @@ fn provisional_an_erroring_statement_is_unknown_and_excludes_the_row() {
         view("      and:\n        - 'price > 1'\n        - 'false'\n"),
         Vec::<String>::new()
     );
+    // A comparison with an empty side is empty (captured), and an empty
+    // statement is false, so `not` admits plain.md.
     assert_eq!(
         view("      not:\n        - 'price > 9'\n"),
-        vec!["priced.md"]
+        vec!["plain.md", "priced.md"]
     );
     assert_eq!(
         view("      not:\n        - 'price > 9'\n        - 'true'\n"),
@@ -632,11 +672,14 @@ fn provisional_an_erroring_statement_is_unknown_and_excludes_the_row() {
     );
 }
 
-/// `sort:mixed` (**provisional**): a column of mixed types sorts by
-/// `MIXED_TYPE_RANK` (number, date, string, boolean, …, null last), and an
-/// error cell sorts with the nulls.
+/// A sort over mixed kinds is ruling R2's total order (2026-10-09; the
+/// project picked a total order): booleans, then
+/// numbers, then dates, then text, reversed for `DESC`, and an empty value
+/// last in either direction (captured, `sort:empty_descending`). Obsidian's
+/// own order differs where a boolean meets another kind (its comparator ties
+/// `true` with every truthy value, `sort_mixed2`).
 #[test]
-fn provisional_a_mixed_type_sort_follows_the_type_rank() {
+fn a_mixed_type_sort_is_the_total_order_of_ruling_r2() {
     let source = MemorySource::new()
         .typed("x", PropertyType::Date)
         .with(
@@ -655,33 +698,32 @@ fn provisional_a_mixed_type_sort_follows_the_type_rank() {
         );
     let result = run(
         &source,
-        "views:\n  - type: table\n    name: T\n    sort:\n      - property: x\n",
+        "views:\n  - type: table\n    name: T\n    order: [x]\n    sort:\n      - property: x\n",
         None,
     );
     assert_eq!(
         paths(&result),
-        vec!["number.md", "date.md", "string.md", "bool.md", "missing.md"]
+        vec!["bool.md", "number.md", "date.md", "string.md", "missing.md"]
     );
     let result = run(
         &source,
-        "views:\n  - type: table\n    name: T\n    sort:\n      - property: x\n        direction: DESC\n",
+        "views:\n  - type: table\n    name: T\n    order: [x]\n    sort:\n      - property: x\n        direction: DESC\n",
         None,
     );
     assert_eq!(
         paths(&result),
-        vec!["missing.md", "bool.md", "string.md", "date.md", "number.md"]
+        vec!["string.md", "date.md", "number.md", "bool.md", "missing.md"]
     );
-    // An error cell (division by zero) sorts with the missing value, and both
-    // keep path order between them.
-    let yaml = "formulas:\n  k: 'if(x.isType(\"number\"), x, 1 / 0)'\nviews:\n  - type: table\n    name: T\n    sort:\n      - property: formula.k\n";
+    // An error cell sorts with the missing values, last.
+    let yaml = "formulas:\n  k: 'if(x.isType(\"number\"), x, 1 + true)'\nviews:\n  - type: table\n    name: T\n    order: [formula.k]\n    sort:\n      - property: formula.k\n";
     let result = run(&source, yaml, None);
     assert_eq!(paths(&result)[0], "number.md");
 }
 
-/// `summary:stddev` (**provisional**): the population standard deviation
+/// `summary:stddev` (captured, Task 13: 2, 4, 4, 4, 5, 5, 7, 9 give 2): the population standard deviation
 /// (divide by n). The sample deviation (n - 1) is a different number here.
 #[test]
-fn provisional_stddev_is_the_population_deviation() {
+fn captured_stddev_is_the_population_deviation() {
     let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    summaries:\n      price: Stddev\n";
     let result = run(&books(), yaml, None);
     let prices = [10.0_f64, 3.0, 30.0];
@@ -744,7 +786,8 @@ fn every_builtin_summary_computes_its_value() {
             MemoryFile::note().property("n", text("not a number")),
         );
     let cases: [(&str, &str, Value); 17] = [
-        ("n", "Average", Value::Number(4.0)),
+        // Captured (Task 13): the numbers' total over every row.
+        ("n", "Average", Value::Number(16.0 / 5.0)),
         ("n", "Min", Value::Number(1.0)),
         ("n", "Max", Value::Number(7.0)),
         ("n", "Sum", Value::Number(16.0)),
@@ -755,7 +798,15 @@ fn every_builtin_summary_computes_its_value() {
             "Stddev",
             Value::Number(((0.0f64 + 9.0 + 0.0 + 9.0) / 4.0).sqrt()),
         ),
-        ("due", "Range", Value::Number(2.0 * 86_400_000.0)),
+        (
+            "due",
+            "Range",
+            Value::Duration(vault_bases::DurationValue {
+                months: 0,
+                ms: 2 * 86_400_000,
+                timed: true,
+            }),
+        ),
         ("due", "Earliest", date("2025-01-01")),
         ("due", "Latest", date("2025-01-03")),
         ("done", "Checked", Value::Number(2.0)),
@@ -780,18 +831,20 @@ fn every_builtin_summary_computes_its_value() {
     // An even count takes the mean of the middle two.
     let even = run(
         &source,
-        "views:\n  - type: table\n    name: T\n    filters: 'file.name == \"a.md\" || file.name == \"b.md\"'\n    summaries:\n      n: Median\n",
+        "views:\n  - type: table\n    name: T\n    filters: 'file.name == \"a\" || file.name == \"b\"'\n    summaries:\n      n: Median\n",
         None,
     );
     assert_eq!(even.summaries[0].value, Ok(Value::Number(2.5)));
-    // A summary name that is neither built in nor declared fails the view.
-    let base = parse_base("views:\n  - type: table\n    name: T\n    summaries:\n      n: Mode\n")
-        .unwrap();
+    // A summary name that is neither built in nor declared is an error
+    // summary; the view still answers its rows (captured, in the corpus).
+    let unknown = run(
+        &source,
+        "views:\n  - type: table\n    name: T\n    summaries:\n      n: Mode\n",
+        None,
+    );
     assert_eq!(
-        compile_view(&base, None).unwrap_err(),
-        CompileError::UnsupportedFunction {
-            name: "Mode".into()
-        }
+        unknown.summaries[0].value,
+        Err(EvalError::UnknownFunction("Mode".into()))
     );
 }
 
@@ -837,15 +890,15 @@ fn provisional_a_hyphenated_name_is_subtraction_in_an_expression_and_a_name_as_a
 /// cell in that column, and its other cells are values.
 #[test]
 fn a_formula_that_errors_on_one_row_keeps_the_row() {
-    let yaml = "formulas:\n  per: 'price / (age - 1)'\nviews:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, formula.per]\n";
+    let yaml = "formulas:\n  per: 'price / (age - 1) + if(age == 1, true, 0)'\nviews:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, formula.per]\n";
     let result = run(&books(), yaml, None);
     assert_eq!(
         paths(&result),
         vec!["Books/Dune.md", "Books/Emma.md", "Books/Ulysses.md"]
     );
     assert_eq!(cell(&result, 0, 1), Value::Number(10.0));
-    assert_eq!(result.rows[1].cells[1], Err(EvalError::DivisionByZero));
-    assert_eq!(cell(&result, 1, 0), Value::String("Emma.md".into()));
+    assert!(matches!(result.rows[1].cells[1], Err(EvalError::Type(_))));
+    assert_eq!(cell(&result, 1, 0), Value::String("Emma".into()));
     assert_eq!(cell(&result, 2, 1), Value::Number(15.0));
 }
 
@@ -952,7 +1005,7 @@ fn a_view_at_every_depth_cap_fits_a_one_mebibyte_stack() {
             for at in 1..=links {
                 yaml.push_str(&format!("  f{at}: 'formula.f{} + 1'\n", at - 1));
             }
-            yaml.push_str(&format!("views:\n  - type: table\n    name: T\n    filters: 'file.name == \"Dune.md\"'\n    order: [formula.f{links}]\n"));
+            yaml.push_str(&format!("views:\n  - type: table\n    name: T\n    filters: 'file.name == \"Dune\"'\n    order: [formula.f{links}]\n"));
             yaml
         };
         // 3 per link and 1 for f0: 21 links fit in 64, 22 do not.
@@ -1159,10 +1212,11 @@ fn provisional_sum_over_no_numbers_is_positive_zero() {
     assert!(sum.is_sign_positive(), "{sum:?}");
 }
 
-/// `summary:unique` (**uncaptured**): equal lists are one value, every
-/// empty cell is one `null`, and numbers compare as SameValueZero.
+/// `summary:unique` (captured, Task 13: `[x]`, `[x]`, `[x, y]` and an empty
+/// cell count 3): equal lists are one value, every empty cell is one
+/// `null`, and numbers compare as SameValueZero.
 #[test]
-fn uncaptured_unique_counts_equal_values_once() {
+fn captured_unique_counts_equal_values_once() {
     let result = run(
         &view_vault(),
         "views:\n  - type: table\n    name: T\n    summaries:\n      list: Unique\n      missing: Unique\n",
@@ -1178,7 +1232,7 @@ fn uncaptured_unique_counts_equal_values_once() {
         Ok(Value::Number(1.0)),
         "four empty cells are one null"
     );
-    let yaml = "formulas:\n  z: 'if(file.name == \"a.md\", -0, if(file.name == \"b.md\", 0, \"0\"))'\nviews:\n  - type: table\n    name: T\n    summaries:\n      formula.z: Unique\n";
+    let yaml = "formulas:\n  z: 'if(file.name == \"a\", -0, if(file.name == \"b\", 0, \"0\"))'\nviews:\n  - type: table\n    name: T\n    summaries:\n      formula.z: Unique\n";
     let result = run(&view_vault(), yaml, None);
     assert_eq!(
         result.summaries[0].value,
@@ -1190,16 +1244,18 @@ fn uncaptured_unique_counts_equal_values_once() {
 /// `filter:empty_or`, `filter:empty_and`, `group:list`, `sort:empty_descending`
 /// as named tests beside their rows.
 #[test]
-fn provisional_empty_groups_list_groups_and_empty_values_descending() {
+fn captured_empty_groups_list_groups_and_empty_values_descending() {
     let source = view_vault();
-    assert!(
+    assert_eq!(
         run(
             &source,
             "views:\n  - type: table\n    name: T\n    filters:\n      or: []\n",
             None
         )
         .rows
-        .is_empty()
+        .len(),
+        4,
+        "an empty `or` constrains nothing"
     );
     assert_eq!(
         run(
@@ -1223,7 +1279,7 @@ fn provisional_empty_groups_list_groups_and_empty_values_descending() {
     );
     let grouped = run(
         &source,
-        "views:\n  - type: table\n    name: T\n    groupBy:\n      property: list\n",
+        "views:\n  - type: table\n    name: T\n    groupBy:\n      property: list\n      direction: ASC\n",
         None,
     );
     let keys: Vec<Value> = grouped
@@ -1240,10 +1296,10 @@ fn provisional_empty_groups_list_groups_and_empty_values_descending() {
     );
     let sorted = run(
         &source,
-        "views:\n  - type: table\n    name: T\n    sort:\n      - property: status\n        direction: DESC\n",
+        "views:\n  - type: table\n    name: T\n    order: [status]\n    sort:\n      - property: status\n        direction: DESC\n",
         None,
     );
-    assert_eq!(paths(&sorted), vec!["b.md", "c.md", "d.md", "a.md"]);
+    assert_eq!(paths(&sorted), vec!["a.md", "b.md", "c.md", "d.md"]);
 }
 
 /// `prefilter:has_tag_spelling`: a `#`, the case and a nested tag do not
@@ -1307,7 +1363,9 @@ fn a_property_prefilter_never_skips_a_list_or_mapping_value() {
     source.clear_log();
     let without = ctx_paths(&source, &compiled.without_prefilters());
     assert_eq!(with, without);
-    assert_eq!(with, vec!["match.md"]);
+    // Captured (Task 13): a one-item list equals that item's text, so
+    // `[p] == "p"` holds.
+    assert_eq!(with, vec!["list.md", "match.md"]);
 }
 
 fn ctx_paths(source: &MemorySource, compiled: &vault_bases::view::CompiledView) -> Vec<String> {
@@ -1342,9 +1400,9 @@ fn a_negated_statement_lifts_no_prefilter() {
         paths(&result),
         vec![
             "Images/cover.png",
+            "Required Reading/Kafka.md",
             "Notes/Lecture.md",
-            "Notes/Textbook.md",
-            "Required Reading/Kafka.md"
+            "Notes/Textbook.md"
         ]
     );
 }
@@ -1371,7 +1429,7 @@ fn an_ext_prefilter_comes_only_from_the_rows_file() {
 /// The review's R6: summaries read only the rows left after `limit`.
 #[test]
 fn summaries_read_only_the_rows_left_after_the_limit() {
-    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    sort:\n      - property: price\n        direction: DESC\n    limit: 2\n    summaries:\n      price: Sum\n      status: Filled\n";
+    let yaml = "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Books\")'\n    order: [price]\n    sort:\n      - property: price\n        direction: DESC\n    limit: 2\n    summaries:\n      price: Sum\n      status: Filled\n";
     let result = run(&books(), yaml, None);
     assert_eq!(paths(&result), vec!["Books/Ulysses.md", "Books/Dune.md"]);
     assert_eq!(result.summaries[0].value, Ok(Value::Number(40.0)));

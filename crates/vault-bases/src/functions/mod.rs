@@ -23,21 +23,47 @@ use crate::expr::{BinaryOp, Expr};
 use crate::source::PropertyType;
 use crate::value::Value;
 
+pub(crate) use link::is_url;
+
 /// Every wikilink string in `value` (in lists too) as a `Link` resolved from
-/// `row`. One call per list level, with a small frame: the depth is the
-/// YAML's, and `property_value` already walks it the same way.
-fn links_in(ctx: &EvalContext<'_>, row: Option<&VaultPath>, value: Value) -> Value {
+/// `row`, and every string that reads as a date as a date, in lists and
+/// objects too (captured, Task 13: `2025-01-01`, `2025-01-01T10:00:00`,
+/// `2025-01-01 10:00:00` and ISO text with an offset are dates whether the
+/// YAML quotes them or not, and so is such text inside a mapping). One call
+/// per level, with a small frame: the depth is the YAML's, and
+/// `property_value` already walks it the same way.
+fn links_in(ctx: &EvalContext<'_>, row: Option<&VaultPath>, value: Value, dates: bool) -> Value {
     match value {
         Value::String(text) => match (row, link::parse_wikilink(&text)) {
             (Some(row), Some(_)) => link::make_link(ctx, row, &text, None)
                 .map(Value::Link)
                 .unwrap_or(Value::String(text)),
-            _ => Value::String(text),
+            _ => match dates
+                .then(|| crate::dates::parse_date_text(&text, ctx.clock))
+                .flatten()
+            {
+                Some(date) => Value::Date(date),
+                None => Value::String(text),
+            },
         },
         Value::List(items) => Value::list(
             items
                 .iter()
-                .map(|item| links_in(ctx, row, item.clone()))
+                .map(|item| links_in(ctx, row, item.clone(), dates))
+                .collect(),
+        ),
+        Value::Object(entries) => Value::object(
+            entries
+                .iter()
+                // A nested key a tags type declares is a tags list too (seen
+                // in a corpus view: a mapping's `tags` shows `#a/b`).
+                .map(|(key, item)| {
+                    let item = match ctx.source.property_type(key) {
+                        Some(PropertyType::Tags) => hashed(item.clone()),
+                        _ => links_in(ctx, row, item.clone(), dates),
+                    };
+                    (key.clone(), item)
+                })
                 .collect(),
         ),
         other => other,
@@ -63,7 +89,21 @@ pub(crate) fn typed_property(
                 .map(Value::Date)
                 .unwrap_or(plain)
         }
-        _ => links_in(ctx, row, plain),
+        // A tags property's items carry their `#` (captured, Task 13:
+        // `tags: [alpha]` shows `#alpha`, and `tags[0]` is the text
+        // `#alpha`).
+        (Some(PropertyType::Tags), _) => hashed(plain),
+        (Some(PropertyType::Text), _) => links_in(ctx, row, plain, false),
+        _ => links_in(ctx, row, plain, true),
+    }
+}
+
+/// Each text item of a tags property, with one leading `#`.
+fn hashed(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(format!("#{}", text.trim_start_matches('#'))),
+        Value::List(items) => Value::list(items.iter().cloned().map(hashed).collect()),
+        other => other,
     }
 }
 
@@ -109,12 +149,12 @@ pub(crate) fn call_method(
     match target {
         // A missing property is `null`. `isEmpty` is true for it (the
         // string and number entries: "or is not present"); every other
-        // method on it is an error cell — "a missing property in a method
-        // call", in the spec's words.
+        // method on it is empty (captured, Task 13: `missing.contains("x")`).
         Value::Null if name == "isEmpty" => {
             arity(name, args, 0, 0)?;
             Ok(Value::Boolean(true))
         }
+        Value::Null => Ok(Value::Null),
         Value::String(text) => string::call(&text, name, args, ctx, scope),
         Value::Number(number) => number::call(number, name, args, ctx, scope),
         Value::List(items) => list::call(&items, name, args, ctx, scope),
@@ -136,6 +176,7 @@ pub(crate) fn field(target: &Value, name: &str, ctx: &EvalContext<'_>) -> Result
         Value::String(text) => string::field(text, name),
         Value::List(items) => list::field(items, name),
         Value::Date(date) => date::field(*date, name, ctx),
+        Value::Duration(duration) => date::duration_field(*duration, name),
         Value::File(path) => file::field(path, name, ctx),
         other => Err(EvalError::NoSuchField {
             target: other.type_name(),

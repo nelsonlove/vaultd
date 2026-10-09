@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-dur-ms-field.base",
+  "view": "s_dur_ms_field",
+  "captured_at_ms": 1791522415745,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_dur_ms_field\": \"1\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

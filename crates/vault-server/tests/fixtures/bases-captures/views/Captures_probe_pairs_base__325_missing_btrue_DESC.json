@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "missing~btrue~DESC",
+  "captured_at_ms": 1791522318070,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/missing~btrue-2.md\",\n    \"mix\": \"true\"\n  },\n  {\n    \"path\": \"Captures/pairs/missing~btrue-1.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

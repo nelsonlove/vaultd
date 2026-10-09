@@ -1,0 +1,8 @@
+{
+  "base": "Captures/global.base",
+  "view": "r12",
+  "captured_at_ms": 1791522183873,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/global/r12.md\",\n    \"f12\": \"-1\",\n    \"t13_now\": \"1791522183878\"\n  }\n]\n",
+  "stderr": ""
+}

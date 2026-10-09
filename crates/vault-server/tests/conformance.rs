@@ -115,7 +115,7 @@ fn build_vault() -> (TempDir, TempDir, TempDir) {
     // (and must not) blank.
     std::fs::write(
         vault.path().join("Views.base"),
-        "formulas:\n  bad: 'title +'\nviews:\n  - type: table\n    name: Table\n    order: [file.name, title]\n  - type: cards\n    name: Cards\n  - type: table\n    name: Bad\n    order: [formula.bad]\n",
+        "formulas:\n  bad: 'title +'\nviews:\n  - type: table\n    name: Table\n    order: [file.name, title]\n  - type: cards\n    name: Cards\n  - type: table\n    name: Bad\n    filters: 'title +'\n",
     )
     .expect("write Views.base");
     std::fs::write(vault.path().join("Broken.base"), "views: [\n").expect("write Broken.base");
@@ -128,7 +128,7 @@ fn build_vault() -> (TempDir, TempDir, TempDir) {
     .expect("write Numbers.md");
     std::fs::write(
         vault.path().join("Numbers.base"),
-        "views:\n  - type: table\n    name: Odd\n    filters: 'file.name == \"Numbers.md\"'\n    order: [big, small, odd]\n",
+        "views:\n  - type: table\n    name: Odd\n    filters: 'file.name == \"Numbers\"'\n    order: [big, small, odd]\n",
     )
     .expect("write Numbers.base");
     (vault, index, run)

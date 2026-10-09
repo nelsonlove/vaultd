@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-exp.base",
+  "view": "x_exp",
+  "captured_at_ms": 1791522465796,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_exp\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

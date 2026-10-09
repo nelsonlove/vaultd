@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-exp-frac.base",
+  "view": "x_exp_frac",
+  "captured_at_ms": 1791522464575,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_exp_frac\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

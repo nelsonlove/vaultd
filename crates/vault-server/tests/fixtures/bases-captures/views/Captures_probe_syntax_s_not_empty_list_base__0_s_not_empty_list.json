@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-not-empty-list.base",
+  "view": "s_not_empty_list",
+  "captured_at_ms": 1791522427973,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_not_empty_list\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

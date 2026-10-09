@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-datetime-plus-1d.base",
+  "view": "s_datetime_plus_1d",
+  "captured_at_ms": 1791522414525,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_datetime_plus_1d\": \"2025-01-02T10:00:00\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "01/02/2025 10:00 AM"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

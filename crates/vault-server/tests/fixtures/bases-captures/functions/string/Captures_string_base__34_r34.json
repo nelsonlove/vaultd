@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r34",
+  "captured_at_ms": 1791522531452,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r34.md\",\n    \"f34\": \"Error: Cannot find function \\\"lower\\\" on type Boolean\",\n    \"t13_now\": \"1791522531460\"\n  }\n]\n",
+  "stderr": ""
+}

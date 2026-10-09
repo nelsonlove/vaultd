@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-file-row.base",
+  "view": "r_file_row",
+  "captured_at_ms": 1791522382767,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_file_row\": \"Captures/probes/syntax-x.md\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "syntax-x"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

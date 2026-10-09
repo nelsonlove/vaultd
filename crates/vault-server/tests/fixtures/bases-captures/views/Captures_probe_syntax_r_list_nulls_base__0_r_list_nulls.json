@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-list-nulls.base",
+  "view": "r_list_nulls",
+  "captured_at_ms": 1791522394972,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_list_nulls\": \"1, null, a\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1 a"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/any.base",
+  "view": "r6",
+  "captured_at_ms": 1791522182704,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/any/r6.md\",\n    \"f6\": \"1, a\",\n    \"t13_now\": \"1791522182708\"\n  }\n]\n",
+  "stderr": ""
+}

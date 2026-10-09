@@ -1,0 +1,31 @@
+{
+  "base": "Captures/view/v1.base",
+  "view": "T",
+  "captured_at_ms": 1791522533840,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/view/a.md\",\n    \"file name\": \"a\"\n  },\n  {\n    \"path\": \"Captures/view/b.md\",\n    \"file name\": \"b\"\n  },\n  {\n    \"path\": \"Captures/view/c.md\",\n    \"file name\": \"c\"\n  },\n  {\n    \"path\": \"Captures/view/d.md\",\n    \"file name\": \"d\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "c"
+          ],
+          [
+            "d"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

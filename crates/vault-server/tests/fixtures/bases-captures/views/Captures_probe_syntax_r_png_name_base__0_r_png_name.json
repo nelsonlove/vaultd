@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-png-name.base",
+  "view": "r_png_name",
+  "captured_at_ms": 1791522402291,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_png_name\": \"image.png\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "image.png"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

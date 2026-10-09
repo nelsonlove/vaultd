@@ -50,3 +50,8 @@ xdg.workspace = true
 # spawned.
 libc.workspace = true
 tempfile.workspace = true
+# `tests/bases_replay.rs`: the capture fixtures' renderer and template
+# filler, and an order-keeping reader for `base:query`'s row objects.
+serde.workspace = true
+serde_json.workspace = true
+vault-bases = { path = "../vault-bases", features = ["fixtures"] }

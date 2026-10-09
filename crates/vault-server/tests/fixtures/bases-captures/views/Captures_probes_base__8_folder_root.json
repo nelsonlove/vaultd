@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "folder_root",
+  "captured_at_ms": 1791522495104,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Root-probe.md\",\n    \"folder\": \"/\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "/"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

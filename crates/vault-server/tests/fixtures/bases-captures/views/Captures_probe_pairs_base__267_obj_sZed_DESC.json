@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "obj~sZed~DESC",
+  "captured_at_ms": 1791522316766,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/obj~sZed-2.md\",\n    \"mix\": \"Zed\"\n  },\n  {\n    \"path\": \"Captures/pairs/obj~sZed-1.md\",\n    \"mix\": \"{\\\"k\\\":\\\"1\\\"}\"\n  }\n]\n",
+  "stderr": ""
+}

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-round-neg-half.base",
+  "view": "s_round_neg_half",
+  "captured_at_ms": 1791522436511,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_round_neg_half\": \"-2\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "-2"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

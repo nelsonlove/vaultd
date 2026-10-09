@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-list-empty.base",
+  "view": "r_list_empty",
+  "captured_at_ms": 1791522393751,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_list_empty\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

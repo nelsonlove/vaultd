@@ -1,0 +1,41 @@
+{
+  "base": "Captures/probes.base",
+  "view": "group_list",
+  "captured_at_ms": 1791522507322,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/summaries-s1.md\",\n    \"l\": \"x\"\n  },\n  {\n    \"path\": \"Captures/probes/summaries-s2.md\",\n    \"l\": \"x\"\n  },\n  {\n    \"path\": \"Captures/probes/summaries-s3.md\",\n    \"l\": \"x, y\"\n  },\n  {\n    \"path\": \"Captures/probes/summaries-s4.md\",\n    \"l\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": "x",
+        "rows": [
+          [
+            "x"
+          ],
+          [
+            "x"
+          ]
+        ]
+      },
+      {
+        "value": "x y",
+        "rows": [
+          [
+            "x\ny"
+          ]
+        ]
+      },
+      {
+        "value": "None",
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "base": "Captures/probes.base",
+  "view": "sort_default",
+  "captured_at_ms": 1791522486539,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/sort_default-a.md\",\n    \"file name\": \"sort_default-a\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_default-m.md\",\n    \"file name\": \"sort_default-m\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_default-z.md\",\n    \"file name\": \"sort_default-z\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "sort_default-a"
+          ],
+          [
+            "sort_default-m"
+          ],
+          [
+            "sort_default-z"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

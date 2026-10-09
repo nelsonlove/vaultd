@@ -187,6 +187,12 @@ fn shapes_that_are_yaml_but_not_a_base_fail_with_a_position() {
             "views:\n  - type: table\n    name: T\n    groupBy:\n      property: a\n      direction: SIDEWAYS\n",
             "direction",
         ),
+        // Captured (Task 13): Obsidian refuses a base whose `groupBy` has
+        // no direction.
+        (
+            "views:\n  - type: table\n    name: T\n    groupBy:\n      property: a\n",
+            "direction",
+        ),
     ] {
         let error = parse_base(text).expect_err(text);
         assert!(
@@ -267,7 +273,9 @@ fn an_empty_view_section_is_accepted_as_empty() {
         let base = parse_base(&text).unwrap_or_else(|error| panic!("{text:?}: {error:?}"));
         let view = &base.views[0];
         assert!(view.filters.is_none(), "{text:?}");
-        assert!(view.order.is_empty(), "{text:?}");
+        // An empty or absent `order` is the one column `file.name`
+        // (captured, Task 13).
+        assert_eq!(view.order, vec!["file.name".to_string()], "{text:?}");
         assert!(view.sort.is_empty(), "{text:?}");
         assert!(view.group_by.is_none(), "{text:?}");
         assert!(view.summaries.is_empty(), "{text:?}");

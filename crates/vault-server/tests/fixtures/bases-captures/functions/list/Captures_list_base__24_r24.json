@@ -1,0 +1,8 @@
+{
+  "base": "Captures/list.base",
+  "view": "r24",
+  "captured_at_ms": 1791522184168,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/list/r24.md\",\n    \"f24\": \"3\",\n    \"t13_now\": \"1791522184173\"\n  }\n]\n",
+  "stderr": ""
+}

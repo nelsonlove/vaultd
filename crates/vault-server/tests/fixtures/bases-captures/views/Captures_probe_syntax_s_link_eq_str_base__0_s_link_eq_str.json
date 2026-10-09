@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-link-eq-str.base",
+  "view": "s_link_eq_str",
+  "captured_at_ms": 1791522421870,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_link_eq_str\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

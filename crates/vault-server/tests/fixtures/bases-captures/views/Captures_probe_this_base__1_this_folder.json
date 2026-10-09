@@ -1,0 +1,73 @@
+{
+  "base": "Captures/probe-this.base",
+  "view": "this_folder",
+  "captured_at_ms": 1791522479217,
+  "exit_code": 0,
+  "stdout": "[]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "any.base"
+          ],
+          [
+            "coercion.base"
+          ],
+          [
+            "date.base"
+          ],
+          [
+            "embeds"
+          ],
+          [
+            "file.base"
+          ],
+          [
+            "global.base"
+          ],
+          [
+            "link.base"
+          ],
+          [
+            "list.base"
+          ],
+          [
+            "number.base"
+          ],
+          [
+            "object.base"
+          ],
+          [
+            "probe-collation.base"
+          ],
+          [
+            "probe-extra.base"
+          ],
+          [
+            "probe-fields.base"
+          ],
+          [
+            "probe-groupby.base"
+          ],
+          [
+            "probe-pairs.base"
+          ],
+          [
+            "probe-syntax-r-date-ms.base"
+          ],
+          [
+            "probe-syntax-r-dur-hours.base"
+          ],
+          [
+            "probe-syntax-r-dur-months.base"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

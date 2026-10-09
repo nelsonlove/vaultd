@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-trim-plain.base",
+  "view": "s_trim_plain",
+  "captured_at_ms": 1791522454812,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_trim_plain\": \"hi\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "hi"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

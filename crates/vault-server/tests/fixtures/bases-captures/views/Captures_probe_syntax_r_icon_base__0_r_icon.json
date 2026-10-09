@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-icon.base",
+  "view": "r_icon",
+  "captured_at_ms": 1791522386425,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_icon\": \"plus\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

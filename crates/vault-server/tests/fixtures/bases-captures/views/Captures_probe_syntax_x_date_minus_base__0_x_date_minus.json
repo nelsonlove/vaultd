@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-date-minus.base",
+  "view": "x_date_minus",
+  "captured_at_ms": 1791522460917,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_date_minus\": \"a day\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a day"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

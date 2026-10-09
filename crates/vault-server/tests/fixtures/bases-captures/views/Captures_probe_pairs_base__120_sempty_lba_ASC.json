@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "sempty~lba~ASC",
+  "captured_at_ms": 1791522253345,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/sempty~lba-1.md\",\n    \"mix\": null\n  },\n  {\n    \"path\": \"Captures/pairs/sempty~lba-2.md\",\n    \"mix\": \"b, a\"\n  }\n]\n",
+  "stderr": ""
+}

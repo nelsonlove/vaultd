@@ -1,0 +1,25 @@
+{
+  "base": "Captures/probe-yaml-dates.base",
+  "view": "yaml_dates",
+  "captured_at_ms": 1791522484084,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/extra/yaml-dates.md\",\n    \"u_date\": \"2025-01-01\",\n    \"u_dt\": \"2025-01-01T10:00:00\",\n    \"u_dt_space\": \"2025-01-01T10:00:00\",\n    \"u_dt_off\": \"2025-01-01T09:00:00\",\n    \"u_dt_z\": \"2025-01-01T05:00:00\",\n    \"q_date\": \"2025-01-01\",\n    \"q_dt_off\": \"2025-01-01T09:00:00\",\n    \"obj\": \"{\\\"at\\\":\\\"2025-01-01T09:00:00\\\",\\\"q\\\":\\\"2025-01-01\\\"}\",\n    \"is_u_date\": \"true\",\n    \"is_u_dt\": \"true\",\n    \"is_u_dt_space\": \"true\",\n    \"is_u_dt_off\": \"true\",\n    \"is_u_dt_z\": \"true\",\n    \"is_q_date\": \"true\",\n    \"is_q_dt_off\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "2025-01-01",
+            "2025-01-01T10:00:00",
+            "2025-01-01 10:00:00",
+            "2025-01-01T10:00:00-04:00"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

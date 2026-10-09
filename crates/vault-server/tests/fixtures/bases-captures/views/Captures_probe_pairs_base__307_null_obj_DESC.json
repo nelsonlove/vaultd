@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "null~obj~DESC",
+  "captured_at_ms": 1791522317680,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/null~obj-2.md\",\n    \"mix\": \"{\\\"k\\\":\\\"1\\\"}\"\n  },\n  {\n    \"path\": \"Captures/pairs/null~obj-1.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

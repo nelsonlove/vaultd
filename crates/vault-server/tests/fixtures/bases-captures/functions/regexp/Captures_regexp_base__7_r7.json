@@ -1,0 +1,8 @@
+{
+  "base": "Captures/regexp.base",
+  "view": "r7",
+  "captured_at_ms": 1791522530574,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/regexp/r7.md\",\n    \"f7\": \"Error: Type error in \\\"matches\\\", parameter \\\"value\\\". Expected String, given Number.\",\n    \"t13_now\": \"1791522530580\"\n  }\n]\n",
+  "stderr": ""
+}

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/list.base",
+  "view": "r33",
+  "captured_at_ms": 1791522184225,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/list/r33.md\",\n    \"f33\": \"Error: Cannot find function \\\"flat\\\" on type Number\",\n    \"t13_now\": \"1791522184231\"\n  }\n]\n",
+  "stderr": ""
+}

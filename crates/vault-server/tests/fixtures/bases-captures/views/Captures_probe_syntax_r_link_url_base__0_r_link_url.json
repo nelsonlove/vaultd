@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-link-url.base",
+  "view": "r_link_url",
+  "captured_at_ms": 1791522391301,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_link_url\": \"https://obsidian.md\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "https://obsidian.md"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

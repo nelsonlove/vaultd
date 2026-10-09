@@ -127,7 +127,9 @@ pub enum CellDto {
     Html {
         value: String,
     },
-    /// The expression failed on this row; the row stays.
+    /// The expression failed on this row, or its formula does not compile
+    /// (it does not parse, or names an unknown function or method); the row
+    /// stays.
     Error {
         message: String,
     },

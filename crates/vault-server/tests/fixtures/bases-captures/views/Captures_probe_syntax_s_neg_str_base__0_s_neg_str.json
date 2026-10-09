@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-neg-str.base",
+  "view": "s_neg_str",
+  "captured_at_ms": 1791522426753,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_neg_str\": \"Error: Unable to negate 5\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Unable to negate 5"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

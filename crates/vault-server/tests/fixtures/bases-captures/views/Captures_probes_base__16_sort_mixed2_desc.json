@@ -1,0 +1,55 @@
+{
+  "base": "Captures/probes.base",
+  "view": "sort_mixed2_desc",
+  "captured_at_ms": 1791522504876,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/sort_mixed2-g.md\",\n    \"mix\": \"Zed\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-i.md\",\n    \"mix\": \"b, a\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-a.md\",\n    \"mix\": \"abc\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-b.md\",\n    \"mix\": \"10\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-c.md\",\n    \"mix\": \"2\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-f.md\",\n    \"mix\": \"2\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-h.md\",\n    \"mix\": \"true\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-j.md\",\n    \"mix\": \"{\\\"k\\\":\\\"1\\\"}\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-d.md\",\n    \"mix\": \"false\"\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-k.md\",\n    \"mix\": null\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-e.md\",\n    \"mix\": null\n  },\n  {\n    \"path\": \"Captures/probes/sort_mixed2-l.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Zed"
+          ],
+          [
+            "b\na"
+          ],
+          [
+            "abc"
+          ],
+          [
+            "10"
+          ],
+          [
+            "[2]"
+          ],
+          [
+            "2"
+          ],
+          [
+            "on"
+          ],
+          [
+            "{\"k\":1}"
+          ],
+          [
+            "on"
+          ],
+          [
+            ""
+          ],
+          [
+            ""
+          ],
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

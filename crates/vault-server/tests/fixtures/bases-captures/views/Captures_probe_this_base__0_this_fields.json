@@ -1,0 +1,24 @@
+{
+  "base": "Captures/probe-this.base",
+  "view": "this_fields",
+  "captured_at_ms": 1791522478001,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/extra/this-x.md\",\n    \"this_name\": null,\n    \"this_path\": null,\n    \"this_null\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "probe-this.base",
+            "Captures/probe-this.base",
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

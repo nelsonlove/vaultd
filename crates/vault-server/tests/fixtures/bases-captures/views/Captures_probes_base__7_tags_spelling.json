@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probes.base",
+  "view": "tags_spelling",
+  "captured_at_ms": 1791522493881,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/tags_spelling-t.md\",\n    \"tags\": \"#Mixed/Case\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Mixed/Case"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

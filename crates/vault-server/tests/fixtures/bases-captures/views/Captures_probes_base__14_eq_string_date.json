@@ -1,0 +1,23 @@
+{
+  "base": "Captures/probes.base",
+  "view": "eq_string_date",
+  "captured_at_ms": 1791522502431,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/eq_string_date-x.md\",\n    \"eq_sd\": \"true\",\n    \"eq_ds\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on",
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

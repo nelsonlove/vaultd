@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::eval::coerce::{number_to_string, sort_order, strict_equals, to_display_string, truthy};
+use crate::eval::coerce::{loose_equals, number_to_string, sort_order, to_display_string, truthy};
 use crate::eval::{EvalContext, EvalError, Scope, evaluate};
 use crate::expr::Expr;
 use crate::value::Value;
@@ -23,6 +23,7 @@ pub(crate) const METHODS: &[&str] = &[
     "sort",
     "unique",
     "mean",
+    "sum",
 ];
 #[allow(
     dead_code,
@@ -40,11 +41,12 @@ pub(crate) fn field(items: &[Value], name: &str) -> Result<Value, EvalError> {
     }
 }
 
-/// A key two values share exactly when `strict_equals` holds between them,
-/// or `None` for a value no other value equals (a list, an object, NaN): the
-/// same classes `==` draws. A resolved link and the file it resolves to share
-/// a key, as `==` makes them equal; an unresolved link equals only an
-/// unresolved link with the same text; a date compares by instant.
+/// The key `unique` keeps one item per: the same value of the same kind (a
+/// number and its text are two items, though `==` makes them equal), or
+/// `None` for an item always kept (a list, an object, NaN: captured, NaN is
+/// never a duplicate). A resolved link and the file it resolves to share a
+/// key; an unresolved link shares one only with the same text; a date
+/// compares by instant. Provisional across kinds: no capture mixes them.
 fn equality_key(value: &Value) -> Option<String> {
     Some(match value {
         Value::Null => "null".into(),
@@ -66,6 +68,52 @@ fn equality_key(value: &Value) -> Option<String> {
         Value::Html(text) => format!("h:{text}"),
         Value::List(_) | Value::Object(_) => return None,
     })
+}
+
+/// Whether a list item is `wanted` for `contains` and its kin: `==`, and a
+/// tag written with its `#` is the same tag without it (captured, Task 13:
+/// a tags property `[alpha]` both `contains("alpha")` and
+/// `contains("#alpha")`).
+///
+/// Provisional beyond the captures: any text item starting `#` is read as a
+/// tag, whether or not a tags property wrote it.
+fn holds(item: &Value, wanted: &Value, ctx: &EvalContext<'_>) -> bool {
+    if loose_equals(item, wanted, ctx.clock) {
+        return true;
+    }
+    // A tag (an item a tags property wrote with its `#`) holds a tag the way
+    // `hasTag` does, nested tags included and without case (seen in a corpus
+    // view: a tags property `[a/b]` `contains("a")`).
+    match (item, wanted) {
+        (Value::String(item), Value::String(wanted)) if item.starts_with('#') => {
+            let item = item.trim_start_matches('#').to_lowercase();
+            let wanted = wanted.trim_start_matches('#').to_lowercase();
+            item == wanted || item.starts_with(&format!("{wanted}/"))
+        }
+        _ => false,
+    }
+}
+
+/// The total of the numbers among `items`, from 0.
+fn number_total(items: &[Value]) -> f64 {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Number(number) => Some(*number),
+            _ => None,
+        })
+        .fold(0.0, |total, number| total + number)
+}
+
+/// Every item of `items` and of the lists in it, at every level. A list
+/// nests at most `MAX_VALUE_DEPTH` levels, so the recursion is bounded.
+fn flatten_into(items: &[Value], out: &mut Vec<Value>) {
+    for item in items {
+        match item {
+            Value::List(inner) => flatten_into(inner, out),
+            other => out.push(other.clone()),
+        }
+    }
 }
 
 fn index_arg(name: &str, value: Option<&Value>) -> Result<Option<i64>, EvalError> {
@@ -161,35 +209,30 @@ fn eager_method(
 ) -> Result<Value, EvalError> {
     let values = eager(args, ctx, scope)?;
     Ok(match name {
+        // `==` decides what a list holds (captured: `[1, 2].contains("1")`).
         "contains" => {
             arity(name, args, 1, 1)?;
-            Value::Boolean(items.iter().any(|item| strict_equals(item, &values[0])))
+            Value::Boolean(items.iter().any(|item| holds(item, &values[0], ctx)))
         }
-        "containsAll" => {
-            arity(name, args, 1, usize::MAX)?;
-            Value::Boolean(
-                values
-                    .iter()
-                    .all(|wanted| items.iter().any(|item| strict_equals(item, wanted))),
-            )
-        }
+        // Captured: `[1].containsAll()` with nothing to look for is true.
+        "containsAll" => Value::Boolean(
+            values
+                .iter()
+                .all(|wanted| items.iter().any(|item| holds(item, wanted, ctx))),
+        ),
         "containsAny" => {
             arity(name, args, 1, usize::MAX)?;
             Value::Boolean(
                 values
                     .iter()
-                    .any(|wanted| items.iter().any(|item| strict_equals(item, wanted))),
+                    .any(|wanted| items.iter().any(|item| holds(item, wanted, ctx))),
             )
         }
+        // Every level (captured: `[1, [2, [3, [4]]]].flat()` is `1, 2, 3, 4`).
         "flat" => {
             arity(name, args, 0, 0)?;
             let mut flat = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Value::List(inner) => flat.extend(inner.iter().cloned()),
-                    other => flat.push(other.clone()),
-                }
-            }
+            flatten_into(items, &mut flat);
             Value::list(flat)
         }
         "isEmpty" => {
@@ -201,16 +244,16 @@ fn eager_method(
             let separator = match values.first() {
                 None => ",".to_string(),
                 Some(Value::String(separator)) => separator.clone(),
-                Some(other) => to_display_string(other)?,
+                Some(other) => to_display_string(other, ctx.clock),
             };
             Value::String(
                 items
                     .iter()
                     .map(|item| match item {
-                        Value::Null => Ok(String::new()),
-                        other => to_display_string(other),
+                        Value::Null => String::new(),
+                        other => to_display_string(other, ctx.clock),
                     })
-                    .collect::<Result<Vec<_>, _>>()?
+                    .collect::<Vec<_>>()
                     .join(&separator),
             )
         }
@@ -235,6 +278,8 @@ fn eager_method(
             sorted.sort_by(sort_order);
             Value::list(sorted)
         }
+        // The distinct items, in sorted order (captured: `[3, 1, 3, 2]` is
+        // `1, 2, 3`, `[2, 1, 2]` is `1, 2`; NaN is never a duplicate).
         "unique" => {
             arity(name, args, 0, 0)?;
             // One pass with a set of equality keys, not a scan of everything
@@ -250,24 +295,22 @@ fn eager_method(
                     kept.push(item.clone());
                 }
             }
+            kept.sort_by(sort_order);
             Value::list(kept)
         }
-        // The syntax page's summary example (`values.mean()`, "the same as
-        // the default Average"): the mean of the numbers, skipping the rest
-        // the way `Average` is described ("all numbers from the input values").
+        // The numbers' total over every item's count (captured: `[1, "a",
+        // 3].mean()` is 1.3333333333333333), and empty for an empty list.
         "mean" => {
             arity(name, args, 0, 0)?;
-            let numbers: Vec<f64> = items
-                .iter()
-                .filter_map(|item| match item {
-                    Value::Number(number) => Some(*number),
-                    _ => None,
-                })
-                .collect();
-            if numbers.is_empty() {
-                return Err(EvalError::Uncaptured("mean:empty".into()));
+            if items.is_empty() {
+                return Ok(Value::Null);
             }
-            Value::Number(numbers.iter().sum::<f64>() / numbers.len() as f64)
+            Value::Number(number_total(items) / items.len() as f64)
+        }
+        // The total of the numbers (captured: `[1, 2, "3"].sum()` is 3).
+        "sum" => {
+            arity(name, args, 0, 0)?;
+            Value::Number(number_total(items))
         }
         _ => {
             return Err(EvalError::NoSuchMethod {

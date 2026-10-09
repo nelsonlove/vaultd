@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r26",
+  "captured_at_ms": 1791522531378,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r26.md\",\n    \"f26\": \"true\",\n    \"t13_now\": \"1791522531385\"\n  }\n]\n",
+  "stderr": ""
+}

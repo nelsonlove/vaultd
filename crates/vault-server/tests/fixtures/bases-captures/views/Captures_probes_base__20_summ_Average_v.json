@@ -1,0 +1,49 @@
+{
+  "base": "Captures/probes.base",
+  "view": "summ_Average_v",
+  "captured_at_ms": 1791522509766,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/summaries-s1.md\",\n    \"v\": \"3\",\n    \"t13typed\": \"2025-01-05\",\n    \"c\": \"true\",\n    \"l\": \"x\"\n  },\n  {\n    \"path\": \"Captures/probes/summaries-s2.md\",\n    \"v\": \"1\",\n    \"t13typed\": \"2024-12-31\",\n    \"c\": \"false\",\n    \"l\": \"x\"\n  },\n  {\n    \"path\": \"Captures/probes/summaries-s3.md\",\n    \"v\": \"10\",\n    \"t13typed\": null,\n    \"c\": null,\n    \"l\": \"x, y\"\n  },\n  {\n    \"path\": \"Captures/probes/summaries-s4.md\",\n    \"v\": null,\n    \"t13typed\": null,\n    \"c\": null,\n    \"l\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "3",
+            "2025-01-05",
+            "on",
+            "x"
+          ],
+          [
+            "1",
+            "2024-12-31",
+            "on",
+            "x"
+          ],
+          [
+            "10",
+            "",
+            "on",
+            "x\ny"
+          ],
+          [
+            "",
+            "",
+            "on",
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": [
+      {
+        "column": 0,
+        "name": "Average",
+        "value": "3.5"
+      }
+    ]
+  }
+}

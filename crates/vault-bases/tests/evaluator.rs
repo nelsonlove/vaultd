@@ -215,9 +215,6 @@ fn formulas_and_locals_resolve_through_the_scope() {
 #[test]
 fn errors_are_typed_values_never_panics() {
     for (expr, expected) in [
-        ("1 / 0", EvalError::DivisionByZero),
-        ("7 % 0", EvalError::DivisionByZero),
-        ("price / age", EvalError::DivisionByZero),
         (
             "frobnicate(1)",
             EvalError::UnknownFunction("frobnicate".into()),
@@ -229,11 +226,17 @@ fn errors_are_typed_values_never_panics() {
                 name: "frobnicate".into(),
             },
         ),
-        ("1 + missing", EvalError::Uncaptured("arith:null".into())),
     ] {
         assert_eq!(on_row(expr), Err(expected), "{expr:?}");
     }
-    for expr in [r#"-"a""#, "[1] - 1", "obj - 1"] {
+    for expr in [
+        r#"-"a""#,
+        "[1] - 1",
+        "obj - 1",
+        "1 + true",
+        "true * 2",
+        r#""5" * 2"#,
+    ] {
         assert!(
             matches!(on_row(expr), Err(EvalError::Type(_))),
             "{expr:?}: {:?}",
@@ -247,24 +250,28 @@ fn errors_are_typed_values_never_panics() {
         ),
         "`file` without a row is a type error"
     );
-    // Open questions for the capture (Task 13): JavaScript would answer each
-    // of these with a value; until a capture settles it, each is uncaptured.
-    for (expr, case) in [
-        ("1e308 * 10", "arith:nonfinite"),
-        ("1e400 + 1", "arith:nonfinite"),
-        ("1 + true", "arith:mixed_bool"),
-        ("true * 2", "arith:mixed_bool"),
-        ("true + true", "arith:mixed_bool"),
-        ("[1] + [2]", "arith:list_plus_list"),
-        (r#"number("Infinity")"#, "number:infinity_string"),
-        (r#"number(" -Infinity ")"#, "number:infinity_string"),
-    ] {
-        assert_eq!(
-            on_row(expr),
-            Err(EvalError::Uncaptured(case.into())),
-            "{expr:?}"
-        );
-    }
+}
+
+/// Captured (Task 13): arithmetic follows JavaScript where Obsidian does —
+/// a division by zero is Infinity, a remainder by zero NaN, an overflow
+/// Infinity — and an empty side is empty.
+#[test]
+fn captured_arithmetic_answers_values() {
+    let number = |expr: &str| match on_row(expr) {
+        Ok(Value::Number(number)) => number,
+        other => panic!("{expr:?}: {other:?}"),
+    };
+    assert_eq!(number("1 / 0"), f64::INFINITY);
+    assert!(number("7 % 0").is_nan());
+    assert_eq!(number("1e308 * 10"), f64::INFINITY);
+    assert_eq!(number(r#"number("Infinity")"#), f64::INFINITY);
+    assert_eq!(number(r#"number(" -Infinity ")"#), f64::NEG_INFINITY);
+    assert_eq!(on_row("1 + missing"), Ok(Value::Null));
+    assert_eq!(on_row(r#""a" + missing"#), Ok(Value::String("a".into())));
+    assert_eq!(
+        on_row("[1] + [2]"),
+        Ok(Value::list(vec![Value::Number(1.0), Value::Number(2.0)]))
+    );
 }
 
 /// The deepest expression built from `open` × k, `inner`, `close` × k that
@@ -374,7 +381,7 @@ fn yaml_non_finite_numbers_reach_the_evaluator_and_format_as_javascript_does() {
         ("ninf.toString()", "-Infinity"),
         ("nan.toString()", "NaN"),
         ("huge.toString()", "Infinity"),
-        ("[inf, nan].toString()", "Infinity,NaN"),
+        ("[inf, nan].toString()", "Infinity, NaN"),
         ("(1e400).toString()", "Infinity"),
         ("inf + \"\"", "Infinity"),
     ] {
@@ -434,20 +441,21 @@ fn a_link_equals_the_file_it_resolves_to() {
             resolved: resolved.map(path),
         })
     };
+    let clock = vault_bases::Clock::fixed(0, "UTC");
+    let equals = |a: &Value, b: &Value| loose_equals(a, b, &clock);
     let file = Value::File(path("A.md"));
     let resolved = link("A", Some("A.md"));
     let unresolved = link("A", None);
-    assert_eq!(loose_equals(&resolved, &file), Ok(true));
-    assert_eq!(loose_equals(&file, &resolved), Ok(true));
-    assert_eq!(loose_equals(&link("B", Some("B.md")), &file), Ok(false));
-    assert_eq!(loose_equals(&unresolved, &file), Ok(false));
-    assert_eq!(
-        loose_equals(&unresolved, &resolved),
-        Ok(false),
+    assert!(equals(&resolved, &file));
+    assert!(equals(&file, &resolved));
+    assert!(!equals(&link("B", Some("B.md")), &file));
+    assert!(!equals(&unresolved, &file));
+    assert!(
+        !equals(&unresolved, &resolved),
         "an unresolved link is not equal to a resolved one with the same text"
     );
-    assert_eq!(loose_equals(&unresolved, &link("A", None)), Ok(true));
-    assert_eq!(loose_equals(&unresolved, &link("a", None)), Ok(false));
+    assert!(equals(&unresolved, &link("A", None)));
+    assert!(!equals(&unresolved, &link("a", None)));
 }
 
 /// Every numeric corner through formatting, arithmetic, comparison and the
@@ -552,8 +560,13 @@ mod sort_order_is_total {
             any::<bool>().prop_map(Value::Boolean),
             (-3i64..3, any::<bool>())
                 .prop_map(|(epoch_ms, has_time)| Value::Date(DateValue { epoch_ms, has_time })),
-            (-2i64..2, -2i64..2)
-                .prop_map(|(months, ms)| Value::Duration(DurationValue { months, ms })),
+            (-2i64..2, -2i64..2).prop_map(|(months, ms)| {
+                Value::Duration(DurationValue {
+                    months,
+                    ms,
+                    timed: false,
+                })
+            }),
             "[ab]{1,2}".prop_map(|name| Value::File(VaultPath::new(format!("{name}.md")).unwrap())),
             ("[ab]{1,2}", any::<bool>()).prop_map(|(target, resolves)| Value::Link(LinkValue {
                 resolved: resolves.then(|| VaultPath::new(format!("{target}.md")).unwrap()),

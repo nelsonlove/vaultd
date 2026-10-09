@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "date~null~DESC",
+  "captured_at_ms": 1791522379039,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/date~null-1.md\",\n    \"mix\": \"2025-01-01\"\n  },\n  {\n    \"path\": \"Captures/pairs/date~null-2.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

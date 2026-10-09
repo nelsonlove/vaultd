@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-unknown-prop.base",
+  "view": "x_unknown_prop",
+  "captured_at_ms": 1791522476780,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_unknown_prop\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

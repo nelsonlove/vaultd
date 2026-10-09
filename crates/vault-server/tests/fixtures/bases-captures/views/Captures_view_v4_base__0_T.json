@@ -1,0 +1,13 @@
+{
+  "base": "Captures/view/v4.base",
+  "view": "T",
+  "captured_at_ms": 1791522539842,
+  "exit_code": 0,
+  "stdout": "Error: \"groupBy\" must be a object in view \"T\"\n",
+  "stderr": "",
+  "rendered": {
+    "error": "Unable to parse your base file:\n\n\"groupBy\" must be a object in view \"T\"",
+    "groups": [],
+    "summaries": []
+  }
+}

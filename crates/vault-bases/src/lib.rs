@@ -9,6 +9,7 @@
 //! exists the evaluator answers a typed error rather than a guess.
 
 mod clock;
+pub mod collate;
 mod dates;
 pub mod eval;
 pub mod expr;
@@ -21,7 +22,7 @@ mod value;
 pub mod view;
 
 pub use clock::Clock;
-pub use dates::format_date;
+pub use dates::{format_date, humanize};
 pub use file::{
     BaseFile, BaseParseError, Direction, FilterNode, GroupBy, PropertySettings, SortKey, ViewDecl,
     parse_base,

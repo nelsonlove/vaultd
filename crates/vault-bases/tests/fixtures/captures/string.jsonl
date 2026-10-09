@@ -1,61 +1,64 @@
-{"family":"string","case":"length","expr":"\"hello\".length","kind":"number","text":"5","source":"published"}
-{"family":"string","case":"length:utf16","expr":"\"🙂a\".length","kind":"number","text":"3","source":"published"}
-{"family":"string","case":"contains","expr":"\"hello\".contains(\"ell\")","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"containsAll","expr":"\"hello\".containsAll(\"h\", \"e\")","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"containsAll:missing","expr":"\"hello\".containsAll(\"h\", \"z\")","kind":"boolean","text":"false","source":"published"}
-{"family":"string","case":"containsAny","expr":"\"hello\".containsAny(\"x\", \"y\", \"e\")","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"endsWith","expr":"\"hello\".endsWith(\"lo\")","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"isEmpty:false","expr":"\"Hello world\".isEmpty()","kind":"boolean","text":"false","source":"published"}
-{"family":"string","case":"isEmpty:true","expr":"\"\".isEmpty()","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"isEmpty:not_present","expr":"missing.isEmpty()","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"lower","expr":"\"HeLLo\".lower()","kind":"string","text":"hello","source":"published"}
-{"family":"string","case":"replace:string_all","expr":"\"a:b:c:d\".replace(\":\", \"-\")","kind":"string","text":"a-b-c-d","source":"published"}
-{"family":"string","case":"replace:regexp_first","expr":"\"a:b:c:d\".replace(/:/, \"-\")","kind":"string","text":"a-b:c:d","source":"published"}
-{"family":"string","case":"replace:regexp_global","expr":"\"a:b:c:d\".replace(/:/g, \"-\")","kind":"string","text":"a-b-c-d","source":"published"}
-{"family":"string","case":"replace:groups","expr":"\"John Smith\".replace(/(\\w+) (\\w+)/, \"$2, $1\")","kind":"string","text":"Smith, John","source":"published"}
-{"family":"string","case":"repeat","expr":"\"123\".repeat(2)","kind":"string","text":"123123","source":"published"}
-{"family":"string","case":"repeat:negative","expr":"\"a\".repeat(-1)","kind":"error","source":"published"}
-{"family":"string","case":"reverse","expr":"\"hello\".reverse()","kind":"string","text":"olleh","source":"published"}
-{"family":"string","case":"reverse:astral","expr":"\"a🙂\".reverse()","kind":"error","source":"uncaptured"}
-{"family":"string","case":"slice","expr":"\"hello\".slice(1, 4)","kind":"string","text":"ell","source":"published"}
-{"family":"string","case":"slice:to_end","expr":"\"hello\".slice(2)","kind":"string","text":"llo","source":"published"}
-{"family":"string","case":"slice:negative","expr":"\"hello\".slice(-3, -1)","kind":"string","text":"ll","source":"provisional"}
-{"family":"string","case":"split:string","expr":"\"a,b,c,d\".split(\",\", 3)","kind":"list","text":"a, b, c","source":"published"}
-{"family":"string","case":"split:regexp","expr":"\"a,b,c,d\".split(/,/, 3)","kind":"list","text":"a, b, c","source":"published"}
-{"family":"string","case":"split:no_limit","expr":"\"a,b\".split(\",\").length","kind":"number","text":"2","source":"published"}
-{"family":"string","case":"split:regexp_groups","expr":"\"a1b\".split(/(\\d)/)","kind":"error","source":"uncaptured"}
-{"family":"string","case":"startsWith","expr":"\"hello\".startsWith(\"he\")","kind":"boolean","text":"true","source":"published"}
-{"family":"string","case":"title","expr":"\"hello world\".title()","kind":"string","text":"Hello World","source":"published"}
-{"family":"string","case":"trim","expr":"\"  hi  \".trim()","kind":"string","text":"hi","source":"published"}
-{"family":"string","case":"method_on_missing","expr":"missing.contains(\"x\")","kind":"error","source":"published"}
-{"family":"string","case":"split:limit_zero","expr":"\"a,b\".split(\",\", 0).length","kind":"number","text":"0","source":"provisional"}
-{"family":"string","case":"contains:wrong_arity","expr":"\"hello\".contains()","kind":"error","source":"published"}
-{"family":"string","case":"lower:wrong_arity","expr":"\"hello\".lower(1)","kind":"error","source":"published"}
-{"family":"string","case":"contains:wrong_argument_type","expr":"\"hello\".contains(1)","kind":"error","source":"published"}
-{"family":"string","case":"lower:wrong_receiver","expr":"true.lower()","kind":"error","source":"published"}
-{"family":"string","case":"repeat:too_long","expr":"\"ab\".repeat(1000000000000)","kind":"error","source":"published"}
-{"family":"string","case":"replace:dollar_amp","expr":"\"abc\".replace(/b/, \"[$&]\")","kind":"string","text":"a[b]c","source":"provisional"}
-{"family":"string","case":"replace:dollar_dollar","expr":"\"a\".replace(/a/, \"$$\")","kind":"string","text":"$","source":"provisional"}
-{"family":"string","case":"replace:before_after","expr":"\"abc\".replace(/b/, \"[$`|$']\")","kind":"string","text":"a[a|c]c","source":"provisional"}
-{"family":"string","case":"replace:dollar_zero","expr":"\"ab\".replace(/a/, \"$0\")","kind":"string","text":"$0b","source":"provisional"}
-{"family":"string","case":"replace:missing_group","expr":"\"ab\".replace(/a/, \"$1\")","kind":"string","text":"$1b","source":"provisional"}
-{"family":"string","case":"replace:unmatched_group","expr":"\"b\".replace(/(a)?b/, \"[$1]\")","kind":"string","text":"[]","source":"provisional"}
-{"family":"string","case":"replace:two_digit","expr":"\"abcdefghijk\".replace(/(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)/, \"$11\")","kind":"string","text":"k","source":"provisional"}
-{"family":"string","case":"replace:two_digit_fallback","expr":"\"ab\".replace(/(a)/, \"$10\")","kind":"string","text":"a0b","source":"provisional"}
-{"family":"string","case":"replace:named","expr":"\"ab\".replace(/(?<x>a)/, \"$<x>!\")","kind":"string","text":"a!b","source":"provisional"}
-{"family":"string","case":"replace:named_without_groups","expr":"\"ab\".replace(/a/, \"$<x>\")","kind":"string","text":"$<x>b","source":"provisional"}
-{"family":"string","case":"replace:lone_dollar","expr":"\"ab\".replace(/a/, \"$\")","kind":"string","text":"$b","source":"provisional"}
-{"family":"string","case":"replace:string_dollar_amp","expr":"\"a.b\".replace(\".\", \"$&$&\")","kind":"string","text":"a..b","source":"provisional"}
-{"family":"string","case":"replace:string_no_groups","expr":"\"a.b\".replace(\".\", \"$1\")","kind":"string","text":"a$1b","source":"provisional"}
-{"family":"string","case":"replace:global_empty","expr":"\"baaac\".replace(/a*/g, \"-\")","kind":"string","text":"-b--c-","source":"provisional"}
-{"family":"string","case":"split:empty_match","expr":"\"abc\".split(/x*/)","kind":"list","text":"a, b, c","source":"provisional"}
-{"family":"string","case":"split:empty_match_limit","expr":"\"abc\".split(/x*/, 2)","kind":"list","text":"a, b","source":"provisional"}
-{"family":"string","case":"split:negative_limit","expr":"\"a,b,c\".split(\",\", -1)","kind":"list","text":"a, b, c","source":"provisional"}
-{"family":"string","case":"split:regexp_negative_limit","expr":"\"a,b,c\".split(/,/, -1)","kind":"list","text":"a, b, c","source":"provisional"}
-{"family":"string","case":"split:regexp_limit_zero","expr":"\"a,b\".split(/,/, 0).length","kind":"number","text":"0","source":"provisional"}
-{"family":"string","case":"split:regexp_empty_text","expr":"\"\".split(/,/).length","kind":"number","text":"1","source":"provisional"}
-{"family":"string","case":"split:regexp_empty_text_matching","expr":"\"\".split(/x*/).length","kind":"number","text":"0","source":"provisional"}
-{"family":"string","case":"trim:whitespace_set","expr":"\"\ufeffhi\".trim()","kind":"error","source":"uncaptured"}
-{"family":"string","case":"trim:js_and_rust_agree","expr":"\"\u00a0hi\u2028\".trim()","kind":"string","text":"hi","source":"provisional"}
-{"family":"string","case":"title:word_boundary","expr":"\"hello-world\".title()","kind":"error","source":"uncaptured"}
-{"family":"string","case":"title:inner_case","expr":"\"hELLO\".title()","kind":"error","source":"uncaptured"}
+{"family": "string", "case": "length", "expr": "\"hello\".length", "kind": "number", "text": "5", "source": "captured"}
+{"family": "string", "case": "length:utf16", "expr": "\"🙂a\".length", "kind": "number", "text": "3", "source": "captured"}
+{"family": "string", "case": "contains", "expr": "\"hello\".contains(\"ell\")", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "containsAll", "expr": "\"hello\".containsAll(\"h\", \"e\")", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "containsAll:missing", "expr": "\"hello\".containsAll(\"h\", \"z\")", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "string", "case": "containsAny", "expr": "\"hello\".containsAny(\"x\", \"y\", \"e\")", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "endsWith", "expr": "\"hello\".endsWith(\"lo\")", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "isEmpty:false", "expr": "\"Hello world\".isEmpty()", "kind": "boolean", "text": "false", "source": "captured"}
+{"family": "string", "case": "isEmpty:true", "expr": "\"\".isEmpty()", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "isEmpty:not_present", "expr": "missing.isEmpty()", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "lower", "expr": "\"HeLLo\".lower()", "kind": "string", "text": "hello", "source": "captured"}
+{"family": "string", "case": "replace:string_all", "expr": "\"a:b:c:d\".replace(\":\", \"-\")", "kind": "string", "text": "a-b-c-d", "source": "captured"}
+{"family": "string", "case": "replace:regexp_first", "expr": "\"a:b:c:d\".replace(/:/, \"-\")", "kind": "string", "text": "a-b:c:d", "source": "captured"}
+{"family": "string", "case": "replace:regexp_global", "expr": "\"a:b:c:d\".replace(/:/g, \"-\")", "kind": "string", "text": "a-b-c-d", "source": "captured"}
+{"family": "string", "case": "replace:groups", "expr": "\"John Smith\".replace(/(\\w+) (\\w+)/, \"$2, $1\")", "kind": "string", "text": "Smith, John", "source": "captured"}
+{"family": "string", "case": "repeat", "expr": "\"123\".repeat(2)", "kind": "string", "text": "123123", "source": "captured"}
+{"family": "string", "case": "repeat:negative", "expr": "\"a\".repeat(-1)", "kind": "error", "source": "captured"}
+{"family": "string", "case": "reverse", "expr": "\"hello\".reverse()", "kind": "string", "text": "olleh", "source": "captured"}
+{"family": "string", "case": "reverse:astral", "expr": "\"a🙂\".reverse()", "kind": "string", "text": "��a", "source": "captured"}
+{"family": "string", "case": "slice", "expr": "\"hello\".slice(1, 4)", "kind": "string", "text": "ell", "source": "captured"}
+{"family": "string", "case": "slice:to_end", "expr": "\"hello\".slice(2)", "kind": "string", "text": "llo", "source": "captured"}
+{"family": "string", "case": "slice:negative", "expr": "\"hello\".slice(-3, -1)", "kind": "string", "text": "ll", "source": "captured"}
+{"family": "string", "case": "split:string", "expr": "\"a,b,c,d\".split(\",\", 3)", "kind": "list", "text": "a, b, c", "source": "captured"}
+{"family": "string", "case": "split:regexp", "expr": "\"a,b,c,d\".split(/,/, 3)", "kind": "list", "text": "a, b, c", "source": "captured"}
+{"family": "string", "case": "split:no_limit", "expr": "\"a,b\".split(\",\").length", "kind": "number", "text": "2", "source": "captured"}
+{"family": "string", "case": "split:regexp_groups", "expr": "\"a1b\".split(/(\\d)/)", "kind": "list", "text": "a, 1, b", "source": "captured"}
+{"family": "string", "case": "startsWith", "expr": "\"hello\".startsWith(\"he\")", "kind": "boolean", "text": "true", "source": "captured"}
+{"family": "string", "case": "title", "expr": "\"hello world\".title()", "kind": "string", "text": "Hello World", "source": "captured"}
+{"family": "string", "case": "trim", "expr": "\"  hi  \".trim()", "kind": "string", "text": "hi", "source": "captured"}
+{"family": "string", "case": "method_on_missing", "expr": "missing.contains(\"x\")", "kind": "null", "text": "", "source": "captured"}
+{"family": "string", "case": "split:limit_zero", "expr": "\"a,b\".split(\",\", 0).length", "kind": "number", "text": "0", "source": "captured"}
+{"family": "string", "case": "contains:wrong_arity", "expr": "\"hello\".contains()", "kind": "error", "source": "captured"}
+{"family": "string", "case": "lower:wrong_arity", "expr": "\"hello\".lower(1)", "kind": "error", "source": "captured"}
+{"family": "string", "case": "contains:wrong_argument_type", "expr": "\"hello\".contains(1)", "kind": "error", "source": "captured"}
+{"family": "string", "case": "lower:wrong_receiver", "expr": "true.lower()", "kind": "error", "source": "captured"}
+{"family": "string", "case": "repeat:too_long", "expr": "\"ab\".repeat(1000000000000)", "kind": "error", "source": "captured"}
+{"family": "string", "case": "replace:dollar_amp", "expr": "\"abc\".replace(/b/, \"[$&]\")", "kind": "string", "text": "a[b]c", "source": "captured"}
+{"family": "string", "case": "replace:dollar_dollar", "expr": "\"a\".replace(/a/, \"$$\")", "kind": "string", "text": "$", "source": "captured"}
+{"family": "string", "case": "replace:before_after", "expr": "\"abc\".replace(/b/, \"[$`|$']\")", "kind": "string", "text": "a[a|c]c", "source": "captured"}
+{"family": "string", "case": "replace:dollar_zero", "expr": "\"ab\".replace(/a/, \"$0\")", "kind": "string", "text": "$0b", "source": "captured"}
+{"family": "string", "case": "replace:missing_group", "expr": "\"ab\".replace(/a/, \"$1\")", "kind": "string", "text": "$1b", "source": "captured"}
+{"family": "string", "case": "replace:unmatched_group", "expr": "\"b\".replace(/(a)?b/, \"[$1]\")", "kind": "string", "text": "[]", "source": "captured"}
+{"family": "string", "case": "replace:two_digit", "expr": "\"abcdefghijk\".replace(/(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)/, \"$11\")", "kind": "string", "text": "k", "source": "captured"}
+{"family": "string", "case": "replace:two_digit_fallback", "expr": "\"ab\".replace(/(a)/, \"$10\")", "kind": "string", "text": "a0b", "source": "captured"}
+{"family": "string", "case": "replace:named", "expr": "\"ab\".replace(/(?<x>a)/, \"$<x>!\")", "kind": "string", "text": "a!b", "source": "captured"}
+{"family": "string", "case": "replace:named_without_groups", "expr": "\"ab\".replace(/a/, \"$<x>\")", "kind": "string", "text": "$<x>b", "source": "captured"}
+{"family": "string", "case": "replace:lone_dollar", "expr": "\"ab\".replace(/a/, \"$\")", "kind": "string", "text": "$b", "source": "captured"}
+{"family": "string", "case": "replace:string_dollar_amp", "expr": "\"a.b\".replace(\".\", \"$&$&\")", "kind": "string", "text": "a$&$&b", "source": "captured"}
+{"family": "string", "case": "replace:string_no_groups", "expr": "\"a.b\".replace(\".\", \"$1\")", "kind": "string", "text": "a$1b", "source": "captured"}
+{"family": "string", "case": "replace:global_empty", "expr": "\"baaac\".replace(/a*/g, \"-\")", "kind": "string", "text": "-b--c-", "source": "captured"}
+{"family": "string", "case": "split:empty_match", "expr": "\"abc\".split(/x*/)", "kind": "list", "text": "a, b, c", "source": "captured"}
+{"family": "string", "case": "split:empty_match_limit", "expr": "\"abc\".split(/x*/, 2)", "kind": "list", "text": "a, b", "source": "captured"}
+{"family": "string", "case": "split:negative_limit", "expr": "\"a,b,c\".split(\",\", -1)", "kind": "list", "text": "a, b, c", "source": "captured"}
+{"family": "string", "case": "split:regexp_negative_limit", "expr": "\"a,b,c\".split(/,/, -1)", "kind": "list", "text": "a, b, c", "source": "captured"}
+{"family": "string", "case": "split:regexp_limit_zero", "expr": "\"a,b\".split(/,/, 0).length", "kind": "number", "text": "0", "source": "captured"}
+{"family": "string", "case": "split:regexp_empty_text", "expr": "\"\".split(/,/).length", "kind": "number", "text": "1", "source": "captured"}
+{"family": "string", "case": "split:regexp_empty_text_matching", "expr": "\"\".split(/x*/).length", "kind": "number", "text": "0", "source": "captured"}
+{"family": "string", "case": "trim:whitespace_set", "expr": "\"﻿hi\".trim()", "kind": "string", "text": "hi", "source": "captured"}
+{"family": "string", "case": "trim:js_and_rust_agree", "expr": "\" hi \".trim()", "kind": "string", "text": "hi", "source": "provisional"}
+{"family": "string", "case": "title:word_boundary", "expr": "\"hello-world\".title()", "kind": "string", "text": "Hello-world", "source": "captured"}
+{"family": "string", "case": "title:inner_case", "expr": "\"hELLO\".title()", "kind": "string", "text": "Hello", "source": "captured"}
+{"family": "string", "case": "contains:case", "expr": "\"Probe/Value\".contains(\"probe\")", "kind": "boolean", "text": "true", "source": "provisional", "why": "uncaptured: inferred from corpus views or from no capture; generate writes this row as a probe view, and the next capture settles it"}
+{"family": "string", "case": "startsWith:case", "expr": "\"Probe\".startsWith(\"probe\")", "kind": "boolean", "text": "false", "source": "provisional", "why": "uncaptured: inferred from corpus views or from no capture; generate writes this row as a probe view, and the next capture settles it"}
+{"family": "string", "case": "method:on_empty", "expr": "missing.lower()", "kind": "null", "text": "", "source": "provisional", "why": "uncaptured: inferred from corpus views or from no capture; generate writes this row as a probe view, and the next capture settles it"}

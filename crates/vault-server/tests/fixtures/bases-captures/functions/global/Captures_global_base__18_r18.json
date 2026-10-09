@@ -1,0 +1,8 @@
+{
+  "base": "Captures/global.base",
+  "view": "r18",
+  "captured_at_ms": 1791522183905,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/global/r18.md\",\n    \"f18\": \"![](https://obsidian.md/images/obsidian-logo-gradient.svg)\",\n    \"t13_now\": \"1791522183910\"\n  }\n]\n",
+  "stderr": ""
+}

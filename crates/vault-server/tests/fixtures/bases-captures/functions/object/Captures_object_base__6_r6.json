@@ -1,0 +1,8 @@
+{
+  "base": "Captures/object.base",
+  "view": "r6",
+  "captured_at_ms": 1791522184422,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/object/r6.md\",\n    \"f6\": \"Error: Cannot find function \\\"keys\\\" on type List\",\n    \"t13_now\": \"1791522184427\"\n  }\n]\n",
+  "stderr": ""
+}

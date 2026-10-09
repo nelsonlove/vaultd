@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-number-date.base",
+  "view": "s_number_date",
+  "captured_at_ms": 1791522434067,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_number_date\": \"1735707600000\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1735707600000"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

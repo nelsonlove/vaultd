@@ -64,7 +64,8 @@ pub enum Prefilter {
     /// (`a` admits `a/b`). The arguments are kept as written: a row source
     /// must strip one leading `#` from each and compare case-insensitively,
     /// as `file.hasTag` does (Obsidian's tags are case-insensitive).
-    /// **Provisional** with `hasTag` itself (`prefilter:has_tag_spelling`).
+    /// Captured (Task 13: `file.hasTag("#BOOK")` admits `book` and
+    /// `Book/fiction`, the view family's `prefilter:has_tag_spelling`).
     HasTag(Vec<String>),
     /// `file.ext == "…"`: the extension without its dot, compared exactly.
     Ext(String),
@@ -75,10 +76,13 @@ pub enum Prefilter {
     /// decides those. It may skip a note that lacks `key`, holds `null`, or
     /// holds a scalar of the literal's own kind that differs from it.
     ///
-    /// Sound while `==` is never true between a string and a date or link
-    /// (a typed property or a frontmatter wikilink keeps its raw text in the
-    /// source): today those pairs are uncaptured errors. If a Task 13
-    /// capture makes one of them true, this rule must widen.
+    /// Captured (Task 13), `==` is true across kinds: numeric text equals a
+    /// number, a one-item list its item's text, a date text naming the same
+    /// instant. Lists and other kinds are admitted, so all but one of those
+    /// pairs reach the full filter. The one gap: a property whose text names
+    /// the same instant as the literal in another spelling (`2025-01-01`
+    /// against `"2025-01-01 00:00"`) is a scalar of the literal's kind that
+    /// differs, and may be skipped.
     PropertyEquals { key: String, value: ScalarLiteral },
 }
 
@@ -306,7 +310,7 @@ impl MemorySource {
         }
         for spelling in [file_part.to_string(), format!("{file_part}.md")] {
             if let Ok(path) = VaultPath::new(spelling) {
-                if self.files.contains_key(&path) {
+                if self.files.contains_key(&path) && self.linkable(&path) {
                     return Some(path);
                 }
             }
@@ -314,10 +318,23 @@ impl MemorySource {
         let wanted = file_part.to_lowercase();
         let mut matches = self.files.keys().filter(|path| {
             let name = path.name().to_lowercase();
-            name == wanted || name.strip_suffix(".md") == Some(wanted.as_str())
+            self.linkable(path)
+                && (name == wanted || name.strip_suffix(".md") == Some(wanted.as_str()))
         });
         let first = matches.next()?.clone();
         matches.next().is_none().then_some(first)
+    }
+
+    /// Whether a link can name `path`: a note always; an attachment only
+    /// when its name has an extension, as the index's row source finds one
+    /// (captured, Task 13: `file("Folder/README")` and
+    /// `file("Folder/.gitignore")` are empty).
+    fn linkable(&self, path: &VaultPath) -> bool {
+        match self.files.get(path) {
+            Some(file) if file.kind == FileKind::Note => true,
+            Some(_) => !extension(path).is_empty(),
+            None => false,
+        }
     }
 
     fn admits(&self, path: &VaultPath, file: &MemoryFile, prefilter: &Prefilter) -> bool {
@@ -458,7 +475,15 @@ impl RowSource for MemorySource {
         Ok(self.lookup(from, target))
     }
 
+    /// As the index's row source: an exact key first, else one that
+    /// differs only in case (captured, Task 13: `types_case`).
     fn property_type(&self, key: &str) -> Option<PropertyType> {
-        self.types.get(key).copied()
+        self.types.get(key).copied().or_else(|| {
+            let folded = key.to_lowercase();
+            self.types
+                .iter()
+                .find(|(declared, _)| declared.to_lowercase() == folded)
+                .map(|(_, kind)| *kind)
+        })
     }
 }

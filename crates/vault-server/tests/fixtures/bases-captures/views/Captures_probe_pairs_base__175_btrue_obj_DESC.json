@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "btrue~obj~DESC",
+  "captured_at_ms": 1791522254515,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/btrue~obj-1.md\",\n    \"mix\": \"true\"\n  },\n  {\n    \"path\": \"Captures/pairs/btrue~obj-2.md\",\n    \"mix\": \"{\\\"k\\\":\\\"1\\\"}\"\n  }\n]\n",
+  "stderr": ""
+}

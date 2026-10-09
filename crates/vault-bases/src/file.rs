@@ -3,8 +3,9 @@ use vault_core::{PropertyValue, SourceSpan, Spanned, parse_yaml_document};
 /// A `.base` file, read but not compiled: every expression is still text.
 ///
 /// Compilation happens per view (`view::compile_view`), so a base whose
-/// formula does not parse still indexes, still lists its views, and answers
-/// `expression_invalid` only for the view that reads the broken formula.
+/// expression does not parse still indexes and still lists its views. A
+/// broken filter answers `expression_invalid` only for the view it filters;
+/// a broken formula is an error cell in the views that read it (ruling R1).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BaseFile {
     pub filters: Option<FilterNode>,
@@ -275,8 +276,12 @@ fn view(value: &Spanned<PropertyValue>, index: usize) -> Result<ViewDecl, BasePa
         }
     };
     let filters = get("filters").map(filter).transpose()?;
+    // A view with no `order` shows the one column `file.name`; `order: []`
+    // shows none (captured, Task 13: every view type, a table, cards, a
+    // list or a plugin's, answers `file name` with no `order`, and a
+    // corpus view declaring `order: []` answers no column).
     let order = match get("order") {
-        None => Vec::new(),
+        None => vec!["file.name".to_string()],
         Some(order) => match &order.value {
             PropertyValue::Sequence(items) => items
                 .iter()
@@ -313,12 +318,15 @@ fn view(value: &Spanned<PropertyValue>, index: usize) -> Result<ViewDecl, BasePa
             let entries = mapping(group, "groupBy")?;
             let property = lookup(entries, "property")
                 .ok_or_else(|| BaseParseError::at(group.span, "groupBy needs a property"))?;
+            // Obsidian refuses the whole base over a `groupBy` with no
+            // direction (captured, Task 13: `"groupBy" must be a object in
+            // view …`), so this does too.
+            let declared = lookup(entries, "direction").ok_or_else(|| {
+                BaseParseError::at(group.span, "groupBy needs a direction (ASC or DESC)")
+            })?;
             Some(GroupBy {
                 property: plain_string(property, "a groupBy property")?,
-                direction: match lookup(entries, "direction") {
-                    Some(value) => direction(value)?,
-                    None => Direction::Asc,
-                },
+                direction: direction(declared)?,
             })
         }
     };

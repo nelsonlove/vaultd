@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "sZed~btrue~DESC",
+  "captured_at_ms": 1791522252652,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/sZed~btrue-1.md\",\n    \"mix\": \"Zed\"\n  },\n  {\n    \"path\": \"Captures/pairs/sZed~btrue-2.md\",\n    \"mix\": \"true\"\n  }\n]\n",
+  "stderr": ""
+}

@@ -15,7 +15,7 @@ fn scratch() -> std::path::PathBuf {
     root.canonicalize().expect("canonicalize the scratch root")
 }
 
-const BASE: &str = "formulas:\n  double: 'price * 2'\n  bad: 'price +'\nproperties:\n  price:\n    displayName: Price\nsummaries:\n  top: 'values.reduce(if(acc == null || value > acc, value, acc), null)'\nviews:\n  - type: table\n    name: Table\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, price, formula.double]\n    sort:\n      - property: price\n        direction: DESC\n    summaries:\n      price: top\n  - type: cards\n    name: Cards\n    image: cover\n  - type: table\n    name: Bad\n    order: [formula.bad]\n  - type: table\n    name: Odd\n    filters: 'frobnicate(price)'\n";
+const BASE: &str = "formulas:\n  double: 'price * 2'\n  bad: 'price +'\nproperties:\n  note.price:\n    displayName: Price\nsummaries:\n  top: 'values.reduce(if(acc == null || value > acc, value, acc), null)'\nviews:\n  - type: table\n    name: Table\n    filters: 'file.inFolder(\"Books\")'\n    order: [file.name, price, formula.double]\n    sort:\n      - property: price\n        direction: DESC\n    summaries:\n      price: top\n  - type: cards\n    name: Cards\n    image: cover\n  - type: table\n    name: Bad\n    filters: 'price +'\n  - type: table\n    name: Odd\n    filters: 'frobnicate(price)'\n";
 
 fn vault() -> (TempDir, TempDir) {
     let vault = TempDir::new_in(scratch()).unwrap();
@@ -109,9 +109,7 @@ fn evaluate_base_answers_rows_columns_summaries_and_typed_cells() {
     assert_eq!(answer.rows[0].group, None);
     assert_eq!(
         answer.rows[0].cells[0],
-        CellDto::String {
-            value: "B.md".into()
-        }
+        CellDto::String { value: "B".into() }
     );
     assert_eq!(
         answer.rows[0].cells[2],
@@ -147,7 +145,7 @@ fn options_and_settings_keep_declared_order() {
         ("A.md", "---\nprice: 1\n---\n"),
         (
             "Order.base",
-            "properties:\n  price:\n    displayName: Price\n    zeta: 1\n    beta: 2\n    omega: 3\n    alpha: 4\n    kappa: 5\nviews:\n  - type: cards\n    name: Cards\n    order: [price]\n    zulu: 1\n    bravo: 2\n    yankee: 3\n    alpha: 4\n    mike: 5\n",
+            "properties:\n  note.price:\n    displayName: Price\n    zeta: 1\n    beta: 2\n    omega: 3\n    alpha: 4\n    kappa: 5\nviews:\n  - type: cards\n    name: Cards\n    order: [price]\n    zulu: 1\n    bravo: 2\n    yankee: 3\n    alpha: 4\n    mike: 5\n",
         ),
     ]);
     let mut daemon = started(&vault, &index);
@@ -371,6 +369,41 @@ fn this_path_changes_the_rows_of_a_view_that_reads_this() {
     );
 }
 
+/// Ruling R1 (2026-10-09; the project picked
+/// Obsidian's behaviour): a formula that does not parse, or names an unknown
+/// function, answers the view with an error cell in its column in every row;
+/// only a filter that does not compile refuses the request
+/// (`every_error_code_has_a_cause`).
+#[test]
+fn a_broken_formula_answers_the_view_with_error_cells() {
+    let (vault, index) = vault_of(&[
+        ("A.md", "---\nprice: 1\n---\n"),
+        ("B.md", "---\nprice: 2\n---\n"),
+        (
+            "Cells.base",
+            "formulas:\n  bad: 'price +'\n  odd: 'frobnicate(price)'\nviews:\n  - type: table\n    name: T\n    filters: 'price > 0'\n    order: [file.name, formula.bad, formula.odd]\n",
+        ),
+    ]);
+    let mut daemon = started(&vault, &index);
+    let answer = answer(&mut daemon, r#"{"path":"Cells.base"}"#);
+    assert_eq!(paths(&answer), vec!["A.md", "B.md"]);
+    for row in &answer.rows {
+        assert_eq!(
+            row.cells[0].clone(),
+            CellDto::String {
+                value: row.path.trim_end_matches(".md").into()
+            }
+        );
+        match (&row.cells[1], &row.cells[2]) {
+            (CellDto::Error { message: bad }, CellDto::Error { message: odd }) => {
+                assert!(bad.contains("does not parse"), "{bad}");
+                assert!(odd.contains("frobnicate"), "{odd}");
+            }
+            other => panic!("expected two error cells, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn every_error_code_has_a_cause() {
     let (vault, index) = vault();
@@ -539,7 +572,7 @@ fn a_written_base_is_semantic_and_evaluates() {
 #[test]
 fn declared_property_types_come_from_the_configuration_zone() {
     let (vault, index) = vault_of(&[
-        ("A.md", "---\ndue: 2020-01-02\nbig: .inf\n---\n"),
+        ("A.md", "---\ndue: x\nbig: .inf\n---\n"),
         (
             "Due.base",
             "views:\n  - type: table\n    name: T\n    order: [due, big]\n",
@@ -550,9 +583,7 @@ fn declared_property_types_come_from_the_configuration_zone() {
     let malformed = answer(&mut daemon, r#"{"path":"Due.base"}"#);
     assert_eq!(
         malformed.rows[0].cells[0],
-        CellDto::String {
-            value: "2020-01-02".into()
-        }
+        CellDto::String { value: "x".into() }
     );
     assert_eq!(
         malformed.rows[0].cells[1],
@@ -563,7 +594,7 @@ fn declared_property_types_come_from_the_configuration_zone() {
     );
     std::fs::write(
         vault.path().join(".obsidian/types.json"),
-        r#"{"types":{"due":"date"}}"#,
+        r#"{"types":{"due":"tags"}}"#,
     )
     .unwrap();
     // A new generation, so the evaluation is not the cached one.
@@ -572,12 +603,10 @@ fn declared_property_types_come_from_the_configuration_zone() {
         r#"{"version":1,"id":"w","request":{"method":"write_note","params":{"path":"B.md","content":"x\n","expected":{"absent":true}}}}"#,
     );
     let typed = answer(&mut daemon, r#"{"path":"Due.base"}"#);
+    // Declared a tags property, `x` is the tag `#x` (captured, Task 13).
     assert_eq!(
         typed.rows[0].cells[0],
-        CellDto::Date {
-            value: "2020-01-02".into(),
-            has_time: false
-        }
+        CellDto::String { value: "#x".into() }
     );
 }
 

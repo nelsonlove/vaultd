@@ -1,0 +1,8 @@
+{
+  "base": "Captures/date.base",
+  "view": "r50",
+  "captured_at_ms": 1791522183451,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/date/r50.md\",\n    \"f50\": \"2025-01-01T04:00:00\",\n    \"t13_now\": \"1791522183458\"\n  }\n]\n",
+  "stderr": ""
+}

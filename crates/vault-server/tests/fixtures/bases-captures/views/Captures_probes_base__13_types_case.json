@@ -1,0 +1,23 @@
+{
+  "base": "Captures/probes.base",
+  "view": "types_case",
+  "captured_at_ms": 1791522501207,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/types_case-k.md\",\n    \"t13typed\": \"2025-03-04\",\n    \"typed_date\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "2025-03-04",
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

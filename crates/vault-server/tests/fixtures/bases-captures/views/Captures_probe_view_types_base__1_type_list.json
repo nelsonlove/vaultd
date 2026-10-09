@@ -1,0 +1,13 @@
+{
+  "base": "Captures/probe-view-types.base",
+  "view": "type_list",
+  "captured_at_ms": 1791522481649,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Root-probe.md\",\n    \"file name\": \"Root-probe\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [],
+    "summaries": []
+  }
+}

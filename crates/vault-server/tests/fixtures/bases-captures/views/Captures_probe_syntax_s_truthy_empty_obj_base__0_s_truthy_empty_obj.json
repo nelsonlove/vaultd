@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-truthy-empty-obj.base",
+  "view": "s_truthy_empty_obj",
+  "captured_at_ms": 1791522456033,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_truthy_empty_obj\": \"false\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

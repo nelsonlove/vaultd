@@ -112,13 +112,17 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
         (r#""a".matches("a")"#, "string"),
         ("[1].toFixed(2)", "list"),
         ("{}.join()", "object"),
-        ("missing.trim()", "null"),
     ] {
         match run_on_empty_vault(text) {
             Err(EvalError::NoSuchMethod { target: got, .. }) => assert_eq!(got, target, "{text}"),
             other => panic!("{text}: expected no such method, got {other:?}"),
         }
     }
+    // Captured (Task 13): a method on an empty value is empty.
+    assert_eq!(
+        run_on_empty_vault("missing.trim()"),
+        Ok(vault_bases::Value::Null)
+    );
     // An argument of the wrong type.
     for text in [
         r#""a".contains(1)"#,
@@ -139,8 +143,6 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
         r#"/(?<=a)b/.matches("ab")"#,
         r#"/a/gg.matches("a")"#,
         r#"/a/igi.matches("a")"#,
-        r#"/b/y.matches("abc")"#,
-        r#""abc".replace(/b/y, "x")"#,
     ] {
         match run_on_empty_vault(text) {
             Err(EvalError::Argument(message)) => {
@@ -149,9 +151,31 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
             other => panic!("{text}: expected an argument error, got {other:?}"),
         }
     }
+    // Captured (Task 13): a sticky expression matches at the start only, and
+    // a split keeps its groups.
+    assert_eq!(
+        run_on_empty_vault(r#"/b/y.matches("abc")"#),
+        Ok(vault_bases::Value::Boolean(false))
+    );
     assert_eq!(
         run_on_empty_vault(r#""a1b".split(/(\d)/)"#),
-        Err(EvalError::Uncaptured("split:regexp_groups".into()))
+        Ok(vault_bases::Value::list(
+            ["a", "1", "b"]
+                .into_iter()
+                .map(|part| vault_bases::Value::String(part.into()))
+                .collect()
+        ))
+    );
+}
+
+/// Captured (Task 13): `"a🙂".reverse()` reverses UTF-16 units, so the
+/// emoji's two halves come out swapped and alone; a Rust string holds each
+/// lone half as U+FFFD, and the replay reads Obsidian's the same way.
+#[test]
+fn astral_reverse_matches_the_capture() {
+    assert_eq!(
+        run_on_empty_vault(r#""a🙂".reverse()"#),
+        Ok(vault_bases::Value::String("\u{fffd}\u{fffd}a".into()))
     );
 }
 

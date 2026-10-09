@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-link-path.base",
+  "view": "r_link_path",
+  "captured_at_ms": 1791522390082,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_link_path\": \"[[Folder/Deep/Inner.md]]\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Folder/Deep/Inner.md"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

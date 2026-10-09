@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r27",
+  "captured_at_ms": 1791522531386,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r27.md\",\n    \"f27\": \"Hello World\",\n    \"t13_now\": \"1791522531392\"\n  }\n]\n",
+  "stderr": ""
+}

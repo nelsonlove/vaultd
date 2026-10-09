@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-date-plus-25h.base",
+  "view": "s_date_plus_25h",
+  "captured_at_ms": 1791522413305,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_date_plus_25h\": \"2026-03-08 13:00\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "2026-03-08 13:00"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

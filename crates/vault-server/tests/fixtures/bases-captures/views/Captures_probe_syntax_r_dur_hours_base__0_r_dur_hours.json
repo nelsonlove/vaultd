@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-dur-hours.base",
+  "view": "r_dur_hours",
+  "captured_at_ms": 1791522380327,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_dur_hours\": \"2 days\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "2 days"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

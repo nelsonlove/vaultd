@@ -1,0 +1,8 @@
+{
+  "base": "Captures/stem.base",
+  "view": "Stem",
+  "captured_at_ms": 1791522530682,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Root-probe.md\",\n    \"file name\": \"Root-probe\"\n  }\n]\n",
+  "stderr": ""
+}

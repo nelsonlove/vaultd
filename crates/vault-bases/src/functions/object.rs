@@ -25,7 +25,9 @@ pub(crate) fn call(
     }
     // Keys keep insertion order here. JavaScript lists integer-like keys
     // first, ascending; whether Obsidian's object keeps that order is not
-    // published, so an object with such a key among others is uncaptured.
+    // published, and Obsidian 1.13.7 cannot parse an object literal, so
+    // Task 13 could not capture it: an object with such a key among others
+    // is still `Uncaptured`.
     if entries.len() > 1 && entries.iter().any(|(key, _)| is_array_index(key)) {
         match name {
             "keys" => return Err(EvalError::Uncaptured("keys:integer_order".into())),

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-cmp-bool.base",
+  "view": "s_cmp_bool",
+  "captured_at_ms": 1791522404752,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_cmp_bool\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

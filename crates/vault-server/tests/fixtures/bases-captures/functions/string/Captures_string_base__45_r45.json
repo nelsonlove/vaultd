@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r45",
+  "captured_at_ms": 1791522531578,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r45.md\",\n    \"f45\": \"$<x>b\",\n    \"t13_now\": \"1791522531589\"\n  }\n]\n",
+  "stderr": ""
+}

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-link-file.base",
+  "view": "r_link_file",
+  "captured_at_ms": 1791522388864,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_link_file\": \"[[Other.md]]\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Other.md"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

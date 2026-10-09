@@ -1,4 +1,4 @@
-use crate::eval::coerce::{parse_js_number, truthy};
+use crate::eval::coerce::{is_js_space, js_to_number, truthy};
 use crate::eval::{EvalContext, EvalError, Scope, evaluate};
 use crate::expr::Expr;
 use crate::value::Value;
@@ -100,22 +100,24 @@ fn list(args: &[Expr], ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value, Ev
 #[inline(never)]
 fn number(args: &[Expr], ctx: &EvalContext<'_>, scope: &Scope) -> Result<Value, EvalError> {
     arity("number", args, 1, 1)?;
+    // Captured: `number("")` and `number("abc")` are errors ("Unable to
+    // parse … as a number"), `number("Infinity")` is Infinity, and
+    // `number(missing)` is empty.
     match evaluate(&args[0], ctx, scope)? {
         Value::Number(number) => Ok(Value::Number(number)),
         Value::Boolean(flag) => Ok(Value::Number(if flag { 1.0 } else { 0.0 })),
         Value::Date(date) => Ok(Value::Number(date.epoch_ms as f64)),
-        Value::String(text) if text.trim().is_empty() => {
-            Err(EvalError::Uncaptured("number:empty_string".into()))
+        Value::String(text) => {
+            let number = js_to_number(&text);
+            if text.trim_matches(is_js_space).is_empty() || number.is_nan() {
+                Err(EvalError::Argument(format!(
+                    "Unable to parse {text:?} as a number."
+                )))
+            } else {
+                Ok(Value::Number(number))
+            }
         }
-        // JavaScript's `Number("Infinity")` is Infinity; whether Bases
-        // answers it or refuses it is not published.
-        Value::String(text) if matches!(text.trim(), "Infinity" | "+Infinity" | "-Infinity") => {
-            Err(EvalError::Uncaptured("number:infinity_string".into()))
-        }
-        Value::String(text) => parse_js_number(&text)
-            .map(Value::Number)
-            .ok_or_else(|| EvalError::Argument(format!("{text:?} is not a number"))),
-        Value::Null => Err(EvalError::Uncaptured("number:null".into())),
+        Value::Null => Ok(Value::Null),
         other => Err(EvalError::Argument(format!(
             "number cannot convert {}",
             other.type_name()
@@ -161,7 +163,7 @@ fn escape_html(args: &[Expr], ctx: &EvalContext<'_>, scope: &Scope) -> Result<Va
             '<' => escaped.push_str("&lt;"),
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
+            // Captured: a single quote is kept.
             other => escaped.push(other),
         }
     }

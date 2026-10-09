@@ -1,0 +1,26 @@
+{
+  "base": "Captures/probe-extra.base",
+  "view": "extra",
+  "captured_at_ms": 1791522186890,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/extra/tags-x.md\",\n    \"tags\": \"#alpha, #Beta/gamma\",\n    \"aliases\": \"One, two\",\n    \"not_missing\": null,\n    \"neg_missing\": null,\n    \"and_missing\": \"false\",\n    \"and_true_missing\": \"false\",\n    \"or_missing\": \"true\",\n    \"if_not_missing\": \"f\",\n    \"date_missing\": null,\n    \"date_missing_empty\": \"true\",\n    \"duration_missing\": null,\n    \"tags_contains\": \"true\",\n    \"tags_contains_hash\": \"true\",\n    \"tags_first\": \"#alpha\",\n    \"tags_type\": \"true\",\n    \"file_tags\": \"#alpha, #ALPHA, #delta, #Beta/gamma\",\n    \"file_unknown\": \"Error: Cannot find \\\"tasks\\\" on type File\",\n    \"file_unknown_two\": \"Error: Cannot find \\\"nosuch\\\" on type File\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "alpha\nBeta/gamma",
+            "One\ntwo",
+            "",
+            "",
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

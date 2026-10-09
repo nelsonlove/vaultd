@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-dur-plus-dur.base",
+  "view": "s_dur_plus_dur",
+  "captured_at_ms": 1791522416967,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_dur_plus_dur\": \"2 days\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "2 days"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

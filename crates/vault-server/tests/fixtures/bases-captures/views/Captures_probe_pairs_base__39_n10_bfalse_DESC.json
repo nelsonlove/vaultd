@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "n10~bfalse~DESC",
+  "captured_at_ms": 1791522251529,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/n10~bfalse-1.md\",\n    \"mix\": \"10\"\n  },\n  {\n    \"path\": \"Captures/pairs/n10~bfalse-2.md\",\n    \"mix\": \"false\"\n  }\n]\n",
+  "stderr": ""
+}

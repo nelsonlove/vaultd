@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-null-eq-null.base",
+  "view": "s_null_eq_null",
+  "captured_at_ms": 1791522429193,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_null_eq_null\": \"true\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "on"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

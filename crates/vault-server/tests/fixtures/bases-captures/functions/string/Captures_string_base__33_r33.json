@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r33",
+  "captured_at_ms": 1791522531433,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r33.md\",\n    \"f33\": \"Error: Type error in \\\"contains\\\", parameter \\\"value\\\". Expected String, given Number.\",\n    \"t13_now\": \"1791522531443\"\n  }\n]\n",
+  "stderr": ""
+}

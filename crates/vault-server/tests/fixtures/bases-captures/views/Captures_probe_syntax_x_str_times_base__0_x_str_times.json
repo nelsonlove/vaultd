@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-str-times.base",
+  "view": "x_str_times",
+  "captured_at_ms": 1791522474338,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_str_times\": \"Error: Invalid operator between String and Number\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Invalid operator between String and Number"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

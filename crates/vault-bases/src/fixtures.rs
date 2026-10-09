@@ -4,7 +4,15 @@
 //! `vault-server`'s replay suite turn it on). A row is `published` (a
 //! published page or standard fixes it), `uncaptured` (no published rule;
 //! the evaluator must answer an error naming the case), or `captured` (Task
-//! 13 recorded Obsidian's answer).
+//! 13 recorded Obsidian's answer), or `provisional` (the evaluator's
+//! reading, with no capture behind it yet; a `why` field says what will
+//! settle it).
+//!
+//! A `captured` row whose answer reads the clock (`now()`, `today()`) holds
+//! the text the captured rule gives at [`FIXTURE_NOW_MS`], not the text
+//! Obsidian showed at its own instant: such a row is checked against
+//! Obsidian only through `vault-server`'s replay suite, which evaluates each
+//! captured view at the instant it was captured.
 //!
 //! A row whose answer is the row file's own facts (its name, path, size or
 //! times) carries `"expect_from": "corpus"` and a `"template"` in place of
@@ -17,7 +25,7 @@ use serde_json::Value as Json;
 use vault_core::{PropertyValue, VaultPath};
 
 use crate::clock::Clock;
-use crate::eval::coerce::number_to_string;
+use crate::eval::coerce::to_display_string;
 use crate::eval::{EvalContext, EvalError, Scope, evaluate};
 use crate::expr::parse_expression;
 use crate::source::{MemoryFile, MemorySource, RowSource, no_span};
@@ -128,60 +136,15 @@ pub fn load_captures(family: &str) -> Vec<CaptureRow> {
         .collect()
 }
 
-/// The text a table cell shows for `value`.
-///
-/// **Provisional where marked.** Strings, numbers and booleans follow
-/// JavaScript's `ToString` (published). How a cell shows a date, a list, a
-/// link and a file is what Task 13's view captures settle; until then the
-/// rules below are the renderer's, and a disagreement with a capture is
-/// fixed here, in one place.
+/// The text Obsidian's `base:query` shows for `value` (captured, Task 13;
+/// Obsidian 1.13.7): an empty cell (`null`, an empty list) is `""`, and
+/// anything else is the value's text as `toString()` gives it
+/// ([`to_display_string`]).
 pub fn render_text(value: &Value, clock: &Clock) -> String {
     match value {
         Value::Null => String::new(),
-        Value::String(text) => text.clone(),
-        Value::Number(number) => number_to_string(*number),
-        Value::Boolean(flag) => flag.to_string(),
-        // Provisional: ISO date, or date and minutes in the clock's zone.
-        Value::Date(date) => {
-            let zoned = jiff::Timestamp::from_millisecond(date.epoch_ms)
-                .expect("a representable instant")
-                .to_zoned(clock.zone.clone());
-            if date.has_time {
-                zoned.strftime("%Y-%m-%d %H:%M").to_string()
-            } else {
-                zoned.strftime("%Y-%m-%d").to_string()
-            }
-        }
-        // Provisional: milliseconds, as the cell model carries them.
-        Value::Duration(duration) => duration.ms.to_string(),
-        // Provisional: items joined by ", ".
-        Value::List(items) => items
-            .iter()
-            .map(|item| render_text(item, clock))
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::Object(entries) => entries
-            .iter()
-            .map(|(key, value)| format!("{key}: {}", render_text(value, clock)))
-            .collect::<Vec<_>>()
-            .join(", "),
-        // Provisional: the display text, else the target as written.
-        Value::Link(link) => match &link.display {
-            Some(display) => render_text(display, clock),
-            None => link
-                .target
-                .trim_start_matches("[[")
-                .trim_end_matches("]]")
-                .to_string(),
-        },
-        // Provisional: the file name without a `.md` extension.
-        Value::File(path) => path
-            .name()
-            .strip_suffix(".md")
-            .unwrap_or(path.name())
-            .to_string(),
-        Value::Regexp(regexp) => format!("/{}/{}", regexp.source, regexp.flags),
-        Value::Image(text) | Value::Icon(text) | Value::Html(text) => text.clone(),
+        Value::List(items) if items.is_empty() => String::new(),
+        other => to_display_string(other, clock),
     }
 }
 
@@ -226,7 +189,8 @@ pub struct TemplateFacts {
 }
 
 /// Fill `{name}`, `{basename}`, `{path}`, `{folder}`, `{size}`,
-/// `{ctime:<fmt>}`, `{mtime:<fmt>}` and `{age_ms}` (`now - ctime`) from
+/// `{ctime:<fmt>}`, `{mtime:<fmt>}`, `{age_ms}` (`now - ctime` in
+/// milliseconds) and `{age}` (the same span as a cell shows a duration) from
 /// `facts`. An unknown token is copied as written, so a misspelt template
 /// goes red rather than silently empty.
 ///
@@ -277,6 +241,12 @@ pub fn fill_template(template: &str, facts: &TemplateFacts, clock: &Clock) -> St
                 "folder" => folder.clone(),
                 "size" => facts.size.to_string(),
                 "age_ms" => (clock.now_ms - facts.ctime_ms).to_string(),
+                // `now() - file.ctime`, a duration, as a cell shows it.
+                "age" => crate::dates::humanize(crate::DurationValue {
+                    months: 0,
+                    ms: clock.now_ms - facts.ctime_ms,
+                    timed: true,
+                }),
                 other => format!("{{{other}}}"),
             },
         });

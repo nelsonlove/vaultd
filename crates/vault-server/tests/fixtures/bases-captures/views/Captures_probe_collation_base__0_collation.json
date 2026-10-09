@@ -1,0 +1,73 @@
+{
+  "base": "Captures/probe-collation.base",
+  "view": "collation",
+  "captured_at_ms": 1791522184447,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/extra/collation/_x.md\",\n    \"file name\": \"_x\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/(x.md\",\n    \"file name\": \"(x\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/⚡x.md\",\n    \"file name\": \"⚡x\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/9.md\",\n    \"file name\": \"9\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/10.md\",\n    \"file name\": \"10\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a b.md\",\n    \"file name\": \"a b\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a-b.md\",\n    \"file name\": \"a-b\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a—b.md\",\n    \"file name\": \"a—b\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a1.md\",\n    \"file name\": \"a1\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a2.md\",\n    \"file name\": \"a2\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a10.md\",\n    \"file name\": \"a10\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/a​b.md\",\n    \"file name\": \"a​b\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/ab.md\",\n    \"file name\": \"ab\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/B.md\",\n    \"file name\": \"B\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/é.md\",\n    \"file name\": \"é\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/e.md\",\n    \"file name\": \"e\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/f.md\",\n    \"file name\": \"f\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/x.y.md\",\n    \"file name\": \"x.y\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/Zü.md\",\n    \"file name\": \"Zü\"\n  },\n  {\n    \"path\": \"Captures/extra/collation/Zu.md\",\n    \"file name\": \"Zu\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "_x"
+          ],
+          [
+            "(x"
+          ],
+          [
+            "⚡x"
+          ],
+          [
+            "9"
+          ],
+          [
+            "10"
+          ],
+          [
+            "a b"
+          ],
+          [
+            "a-b"
+          ],
+          [
+            "a—b"
+          ],
+          [
+            "a1"
+          ],
+          [
+            "a2"
+          ],
+          [
+            "a10"
+          ],
+          [
+            "a​b"
+          ],
+          [
+            "ab"
+          ],
+          [
+            "B"
+          ],
+          [
+            "é"
+          ],
+          [
+            "e"
+          ],
+          [
+            "f"
+          ],
+          [
+            "x.y"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

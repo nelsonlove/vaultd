@@ -1,0 +1,25 @@
+{
+  "base": "Captures/view/v6.base",
+  "view": "T",
+  "captured_at_ms": 1791522543842,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/view/a.md\",\n    \"file name\": \"a\"\n  },\n  {\n    \"path\": \"Captures/view/b.md\",\n    \"file name\": \"b\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

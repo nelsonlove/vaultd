@@ -1,0 +1,13 @@
+{
+  "base": "Captures/probe-view-types.base",
+  "view": "type_tasknotesKanban",
+  "captured_at_ms": 1791522482863,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Root-probe.md\",\n    \"file name\": \"Root-probe\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "Unknown view type: tasknotesKanban",
+    "groups": [],
+    "summaries": []
+  }
+}

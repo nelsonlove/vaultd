@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-unknown-method.base",
+  "view": "x_unknown_method",
+  "captured_at_ms": 1791522475560,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_unknown_method\": \"Error: Cannot find function \\\"frobnicate\\\" on type Number\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "Cannot find function \"frobnicate\" on type Number"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

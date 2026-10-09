@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "sabc~missing~DESC",
+  "captured_at_ms": 1791522252319,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/sabc~missing-1.md\",\n    \"mix\": \"abc\"\n  },\n  {\n    \"path\": \"Captures/pairs/sabc~missing-2.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

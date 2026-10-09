@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vault_core::{PropertyValue, VaultPath};
 
-use crate::eval::coerce::{sort_order, truthy};
+use crate::clock::Clock;
+use crate::eval::coerce::{sort_compare, truthy};
 use crate::eval::{EvalContext, EvalError, Formulas, Scope, evaluate, row_property};
 use crate::expr::{Expr, MAX_DEPTH, parse_expression};
 use crate::file::{BaseFile, Direction, FilterNode, ViewDecl};
@@ -45,6 +46,11 @@ pub enum PropertyRef {
 }
 
 pub fn property_ref(key: &str) -> PropertyRef {
+    // A bare `file` is the file itself (captured, Task 13: Obsidian writes a
+    // `file.file` column back as `file`, and shows the file's path in it).
+    if key == "file" {
+        return PropertyRef::File("file".into());
+    }
     if let Some(field) = key.strip_prefix("file.") {
         PropertyRef::File(field.to_string())
     } else if let Some(name) = key.strip_prefix("formula.") {
@@ -109,15 +115,18 @@ struct SummaryDecl {
     property: String,
     reference: PropertyRef,
     name: String,
-    custom: Option<Expr>,
+    /// `Err` when the expression does not compile: the summary is that
+    /// error (ruling R1).
+    custom: Option<Result<Expr, EvalError>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CompiledView {
     decl: ViewDecl,
     filters: Vec<Filter>,
-    /// Every formula the view reads, transitively, with its tree height.
-    formulas: BTreeMap<String, (Expr, usize)>,
+    /// Every formula the view reads, transitively, with its tree height, or
+    /// the error every cell of a formula that does not compile shows.
+    formulas: BTreeMap<String, Result<(Expr, usize), EvalError>>,
     columns: Vec<ColumnDecl>,
     sort: Vec<(PropertyRef, Direction)>,
     group: Option<(PropertyRef, Direction)>,
@@ -322,20 +331,27 @@ fn note_ref(reference: &PropertyRef, deps: &mut ViewDependencies, formulas: &mut
     }
 }
 
+/// A property's full name: `note.x` for a note property however it is
+/// written, `file.x` and `formula.x` as written, `file.file` for `file`.
+fn canonical(key: &str) -> String {
+    match property_ref(key) {
+        PropertyRef::File(field) => format!("file.{field}"),
+        PropertyRef::Formula(name) => format!("formula.{name}"),
+        PropertyRef::Note(name) => format!("note.{name}"),
+    }
+}
+
 /// The base's `properties` settings for one column: the entry declared
-/// under the same key, else one naming the same property another way
-/// (`status` and `note.status`).
+/// under the column's full name (seen in corpus views, Task 13: a column
+/// `x` takes the settings declared under `note.x`, and ignores settings
+/// declared under a bare `x`).
 fn column(base: &BaseFile, property: &str) -> ColumnDecl {
-    let reference = property_ref(property);
+    let full = canonical(property);
     let settings = base
         .properties
         .iter()
-        .find(|(key, _)| key == property)
-        .or_else(|| {
-            base.properties
-                .iter()
-                .find(|(key, _)| property_ref(key) == reference)
-        })
+        .rev()
+        .find(|(key, _)| *key == full)
         .map(|(_, settings)| settings.clone());
     ColumnDecl {
         property: property.to_string(),
@@ -346,6 +362,38 @@ fn column(base: &BaseFile, property: &str) -> ColumnDecl {
             .map(|settings| settings.options)
             .unwrap_or_default(),
     }
+}
+
+/// Compile one formula (or one of the base's own summaries), noting what it
+/// reads. Ruling R1 (2026-10-09; the project
+/// picked Obsidian's behaviour): one that does not parse, or that calls a
+/// function or method no one defines, does not refuse the view; it is the
+/// error its every cell shows. An empty formula (the `Untitled: ""`
+/// Obsidian's editor leaves) is no expression, an empty cell, rather than a
+/// syntax error (captured, seen in a corpus view, Task 13).
+fn compile_formula(
+    name: &str,
+    text: &str,
+    deps: &mut ViewDependencies,
+    formulas: &mut BTreeSet<String>,
+) -> Result<(Expr, usize), EvalError> {
+    let expr = if text.trim().is_empty() {
+        Expr::Null
+    } else {
+        parse_expression(text).map_err(|error| EvalError::FormulaInvalid {
+            name: name.to_string(),
+            message: format!("{} at {}", error.message, error.position),
+        })?
+    };
+    scan(&expr, deps, formulas).map_err(|error| match error {
+        CompileError::UnsupportedFunction { name } => EvalError::UnknownFunction(name),
+        other => EvalError::FormulaInvalid {
+            name: name.to_string(),
+            message: format!("{other:?}"),
+        },
+    })?;
+    let height = height(&expr);
+    Ok((expr, height))
 }
 
 /// Compile one view of `base`: the named one (matched exactly), or the first
@@ -381,10 +429,17 @@ pub fn compile_view(base: &BaseFile, view: Option<&str>) -> Result<CompiledView,
         .iter()
         .map(|property| column(base, property))
         .collect();
+    // A sort key the view shows in no column changes nothing. Provisional:
+    // inferred from corpus views (views sorted by a hidden formula or a
+    // hidden `file.basename` keep name order, while a view showing the same
+    // formula sorts by it); the probes `sort_hidden` and `sort_shown` in
+    // `generate` settle it, and the fixture row `sort:hidden_key` tracks it.
+    let shown: Vec<PropertyRef> = decl.order.iter().map(|key| property_ref(key)).collect();
     let sort: Vec<(PropertyRef, Direction)> = decl
         .sort
         .iter()
         .map(|key| (property_ref(&key.property), key.direction))
+        .filter(|(reference, _)| shown.contains(reference))
         .collect();
     let group = decl
         .group_by
@@ -393,7 +448,9 @@ pub fn compile_view(base: &BaseFile, view: Option<&str>) -> Result<CompiledView,
     for reference in columns
         .iter()
         .map(|column| property_ref(&column.property))
-        .chain(sort.iter().map(|(reference, _)| reference.clone()))
+        // Every declared sort key counts as read, the ignored ones too: the
+        // staleness rule may only over-report.
+        .chain(decl.sort.iter().map(|key| property_ref(&key.property)))
         .chain(group.iter().map(|(reference, _)| reference.clone()))
     {
         note_ref(&reference, &mut deps, &mut wanted);
@@ -403,15 +460,18 @@ pub fn compile_view(base: &BaseFile, view: Option<&str>) -> Result<CompiledView,
     for (property, name) in &decl.summaries {
         let reference = property_ref(property);
         note_ref(&reference, &mut deps, &mut wanted);
-        let custom = match base.summaries.iter().rev().find(|(key, _)| key == name) {
-            Some((_, text)) => {
-                let expr = parse(text)?;
-                scan(&expr, &mut deps, &mut wanted)?;
-                Some(expr)
-            }
-            None if BUILTIN_SUMMARIES.contains(&name.as_str()) => None,
-            None => return Err(CompileError::UnsupportedFunction { name: name.clone() }),
-        };
+        // A summary name that is neither built in nor the base's own is an
+        // error summary, not a refused view: Obsidian shows the view's rows
+        // (seen in a corpus view, Task 13).
+        // One that does not compile is an error summary (ruling R1).
+        let custom = base
+            .summaries
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, text)| {
+                compile_formula(name, text, &mut deps, &mut wanted).map(|(expr, _)| expr)
+            });
         summaries.push(SummaryDecl {
             property: property.clone(),
             reference,
@@ -421,8 +481,8 @@ pub fn compile_view(base: &BaseFile, view: Option<&str>) -> Result<CompiledView,
     }
 
     // Formulas the view reads, transitively (a work list, not recursion).
-    // One that does not parse fails this view; one no view reads fails
-    // nothing.
+    // One that does not compile is an error cell in every row that reads it
+    // (ruling R1), and fails nothing else.
     let mut formulas = BTreeMap::new();
     let mut queue: Vec<String> = wanted.iter().cloned().collect();
     while let Some(name) = queue.pop() {
@@ -434,12 +494,10 @@ pub fn compile_view(base: &BaseFile, view: Option<&str>) -> Result<CompiledView,
             // failure: Obsidian keeps the column and shows nothing usable.
             continue;
         };
-        let expr = parse(text)?;
         let mut more = BTreeSet::new();
-        scan(&expr, &mut deps, &mut more)?;
+        let compiled = compile_formula(&name, text, &mut deps, &mut more);
         queue.extend(more.into_iter().filter(|next| !formulas.contains_key(next)));
-        let height = height(&expr);
-        formulas.insert(name, (expr, height));
+        formulas.insert(name, compiled);
     }
 
     let mut prefilters = Vec::new();
@@ -474,7 +532,7 @@ fn top_level_prefilters(filter: &Filter, out: &mut Vec<Prefilter>) {
 
 /// `formula.x`, memoized per row, with cycle detection and a depth budget.
 struct FormulaTable<'v> {
-    formulas: &'v BTreeMap<String, (Expr, usize)>,
+    formulas: &'v BTreeMap<String, Result<(Expr, usize), EvalError>>,
     memo: RefCell<BTreeMap<(VaultPath, String), Cell>>,
     active: RefCell<Vec<String>>,
     /// An upper bound on the expression levels on the stack: the height of
@@ -512,8 +570,10 @@ impl Formulas for FormulaTable<'_> {
         if self.active.borrow().iter().any(|active| active == name) {
             return Err(EvalError::FormulaCycle(name.to_string()));
         }
-        let Some((expr, height)) = self.formulas.get(name) else {
-            return Err(EvalError::UnknownFormula(name.to_string()));
+        let (expr, height) = match self.formulas.get(name) {
+            Some(Ok(compiled)) => compiled,
+            Some(Err(error)) => return Err(error.clone()),
+            None => return Err(EvalError::UnknownFormula(name.to_string())),
         };
         let before = self.depth.get();
         let depth = before + height;
@@ -538,7 +598,13 @@ impl Formulas for FormulaTable<'_> {
 fn read(reference: &PropertyRef, ctx: &EvalContext<'_>, row: &VaultPath) -> Cell {
     let scope = Scope::row(row);
     match reference {
-        PropertyRef::File(field) => functions::field(&Value::File(row.clone()), field, ctx),
+        // A column naming a field a file does not have is empty (seen in a
+        // corpus view, Task 13), while the same field in a formula is an
+        // error (captured: `file.nosuch`).
+        PropertyRef::File(field) => match functions::field(&Value::File(row.clone()), field, ctx) {
+            Err(EvalError::NoSuchField { .. }) => Ok(Value::Null),
+            other => other,
+        },
         PropertyRef::Formula(name) => ctx.formulas.formula(name, ctx, &scope),
         PropertyRef::Note(key) => row_property(ctx, &scope, key),
     }
@@ -551,8 +617,10 @@ fn read(reference: &PropertyRef, ctx: &EvalContext<'_>, row: &VaultPath) -> Cell
 /// true, else unknown if any is unknown; `not` (the views page: "results
 /// will not be shown if any of the conditions in the filter group are met")
 /// is false if any child is true, else unknown if any is unknown. An unknown
-/// verdict at the top excludes the row. **Provisional** — `filter:error_row`
-/// (Task 13) settles whether Obsidian shows such a row.
+/// verdict at the top excludes the row (captured, Task 13: the probe
+/// `filter_error_row` shows only the note whose `price > 2` holds). An empty
+/// group holds every row, `or: []` included (captured: the view family's
+/// `filter:empty_or`).
 fn verdict(
     filter: &Filter,
     ctx: &EvalContext<'_>,
@@ -581,7 +649,9 @@ fn verdict(
             .map(|value| truthy(&value)),
         // Any false makes it false; else all true makes it true.
         Filter::And(items) => combine(children(items), false, true),
-        // Any true makes it true; else all false makes it false.
+        // Any true makes it true; else all false makes it false; an empty
+        // `or` constrains nothing.
+        Filter::Or(items) if items.is_empty() => Some(true),
         Filter::Or(items) => combine(children(items), true, false),
         // Any true makes it false; else all false makes it true.
         Filter::Not(items) => combine(children(items), true, true),
@@ -595,14 +665,42 @@ fn directed(ordering: Ordering, direction: Direction) -> Ordering {
     }
 }
 
-/// An error cell sorts with the empty values: last ascending, and first
-/// descending, since `DESC` reverses the whole total order. **Provisional**,
-/// with the mixed-type order (`sort:mixed`, `sort:empty_descending`).
-fn order(a: &Cell, b: &Cell) -> Ordering {
-    sort_order(
-        a.as_ref().unwrap_or(&Value::Null),
-        b.as_ref().unwrap_or(&Value::Null),
-    )
+/// One sort key's order between two rows. In a key whose every value that
+/// is not empty is a boolean (a checkbox column), an empty value is `false`
+/// and the key orders by truthiness in its direction (captured, Task 13:
+/// `sort_mixed`). In any other key, empty values and error cells go last in
+/// either direction (`sort:empty_descending`), and the rest compare by
+/// [`sort_compare`] in the key's direction.
+///
+/// `booleans` is decided once per key over every row, so the comparison is a
+/// total order (ruling R2, a total order): no value is `false` against one
+/// row and last against another.
+fn key_order(a: &Cell, b: &Cell, booleans: bool, direction: Direction, clock: &Clock) -> Ordering {
+    let a = a.as_ref().unwrap_or(&Value::Null);
+    let b = b.as_ref().unwrap_or(&Value::Null);
+    if booleans {
+        return directed(truthy(a).cmp(&truthy(b)), direction);
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        _ => directed(sort_compare(a, b, clock), direction),
+    }
+}
+
+/// Whether every value of one key that is not empty is a boolean, and one
+/// is: such a key orders empty values as `false` ([`key_order`]).
+fn boolean_key<'a>(cells: impl IntoIterator<Item = Option<&'a Cell>>) -> bool {
+    let mut any = false;
+    for cell in cells {
+        match cell.and_then(|cell| cell.as_ref().ok()) {
+            None | Some(Value::Null) => {}
+            Some(Value::Boolean(_)) => any = true,
+            Some(_) => return false,
+        }
+    }
+    any
 }
 
 /// One row of a view's answer.
@@ -674,28 +772,62 @@ pub fn evaluate_view(
         }
     }
 
-    // `sort_by` is stable: rows equal on every key keep path order.
+    // A view with no sort key is in file name order (captured, Task 13: a
+    // view with no `sort` lists `a.md`, `Capture.md`, `image.png`,
+    // `Root-probe.md`). Otherwise the keys order the rows stably from path
+    // order, so rows equal on every key stay in path order (seen in corpus
+    // views, Task 13; the probe `sort_all_empty` in `generate` settles it).
+    let clock = ctx.clock;
+    // Path order as Obsidian holds it: collated, so a lower-case name sorts
+    // with its letter, not after every capital (seen in corpus views).
+    rows.sort_by(|a, b| crate::collate::collate_strictly(a.path.as_str(), b.path.as_str()));
+    if view.sort.is_empty() {
+        let mut named: Vec<(String, Kept)> = rows
+            .into_iter()
+            .map(|row| {
+                let name = match functions::field(&Value::File(row.path.clone()), "name", &ctx) {
+                    Ok(Value::String(name)) => name,
+                    _ => row.path.name().to_string(),
+                };
+                (name, row)
+            })
+            .collect();
+        named.sort_by(|(a, _), (b, _)| crate::collate::collate(a, b));
+        rows = named.into_iter().map(|(_, row)| row).collect();
+    }
+    let booleans: Vec<bool> = (0..view.sort.len())
+        .map(|index| boolean_key(rows.iter().map(|row| row.keys.get(index))))
+        .collect();
+    // Stable: rows equal on every key keep the order above.
     rows.sort_by(|a, b| {
         for (index, (_, direction)) in view.sort.iter().enumerate() {
-            let ordering = directed(order(&a.keys[index], &b.keys[index]), *direction);
+            let ordering = key_order(
+                &a.keys[index],
+                &b.keys[index],
+                booleans[index],
+                *direction,
+                clock,
+            );
             if ordering.is_ne() {
                 return ordering;
             }
         }
         Ordering::Equal
     });
-    // `limit` counts sorted rows before grouping (`limit:before_group`, the
-    // spec's stated order; the capture settles it).
+    // `limit` counts sorted rows before grouping (captured, Task 13: the
+    // probe `limit_group` keeps one row in each of its two groups).
     if let Some(limit) = view.decl.limit {
         rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
-    // Stable again, so the sorted order holds inside each group.
+    // Stably again, so the sorted order holds inside each group; groups
+    // order as sort keys do (captured: `group_dir`, `group_list`).
     if let Some((_, direction)) = &view.group {
         let null = Ok(Value::Null);
+        let booleans = boolean_key(rows.iter().map(|row| row.group.as_ref()));
         rows.sort_by(|a, b| {
             let a = a.group.as_ref().unwrap_or(&null);
             let b = b.group.as_ref().unwrap_or(&null);
-            directed(order(a, b), *direction)
+            key_order(a, b, booleans, *direction, clock)
         });
     }
 
@@ -728,12 +860,16 @@ pub fn evaluate_view(
                 .map(|row| read(&summary.reference, &ctx, &row.path).unwrap_or(Value::Null))
                 .collect();
             let value = match &summary.custom {
-                Some(expr) => evaluate(
+                Some(Err(error)) => Err(error.clone()),
+                Some(Ok(expr)) => evaluate(
                     expr,
                     &ctx,
                     &Scope::default().bind("values", Value::list(values)),
                 ),
-                None => summary::builtin(&summary.name, &values),
+                None if BUILTIN_SUMMARIES.contains(&summary.name.as_str()) => {
+                    summary::builtin(&summary.name, &values)
+                }
+                None => Err(EvalError::UnknownFunction(summary.name.clone())),
             };
             SummaryResult {
                 property: summary.property.clone(),

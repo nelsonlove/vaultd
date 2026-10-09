@@ -6,7 +6,8 @@
 //! (`IndexReader::evaluation_read`). The evaluation itself runs with no lock
 //! held. `vault-bases` never sees either.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -122,6 +123,24 @@ struct IndexRowSource<'c> {
     connection: &'c Connection,
     resolver: Arc<Resolver>,
     types: &'c BTreeMap<String, PropertyType>,
+    /// [`IndexRowSource::attachment`]'s answers in this evaluation, by
+    /// target text: one lookup per distinct target, not one per row.
+    attachments: RefCell<HashMap<String, Option<VaultPath>>>,
+}
+
+impl<'c> IndexRowSource<'c> {
+    fn new(
+        connection: &'c Connection,
+        resolver: Arc<Resolver>,
+        types: &'c BTreeMap<String, PropertyType>,
+    ) -> Self {
+        Self {
+            connection,
+            resolver,
+            types,
+            attachments: RefCell::new(HashMap::new()),
+        }
+    }
 }
 
 /// `substr(path, 1, n) = prefix` rather than `LIKE`, so `%` and `_` in a
@@ -176,6 +195,7 @@ impl IndexRowSource<'_> {
                     .map(|target| codec::decode_path(&target))
                     .transpose()
                     .map_err(source_error)?,
+                "unresolved" => self.attachment(&raw_target)?,
                 _ => None,
             };
             facts.push(LinkFact {
@@ -185,6 +205,58 @@ impl IndexRowSource<'_> {
             });
         }
         Ok(facts)
+    }
+
+    /// The attachment `target` names, when the link resolver leaves it
+    /// unresolved: the resolver's catalog holds notes and bases, and Obsidian
+    /// resolves a link to any file (captured, Task 13: `file("Folder/image.png")`
+    /// is the image, and a note embedding it `hasLink` it). An exact path
+    /// first, else the one attachment with that name in any folder, letters
+    /// compared without case; two such files name neither.
+    fn attachment(&self, target: &str) -> Result<Option<VaultPath>, SourceError> {
+        if let Some(known) = self.attachments.borrow().get(target) {
+            return Ok(known.clone());
+        }
+        let found = self.find_attachment(target)?;
+        self.attachments
+            .borrow_mut()
+            .insert(target.to_string(), found.clone());
+        Ok(found)
+    }
+
+    fn find_attachment(&self, target: &str) -> Result<Option<VaultPath>, SourceError> {
+        let parsed = LinkTarget::parse(target);
+        let Some(file) = parsed.file_target.as_deref() else {
+            return Ok(None);
+        };
+        // A name with no extension names a note, never an attachment
+        // (captured: `file("Folder/README")` is empty).
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let has_extension = name.chars().skip(1).any(|c| c == '.');
+        if file.starts_with("./") || file.starts_with("../") || !has_extension {
+            return Ok(None);
+        }
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT path FROM tree_entries WHERE kind = 'file' \
+                 AND (lower(path) = lower(?1) OR substr(lower(path), -length(?1) - 1) = '/' || lower(?1)) \
+                 ORDER BY path LIMIT 8",
+            )
+            .map_err(source_error)?;
+        let found = statement
+            .query_map(params![file], |row| row.get::<_, String>(0))
+            .map_err(source_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(source_error)?;
+        let chosen = match found.iter().find(|path| path.as_str() == file) {
+            Some(exact) => Some(exact),
+            None if found.len() == 1 => found.first(),
+            None => None,
+        };
+        chosen
+            .map(|path| codec::decode_path(path).map_err(source_error))
+            .transpose()
     }
 
     /// Whether the declared types may turn `key`'s text into something a
@@ -427,28 +499,65 @@ impl RowSource for IndexRowSource<'_> {
             .map_err(source_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(source_error)?;
-        paths
+        let mut found: BTreeSet<VaultPath> = paths
             .iter()
             .map(|path| codec::decode_path(path).map_err(source_error))
-            .collect()
+            .collect::<Result<_, _>>()?;
+        // An attachment's backlinks are the notes whose links the resolver
+        // left unresolved and `attachment` resolves to it, so that
+        // `backlinks` agrees with `links` and `hasLink`.
+        let is_attachment = self
+            .facts(path)?
+            .is_some_and(|facts| facts.kind == FileKind::File);
+        if is_attachment {
+            let mut statement = self
+                .connection
+                .prepare_cached(
+                    "SELECT DISTINCT r.note_path, r.raw_target FROM resolutions s \
+                     JOIN note_references r ON r.id = s.reference_id \
+                     WHERE s.kind = 'unresolved' AND instr(lower(r.raw_target), lower(?1)) > 0",
+                )
+                .map_err(source_error)?;
+            let candidates = statement
+                .query_map(params![path.name()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(source_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(source_error)?;
+            for (note, raw_target) in candidates {
+                if self.attachment(&raw_target)?.as_ref() == Some(path) {
+                    found.insert(codec::decode_path(&note).map_err(source_error)?);
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
     }
 
     fn resolve(&self, from: &VaultPath, target: &str) -> Result<Option<VaultPath>, SourceError> {
-        Ok(
-            match self
-                .resolver
-                .resolve_target(from, &LinkTarget::parse(target))
-            {
-                Resolution::Resolved { target, .. } | Resolution::MissingSubpath { target, .. } => {
-                    Some(target)
-                }
-                _ => None,
-            },
-        )
+        match self
+            .resolver
+            .resolve_target(from, &LinkTarget::parse(target))
+        {
+            Resolution::Resolved { target, .. } | Resolution::MissingSubpath { target, .. } => {
+                Ok(Some(target))
+            }
+            Resolution::Unresolved => self.attachment(target),
+            _ => Ok(None),
+        }
     }
 
+    /// A declared type, its key matched without case when no key matches
+    /// exactly (captured, Task 13: `types.json` declaring `T13Typed` a date
+    /// types a note's `t13typed`).
     fn property_type(&self, key: &str) -> Option<PropertyType> {
-        self.types.get(key).copied()
+        self.types.get(key).copied().or_else(|| {
+            let folded = key.to_lowercase();
+            self.types
+                .iter()
+                .find(|(declared, _)| declared.to_lowercase() == folded)
+                .map(|(_, kind)| *kind)
+        })
     }
 }
 
@@ -560,11 +669,7 @@ impl IndexReader {
     ) -> Result<Vec<VaultPath>, IndexError> {
         let (_, resolver) = self.resolver()?;
         self.read(|transaction, _| {
-            let source = IndexRowSource {
-                connection: transaction,
-                resolver,
-                types,
-            };
+            let source = IndexRowSource::new(transaction, resolver, types);
             source
                 .candidates(prefilters)
                 .map_err(|error| IndexError::Storage(error.0))
@@ -581,11 +686,7 @@ impl IndexReader {
     ) -> Result<Vec<String>, IndexError> {
         let (_, resolver) = self.resolver()?;
         self.read(|transaction, _| {
-            let source = IndexRowSource {
-                connection: transaction,
-                resolver,
-                types,
-            };
+            let source = IndexRowSource::new(transaction, resolver, types);
             let (sql, arguments, _) = source.candidates_query(prefilters);
             let mut statement = transaction.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
             let details = statement
@@ -661,11 +762,7 @@ fn evaluate_in(
     }
     let generation = read.generation;
     let compiled = compile_view(&file, query.view).map_err(BaseQueryError::Compile)?;
-    let source = IndexRowSource {
-        connection: read.connection(),
-        resolver,
-        types: query.types,
-    };
+    let source = IndexRowSource::new(read.connection(), resolver, query.types);
     // No embedding note means `this` is the base itself.
     let this = query.this_path.unwrap_or(query.path);
     let ctx = EvalContext::new(&source, clock, query.path, this);

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-nested-list.base",
+  "view": "x_nested_list",
+  "captured_at_ms": 1791522467016,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_nested_list\": \"1, 2, 3\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1\n2\n3"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

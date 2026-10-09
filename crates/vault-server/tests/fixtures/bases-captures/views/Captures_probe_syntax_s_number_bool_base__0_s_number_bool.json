@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-number-bool.base",
+  "view": "s_number_bool",
+  "captured_at_ms": 1791522432849,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_number_bool\": \"1\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "1"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-date-ms.base",
+  "view": "r_date_ms",
+  "captured_at_ms": 1791522379109,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_date_ms\": \"2025-01-01T10:00:00\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "01/01/2025 10:00 AM"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

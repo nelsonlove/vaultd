@@ -1,0 +1,8 @@
+{
+  "base": "Captures/string.base",
+  "view": "r35",
+  "captured_at_ms": 1791522531460,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/string/r35.md\",\n    \"f35\": \"Error: Invalid string length\",\n    \"t13_now\": \"1791522531467\"\n  }\n]\n",
+  "stderr": ""
+}

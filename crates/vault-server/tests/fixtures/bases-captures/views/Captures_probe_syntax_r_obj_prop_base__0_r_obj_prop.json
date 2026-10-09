@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-obj-prop.base",
+  "view": "r_obj_prop",
+  "captured_at_ms": 1791522398631,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_obj_prop\": \"{\\\"a\\\":\\\"1, 2\\\",\\\"b\\\":\\\"{\\\\\\\"c\\\\\\\":\\\\\\\"true\\\\\\\"}\\\",\\\"d\\\":\\\"null\\\"}\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "{\"a\":\"1, 2\",\"b\":\"{\\\"c\\\":\\\"true\\\"}\",\"d\":\"null\"}"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

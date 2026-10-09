@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-s-today-plus-36h.base",
+  "view": "s_today_plus_36h",
+  "captured_at_ms": 1791522443839,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"s_today_plus_36h\": \"2025-01-02T12:00:00\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "01/02/2025 12:00 PM"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

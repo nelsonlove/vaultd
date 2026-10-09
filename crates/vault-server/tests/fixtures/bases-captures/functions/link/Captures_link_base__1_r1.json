@@ -1,0 +1,8 @@
+{
+  "base": "Captures/link.base",
+  "view": "r1",
+  "captured_at_ms": 1791522183930,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/link/r1.md\",\n    \"f1\": \"[[Other|display]]\",\n    \"t13_now\": \"1791522183935\"\n  }\n]\n",
+  "stderr": ""
+}

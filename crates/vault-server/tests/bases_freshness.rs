@@ -551,11 +551,7 @@ fn dated() -> (TempDir, TempDir, Daemon) {
     let (vault, index, mut daemon) = setup();
     std::fs::create_dir_all(vault.path().join("Dates")).unwrap();
     std::fs::create_dir_all(vault.path().join(".obsidian")).unwrap();
-    std::fs::write(
-        vault.path().join("Dates/D.md"),
-        "---\ndue: 2024-01-02\n---\n",
-    )
-    .unwrap();
+    std::fs::write(vault.path().join("Dates/D.md"), "---\ndue: x\n---\n").unwrap();
     std::fs::write(
         vault.path().join("Due.base"),
         "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Dates\")'\n    order: [due]\n",
@@ -566,7 +562,10 @@ fn dated() -> (TempDir, TempDir, Daemon) {
     (vault, index, daemon)
 }
 
-const UNTYPED: &str = r#"{"kind":"string","value":"2024-01-02"}"#;
+/// Untyped, `due: x` is the text `x`; declared a tags property it is `#x`
+/// (captured, Task 13). Text that reads as a date is a date whether typed
+/// or not, so a date type no longer changes what a cell shows.
+const UNTYPED: &str = r#"{"kind":"string","value":"x"}"#;
 
 /// H1: a `types.json` write is a `config_changed` with no generation, and
 /// the cached answer must not outlive it: a client that re-asks on
@@ -575,10 +574,10 @@ const UNTYPED: &str = r#"{"kind":"string","value":"2024-01-02"}"#;
 fn a_types_change_reaches_a_re_asked_answer() {
     let (_vault, _index, mut daemon) = dated();
     assert_eq!(first_cell(&mut daemon, "Due.base"), UNTYPED);
-    write_types(&mut daemon, r#"{"types":{"due":"date"}}"#);
+    write_types(&mut daemon, r#"{"types":{"due":"tags"}}"#);
     let typed = first_cell(&mut daemon, "Due.base");
     assert!(
-        typed.contains(r#""kind":"date""#),
+        typed.contains(r##""value":"#x""##),
         "still {typed} after config_changed"
     );
 }
@@ -593,7 +592,7 @@ fn a_types_change_invalidates_the_views_it_retypes() {
         &mut daemon,
         r#"{"version":1,"id":"g","request":{"method":"evaluate_base","params":{"path":"Due.base"}}}"#,
     );
-    write_types(&mut daemon, r#"{"types":{"due":"date"}}"#);
+    write_types(&mut daemon, r#"{"types":{"due":"tags"}}"#);
     let named: BTreeSet<String> = daemon
         .drain_events()
         .iter()
@@ -621,11 +620,7 @@ fn a_types_change_written_straight_to_disk_is_announced_and_reaches_a_re_ask() {
     let index = TempDir::new_in(scratch()).unwrap();
     std::fs::create_dir_all(vault.path().join("Dates")).unwrap();
     std::fs::create_dir_all(vault.path().join(".obsidian")).unwrap();
-    std::fs::write(
-        vault.path().join("Dates/D.md"),
-        "---\ndue: 2024-01-02\n---\n",
-    )
-    .unwrap();
+    std::fs::write(vault.path().join("Dates/D.md"), "---\ndue: x\n---\n").unwrap();
     std::fs::write(
         vault.path().join("Due.base"),
         "views:\n  - type: table\n    name: T\n    filters: 'file.inFolder(\"Dates\")'\n    order: [due]\n",
@@ -646,7 +641,7 @@ fn a_types_change_written_straight_to_disk_is_announced_and_reaches_a_re_ask() {
 
     std::fs::write(
         vault.path().join(".obsidian/types.json"),
-        r#"{"types":{"due":"date"}}"#,
+        r#"{"types":{"due":"tags"}}"#,
     )
     .unwrap();
     daemon.wait_for_event(|event| {
@@ -665,7 +660,7 @@ fn a_types_change_written_straight_to_disk_is_announced_and_reaches_a_re_ask() {
         .collect();
     assert!(named.contains("Due.base#T"), "named {named:?}");
     let typed = first_cell(&mut daemon, "Due.base");
-    assert!(typed.contains(r#""kind":"date""#), "still {typed}");
+    assert!(typed.contains(r##""value":"#x""##), "still {typed}");
 }
 
 /// H1's control: one unrelated generation later the same request answers
@@ -677,12 +672,12 @@ fn a_new_generation_shows_the_new_type() {
     assert_eq!(first_cell(&mut daemon, "Due.base"), UNTYPED);
     std::fs::write(
         vault.path().join(".obsidian/types.json"),
-        r#"{"types":{"due":"date"}}"#,
+        r#"{"types":{"due":"tags"}}"#,
     )
     .unwrap();
     write_note(&mut daemon, "Other/U.md", "plain\n");
     let typed = first_cell(&mut daemon, "Due.base");
-    assert!(typed.contains(r#""kind":"date""#), "{typed}");
+    assert!(typed.contains(r##""value":"#x""##), "{typed}");
 }
 
 /// M1: a view that reads an attachment through `file()` reads its size and

@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-obj.base",
+  "view": "x_obj",
+  "captured_at_ms": 1791522473116,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_obj\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

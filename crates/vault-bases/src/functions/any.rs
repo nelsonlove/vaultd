@@ -29,11 +29,9 @@ pub(crate) fn call(
             Ok(Value::Boolean(target.type_name() == wanted))
         }
         "toString" => {
+            // Captured: `missing.toString()` is the text `null`.
             arity(name, args, 0, 0)?;
-            if matches!(target, Value::Null) {
-                return Err(EvalError::Uncaptured("tostring:null".into()));
-            }
-            Ok(Value::String(to_display_string(target)?))
+            Ok(Value::String(to_display_string(target, ctx.clock)))
         }
         _ => Err(EvalError::NoSuchMethod {
             target: target.type_name(),

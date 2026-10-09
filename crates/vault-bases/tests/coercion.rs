@@ -59,12 +59,17 @@ fn only_the_javascript_number_grammar_parses() {
 }
 
 #[test]
-fn comparison_of_mixed_types_is_uncaptured_but_sort_order_is_total() {
-    assert!(compare(&Value::Number(1.0), &Value::String("1".into())).is_err());
+fn comparison_of_mixed_types_is_captured_and_sort_order_is_total() {
+    // Captured (Task 13): `1 < "2"` compares as numbers.
+    let clock = vault_bases::Clock::fixed(0, "UTC");
+    assert_eq!(
+        compare(&Value::Number(1.0), &Value::String("2".into()), &clock),
+        Some(Ordering::Less)
+    );
     assert_eq!(
         sort_order(&Value::Number(1.0), &Value::String("1".into())),
         Ordering::Less,
-        "the provisional rank puts numbers before strings"
+        "the total order puts numbers before text"
     );
     assert_eq!(
         sort_order(&Value::Null, &Value::Number(-1e300)),

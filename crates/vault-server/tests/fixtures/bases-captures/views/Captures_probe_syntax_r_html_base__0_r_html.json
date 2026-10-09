@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-r-html.base",
+  "view": "r_html",
+  "captured_at_ms": 1791522385205,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"r_html\": \"<b>x</b>\"\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            "x"
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

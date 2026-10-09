@@ -1,0 +1,13 @@
+{
+  "base": "Captures/probe-groupby.base",
+  "view": "group_nodir",
+  "captured_at_ms": 1791522189371,
+  "exit_code": 0,
+  "stdout": "Error: \"groupBy\" must be a object in view \"group_nodir\"\n",
+  "stderr": "",
+  "rendered": {
+    "error": "Unable to parse your base file:\n\n\"groupBy\" must be a object in view \"group_nodir\"",
+    "groups": [],
+    "summaries": []
+  }
+}

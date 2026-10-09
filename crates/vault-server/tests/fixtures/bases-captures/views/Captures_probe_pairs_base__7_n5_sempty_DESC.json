@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "n5~sempty~DESC",
+  "captured_at_ms": 1791522190768,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/n5~sempty-1.md\",\n    \"mix\": \"5\"\n  },\n  {\n    \"path\": \"Captures/pairs/n5~sempty-2.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

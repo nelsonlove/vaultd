@@ -31,19 +31,30 @@ pub(crate) const FIELDS: &[&str] = &[
     "file",
 ];
 
-fn link_values(facts: Vec<LinkFact>) -> Value {
-    Value::list(
-        facts
-            .into_iter()
-            .map(|fact| {
-                Value::Link(LinkValue {
-                    target: fact.raw_target,
-                    display: fact.display.map(|display| Box::new(Value::String(display))),
-                    resolved: fact.resolved,
-                })
+/// Links as `file.links` and `file.embeds` give them: each shows its
+/// written display, else its target as written (captured:
+/// `[[Other|Other]], [[Folder/image.png|Folder/image.png]]`).
+///
+/// A link or embed of a URL is not one of them (seen in a corpus view: a
+/// note whose first embed is a web image is not found by `file.embeds[0]`).
+fn link_values(facts: Vec<LinkFact>) -> Vec<Value> {
+    facts
+        .into_iter()
+        .filter(|fact| {
+            let target = fact.raw_target.as_str();
+            !(super::link::is_url(target)
+                || target.starts_with("data:")
+                || target.starts_with("mailto:"))
+        })
+        .map(|fact| {
+            let display = fact.display.unwrap_or_else(|| fact.raw_target.clone());
+            Value::Link(LinkValue {
+                target: fact.raw_target,
+                display: Some(Box::new(Value::String(display))),
+                resolved: fact.resolved,
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 /// Whether `tag` is `wanted` or a nested tag under it, ignoring case — tags
@@ -78,14 +89,19 @@ pub(crate) fn field(
     Ok(match name {
         "file" => Value::File(path.clone()),
         "path" => Value::String(path.as_str().to_string()),
-        "name" => Value::String(path.name().to_string()),
+        // Captured: a note's name drops `.md` (`a.md` is `a`), any other
+        // file keeps its extension (`image.png`).
+        "name" => Value::String(match extension(path) {
+            "md" => basename(path).to_string(),
+            _ => path.name().to_string(),
+        }),
         "basename" => Value::String(basename(path).to_string()),
         "ext" => Value::String(extension(path).to_string()),
-        // Whether a root file's folder is `""` or `"/"` is not published.
-        "folder" => match path.as_str().rsplit_once('/') {
-            Some((folder, _)) => Value::String(folder.to_string()),
-            None => return Err(EvalError::Uncaptured("folder:root".into())),
-        },
+        // Captured: a file at the root is in the folder `/`.
+        "folder" => Value::String(match path.as_str().rsplit_once('/') {
+            Some((folder, _)) => folder.to_string(),
+            None => "/".to_string(),
+        }),
         "size" => Value::Number(facts()?.size as f64),
         // The row source decides what a creation time is (on Linux, with no
         // birth time, it is the modification time); this only reads it.
@@ -104,23 +120,40 @@ pub(crate) fn field(
                 .map(|(key, value)| (key.clone(), typed_property(ctx, Some(path), key, value)))
                 .collect(),
         ),
-        // Whether the items carry their `#` is not published; an empty list
-        // is the same either way.
-        "tags" => {
-            if !ctx.source.tags(path)?.is_empty() {
-                return Err(EvalError::Uncaptured("tags:spelling".into()));
-            }
-            Value::list(Vec::new())
+        // Captured: each tag with its `#`, the body's tags first and then
+        // the frontmatter's, each spelling once (`#alpha, #ALPHA, #delta,
+        // #Beta/gamma` for a note whose frontmatter holds `alpha` and
+        // `Beta/gamma` and whose body holds `#alpha #ALPHA #delta`).
+        "tags" => Value::list(ordered_tags(ctx, path)?),
+        // Captured: `file.links` holds the embeds too (three for a note with
+        // two links and one embed).
+        "links" => {
+            let mut links = link_values(ctx.source.links(path)?);
+            links.extend(link_values(ctx.source.embeds(path)?));
+            Value::list(links)
         }
-        "links" => link_values(ctx.source.links(path)?),
-        "embeds" => link_values(ctx.source.embeds(path)?),
+        "embeds" => Value::list(link_values(ctx.source.embeds(path)?)),
+        // Captured: each backlink is a link to the linking file, shown by
+        // its name (`[[Other.md|Other]]`), not a file.
         "backlinks" => Value::list(
             ctx.source
                 .backlinks(path)?
                 .into_iter()
-                .map(Value::File)
+                .map(|from| {
+                    let shown = match extension(&from) {
+                        "md" => basename(&from).to_string(),
+                        _ => from.name().to_string(),
+                    };
+                    Value::Link(LinkValue {
+                        target: from.as_str().to_string(),
+                        display: Some(Box::new(Value::String(shown))),
+                        resolved: Some(from),
+                    })
+                })
                 .collect(),
         ),
+        // Captured: `file.tasks` in a formula is an error ("Cannot find
+        // \"tasks\" on type File"); as a column it is empty (`view::read`).
         _ => {
             return Err(EvalError::NoSuchField {
                 target: "file",
@@ -128,6 +161,57 @@ pub(crate) fn field(
             });
         }
     })
+}
+
+/// The frontmatter's tags of `path`: the items of its `tags` or `tag`
+/// property, without a leading `#`.
+fn frontmatter_tags(ctx: &EvalContext<'_>, path: &VaultPath) -> Result<Vec<String>, EvalError> {
+    let mut tags = Vec::new();
+    for (key, value) in ctx.source.properties(path)? {
+        if !key.eq_ignore_ascii_case("tags") && !key.eq_ignore_ascii_case("tag") {
+            continue;
+        }
+        let items = match &value {
+            vault_core::PropertyValue::Sequence(items) => {
+                items.iter().map(|item| item.value.clone()).collect()
+            }
+            other => vec![other.clone()],
+        };
+        for item in items {
+            if let vault_core::PropertyValue::String(text) = item {
+                for tag in text.split([',', ' ']).filter(|tag| !tag.is_empty()) {
+                    tags.push(tag.trim_start_matches('#').to_string());
+                }
+            }
+        }
+    }
+    Ok(tags)
+}
+
+/// `file.tags`: the body's tags in order, then the frontmatter's, each
+/// exact spelling once, each with its `#`.
+fn ordered_tags(ctx: &EvalContext<'_>, path: &VaultPath) -> Result<Vec<Value>, EvalError> {
+    let frontmatter = frontmatter_tags(ctx, path)?;
+    // The row source lists every tag; each frontmatter tag accounts for one
+    // of them, and the rest were written in the body.
+    let mut unclaimed = frontmatter.clone();
+    let mut body = Vec::new();
+    for tag in ctx.source.tags(path)? {
+        let tag = tag.trim_start_matches('#').to_string();
+        match unclaimed.iter().position(|front| *front == tag) {
+            Some(at) => {
+                unclaimed.remove(at);
+            }
+            None => body.push(tag),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(body
+        .into_iter()
+        .chain(frontmatter)
+        .filter(|tag| seen.insert(tag.clone()))
+        .map(|tag| Value::String(format!("#{tag}")))
+        .collect())
 }
 
 /// The file a `hasLink` argument names: a file, a link's resolution, or a
@@ -159,19 +243,17 @@ pub(crate) fn call(
 ) -> Result<Value, EvalError> {
     let values = eager(args, ctx, scope)?;
     Ok(match name {
-        // **Provisional** (`asLink`, settled by Task 13's capture): with no
-        // display given, the link shows what Obsidian shows for a link to a
-        // file, its basename.
+        // Captured: a link to the file's path, with the display given or
+        // none (`[[Captures/file/r17.md]]`).
         "asLink" => {
             arity(name, args, 0, 1)?;
-            let display = values
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| Value::String(basename(path).to_string()));
-            crate::eval::ensure_room(&display)?;
+            let display = values.into_iter().next();
+            if let Some(display) = &display {
+                crate::eval::ensure_room(display)?;
+            }
             Value::Link(LinkValue {
                 target: path.as_str().to_string(),
-                display: Some(Box::new(display)),
+                display: display.map(Box::new),
                 resolved: Some(path.clone()),
             })
         }
@@ -179,7 +261,7 @@ pub(crate) fn call(
             arity(name, args, 1, 1)?;
             let argument = values.into_iter().next().expect("one argument");
             match target_path(ctx, path, argument)? {
-                Some(wanted) => Value::Boolean(super::link::reaches(ctx, path, &wanted)?),
+                Some(wanted) => Value::Boolean(super::link::reaches(ctx, path, &wanted, true)?),
                 None => Value::Boolean(false),
             }
         }

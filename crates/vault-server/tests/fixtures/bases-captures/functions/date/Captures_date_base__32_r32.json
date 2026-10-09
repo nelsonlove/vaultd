@@ -1,0 +1,8 @@
+{
+  "base": "Captures/date.base",
+  "view": "r32",
+  "captured_at_ms": 1791522183315,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/date/r32.md\",\n    \"f32\": \"Tuesday, May 27th 2025, 2:05:09 pm\",\n    \"t13_now\": \"1791522183323\"\n  }\n]\n",
+  "stderr": ""
+}

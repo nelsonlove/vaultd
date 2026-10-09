@@ -1,0 +1,22 @@
+{
+  "base": "Captures/probe-syntax-x-num-dot-method.base",
+  "view": "x_num_dot_method",
+  "captured_at_ms": 1791522468237,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/probes/syntax-x.md\",\n    \"x_num_dot_method\": null\n  }\n]\n",
+  "stderr": "",
+  "rendered": {
+    "error": "",
+    "groups": [
+      {
+        "value": null,
+        "rows": [
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "summaries": []
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "base": "Captures/probe-pairs.base",
+  "view": "l2~missing~ASC",
+  "captured_at_ms": 1791522315902,
+  "exit_code": 0,
+  "stdout": "[\n  {\n    \"path\": \"Captures/pairs/l2~missing-1.md\",\n    \"mix\": \"2\"\n  },\n  {\n    \"path\": \"Captures/pairs/l2~missing-2.md\",\n    \"mix\": null\n  }\n]\n",
+  "stderr": ""
+}

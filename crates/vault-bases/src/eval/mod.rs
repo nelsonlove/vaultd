@@ -31,6 +31,10 @@ pub enum EvalError {
     NoSuchField { target: &'static str, name: String },
     #[error("no formula named {0}")]
     UnknownFormula(String),
+    /// A formula that does not parse: every cell that reads it shows this
+    /// (ruling R1; Obsidian shows such a cell empty).
+    #[error("formula {name} does not parse: {message}")]
+    FormulaInvalid { name: String, message: String },
     #[error("formula cycle through {0}")]
     FormulaCycle(String),
     /// Formulas that read formulas nest past the evaluator's depth budget
@@ -267,51 +271,59 @@ fn arithmetic(
     if let Some(value) = functions::date_arithmetic(op, &left, &right, ctx)? {
         return Ok(value);
     }
-    // Whether arithmetic that leaves the finite numbers gives JavaScript's
-    // `Infinity`/`NaN` or an error is not published (`arith:nonfinite`).
-    let finite = |number: f64| {
-        if number.is_finite() {
-            Ok(Value::Number(number))
-        } else {
-            Err(EvalError::Uncaptured("arith:nonfinite".into()))
-        }
+    // As captured (Task 13): numbers follow JavaScript, `Infinity` and `NaN`
+    // included (`1 / 0`, `1 % 0`); `+` with text on either side joins texts
+    // (`1 + "a"` is `1a`), and an empty side adds nothing (`"a" + missing`
+    // is `a`); any other arithmetic with an empty side is empty (`1 +
+    // missing`); two lists join (`[1] + [2]`); a boolean or text in any
+    // other arithmetic is an error ("Invalid operator between Number and
+    // Boolean").
+    let invalid = || {
+        EvalError::Type(format!(
+            "Invalid operator between {} and {}",
+            kind_title(&left),
+            kind_title(&right)
+        ))
     };
     match (op, &left, &right) {
-        (BinaryOp::Add, Value::Number(a), Value::Number(b)) => finite(a + b),
-        (BinaryOp::Sub, Value::Number(a), Value::Number(b)) => finite(a - b),
-        (BinaryOp::Mul, Value::Number(a), Value::Number(b)) => finite(a * b),
-        (BinaryOp::Div, Value::Number(_), Value::Number(b)) if *b == 0.0 => {
-            Err(EvalError::DivisionByZero)
+        (BinaryOp::Add, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
+        (BinaryOp::Sub, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
+        (BinaryOp::Mul, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
+        (BinaryOp::Div, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a / b)),
+        (BinaryOp::Rem, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a % b)),
+        (BinaryOp::Add, Value::String(text), Value::Null)
+        | (BinaryOp::Add, Value::Null, Value::String(text)) => Ok(Value::String(text.clone())),
+        (BinaryOp::Add, Value::String(_), _) | (BinaryOp::Add, _, Value::String(_)) => {
+            Ok(Value::String(
+                coerce::to_display_string(&left, ctx.clock)
+                    + &coerce::to_display_string(&right, ctx.clock),
+            ))
         }
-        (BinaryOp::Rem, Value::Number(_), Value::Number(b)) if *b == 0.0 => {
-            Err(EvalError::DivisionByZero)
+        (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+        (BinaryOp::Add, Value::List(a), Value::List(b)) => {
+            built_list(a.iter().chain(b.iter()).cloned().collect())
         }
-        (BinaryOp::Div, Value::Number(a), Value::Number(b)) => finite(a / b),
-        (BinaryOp::Rem, Value::Number(a), Value::Number(b)) => finite(a % b),
-        (BinaryOp::Add, Value::String(_), Value::Null)
-        | (BinaryOp::Add, Value::Null, Value::String(_)) => {
-            Err(EvalError::Uncaptured("add:string:null".into()))
-        }
-        (BinaryOp::Add, Value::String(_), _) | (BinaryOp::Add, _, Value::String(_)) => Ok(
-            Value::String(coerce::to_display_string(&left)? + &coerce::to_display_string(&right)?),
-        ),
-        (_, Value::Null, _) | (_, _, Value::Null) => {
-            Err(EvalError::Uncaptured("arith:null".into()))
-        }
-        // JavaScript would convert a boolean to 0 or 1 and concatenate two
-        // lists as text; whether Bases does either is not published.
-        (_, Value::Boolean(_), Value::Number(_) | Value::Boolean(_))
-        | (_, Value::Number(_), Value::Boolean(_)) => {
-            Err(EvalError::Uncaptured("arith:mixed_bool".into()))
-        }
-        (BinaryOp::Add, Value::List(_), Value::List(_)) => {
-            Err(EvalError::Uncaptured("arith:list_plus_list".into()))
-        }
-        _ => Err(EvalError::Type(format!(
-            "cannot apply {op:?} to {} and {}",
-            left.type_name(),
-            right.type_name()
-        ))),
+        _ => Err(invalid()),
+    }
+}
+
+/// A value kind as Obsidian's messages name it (`Number`, `String`, …).
+fn kind_title(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "Null",
+        Value::String(_) => "String",
+        Value::Number(_) => "Number",
+        Value::Boolean(_) => "Boolean",
+        Value::Date(_) => "Date",
+        Value::Duration(_) => "Duration",
+        Value::List(_) => "List",
+        Value::Object(_) => "Object",
+        Value::Link(_) => "Link",
+        Value::File(_) => "File",
+        Value::Regexp(_) => "RegExp",
+        Value::Image(_) => "Image",
+        Value::Icon(_) => "Icon",
+        Value::Html(_) => "HTML",
     }
 }
 
@@ -378,12 +390,18 @@ fn javascript_classes(source: &str) -> String {
 ///
 /// Flags: `i`, `m`, `s` map onto the builder; `g` is read by `replace`; `u`
 /// and `d` change nothing the evaluator exposes (`d` adds match indices no
-/// function returns). `y` (sticky) is refused: it anchors each match at the
-/// expression's `lastIndex`, state a Bases value does not carry, so no
-/// function could honour it. A repeated flag is refused, as JavaScript
-/// refuses it.
+/// function returns). `y` (sticky) anchors the match at the start, where a
+/// fresh expression's `lastIndex` is (captured, Task 13:
+/// `/b/y.matches("abc")` is false). A repeated flag is refused, as
+/// JavaScript refuses it.
 pub(crate) fn compile_regexp(source: &str, flags: &str) -> Result<RegexpValue, EvalError> {
-    let mut builder = regex::RegexBuilder::new(&javascript_classes(source));
+    let pattern = javascript_classes(source);
+    let pattern = if flags.contains('y') {
+        format!(r"\A(?:{pattern})")
+    } else {
+        pattern
+    };
+    let mut builder = regex::RegexBuilder::new(&pattern);
     for (at, flag) in flags.char_indices() {
         if flags[..at].contains(flag) {
             return Err(EvalError::Argument(format!(
@@ -400,12 +418,7 @@ pub(crate) fn compile_regexp(source: &str, flags: &str) -> Result<RegexpValue, E
             's' => {
                 builder.dot_matches_new_line(true);
             }
-            'g' | 'u' | 'd' => {}
-            'y' => {
-                return Err(EvalError::Argument(
-                    "the sticky regular expression flag 'y' is not supported".into(),
-                ));
-            }
+            'g' | 'u' | 'd' | 'y' => {}
             other => {
                 return Err(EvalError::Argument(format!(
                     "unknown regular expression flag {other:?}"
@@ -564,7 +577,16 @@ fn index_of(
             .map(|(_, value)| value.clone())
             .unwrap_or(Value::Null)),
         (Value::Null, _) => Ok(Value::Null),
-        (Value::String(_), _) => Err(EvalError::Uncaptured("index:string".into())),
+        // A character of text, by UTF-16 unit as JavaScript indexes it;
+        // past the end it is empty (captured: `"abc"[0]`, `"abc"[5]`).
+        (Value::String(text), Value::Number(at)) => Ok(if at >= 0.0 && at.fract() == 0.0 {
+            text.encode_utf16()
+                .nth(at as usize)
+                .map(|unit| Value::String(String::from_utf16_lossy(&[unit])))
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        }),
         (target, index) => Err(EvalError::Type(format!(
             "cannot index {} with {}",
             target.type_name(),
@@ -593,6 +615,11 @@ fn unary(
     scope: &Scope,
 ) -> Result<Value, EvalError> {
     let value = evaluate(operand, ctx, scope)?;
+    // Either operator on an empty value is empty (captured, Task 13:
+    // `!missing`, `-missing`).
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
     match op {
         UnaryOp::Not => Ok(Value::Boolean(!coerce::truthy(&value))),
         UnaryOp::Negate => match value {
@@ -635,7 +662,7 @@ fn binary(
         }
         BinaryOp::Eq | BinaryOp::Ne => {
             let left = evaluate(left, ctx, scope)?;
-            let equal = coerce::loose_equals(&left, &evaluate(right, ctx, scope)?)?;
+            let equal = coerce::loose_equals(&left, &evaluate(right, ctx, scope)?, ctx.clock);
             Ok(Value::Boolean(if op == BinaryOp::Eq {
                 equal
             } else {
@@ -644,13 +671,19 @@ fn binary(
         }
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
             let left = evaluate(left, ctx, scope)?;
-            let ordering = coerce::compare(&left, &evaluate(right, ctx, scope)?)?;
-            Ok(Value::Boolean(match op {
+            let right = evaluate(right, ctx, scope)?;
+            // A comparison with an empty side is empty (captured: `missing <
+            // 1`); one with no order between its sides is false.
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let ordering = coerce::compare(&left, &right, ctx.clock);
+            Ok(Value::Boolean(ordering.is_some_and(|ordering| match op {
                 BinaryOp::Lt => ordering.is_lt(),
                 BinaryOp::Le => ordering.is_le(),
                 BinaryOp::Gt => ordering.is_gt(),
                 _ => ordering.is_ge(),
-            }))
+            })))
         }
         _ => {
             let left = evaluate(left, ctx, scope)?;
