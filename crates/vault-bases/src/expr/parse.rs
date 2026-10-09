@@ -177,7 +177,13 @@ impl Parser {
             Token::Ident(name) => return self.name(name, spanned.start),
             Token::Punct("(") => return self.parenthesized(),
             Token::Punct("[") => return self.list(),
-            Token::Punct("{") => return self.object(),
+            // Obsidian 1.13.7 cannot parse an object literal (captured,
+            // `x_obj`, `x_obj_empty`, `x_obj_keys`; ruling R1, spec ruling
+            // 7). An object reaches an expression only as a property value.
+            Token::Punct("{") => {
+                self.at -= 1;
+                return Err(self.error("object literals are not supported"));
+            }
             Token::Punct("!") => return self.unary(UnaryOp::Not),
             Token::Punct("-") => return self.unary(UnaryOp::Negate),
             Token::Punct(_) => {
@@ -216,37 +222,6 @@ impl Parser {
     fn list(&mut self) -> Result<Node, ExpressionError> {
         let (items, height) = self.arguments("]", false)?;
         Ok((Expr::List(items), self.wrap(height)?))
-    }
-
-    fn object(&mut self) -> Result<Node, ExpressionError> {
-        let mut entries = Vec::new();
-        let mut height = 0;
-        if !self.eat("}") {
-            loop {
-                let key = self.object_key()?;
-                self.expect(":")?;
-                let (value, value_height) = self.expression(1)?;
-                entries.push((key, value));
-                height = height.max(value_height);
-                if self.eat("}") {
-                    break;
-                }
-                self.expect(",")?;
-            }
-        }
-        Ok((Expr::Object(entries), self.wrap(height)?))
-    }
-
-    fn object_key(&mut self) -> Result<String, ExpressionError> {
-        let key = match self.peek() {
-            Some(Spanned {
-                token: Token::String(key) | Token::Ident(key),
-                ..
-            }) => key.clone(),
-            _ => return Err(self.error("expected an object key")),
-        };
-        self.at += 1;
-        Ok(key)
     }
 
     fn unary(&mut self, op: UnaryOp) -> Result<Node, ExpressionError> {

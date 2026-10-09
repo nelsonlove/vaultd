@@ -1,6 +1,6 @@
 {"family": "coercion", "case": "truthy:empty_string", "expr": "\"\".isTruthy()", "kind": "boolean", "text": "false", "source": "captured"}
 {"family": "coercion", "case": "truthy:string", "expr": "\"a\".isTruthy()", "kind": "boolean", "text": "true", "source": "captured"}
-{"family": "coercion", "case": "truthy:zero", "expr": "0.isTruthy()", "kind": "boolean", "text": "false", "source": "provisional"}
+{"family": "coercion", "case": "truthy:zero", "expr": "0.isTruthy()", "kind": "invalid", "source": "captured"}
 {"family": "coercion", "case": "truthy:null", "expr": "missing.isTruthy()", "kind": "boolean", "text": "false", "source": "captured"}
 {"family": "coercion", "case": "truthy:empty_list", "expr": "[].isTruthy()", "kind": "boolean", "text": "false", "source": "captured"}
 {"family": "coercion", "case": "not:empty_string", "expr": "!\"\"", "kind": "boolean", "text": "true", "source": "captured"}
@@ -14,7 +14,7 @@
 {"family": "coercion", "case": "eq:number:string", "expr": "5 == \"5\"", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "coercion", "case": "eq:boolean:number", "expr": "true == 1", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "coercion", "case": "eq:list:list", "expr": "[1] == [1]", "kind": "boolean", "text": "true", "source": "captured"}
-{"family": "coercion", "case": "eq:object:object", "expr": "{} == {}", "kind": "boolean", "text": "true", "source": "provisional"}
+{"family": "coercion", "case": "eq:object:object", "expr": "{} == {}", "kind": "invalid", "source": "captured"}
 {"family": "coercion", "case": "cmp:number", "expr": "1 < 2", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "coercion", "case": "cmp:string", "expr": "\"apple\" < \"banana\"", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "coercion", "case": "cmp:string_utf16", "expr": "\"Z\" < \"a\"", "kind": "boolean", "text": "true", "source": "captured"}
@@ -33,7 +33,7 @@
 {"family": "coercion", "case": "div:zero", "expr": "1 / 0", "kind": "number", "text": "Infinity", "source": "captured"}
 {"family": "coercion", "case": "rem:zero", "expr": "1 % 0", "kind": "number", "text": "NaN", "source": "captured"}
 {"family": "coercion", "case": "negate:number", "expr": "-(2.5)", "kind": "number", "text": "-2.5", "source": "captured"}
-{"family": "coercion", "case": "number_text:exponent", "expr": "(1e21).toString()", "kind": "string", "text": "1e+21", "source": "provisional"}
+{"family": "coercion", "case": "number_text:exponent", "expr": "(1e21).toString()", "kind": "invalid", "source": "captured"}
 {"family": "coercion", "case": "number_text:small", "expr": "(0.00000015).toString()", "kind": "string", "text": "1.5e-7", "source": "captured"}
 {"family": "coercion", "case": "property:bare", "expr": "price", "props": {"price": 2.5}, "kind": "number", "text": "2.5", "source": "captured"}
 {"family": "coercion", "case": "property:note_prefix", "expr": "note.price", "props": {"price": 2.5}, "kind": "number", "text": "2.5", "source": "captured"}
@@ -46,9 +46,9 @@
 {"family": "coercion", "case": "index:string", "expr": "\"abc\"[0]", "kind": "string", "text": "a", "source": "captured"}
 {"family": "coercion", "case": "cmp:boolean", "expr": "false < true", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "coercion", "case": "cmp:boolean_reversed", "expr": "true < false", "kind": "boolean", "text": "false", "source": "captured"}
-{"family": "coercion", "case": "number_text:infinity", "expr": "(1e400).toString()", "kind": "string", "text": "Infinity", "source": "provisional"}
-{"family": "coercion", "case": "number_text:negative_infinity", "expr": "(-1e400).toString()", "kind": "string", "text": "-Infinity", "source": "provisional"}
-{"family": "coercion", "case": "number_cell:infinity", "expr": "1e400", "kind": "number", "text": "Infinity", "source": "provisional"}
+{"family": "coercion", "case": "number_text:infinity", "expr": "(1e400).toString()", "kind": "invalid", "source": "captured"}
+{"family": "coercion", "case": "number_text:negative_infinity", "expr": "(-1e400).toString()", "kind": "invalid", "source": "captured"}
+{"family": "coercion", "case": "number_cell:infinity", "expr": "1e400", "kind": "invalid", "source": "captured"}
 {"family": "coercion", "case": "arith:mixed_bool", "expr": "1 + true", "kind": "error", "source": "captured"}
 {"family": "coercion", "case": "arith:list_plus_list", "expr": "[1] + [2]", "kind": "list", "text": "1, 2", "source": "captured"}
-{"family": "coercion", "case": "arith:nonfinite", "expr": "1e308 * 10", "kind": "number", "text": "Infinity", "source": "provisional"}
+{"family": "coercion", "case": "arith:nonfinite", "expr": "1e308 * 10", "kind": "invalid", "source": "captured"}

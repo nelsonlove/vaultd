@@ -714,10 +714,23 @@ fn a_mixed_type_sort_is_the_total_order_of_ruling_r2() {
         paths(&result),
         vec!["string.md", "date.md", "number.md", "bool.md", "missing.md"]
     );
-    // An error cell sorts with the missing values, last.
-    let yaml = "formulas:\n  k: 'if(x.isType(\"number\"), x, 1 + true)'\nviews:\n  - type: table\n    name: T\n    order: [formula.k]\n    sort:\n      - property: formula.k\n";
-    let result = run(&source, yaml, None);
-    assert_eq!(paths(&result)[0], "number.md");
+    // An error cell sorts with the missing values, last in either direction,
+    // and the error rows keep name order among themselves.
+    for direction in ["ASC", "DESC"] {
+        let yaml = format!(
+            "formulas:\n  k: 'if(x.isType(\"number\"), x, 1 + true)'\nviews:\n  - type: table\n    name: T\n    order: [formula.k]\n    sort:\n      - property: formula.k\n        direction: {direction}\n"
+        );
+        let result = run(&source, &yaml, None);
+        assert_eq!(
+            paths(&result),
+            vec!["number.md", "bool.md", "date.md", "missing.md", "string.md"],
+            "{direction}"
+        );
+        assert!(
+            result.rows[1..].iter().all(|row| row.cells[0].is_err()),
+            "{direction}"
+        );
+    }
 }
 
 /// `summary:stddev` (captured, Task 13: 2, 4, 4, 4, 5, 5, 7, 9 give 2): the population standard deviation

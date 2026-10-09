@@ -2,13 +2,13 @@
 {"family": "regexp", "case": "matches:false", "expr": "/^x/.matches(\"abc\")", "kind": "boolean", "text": "false", "source": "captured"}
 {"family": "regexp", "case": "matches:case_flag", "expr": "/ABC/i.matches(\"abc\")", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "regexp", "case": "lookbehind_unsupported", "expr": "/(?<=a)b/.matches(\"ab\")", "kind": "error", "source": "provisional"}
-{"family": "regexp", "case": "invalid_flag", "expr": "/a/q.matches(\"a\")", "kind": "error", "source": "provisional"}
-{"family": "regexp", "case": "invalid_pattern", "expr": "/a(/.matches(\"a\")", "kind": "error", "source": "provisional"}
+{"family": "regexp", "case": "invalid_flag", "expr": "/a/q.matches(\"a\")", "kind": "invalid", "source": "captured"}
+{"family": "regexp", "case": "invalid_pattern", "expr": "/a(/.matches(\"a\")", "kind": "invalid", "source": "captured"}
 {"family": "regexp", "case": "matches:wrong_arity", "expr": "/a/.matches()", "kind": "error", "source": "captured"}
 {"family": "regexp", "case": "matches:wrong_argument_type", "expr": "/a/.matches(1)", "kind": "error", "source": "captured"}
 {"family": "regexp", "case": "matches:wrong_receiver", "expr": "\"a\".matches(\"a\")", "kind": "error", "source": "captured"}
 {"family": "regexp", "case": "matches:global_flag", "expr": "/b/g.matches(\"abc\")", "kind": "boolean", "text": "true", "source": "captured"}
-{"family": "regexp", "case": "flag:repeated", "expr": "/a/gg.matches(\"a\")", "kind": "error", "source": "provisional"}
+{"family": "regexp", "case": "flag:repeated", "expr": "/a/gg.matches(\"a\")", "kind": "invalid", "source": "captured"}
 {"family": "regexp", "case": "flag:sticky_refused", "expr": "/b/y.matches(\"abc\")", "kind": "boolean", "text": "false", "source": "captured"}
 {"family": "regexp", "case": "digit:ascii_only", "expr": "/\\d/.matches(\"٣\")", "kind": "boolean", "text": "false", "source": "captured"}
 {"family": "regexp", "case": "digit:in_class", "expr": "/[\\d]/.matches(\"٣\")", "kind": "boolean", "text": "false", "source": "captured"}

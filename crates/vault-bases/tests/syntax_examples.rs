@@ -1,8 +1,8 @@
 use vault_bases::expr::{BinaryOp, Expr, UnaryOp, parse_expression};
 
 /// Every expression on the published syntax, functions and views pages,
-/// transcribed 2026-10-02. Each one must parse; what it evaluates to is
-/// pinned per family in Tasks 3 to 7.
+/// transcribed 2026-10-02, but those in [`PUBLISHED_BUT_REFUSED`]. Each one
+/// must parse; what it evaluates to is pinned per family in Tasks 3 to 7.
 const PUBLISHED: &[&str] = &[
     r#"file.hasTag("tag")"#,
     r#"file.hasTag("book")"#,
@@ -69,10 +69,8 @@ const PUBLISHED: &[&str] = &[
     r#"icon("arrow-right")"#,
     r#"list("value")"#,
     r#"number("3.4")"#,
-    "1.isTruthy()",
     r#""example".isType("string")"#,
     r#"true.isType("boolean")"#,
-    "123.toString()",
     r#"now().date().format("YYYY-MM-DD HH:mm:ss")"#,
     r#"date.format("YYYY-MM-DD")"#,
     "now().time()",
@@ -97,7 +95,6 @@ const PUBLISHED: &[&str] = &[
     "(-5).abs()",
     "(2.1).ceil()",
     "(2.9).floor()",
-    "5.isEmpty()",
     "(2.5).round()",
     "(2.3333).round(2)",
     "(3.14159).toFixed(2)",
@@ -120,9 +117,25 @@ const PUBLISHED: &[&str] = &[
     "file.hasLink(otherFile)",
     r#"file.hasTag("tag1", "tag2")"#,
     r#"file.inFolder("notes")"#,
-    "{}.isEmpty()",
     r#"/abc/.matches("abcde")"#,
 ];
+
+/// Published examples Obsidian 1.13.7 itself cannot parse (captured: it
+/// shows such a cell empty): a method on a bare number literal and an object
+/// literal. vaultd refuses them too (ruling R1, spec ruling 7).
+const PUBLISHED_BUT_REFUSED: &[&str] = &[
+    "1.isTruthy()",
+    "123.toString()",
+    "5.isEmpty()",
+    "{}.isEmpty()",
+];
+
+#[test]
+fn published_examples_obsidian_cannot_parse_are_refused() {
+    for text in PUBLISHED_BUT_REFUSED {
+        assert!(parse_expression(text).is_err(), "{text:?}");
+    }
+}
 
 #[test]
 fn every_published_expression_parses() {
@@ -202,19 +215,52 @@ fn subtraction_and_division_associate_to_the_left() {
     );
 }
 
+/// Ruling R1 (spec ruling 7): what Obsidian 1.13.7 cannot parse, vaultd
+/// refuses too (captured, the `x_*` syntax probes and the family rows of
+/// kind `invalid`): exponent literals, a method on a bare number literal,
+/// object literals, a regular expression literal JavaScript refuses, and a
+/// raw line or paragraph separator inside a string.
 #[test]
-fn a_method_on_a_number_literal_is_a_method_not_a_decimal() {
+fn what_obsidian_cannot_parse_is_refused() {
+    for text in [
+        "1e3",
+        "1.5e3",
+        "1E-7",
+        "(1e21).toString()",
+        "5.isEmpty()",
+        "0.isTruthy()",
+        "{}",
+        r#"{"a": 1, b: 2}"#,
+        "{}.isEmpty()",
+        "/a/q",
+        "/a/gg",
+        "/a(/",
+        "\"a\u{2028}\"",
+        "'a\u{2029}'",
+    ] {
+        assert!(parse_expression(text).is_err(), "{text:?}");
+    }
+    // The forms next to them still parse.
     assert_eq!(
-        parse_expression("5.isEmpty()").unwrap(),
+        parse_expression("(5).isEmpty()").unwrap(),
         Expr::Method {
             target: Box::new(Expr::Number(5.0)),
             name: "isEmpty".into(),
             args: vec![],
-            position: 2,
+            position: 4,
         }
     );
     assert_eq!(parse_expression("2.5").unwrap(), Expr::Number(2.5));
-    assert_eq!(parse_expression("1e3").unwrap(), Expr::Number(1000.0));
+    assert!(parse_expression("e3").is_ok(), "a name, not a number");
+    assert!(
+        parse_expression(r#""a\u2028""#).is_ok(),
+        "the escape is fine"
+    );
+    assert!(
+        parse_expression("/(?<=a)b/").is_ok(),
+        "JavaScript reads a look-behind"
+    );
+    assert!(parse_expression("/a/gimsuy").is_ok());
 }
 
 #[test]
@@ -276,7 +322,7 @@ fn indexing_member_access_and_calls_chain_left_to_right() {
 }
 
 #[test]
-fn literals_cover_strings_with_escapes_lists_objects_and_null() {
+fn literals_cover_strings_with_escapes_lists_and_null() {
     assert_eq!(
         parse_expression(r#"'it\'s' + "a\"b\né""#).unwrap(),
         Expr::Binary {
@@ -292,13 +338,6 @@ fn literals_cover_strings_with_escapes_lists_objects_and_null() {
             Expr::String("a".into()),
             Expr::Null,
             Expr::List(vec![Expr::Boolean(true)]),
-        ])
-    );
-    assert_eq!(
-        parse_expression(r#"{"a": 1, b: 2}"#).unwrap(),
-        Expr::Object(vec![
-            ("a".into(), Expr::Number(1.0)),
-            ("b".into(), Expr::Number(2.0)),
         ])
     );
     assert_eq!(

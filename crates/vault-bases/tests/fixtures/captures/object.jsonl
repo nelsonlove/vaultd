@@ -1,11 +1,11 @@
-{"family": "object", "case": "isEmpty:true", "expr": "{}.isEmpty()", "kind": "boolean", "text": "true", "source": "provisional"}
-{"family": "object", "case": "isEmpty:false", "expr": "{\"a\": 1}.isEmpty()", "kind": "boolean", "text": "false", "source": "provisional"}
-{"family": "object", "case": "keys", "expr": "{\"a\": 1, \"b\": 2}.keys()", "kind": "list", "text": "a, b", "source": "provisional"}
-{"family": "object", "case": "values", "expr": "{\"a\": 1, \"b\": 2}.values()", "kind": "list", "text": "1, 2", "source": "provisional"}
+{"family": "object", "case": "isEmpty:true", "expr": "{}.isEmpty()", "kind": "invalid", "source": "captured"}
+{"family": "object", "case": "isEmpty:false", "expr": "{\"a\": 1}.isEmpty()", "kind": "invalid", "source": "captured"}
+{"family": "object", "case": "keys", "expr": "{\"a\": 1, \"b\": 2}.keys()", "kind": "invalid", "source": "captured"}
+{"family": "object", "case": "values", "expr": "{\"a\": 1, \"b\": 2}.values()", "kind": "invalid", "source": "captured"}
 {"family": "object", "case": "property_object", "expr": "meta.keys()", "props": {"meta": {"x": 1, "y": 2}}, "kind": "list", "text": "x, y", "source": "captured"}
-{"family": "object", "case": "keys:wrong_arity", "expr": "{\"a\": 1}.keys(1)", "kind": "error", "source": "provisional"}
+{"family": "object", "case": "keys:wrong_arity", "expr": "{\"a\": 1}.keys(1)", "kind": "invalid", "source": "captured"}
 {"family": "object", "case": "keys:wrong_receiver", "expr": "[1].keys()", "kind": "error", "source": "captured"}
-{"family": "object", "case": "keys:integer_order", "expr": "{\"b\": 1, \"1\": 2}.keys()", "kind": "error", "source": "provisional"}
-{"family": "object", "case": "values:integer_order", "expr": "{\"b\": 1, \"1\": 2}.values()", "kind": "error", "source": "provisional"}
-{"family": "object", "case": "keys:one_integer_key", "expr": "{\"1\": 2}.keys()", "kind": "list", "text": "1", "source": "provisional"}
+{"family": "object", "case": "keys:integer_order", "expr": "{\"b\": 1, \"1\": 2}.keys()", "kind": "invalid", "source": "captured"}
+{"family": "object", "case": "values:integer_order", "expr": "{\"b\": 1, \"1\": 2}.values()", "kind": "invalid", "source": "captured"}
+{"family": "object", "case": "keys:one_integer_key", "expr": "{\"1\": 2}.keys()", "kind": "invalid", "source": "captured"}
 {"family": "object", "case": "eq:mappings", "expr": "o == p", "props": {"o": {"a": 1}, "p": {"a": 1}}, "kind": "boolean", "text": "true", "source": "provisional", "why": "uncaptured: inferred from corpus views or from no capture; generate writes this row as a probe view, and the next capture settles it"}

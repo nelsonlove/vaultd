@@ -91,13 +91,6 @@ fn every_expression_form_evaluates_on_a_memory_source() {
                 Value::list(vec![Value::Boolean(true)]),
             ])),
         ),
-        (
-            r#"{"a": 1, b: 2}"#,
-            Ok(Value::object(vec![
-                ("a".into(), Value::Number(1.0)),
-                ("b".into(), Value::Number(2.0)),
-            ])),
-        ),
         // Identifiers: a bare property, `this`, `file`, a missing name.
         ("price", Ok(Value::Number(2.5))),
         ("this", Ok(Value::File(path(THIS)))),
@@ -170,10 +163,11 @@ fn a_regular_expression_literal_compiles_and_a_bad_flag_is_an_argument_error() {
         ("a+b", "i")
     );
     assert!(regexp.regex.is_match("xAAB"), "the i flag is applied");
-    assert!(matches!(on_row("/a/q"), Err(EvalError::Argument(_))));
+    // A flag JavaScript refuses does not parse (ruling R1, spec ruling 7).
+    assert!(parse_expression("/a/q").is_err());
     assert!(
         matches!(on_row("/(?<=a)b/"), Err(EvalError::Argument(_))),
-        "look-behind is refused, not silently changed"
+        "look-behind parses, as JavaScript reads it, and is refused when evaluated, not silently changed"
     );
 }
 
@@ -220,7 +214,7 @@ fn errors_are_typed_values_never_panics() {
             EvalError::UnknownFunction("frobnicate".into()),
         ),
         (
-            "5.frobnicate()",
+            "(5).frobnicate()",
             EvalError::NoSuchMethod {
                 target: "number",
                 name: "frobnicate".into(),
@@ -263,7 +257,7 @@ fn captured_arithmetic_answers_values() {
     };
     assert_eq!(number("1 / 0"), f64::INFINITY);
     assert!(number("7 % 0").is_nan());
-    assert_eq!(number("1e308 * 10"), f64::INFINITY);
+    assert_eq!(number(&format!("{} * 10", f64::MAX)), f64::INFINITY);
     assert_eq!(number(r#"number("Infinity")"#), f64::INFINITY);
     assert_eq!(number(r#"number(" -Infinity ")"#), f64::NEG_INFINITY);
     assert_eq!(on_row("1 + missing"), Ok(Value::Null));
@@ -294,7 +288,7 @@ fn deepest(open: &str, inner: &str, close: &str) -> (String, String) {
 fn every_shape_at_the_cap() {
     use vault_bases::expr::ExpressionErrorKind;
 
-    let shapes: [(&str, &str, &str, Option<Value>); 18] = [
+    let shapes: [(&str, &str, &str, Option<Value>); 17] = [
         ("1+", "1", "", None),
         ("-", "1", "", None),
         ("!", "true", "", None),
@@ -302,7 +296,6 @@ fn every_shape_at_the_cap() {
         ("", "missing", ".sub", Some(Value::Null)),
         ("if(true, ", "1", ")", Some(Value::Number(1.0))),
         ("[", "1", "]", None),
-        ("{a: ", "1", "}", None),
         ("max(", "1", ")", Some(Value::Number(1.0))),
         ("min(2, ", "1", ")", Some(Value::Number(1.0))),
         ("escapeHTML(", "\"x\"", ")", Some(Value::String("x".into()))),
@@ -382,7 +375,6 @@ fn yaml_non_finite_numbers_reach_the_evaluator_and_format_as_javascript_does() {
         ("nan.toString()", "NaN"),
         ("huge.toString()", "Infinity"),
         ("[inf, nan].toString()", "Infinity, NaN"),
-        ("(1e400).toString()", "Infinity"),
         ("inf + \"\"", "Infinity"),
     ] {
         assert_eq!(on_yaml(expr), Ok(Value::String(text.into())), "{expr}");
@@ -463,18 +455,21 @@ fn a_link_equals_the_file_it_resolves_to() {
 /// and every value renders as a cell.
 #[test]
 fn every_numeric_corner_is_a_value_or_a_typed_error() {
+    // No exponent literals: Obsidian 1.13.7 cannot parse them (ruling R1,
+    // spec ruling 7), so the large and small corners are written out, and
+    // the infinities come from the YAML properties.
+    let max = format!("{}", f64::MAX);
+    let tiny = format!("{:.324}", 5e-324);
     let corners = [
         "0",
         "(-0)",
         "1",
         "(-1)",
         "0.5",
-        "1e21",
-        "1e-7",
-        "5e-324",
-        "1.7976931348623157e308",
-        "1e400",
-        "(-1e400)",
+        "1000000000000000000000",
+        "0.0000001",
+        tiny.as_str(),
+        max.as_str(),
         "inf",
         "ninf",
         "nan",

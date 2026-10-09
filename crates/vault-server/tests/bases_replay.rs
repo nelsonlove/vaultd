@@ -43,6 +43,14 @@
 //! rulings 7 and 8, leave vaultd apart from Obsidian, and what no collation
 //! reproduces); the corpus captures carry their own, so a
 //! corpus base's name never enters the repository.
+//!
+//! Two checks keep a real vault's notes out of the committed captures (the
+//! ruling of 2026-10-08). `committed_captures_name_only_generated_paths` runs
+//! everywhere, but sees only names written as paths (a wikilink target, a
+//! run ending in a file extension). A real note's name written bare, with
+//! no extension, is caught only by `committed_files_hold_no_corpus_name`,
+//! which needs the local corpus (`MANIFEST.json` and the corpus captures)
+//! and is skipped where that is missing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

@@ -51,10 +51,6 @@ fn deep_input_is_a_typed_error_on_a_two_mebibyte_stack() {
             format!("{}1{}", "[".repeat(10_000), "]".repeat(10_000)),
         ),
         (
-            "{a: x10,000",
-            format!("{}1{}", "{a:".repeat(10_000), "}".repeat(10_000)),
-        ),
-        (
             "f( x10,000",
             format!("{}1{}", "f(".repeat(10_000), ")".repeat(10_000)),
         ),
@@ -236,15 +232,9 @@ fn provisional_a_trailing_or_leading_dot_is_part_of_a_number() {
         },
         "as in JavaScript, `1.` then `.b`"
     );
-    assert_eq!(
-        parse_expression("5.isEmpty()").unwrap(),
-        Expr::Method {
-            target: Box::new(Expr::Number(5.0)),
-            name: "isEmpty".into(),
-            args: vec![],
-            position: 2,
-        },
-        "a name after the dot still makes a method call"
+    assert!(
+        parse_expression("5.isEmpty()").is_err(),
+        "a name after the dot of a whole number is refused, as Obsidian 1.13.7 refuses it (ruling R1, spec ruling 7)"
     );
 }
 

@@ -148,24 +148,32 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
         if c.is_ascii_digit() || leading_dot {
             let mut end = start;
             let mut seen_dot = false;
-            let mut seen_exponent = false;
             while let Some(&(at, d)) = chars.peek() {
                 if d.is_ascii_digit() {
                     end = at + 1;
                     chars.next();
-                } else if d == '.' && !seen_dot && !seen_exponent {
-                    // A dot continues the number unless a name follows:
-                    // `5.isEmpty()` is a method on 5, `2.5` is a decimal,
-                    // and `1.` alone is 1, as in JavaScript (provisional,
-                    // ruling N2).
+                } else if d == '.' && !seen_dot {
+                    // A dot continues the number: `2.5` is a decimal, and
+                    // `1.` alone is 1, as in JavaScript (provisional, ruling
+                    // N2). A name after the dot of a whole number
+                    // (`5.isEmpty()`) is refused, as Obsidian 1.13.7 refuses
+                    // it (captured, `x_num_dot_method`; ruling R1, spec
+                    // ruling 7): `(5).isEmpty()` is the method call.
                     let name_follows = text[at + 1..].chars().next().is_some_and(is_ident_start);
                     if name_follows {
-                        break;
+                        return Err(error(
+                            at,
+                            "a method on a bare number literal; write (5).method()",
+                        ));
                     }
                     seen_dot = true;
                     end = at + 1;
                     chars.next();
-                } else if (d == 'e' || d == 'E') && !seen_exponent {
+                } else if d == 'e' || d == 'E' {
+                    // Obsidian 1.13.7 cannot parse an exponent literal
+                    // (captured, `x_exp`, `x_exp_frac`; ruling R1, spec
+                    // ruling 7). Without digits after it, the `e` starts a
+                    // name and the parser refuses the pair.
                     let rest = &text[at + 1..];
                     let digits_follow = rest
                         .strip_prefix(['+', '-'])
@@ -173,18 +181,10 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
                         .chars()
                         .next()
                         .is_some_and(|n| n.is_ascii_digit());
-                    if !digits_follow {
-                        break;
+                    if digits_follow {
+                        return Err(error(at, "exponent literals are not supported"));
                     }
-                    seen_exponent = true;
-                    chars.next();
-                    if let Some(&(sign_at, sign)) = chars.peek() {
-                        if sign == '+' || sign == '-' {
-                            chars.next();
-                            end = sign_at + 1;
-                        }
-                    }
-                    end = end.max(at + 1);
+                    break;
                 } else {
                     break;
                 }
@@ -206,6 +206,12 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
                 if d == c {
                     closed = true;
                     break;
+                }
+                // A raw line or paragraph separator ends no JavaScript
+                // string Obsidian 1.13.7 reads (captured, `string` r58;
+                // ruling R1, spec ruling 7); the `\u2028` escape is fine.
+                if d == '\u{2028}' || d == '\u{2029}' {
+                    return Err(error(at, "a line separator inside a string literal"));
                 }
                 if d == '\\' {
                     let Some((_, escaped)) = chars.next() else {
@@ -264,6 +270,19 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, ExpressionError> {
                     chars.next();
                 } else {
                     break;
+                }
+            }
+            // A literal JavaScript would refuse (an unknown or repeated
+            // flag, a pattern that does not compile) is a parse error, as
+            // Obsidian 1.13.7 shows it (captured, `regexp` r4, r5, r10;
+            // ruling R1, spec ruling 7). A pattern JavaScript accepts but
+            // the `regex` crate cannot express (a look-around, a
+            // backreference: the crate's "not supported" errors) parses, and
+            // stays an argument error when evaluated (`regexp` r3).
+            if let Err(refused) = crate::eval::compile_regexp(&source, &flags) {
+                let message = refused.to_string();
+                if !message.contains("not supported") {
+                    return Err(error(start, message));
                 }
             }
             tokens.push(Spanned {

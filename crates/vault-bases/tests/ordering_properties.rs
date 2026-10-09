@@ -115,15 +115,33 @@ proptest! {
     }
 }
 
-/// Every kind a cell can hold, numeric-looking text and durations included:
-/// the mix the review's M1 cycle came from (`-10`, `-5`, `"-7"`).
+/// Every kind a cell can hold, numeric-looking text, durations, objects,
+/// links and `-0` included: the mix the review's M1 cycle came from (`-10`,
+/// `-5`, `"-7"`).
 fn mixed_value() -> impl Strategy<Value = Value> {
+    let link = (
+        "[a-cA-C]{0,2}",
+        prop::option::of("[ab]\\.md"),
+        prop::option::of("[a-c]{0,2}"),
+    )
+        .prop_map(|(target, resolved, display)| {
+            Value::Link(vault_bases::LinkValue {
+                target,
+                display: display.map(|text| Box::new(Value::String(text))),
+                resolved: resolved.map(|path| VaultPath::new(path).unwrap()),
+            })
+        });
+    let object = prop::collection::vec(("[ab]", value()), 0..3).prop_map(Value::object);
     prop_oneof![
         value(),
         "-?[0-9]{1,2}(\\.[0-9])?".prop_map(Value::String),
         (-20i32..20).prop_map(|n| Value::Number(f64::from(n))),
         Just(Value::Number(f64::NAN)),
         Just(Value::Number(f64::INFINITY)),
+        Just(Value::Number(-0.0)),
+        Just(Value::Number(0.0)),
+        link,
+        object,
         (0i64..5, -3_600_000i64..3_600_000).prop_map(|(months, ms)| Value::Duration(
             vault_bases::DurationValue {
                 months,

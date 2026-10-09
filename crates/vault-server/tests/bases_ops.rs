@@ -627,21 +627,22 @@ fn list_levels(cell: &CellDto) -> (usize, &CellDto) {
 /// their 32 levels and the leaf becomes the error cell; 31 nested objects
 /// (three JSON levels each, the widest cell) still fit a client's 128-level
 /// JSON reading limit, which this harness's own parse proves. 40 levels are
-/// cut at the same place.
+/// cut at the same place. The objects come from a frontmatter mapping: an
+/// expression cannot spell an object literal (ruling R1, spec ruling 7).
 #[test]
 fn a_cell_nested_too_deeply_is_an_error_cell() {
     let lists = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
-    let objects = |depth: usize| format!("{}1{}", "{\"a\": ".repeat(depth), "}".repeat(depth));
+    let objects = |depth: usize| format!("{}1{}", "{a: ".repeat(depth), "}".repeat(depth));
+    let note = format!("---\ndeep: {}\n---\nx\n", objects(31));
     let (vault, index) = vault_of(&[
-        ("A.md", "x\n"),
+        ("A.md", note.as_str()),
         (
             "Deep.base",
             &format!(
-                "formulas:\n  whole: '{}'\n  cut: '{}'\n  far: '{}'\n  objects: '{}'\nviews:\n  - type: table\n    name: T\n    order: [formula.whole, formula.cut, formula.far, formula.objects]\n",
+                "formulas:\n  whole: '{}'\n  cut: '{}'\n  far: '{}'\nviews:\n  - type: table\n    name: T\n    order: [formula.whole, formula.cut, formula.far, deep]\n",
                 lists(31),
                 lists(32),
                 lists(40),
-                objects(31)
             ),
         ),
     ]);

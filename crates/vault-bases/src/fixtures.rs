@@ -14,6 +14,10 @@
 //! Obsidian only through `vault-server`'s replay suite, which evaluates each
 //! captured view at the instant it was captured.
 //!
+//! A row of kind `invalid` holds an expression Obsidian 1.13.7 cannot parse
+//! (it shows the cell empty): the parser must refuse it (ruling R1, spec
+//! ruling 7).
+//!
 //! A row whose answer is the row file's own facts (its name, path, size or
 //! times) carries `"expect_from": "corpus"` and a `"template"` in place of
 //! `"text"`: here the template is filled from `Capture.md`'s facts, in the
@@ -298,9 +302,16 @@ pub fn check_family(family: &str) -> Vec<String> {
         let base_path = VaultPath::new("Captures.base").expect("a valid path");
         let ctx = EvalContext::new(&source, &clock, &base_path, &row_path);
         let label = format!("[{}] {} `{}`", row.source, row.case, row.expr);
-        // A row's expression must parse: a parse error is a broken row, never
-        // the error an `error` row expects.
-        let expr = match parse_expression(&row.expr) {
+        // A row's expression must parse, unless the row is `invalid`: a parse
+        // error is a broken row, never the error an `error` row expects.
+        let parsed = parse_expression(&row.expr);
+        if row.kind == "invalid" {
+            if let Ok(expr) = parsed {
+                failures.push(format!("{label}: expected a parse error, got {expr:?}"));
+            }
+            continue;
+        }
+        let expr = match parsed {
             Ok(expr) => expr,
             Err(error) => {
                 failures.push(format!(

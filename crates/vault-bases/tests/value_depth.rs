@@ -67,8 +67,10 @@ fn a_twenty_thousand_step_nesting_reduce_answers_value_too_deep() {
 #[test]
 fn a_value_at_the_cap_is_fine_and_one_level_over_fails() {
     on_a_one_mebibyte_stack(|| {
-        // Each form wraps `acc` one level deeper per step, from `[]`.
-        for build in ["[acc]", "{a: acc}", "[1].map(acc)"] {
+        // Each form wraps `acc` one level deeper per step, from `[]`. (No
+        // object form: an expression cannot spell an object literal, ruling
+        // R1, spec ruling 7.)
+        for build in ["[acc]", "[1].map(acc)"] {
             let steps = MAX_VALUE_DEPTH - 1;
             let fits = eval(&note_with(steps), &format!("xs.reduce({build}, [])")).unwrap();
             assert_eq!(depth(&fits), MAX_VALUE_DEPTH, "{build}");

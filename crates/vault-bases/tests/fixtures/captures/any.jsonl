@@ -1,9 +1,9 @@
-{"family": "any", "case": "isTruthy:published", "expr": "1.isTruthy()", "kind": "boolean", "text": "true", "source": "provisional"}
+{"family": "any", "case": "isTruthy:published", "expr": "1.isTruthy()", "kind": "invalid", "source": "captured"}
 {"family": "any", "case": "isType:string", "expr": "\"example\".isType(\"string\")", "kind": "boolean", "text": "true", "source": "captured"}
 {"family": "any", "case": "isType:boolean", "expr": "true.isType(\"boolean\")", "kind": "boolean", "text": "true", "source": "captured"}
-{"family": "any", "case": "isType:number_not_string", "expr": "5.isType(\"string\")", "kind": "boolean", "text": "false", "source": "provisional"}
+{"family": "any", "case": "isType:number_not_string", "expr": "5.isType(\"string\")", "kind": "invalid", "source": "captured"}
 {"family": "any", "case": "isType:list", "expr": "[1].isType(\"list\")", "kind": "boolean", "text": "true", "source": "captured"}
-{"family": "any", "case": "toString:number", "expr": "123.toString()", "kind": "string", "text": "123", "source": "provisional"}
+{"family": "any", "case": "toString:number", "expr": "123.toString()", "kind": "invalid", "source": "captured"}
 {"family": "any", "case": "toString:list", "expr": "[1, \"a\"].toString()", "kind": "string", "text": "1, a", "source": "captured"}
 {"family": "any", "case": "tostring:null", "expr": "missing.toString()", "kind": "string", "text": "null", "source": "captured"}
-{"family": "any", "case": "no_such_method", "expr": "5.frobnicate()", "kind": "error", "source": "provisional"}
+{"family": "any", "case": "no_such_method", "expr": "5.frobnicate()", "kind": "invalid", "source": "captured"}

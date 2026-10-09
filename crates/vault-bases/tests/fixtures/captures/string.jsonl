@@ -56,7 +56,7 @@
 {"family": "string", "case": "split:regexp_empty_text", "expr": "\"\".split(/,/).length", "kind": "number", "text": "1", "source": "captured"}
 {"family": "string", "case": "split:regexp_empty_text_matching", "expr": "\"\".split(/x*/).length", "kind": "number", "text": "0", "source": "captured"}
 {"family": "string", "case": "trim:whitespace_set", "expr": "\"﻿hi\".trim()", "kind": "string", "text": "hi", "source": "captured"}
-{"family": "string", "case": "trim:js_and_rust_agree", "expr": "\" hi \".trim()", "kind": "string", "text": "hi", "source": "provisional"}
+{"family": "string", "case": "trim:js_and_rust_agree", "expr": "\" hi \".trim()", "kind": "invalid", "source": "captured"}
 {"family": "string", "case": "title:word_boundary", "expr": "\"hello-world\".title()", "kind": "string", "text": "Hello-world", "source": "captured"}
 {"family": "string", "case": "title:inner_case", "expr": "\"hELLO\".title()", "kind": "string", "text": "Hello", "source": "captured"}
 {"family": "string", "case": "contains:case", "expr": "\"Probe/Value\".contains(\"probe\")", "kind": "boolean", "text": "true", "source": "provisional", "why": "uncaptured: inferred from corpus views or from no capture; generate writes this row as a probe view, and the next capture settles it"}

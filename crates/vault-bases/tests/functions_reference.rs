@@ -76,7 +76,10 @@ fn run_on_empty_vault(text: &str) -> Result<vault_bases::Value, vault_bases::eva
     let path = VaultPath::new("A.md").unwrap();
     let ctx = EvalContext::new(&source, &clock, &path, &path);
     let expr = parse_expression(text).unwrap_or_else(|error| panic!("{text}: {}", error.message));
-    evaluate(&expr, &ctx, &Scope::default())
+    // `obj`, an empty object: an expression cannot spell an object literal
+    // (ruling R1, spec ruling 7).
+    let scope = Scope::default().bind("obj", vault_bases::Value::object(Vec::new()));
+    evaluate(&expr, &ctx, &scope)
 }
 
 #[test]
@@ -93,7 +96,7 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
         "[1].map()",
         "[1].reduce(acc)",
         "[1].unique(1)",
-        "{}.keys(1)",
+        "obj.keys(1)",
         "/a/.matches()",
         "missing.isEmpty(1)",
     ] {
@@ -111,7 +114,7 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
         (r#""a".keys()"#, "string"),
         (r#""a".matches("a")"#, "string"),
         ("[1].toFixed(2)", "list"),
-        ("{}.join()", "object"),
+        ("obj.join()", "object"),
     ] {
         match run_on_empty_vault(text) {
             Err(EvalError::NoSuchMethod { target: got, .. }) => assert_eq!(got, target, "{text}"),
@@ -135,21 +138,23 @@ fn wrong_arity_wrong_types_and_bad_regexps_are_typed_errors() {
             "{text}"
         );
     }
-    // A bad flag, a pattern that does not compile, and one the regex crate
-    // cannot express are argument errors, not parse errors or panics.
+    // A bad flag and a pattern that does not compile are parse errors, as
+    // in Obsidian 1.13.7 (ruling R1, spec ruling 7); a pattern JavaScript
+    // reads but the regex crate cannot express is an argument error, not a
+    // panic or a silently different match.
     for text in [
         r#"/a/q.matches("a")"#,
         r#"/a(/.matches("a")"#,
-        r#"/(?<=a)b/.matches("ab")"#,
         r#"/a/gg.matches("a")"#,
         r#"/a/igi.matches("a")"#,
     ] {
-        match run_on_empty_vault(text) {
-            Err(EvalError::Argument(message)) => {
-                assert!(message.contains("regular expression"), "{text}: {message}")
-            }
-            other => panic!("{text}: expected an argument error, got {other:?}"),
+        assert!(vault_bases::expr::parse_expression(text).is_err(), "{text}");
+    }
+    match run_on_empty_vault(r#"/(?<=a)b/.matches("ab")"#) {
+        Err(EvalError::Argument(message)) => {
+            assert!(message.contains("regular expression"), "{message}")
         }
+        other => panic!("expected an argument error, got {other:?}"),
     }
     // Captured (Task 13): a sticky expression matches at the start only, and
     // a split keeps its groups.
