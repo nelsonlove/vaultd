@@ -88,8 +88,8 @@ pub fn decode_dependency_key_for_test(
 }
 
 /// Decode a stored `properties.value_json` and classify it the way
-/// `property_scalars` stores it: `(kind, string_value, number_value)`. The
-/// scalar-mirror oracle compares every stored scalar row to this, so a route
+/// `properties`' scalar columns store it: `(kind, string_value, number_value)`. The
+/// scalar-mirror oracle compares every stored row's scalar columns to this, so a route
 /// that writes the right rows with the wrong values is caught without the
 /// tests duplicating the crate's private property encoding.
 #[doc(hidden)]

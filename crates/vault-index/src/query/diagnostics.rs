@@ -78,7 +78,7 @@ pub(crate) fn note_diagnostics(
         "{DIAGNOSTIC_UNION_CTE} SELECT {DIAGNOSTIC_COLUMNS} FROM all_diagnostics \
          WHERE path = ?1 {DIAGNOSTIC_ORDER}"
     );
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     let rows = statement
         .query_map(params![path], map_row)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -91,7 +91,7 @@ pub(crate) fn all_diagnostics(connection: &Connection) -> Result<Vec<Diagnostic>
     let sql = format!(
         "{DIAGNOSTIC_UNION_CTE} SELECT {DIAGNOSTIC_COLUMNS} FROM all_diagnostics {DIAGNOSTIC_ORDER}"
     );
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     let rows = statement
         .query_map([], map_row)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -164,7 +164,7 @@ pub(crate) fn diagnostic_page(
          WHERE {where_clause} {DIAGNOSTIC_ORDER} LIMIT {}",
         i64::from(limit) + 1
     );
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     let parameters: Vec<&dyn rusqlite::ToSql> =
         arguments.iter().map(|argument| argument.as_ref()).collect();
     let rows = statement

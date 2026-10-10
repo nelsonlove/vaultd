@@ -262,7 +262,7 @@ fn a_genuine_version_two_cache_is_replaced_by_the_current_schema() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(user_version, SQL_SCHEMA_VERSION);
-    assert_eq!(user_version, 4);
+    assert_eq!(user_version, 5);
     for table in ["sections", "list_items"] {
         let present: i64 = connection
             .query_row(
@@ -392,7 +392,7 @@ fn a_busy_healthy_derived_cache_is_not_deleted_as_corrupt() {
 }
 
 #[test]
-fn a_genuine_version_three_cache_is_replaced_by_schema_four() {
+fn a_genuine_version_three_cache_is_replaced_by_the_current_schema() {
     let vault = tempfile::tempdir_in(common::scratch_root()).unwrap();
     let index_dir = tempfile::tempdir_in(common::scratch_root()).unwrap();
     fs::write(
@@ -445,10 +445,77 @@ fn a_genuine_version_three_cache_is_replaced_by_schema_four() {
     let user_version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(user_version, 4);
+    assert_eq!(user_version, 5);
     let scalars: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM property_scalars WHERE note_path = 'Note.md'",
+            "SELECT COUNT(*) FROM properties WHERE note_path = 'Note.md' AND key_fold = 'status' \
+             AND kind = 'string' AND string_value = 'open'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(scalars, 1, "the rebuilt cache indexes the scalar");
+}
+
+#[test]
+fn a_genuine_version_four_cache_is_replaced_by_schema_five() {
+    let vault = tempfile::tempdir_in(common::scratch_root()).unwrap();
+    let index_dir = tempfile::tempdir_in(common::scratch_root()).unwrap();
+    fs::write(
+        vault.path().join("Note.md"),
+        "---\nstatus: open\n---\n# Note\n",
+    )
+    .unwrap();
+    let index_path = index_dir.path().join("derived.sqlite3");
+
+    let mut config = IndexConfig::explicit(vault.path(), &index_path).unwrap();
+    config.location = IndexLocation::Derived;
+    {
+        let connection = rusqlite::Connection::open(&index_path).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema_v4.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_metadata \
+                 (singleton, semantic_format_version, vault_identity, generation, created_at_unix_ms) \
+                 VALUES (1, 4, ?1, NULL, 0)",
+                rusqlite::params![config.vault_identity],
+            )
+            .unwrap();
+        // A marker only the v4 file carries: if the open reused this file
+        // instead of replacing it, the marker would survive.
+        connection
+            .execute_batch("CREATE TABLE v4_marker (x INTEGER);")
+            .unwrap();
+    }
+
+    let mut service = IndexService::open(config).unwrap();
+    assert_eq!(
+        service.current_generation().unwrap(),
+        None,
+        "the v4 cache was discarded"
+    );
+    let marker: i64 = service
+        .connection_for_test()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'v4_marker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, 0, "the v4 file was replaced, not reused");
+    service.refresh(false).unwrap();
+    let connection = service.connection_for_test();
+    let user_version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(user_version, 5);
+    let scalars: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM properties WHERE note_path = 'Note.md' AND key_fold = 'status' \
+             AND kind = 'string' AND string_value = 'open'",
             [],
             |row| row.get(0),
         )

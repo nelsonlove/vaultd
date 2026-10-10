@@ -958,42 +958,19 @@ pub fn scratch_root() -> PathBuf {
     root.canonicalize().expect("canonicalize the scratch root")
 }
 
-/// Claim 6 of the live oracle: `property_scalars` holds exactly one row per
-/// `properties` row, under the same `(note_path, ordinal)` and key, and no
-/// row of its own. Checked in SQL both ways, so a missed insert and a missed
-/// delete are both caught. Every matched row's columns are then compared too:
-/// `key_fold` is the key lowercased in Rust, and `kind`, `string_value` and
-/// `number_value` are what the crate's classifier makes of the decoded
-/// `properties.value_json` (a NaN is stored as NULL by SQLite).
+/// Claim 6 of the live oracle: every `properties` row's scalar columns
+/// classify its own value. (Schema v4 kept them in a separate
+/// `property_scalars` table, checked here for one row per property both
+/// ways; schema v5 folded them into `properties`, so a property and its
+/// scalar can no longer drift apart in number, only in value.) Every row is
+/// compared: `key_fold` is the key lowercased in Rust, and `kind`,
+/// `string_value` and `number_value` are what the crate's classifier makes of
+/// the decoded `value_json` (a NaN is stored as NULL by SQLite).
 pub fn property_scalars_mirror(connection: &rusqlite::Connection) -> Result<(), String> {
-    let missing: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM properties p LEFT JOIN property_scalars s \
-             ON s.note_path = p.note_path AND s.ordinal = p.ordinal \
-             WHERE s.note_path IS NULL OR s.key_text != p.key_text",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let stray: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM property_scalars s LEFT JOIN properties p \
-             ON s.note_path = p.note_path AND s.ordinal = p.ordinal \
-             WHERE p.note_path IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if missing != 0 || stray != 0 {
-        return Err(format!(
-            "{missing} properties rows without a matching scalar, {stray} scalars without a property"
-        ));
-    }
     let mut statement = connection
         .prepare(
-            "SELECT p.note_path, p.ordinal, p.key_text, p.value_json, s.key_fold, s.kind, \
-             s.string_value, s.number_value FROM properties p JOIN property_scalars s \
-             ON s.note_path = p.note_path AND s.ordinal = p.ordinal",
+            "SELECT note_path, ordinal, key_text, value_json, key_fold, kind, \
+             string_value, number_value FROM properties",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement

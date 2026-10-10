@@ -266,6 +266,19 @@ pub(crate) fn i64_to_usize(value: i64, field: &str) -> Result<usize, IndexError>
         .map_err(|_| IndexError::IncompatibleIndex(format!("{field} is negative")))
 }
 
+/// `properties`' secondary indexes, exactly as `schema_v5.sql` creates them
+/// (pinned by `the_cold_build_recreates_the_property_indexes_as_the_schema_declares`).
+/// The cold build drops them before its bulk load and creates them after.
+const CREATE_PROPERTY_INDEXES: &str = "\
+CREATE INDEX properties_by_key ON properties (key_fold, note_path);
+CREATE INDEX properties_by_string ON properties (key_fold, string_value);
+CREATE INDEX properties_by_number ON properties (key_fold, number_value);";
+
+const DROP_PROPERTY_INDEXES: &str = "\
+DROP INDEX IF EXISTS properties_by_key;
+DROP INDEX IF EXISTS properties_by_string;
+DROP INDEX IF EXISTS properties_by_number;";
+
 #[doc(hidden)]
 pub struct IndexStore {
     pub(crate) connection: Connection,
@@ -309,41 +322,35 @@ impl IndexStore {
             ],
         )?;
 
+        // Prepared once per connection and reused for every row of the
+        // transaction (and every later one).
+        let mut insert_property = transaction.prepare_cached(
+            "INSERT INTO properties \
+             (note_path, ordinal, key_text, value_json, span_start, span_end, \
+              key_span_start, key_span_end, value_span_start, value_span_end, \
+              key_fold, kind, string_value, number_value) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
         for (ordinal, property) in note.properties.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO properties \
-                 (note_path, ordinal, key_text, value_json, span_start, span_end, \
-                  key_span_start, key_span_end, value_span_start, value_span_end) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    path,
-                    usize_to_i64(ordinal, "property ordinal")?,
-                    property.key.value,
-                    codec::encode_property_value(&property.value.value)?,
-                    usize_to_i64(property.span.start(), "property span start")?,
-                    usize_to_i64(property.span.end(), "property span end")?,
-                    usize_to_i64(property.key.span.start(), "property key span start")?,
-                    usize_to_i64(property.key.span.end(), "property key span end")?,
-                    usize_to_i64(property.value.span.start(), "property value span start")?,
-                    usize_to_i64(property.value.span.end(), "property value span end")?,
-                ],
-            )?;
             let scalar = codec::property_scalar(&property.value.value);
-            transaction.execute(
-                "INSERT INTO property_scalars \
-                 (note_path, ordinal, key_text, key_fold, kind, string_value, number_value) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    path,
-                    usize_to_i64(ordinal, "property ordinal")?,
-                    property.key.value,
-                    property.key.value.to_lowercase(),
-                    scalar.kind,
-                    scalar.string_value,
-                    scalar.number_value,
-                ],
-            )?;
+            insert_property.execute(params![
+                path,
+                usize_to_i64(ordinal, "property ordinal")?,
+                property.key.value,
+                codec::encode_property_value(&property.value.value)?,
+                usize_to_i64(property.span.start(), "property span start")?,
+                usize_to_i64(property.span.end(), "property span end")?,
+                usize_to_i64(property.key.span.start(), "property key span start")?,
+                usize_to_i64(property.key.span.end(), "property key span end")?,
+                usize_to_i64(property.value.span.start(), "property value span start")?,
+                usize_to_i64(property.value.span.end(), "property value span end")?,
+                property.key.value.to_lowercase(),
+                scalar.kind,
+                scalar.string_value,
+                scalar.number_value,
+            ])?;
         }
+        drop(insert_property);
 
         for (ordinal, alias) in note.aliases.iter().enumerate() {
             transaction.execute(
@@ -794,8 +801,21 @@ impl IndexStore {
         for path in deleted {
             transaction.execute("DELETE FROM notes WHERE path = ?1", params![path.as_str()])?;
         }
+        // The cold build (no generation yet) loads every note at once, so
+        // `properties`' secondary indexes are built after its rows are in,
+        // once, rather than maintained row by row: they are dropped here
+        // and created again below, inside this same transaction, so no other
+        // connection ever sees the table without them. Every other route keeps
+        // them in place.
+        let cold = expected.is_none();
+        if cold {
+            transaction.execute_batch(DROP_PROPERTY_INDEXES)?;
+        }
         for (note, fingerprint) in notes {
             Self::replace_note(&transaction, note, *fingerprint)?;
+        }
+        if cold {
+            transaction.execute_batch(CREATE_PROPERTY_INDEXES)?;
         }
         for (path, fingerprint) in fingerprint_updates {
             update_fingerprint(&transaction, path, *fingerprint)?;

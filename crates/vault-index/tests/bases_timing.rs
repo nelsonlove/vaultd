@@ -18,9 +18,9 @@
 //!   `file.backlinks` over 1,000 attachments that 10,000 notes embed, against
 //!   the same rows without it (the row source scans the unresolved
 //!   references once per attachment row, with no cache).
-//! - `the_value_indexes_cost_on_reconciliation`: a cold build and a one-note
-//!   edit with `property_scalars_by_string` and `property_scalars_by_number`
-//!   present, and with both dropped before the build; interleaved, twice.
+//! - `the_value_indexes_cost_on_reconciliation`: a cold build, then one-note
+//!   edits with `properties_by_string` and `properties_by_number` present,
+//!   and with both dropped after the build; interleaved, twice.
 
 mod common;
 
@@ -315,7 +315,7 @@ fn value_indexes(index: &TempDir) -> usize {
     connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN \
-             ('property_scalars_by_string', 'property_scalars_by_number')",
+             ('properties_by_string', 'properties_by_number')",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -335,18 +335,21 @@ fn the_value_indexes_cost_on_reconciliation() {
         for with in [true, false] {
             let index = TempDir::new_in(common::scratch_root()).unwrap();
             let mut service = open(vault.path(), &index);
+            // The cold build creates every secondary index after its bulk
+            // load (Task 14 fix round), so the indexes are dropped after it:
+            // the cold column is the same work in both rows.
+            let started = Instant::now();
+            service.refresh(false).unwrap();
+            let cold = millis(started);
             if !with {
                 let connection =
                     rusqlite::Connection::open(index.path().join("index.sqlite3")).unwrap();
                 connection
                     .execute_batch(
-                        "DROP INDEX property_scalars_by_string; DROP INDEX property_scalars_by_number;",
+                        "DROP INDEX properties_by_string; DROP INDEX properties_by_number;",
                     )
                     .unwrap();
             }
-            let started = Instant::now();
-            service.refresh(false).unwrap();
-            let cold = millis(started);
             let mut samples = Vec::new();
             for at in 0..WARM_UP + MEASURED {
                 round += 1;

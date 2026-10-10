@@ -15,14 +15,14 @@ fn open(vault: &TempDir, index: &TempDir) -> IndexService {
     service
 }
 
-/// One `property_scalars` row: ordinal, key, kind, string value, number value.
+/// One property's scalar columns: ordinal, key, kind, string value, number value.
 type ScalarRow = (i64, String, String, Option<String>, Option<f64>);
 
 fn scalars(service: &IndexService, path: &str) -> Vec<ScalarRow> {
     let connection = service.connection_for_test();
     let mut statement = connection
         .prepare(
-            "SELECT ordinal, key_text, kind, string_value, number_value FROM property_scalars \
+            "SELECT ordinal, key_text, kind, string_value, number_value FROM properties \
              WHERE note_path = ?1 ORDER BY ordinal",
         )
         .unwrap();
@@ -119,21 +119,29 @@ fn an_edit_and_a_delete_move_the_scalars_with_the_note() {
 }
 
 #[test]
-fn a_fresh_index_has_both_new_tables() {
+fn a_fresh_index_has_the_bases_table_and_no_separate_scalar_table() {
     let vault = TempDir::new_in(common::scratch_root()).unwrap();
     let index = TempDir::new_in(common::scratch_root()).unwrap();
     let service = open(&vault, &index);
-    for table in ["property_scalars", "bases"] {
-        let count: i64 = service
-            .connection_for_test()
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "{table} exists");
-    }
+    // Schema v5 folded `property_scalars` into `properties`.
+    let scalars: i64 = service
+        .connection_for_test()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'property_scalars'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(scalars, 0, "no separate scalar table");
+    let count: i64 = service
+        .connection_for_test()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'bases'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "bases exists");
     let bases: i64 = service
         .connection_for_test()
         .query_row("SELECT COUNT(*) FROM bases", [], |row| row.get(0))
@@ -149,7 +157,7 @@ fn a_fresh_index_has_both_new_tables() {
 /// publishes through the delta route, and the complete route
 /// (`refresh_complete_for_test`), which re-inventories the whole vault and
 /// publishes through `begin_publish` with a previous generation. Both must
-/// leave `property_scalars` mirroring `properties`, value for value.
+/// leave every property's scalar columns classifying its value.
 #[test]
 fn both_warm_refresh_routes_keep_the_scalars_in_step() {
     for complete in [false, true] {
@@ -285,7 +293,7 @@ fn keys_are_folded_in_rust_for_lookup() {
     let found = |fold: &str| -> Vec<(String, String)> {
         let mut statement = connection
             .prepare(
-                "SELECT note_path, key_text FROM property_scalars WHERE key_fold = ?1 \
+                "SELECT note_path, key_text FROM properties WHERE key_fold = ?1 \
                  ORDER BY ordinal",
             )
             .unwrap();
@@ -323,5 +331,62 @@ fn true_and_false_are_stored_as_one_and_zero() {
         ]
     );
     assert_ne!(rows[0].4, rows[1].4);
+    common::property_scalars_mirror(service.connection_for_test()).expect("mirror");
+}
+
+/// The table's secondary indexes, as `sqlite_master` holds them.
+fn scalar_indexes(connection: &rusqlite::Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' \
+             AND tbl_name = 'properties' AND sql IS NOT NULL ORDER BY name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Task 14 fix round: the cold build drops `properties`' three
+/// secondary indexes before its bulk load and creates them after. They come
+/// back exactly as the schema declares them, the rows they index are the
+/// mirror of `properties`, and the next (incremental) route keeps them.
+#[test]
+fn the_cold_build_recreates_the_property_indexes_as_the_schema_declares() {
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    for at in 0..50 {
+        fs::write(
+            vault.path().join(format!("N{at:02}.md")),
+            format!("---\ntitle: N{at}\nrank: {at}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    let config =
+        IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).expect("config");
+    let mut service = IndexService::open(config).expect("service");
+    let declared = scalar_indexes(service.connection_for_test());
+    assert_eq!(
+        declared
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "properties_by_key",
+            "properties_by_number",
+            "properties_by_string"
+        ]
+    );
+    service.refresh(false).expect("cold build");
+    assert_eq!(scalar_indexes(service.connection_for_test()), declared);
+    common::property_scalars_mirror(service.connection_for_test()).expect("mirror");
+    let edited = VaultPath::new("N07.md").unwrap();
+    fs::write(vault.path().join("N07.md"), "---\ntitle: seven\n---\n").unwrap();
+    service
+        .refresh_paths(BTreeSet::from([edited]), ChangeCause::Watcher)
+        .expect("edit");
+    assert_eq!(scalar_indexes(service.connection_for_test()), declared);
     common::property_scalars_mirror(service.connection_for_test()).expect("mirror");
 }

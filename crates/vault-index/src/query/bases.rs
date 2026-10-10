@@ -119,6 +119,10 @@ fn source_error(error: impl std::fmt::Display) -> SourceError {
 
 /// The row source over one pinned read: a connection inside a read
 /// transaction at the evaluated generation.
+/// Unresolved references by the lowercased file name they target:
+/// `(note, raw target)` each.
+type UnresolvedByName = HashMap<String, Vec<(String, String)>>;
+
 struct IndexRowSource<'c> {
     connection: &'c Connection,
     resolver: Arc<Resolver>,
@@ -126,6 +130,17 @@ struct IndexRowSource<'c> {
     /// [`IndexRowSource::attachment`]'s answers in this evaluation, by
     /// target text: one lookup per distinct target, not one per row.
     attachments: RefCell<HashMap<String, Option<VaultPath>>>,
+    /// The references the resolver left unresolved, by the ASCII-lowercased
+    /// last component of their file target: `(note, raw target)` each.
+    /// Built on the first attachment backlinks read of this evaluation (one
+    /// generation), so each attachment row is one lookup instead of a scan
+    /// of every unresolved reference.
+    unresolved_by_name: RefCell<Option<UnresolvedByName>>,
+    /// Every file (non-note) path in the tree, by its ASCII-lowercased last
+    /// component, sorted by path. Built on the first attachment lookup of
+    /// this evaluation: one scan of `tree_entries`, after which each distinct
+    /// target is one lookup instead of one scan.
+    files_by_name: RefCell<Option<HashMap<String, Vec<String>>>>,
 }
 
 impl<'c> IndexRowSource<'c> {
@@ -139,7 +154,76 @@ impl<'c> IndexRowSource<'c> {
             resolver,
             types,
             attachments: RefCell::new(HashMap::new()),
+            unresolved_by_name: RefCell::new(None),
+            files_by_name: RefCell::new(None),
         }
+    }
+
+    /// The file name an attachment lookup compares against: the last
+    /// component of the target's file part, ASCII-lowercased (SQLite's
+    /// `lower`, which [`Self::find_attachment`] matches with).
+    fn attachment_key(target: &str) -> Option<String> {
+        let parsed = LinkTarget::parse(target);
+        let file = parsed.file_target.as_deref()?;
+        Some(file.rsplit('/').next().unwrap_or(file).to_ascii_lowercase())
+    }
+
+    /// Fill [`Self::files_by_name`] once: one pass over the tree's files.
+    fn load_files_by_name(&self) -> Result<(), SourceError> {
+        if self.files_by_name.borrow().is_some() {
+            return Ok(());
+        }
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT path FROM tree_entries WHERE kind = 'file' ORDER BY path")
+            .map_err(source_error)?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(source_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(source_error)?;
+        let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        for path in paths {
+            let key = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path)
+                .to_ascii_lowercase();
+            by_name.entry(key).or_default().push(path);
+        }
+        *self.files_by_name.borrow_mut() = Some(by_name);
+        Ok(())
+    }
+
+    /// Fill [`Self::unresolved_by_name`] once: one pass over the unresolved
+    /// references.
+    fn load_unresolved_by_name(&self) -> Result<(), SourceError> {
+        if self.unresolved_by_name.borrow().is_some() {
+            return Ok(());
+        }
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT DISTINCT r.note_path, r.raw_target FROM resolutions s \
+                 JOIN note_references r ON r.id = s.reference_id \
+                 WHERE s.kind = 'unresolved'",
+            )
+            .map_err(source_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(source_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(source_error)?;
+        let mut by_name: UnresolvedByName = HashMap::new();
+        for (note, raw_target) in rows {
+            if let Some(key) = Self::attachment_key(&raw_target) {
+                by_name.entry(key).or_default().push((note, raw_target));
+            }
+        }
+        *self.unresolved_by_name.borrow_mut() = Some(by_name);
+        Ok(())
     }
 }
 
@@ -236,19 +320,31 @@ impl IndexRowSource<'_> {
         if file.starts_with("./") || file.starts_with("../") || !has_extension {
             return Ok(None);
         }
-        let mut statement = self
-            .connection
-            .prepare_cached(
-                "SELECT path FROM tree_entries WHERE kind = 'file' \
-                 AND (lower(path) = lower(?1) OR substr(lower(path), -length(?1) - 1) = '/' || lower(?1)) \
-                 ORDER BY path LIMIT 8",
-            )
-            .map_err(source_error)?;
-        let found = statement
-            .query_map(params![file], |row| row.get::<_, String>(0))
-            .map_err(source_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(source_error)?;
+        // The rule the SQL form had (`lower(path) = lower(file)`, or the path
+        // ends in `/` plus the lowercased file; ordered by path, at most 8),
+        // answered from the map: only a path whose last component is the
+        // file's last component can match either way.
+        self.load_files_by_name()?;
+        let folded = file.to_ascii_lowercase();
+        let suffix = format!("/{folded}");
+        let key = folded.rsplit('/').next().unwrap_or(&folded).to_string();
+        let found: Vec<String> = self
+            .files_by_name
+            .borrow()
+            .as_ref()
+            .and_then(|by_name| by_name.get(&key))
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter(|path| {
+                        let lower = path.to_ascii_lowercase();
+                        lower == folded || lower.ends_with(&suffix)
+                    })
+                    .take(8)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         let chosen = match found.iter().find(|path| path.as_str() == file) {
             Some(exact) => Some(exact),
             None if found.len() == 1 => found.first(),
@@ -280,8 +376,8 @@ impl IndexRowSource<'_> {
     /// reads.
     ///
     /// Written as a `UNION ALL` of probes so each is served by an index: the
-    /// equal-value probe by `property_scalars_by_string` or
-    /// `property_scalars_by_number` (`key_fold` and the value), the
+    /// equal-value probe by `properties_by_string` or
+    /// `properties_by_number` (`key_fold` and the value), the
     /// other-kind and wikilink probes by the `key_fold` prefix.
     fn property_equals(
         &self,
@@ -321,14 +417,14 @@ impl IndexRowSource<'_> {
         };
         arguments.push(Argument::Text(fold.clone()));
         let mut probes = format!(
-            "SELECT note_path FROM property_scalars WHERE key_fold = ? AND {equal} \
-             UNION ALL SELECT note_path FROM property_scalars WHERE key_fold = ? AND kind IN ({other})"
+            "SELECT note_path FROM properties WHERE key_fold = ? AND {equal} \
+             UNION ALL SELECT note_path FROM properties WHERE key_fold = ? AND kind IN ({other})"
         );
         if matches!(value, ScalarLiteral::String(_)) {
             // A frontmatter wikilink is a link to the filter, never text.
             arguments.push(Argument::Text(fold));
             probes.push_str(
-                " UNION ALL SELECT note_path FROM property_scalars WHERE key_fold = ? \
+                " UNION ALL SELECT note_path FROM properties WHERE key_fold = ? \
                  AND kind IN ('string', 'date') AND instr(string_value, '[[') > 0",
             );
         }
@@ -510,21 +606,16 @@ impl RowSource for IndexRowSource<'_> {
             .facts(path)?
             .is_some_and(|facts| facts.kind == FileKind::File);
         if is_attachment {
-            let mut statement = self
-                .connection
-                .prepare_cached(
-                    "SELECT DISTINCT r.note_path, r.raw_target FROM resolutions s \
-                     JOIN note_references r ON r.id = s.reference_id \
-                     WHERE s.kind = 'unresolved' AND instr(lower(r.raw_target), lower(?1)) > 0",
-                )
-                .map_err(source_error)?;
-            let candidates = statement
-                .query_map(params![path.name()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(source_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(source_error)?;
+            // Only a reference whose file target ends in this attachment's
+            // name can resolve to it (`find_attachment` matches the whole
+            // path or a `/`-suffix of it), so the candidates are one lookup.
+            self.load_unresolved_by_name()?;
+            let candidates = self
+                .unresolved_by_name
+                .borrow()
+                .as_ref()
+                .and_then(|by_name| by_name.get(&path.name().to_ascii_lowercase()).cloned())
+                .unwrap_or_default();
             for (note, raw_target) in candidates {
                 if self.attachment(&raw_target)?.as_ref() == Some(path) {
                     found.insert(codec::decode_path(&note).map_err(source_error)?);
@@ -583,9 +674,17 @@ fn parse_failure(diagnostics_json: &str) -> BaseParseError {
 
 const LIST_BASES: &str = "list_bases";
 
-/// How many times `evaluate_base` asks again when the writer installs a
-/// generation between building the resolver and opening the read.
-const EVALUATION_ATTEMPTS: usize = 3;
+/// How long `evaluate_base` keeps asking again when a refusal says the
+/// generation moved under it (a foreign writer's commit, or the writer's
+/// commit landing between the snapshot and the guard), before it answers the
+/// typed error. An answer is never refused merely because the vault keeps
+/// changing: each attempt pins whatever generation is published then.
+const EVALUATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The first pause between attempts; it doubles up to
+/// [`EVALUATION_BACKOFF_MAX`].
+const EVALUATION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+const EVALUATION_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(32);
 
 impl IndexReader {
     /// Every indexed base in path order, paged by the protocol's rule, with
@@ -704,19 +803,20 @@ impl IndexReader {
     /// `reader.rs`): the base's parsed file and the `this_path` check are
     /// copied out of the live graph, and a private connection is pinned to
     /// the generation. The evaluation then runs with no lock held, so a
-    /// publication or another read never waits for it. Asks again when the
-    /// writer installs between building the resolver and taking the guard,
-    /// so the resolver, the base and the rows are always one generation.
+    /// publication or another read never waits for it. The resolver is the
+    /// one for the pinned generation (built from a catalog copied under the
+    /// same guard when none is), so the resolver, the base and the rows are
+    /// always one generation. A refusal because the generation moved is
+    /// asked again with backoff for up to [`EVALUATION_BUDGET`].
     pub fn evaluate_base(
         &self,
         query: &BaseQuery<'_>,
         clock: &Clock,
     ) -> Result<BaseAnswer, BaseQueryError> {
-        let mut last =
-            IndexError::Storage("the generation would not hold still for an evaluation".into());
-        for _ in 0..EVALUATION_ATTEMPTS {
-            let (resolver_generation, resolver) = self.resolver()?;
-            let started = self.evaluation_read(resolver_generation, |graph| {
+        let deadline = std::time::Instant::now() + EVALUATION_BUDGET;
+        let mut pause = EVALUATION_BACKOFF;
+        loop {
+            let started = self.evaluation_read_resolving(|graph| {
                 let record = graph
                     .base(query.path)
                     .map(|record| (record.file.clone(), record.error.clone()));
@@ -724,14 +824,19 @@ impl IndexReader {
                 (record, this_is_a_note)
             });
             match started {
-                Ok((read, (record, this_is_a_note))) => {
+                Ok((read, (record, this_is_a_note), resolver)) => {
                     return evaluate_in(&read, record, this_is_a_note, resolver, query, clock);
                 }
-                Err(error @ IndexError::LiveStateStale(_)) => last = error,
+                Err(error @ IndexError::LiveStateStale(_)) => {
+                    if std::time::Instant::now() + pause > deadline {
+                        return Err(error.into());
+                    }
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(EVALUATION_BACKOFF_MAX);
+                }
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(last.into())
     }
 }
 
@@ -779,7 +884,7 @@ fn evaluate_in(
 
 /// What prefilter matching needs to know about one changed path at the
 /// current generation: its tags (as the `tags` table folds them) and its
-/// property keys (as `property_scalars` folds them).
+/// property keys (as `properties.key_fold` folds them).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PrefilterFacts {
     pub tags: Vec<String>,
@@ -806,7 +911,7 @@ impl IndexReader {
             let mut tags = transaction
                 .prepare_cached("SELECT comparison_key FROM tags WHERE note_path = ?1")?;
             let mut keys = transaction
-                .prepare_cached("SELECT key_fold FROM property_scalars WHERE note_path = ?1")?;
+                .prepare_cached("SELECT key_fold FROM properties WHERE note_path = ?1")?;
             for path in paths {
                 let kind: Option<String> = exists
                     .query_row(params![path.as_str()], |row| row.get(0))

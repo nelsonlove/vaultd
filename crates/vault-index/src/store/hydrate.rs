@@ -213,10 +213,6 @@ mod tests {
                 "hydration SQL touched properties: {sql}"
             );
             assert!(
-                !lower.contains("property_scalars"),
-                "hydration SQL touched property_scalars: {sql}"
-            );
-            assert!(
                 !lower.contains("aliases"),
                 "hydration SQL touched aliases: {sql}"
             );
@@ -231,14 +227,7 @@ mod tests {
     fn the_base_hydration_query_reads_only_the_bases_table() {
         let lower = crate::store::BASE_RECORDS_SQL.to_lowercase();
         assert!(lower.contains("from bases "), "{lower}");
-        for table in [
-            "notes",
-            "properties",
-            "property_scalars",
-            "aliases",
-            "tags",
-            "join",
-        ] {
+        for table in ["notes", "properties", "aliases", "tags", "join"] {
             assert!(
                 !lower.contains(table),
                 "base hydration SQL touched {table}: {lower}"

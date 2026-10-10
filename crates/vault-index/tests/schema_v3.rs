@@ -77,9 +77,9 @@ fn structural_store() -> StructuralStore {
 }
 
 #[test]
-fn schema_version_constants_are_four() {
-    assert_eq!(SQL_SCHEMA_VERSION, 4);
-    assert_eq!(SEMANTIC_FORMAT_VERSION, 4);
+fn schema_version_constants_are_five() {
+    assert_eq!(SQL_SCHEMA_VERSION, 5);
+    assert_eq!(SEMANTIC_FORMAT_VERSION, 5);
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn a_fresh_index_carries_the_structural_tables() {
     let user_version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("user_version");
-    assert_eq!(user_version, 4);
+    assert_eq!(user_version, 5);
 
     for table in ["sections", "list_items", "tree_entries"] {
         let count: i64 = connection

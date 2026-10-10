@@ -470,17 +470,17 @@ fn the_value_indexes_serve_the_property_prefilter() {
     };
     let text = plan(equals("status", ScalarLiteral::String("p".into())));
     assert!(
-        text.contains("property_scalars_by_string (key_fold=? AND string_value=?)"),
+        text.contains("properties_by_string (key_fold=? AND string_value=?)"),
         "{text}"
     );
     let number = plan(equals("n", ScalarLiteral::Number(1.0)));
     assert!(
-        number.contains("property_scalars_by_number (key_fold=? AND number_value=?)"),
+        number.contains("properties_by_number (key_fold=? AND number_value=?)"),
         "{number}"
     );
     let flag = plan(equals("n", ScalarLiteral::Boolean(true)));
     assert!(
-        flag.contains("property_scalars_by_number (key_fold=? AND number_value=?)"),
+        flag.contains("properties_by_number (key_fold=? AND number_value=?)"),
         "{flag}"
     );
 }
@@ -844,4 +844,117 @@ fn every_evaluation_path_returns_its_pooled_connection() {
     );
     evaluate_rows(&reader);
     assert_eq!(reader.evaluation_pool_len_for_test(), idle);
+}
+
+/// Task 14 fix round: the attachment backlinks arm looks its candidates up by
+/// the target's file name (ASCII case folded, as SQLite's `lower` folds it)
+/// instead of scanning every unresolved reference. A different-case spelling
+/// and a folder-qualified one still find the attachment; a name that only
+/// contains the attachment's name does not.
+#[test]
+fn attachment_backlinks_match_by_name_without_case_and_never_by_substring() {
+    let files = [
+        ("Notes/Lower.md", "![[photo.png]]\n"),
+        ("Notes/Folder.md", "![[Images/Photo.PNG]]\n"),
+        ("Notes/Near.md", "![[xphoto.png]] ![[photo.png.bak]]\n"),
+        ("Notes/None.md", "nothing\n"),
+        ("Images/Photo.PNG", "png"),
+        (
+            "Q.base",
+            "views:\n  - type: table\n    name: Linked\n    filters: 'file.backlinks.length > 0'\n  - type: table\n    name: Backlinkers\n    filters: 'file.hasLink(\"Images/Photo.PNG\")'\n",
+        ),
+    ];
+    let (service, _vault, _index) = service(&files);
+    assert_eq!(
+        rows(&service, "Q.base", Some("Linked"), None),
+        vec!["Images/Photo.PNG"]
+    );
+    // The backlinks agree with the links from the other end.
+    assert_eq!(
+        rows(&service, "Q.base", Some("Backlinkers"), None),
+        vec!["Notes/Folder.md", "Notes/Lower.md"]
+    );
+}
+
+/// Task 14 fix round: an evaluation is never refused merely because the vault
+/// keeps changing. A whole-vault view is evaluated in a loop for 10 s while a
+/// writer publishes one new note every 7 ms; every request answers, and each
+/// answer is one generation's: its row count is exactly the files that
+/// generation held (the base, the starting notes, one more per publication
+/// since).
+#[test]
+fn a_whole_vault_evaluation_answers_while_the_writer_publishes_every_seven_ms() {
+    const START: usize = 3_000;
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    for at in 0..START {
+        fs::write(
+            vault.path().join(format!("N{at:05}.md")),
+            format!("n {at}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        vault.path().join("All.base"),
+        "views:\n  - type: table\n    name: All\n    order: [file.name]\n",
+    )
+    .unwrap();
+    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).unwrap();
+    let mut service = IndexService::open(config).unwrap();
+    service.refresh(false).unwrap();
+    let reader = service.reader().unwrap();
+    let first = reader.published_status().unwrap().generation.unwrap().get();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (answered, refused) = thread::scope(|scope| {
+        let evaluations = scope.spawn(|| {
+            let types = BTreeMap::new();
+            let mut answered = 0usize;
+            let mut refused = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match reader.evaluate_base(
+                    &BaseQuery {
+                        path: &vp("All.base"),
+                        view: None,
+                        this_path: None,
+                        types: &types,
+                    },
+                    &Clock::fixed(NOW, "UTC"),
+                ) {
+                    Ok(answer) => {
+                        let generation = answer.generation.get();
+                        let published = usize::try_from(generation - first).unwrap();
+                        assert_eq!(
+                            answer.result.total_rows,
+                            START + 1 + published,
+                            "the answer at generation {generation} mixes generations"
+                        );
+                        answered += 1;
+                    }
+                    Err(error) => refused.push(format!("{error:?}")),
+                }
+            }
+            (answered, refused)
+        });
+        let started = std::time::Instant::now();
+        let mut at = 0usize;
+        while started.elapsed() < Duration::from_secs(10) {
+            let path = vp(&format!("New{at:06}.md"));
+            fs::write(vault.path().join(path.as_str()), "new\n").unwrap();
+            service
+                .refresh_paths(BTreeSet::from([path]), ChangeCause::Watcher)
+                .unwrap();
+            at += 1;
+            thread::sleep(Duration::from_millis(7));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        evaluations.join().unwrap()
+    });
+    assert!(answered > 0, "no evaluation answered");
+    assert!(
+        refused.is_empty(),
+        "{} of {} evaluations were refused: {:?}",
+        refused.len(),
+        answered + refused.len(),
+        refused
+    );
 }

@@ -604,7 +604,7 @@ pub(crate) struct ReferenceColumns<'a> {
     pub display: Option<&'a str>,
 }
 
-/// One `property_scalars` row's value columns.
+/// One `properties` row's scalar columns.
 pub(crate) struct StoredScalar {
     pub kind: &'static str,
     pub string_value: Option<String>,
@@ -664,7 +664,7 @@ fn looks_like_date(text: &str) -> bool {
     }
 }
 
-/// Classify one property value into its `property_scalars` columns. The
+/// Classify one property value into its scalar columns in `properties`. The
 /// `date` kind is lexical (see `looks_like_date`): the index knows no
 /// property types, so the kind is a read optimisation, never a correctness
 /// input.

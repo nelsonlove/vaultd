@@ -24,7 +24,7 @@
 //!    route stats only the paths a hint named (plus the folders above them),
 //!    so this is where "it converges on what a complete walk would write"
 //!    stops being an assumption.
-//! 6. **Scalar mirror** — `property_scalars` mirrors `properties` row for
+//! 6. **Scalar mirror** — `properties`' scalar columns classify each row's value, row for
 //!    row, column for column.
 //!
 //! A batch normally reconciles through the targeted route (`refresh_paths`).

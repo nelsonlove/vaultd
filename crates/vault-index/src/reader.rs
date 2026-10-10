@@ -365,6 +365,107 @@ impl IndexReader {
         expected: Generation,
         under_guard: impl FnOnce(&crate::LiveGraph) -> T,
     ) -> Result<(EvaluationRead<'_>, T), IndexError> {
+        self.pin_evaluation(Some(expected), true, under_guard)
+    }
+
+    /// [`Self::evaluation_read`] at whatever generation is published, with
+    /// the resolver for exactly that generation.
+    ///
+    /// Under the guard, beside pinning the snapshot: the shared resolver is
+    /// taken when it is already built for the pinned generation; otherwise
+    /// the resolution catalog is copied out of the live graph (as
+    /// [`Self::resolver`] does), and after the guard is released the
+    /// resolver is built from the copy and installed for that generation
+    /// (never over a newer one). The snapshot stays pinned while it builds,
+    /// so a publication landing meanwhile cannot make the resolver, the base
+    /// and the rows disagree: there is no race to lose. (Task 14 fix round:
+    /// building the resolver first and pinning second lost to a writer
+    /// publishing every 7 ms on 30 to 55 percent of whole-vault
+    /// evaluations.)
+    pub(crate) fn evaluation_read_resolving<T>(
+        &self,
+        under_guard: impl FnOnce(&crate::LiveGraph) -> T,
+    ) -> Result<(EvaluationRead<'_>, T, Arc<Resolver>), IndexError> {
+        enum Source {
+            Ready(Arc<Resolver>),
+            /// Another read is building this generation's resolver: wait for
+            /// it, and build from the copy only if it never settles.
+            Wait(Vec<vault_core::ResolutionNote>),
+            /// This read claimed the build.
+            Build(Vec<vault_core::ResolutionNote>),
+        }
+        let (read, (extracted, source)) = self.pin_evaluation(None, false, |graph| {
+            let generation = graph.generation();
+            let source = match self.resolvers.lock() {
+                Ok(mut state) => match state.resolver.as_ref() {
+                    Some((built, resolver)) if *built == generation => {
+                        Source::Ready(Arc::clone(resolver))
+                    }
+                    _ if state.building == Some(generation) => {
+                        Source::Wait(resolution_catalog(graph))
+                    }
+                    _ => {
+                        state.building = Some(generation);
+                        Source::Build(resolution_catalog(graph))
+                    }
+                },
+                Err(_) => Source::Build(resolution_catalog(graph)),
+            };
+            (under_guard(graph), source)
+        })?;
+        let generation = read.generation;
+        let build = |catalog: Vec<vault_core::ResolutionNote>| {
+            if let Some(hook) = &self.resolver_build_pause {
+                hook();
+            }
+            let resolver = Arc::new(Resolver::from_catalog(catalog));
+            self.resolvers
+                .settle(generation, Some(Arc::clone(&resolver)));
+            resolver
+        };
+        let resolver = match source {
+            Source::Ready(resolver) => resolver,
+            Source::Build(catalog) => build(catalog),
+            Source::Wait(catalog) => {
+                let state = self.resolvers.lock()?;
+                let (state, _) = self
+                    .resolvers
+                    .settled
+                    .wait_timeout_while(state, BUILD_PATIENCE, |state| {
+                        state.building == Some(generation)
+                    })
+                    .map_err(|error| {
+                        IndexError::Storage(format!("resolver slot is poisoned: {error}"))
+                    })?;
+                let settled = state
+                    .resolver
+                    .as_ref()
+                    .filter(|(built, _)| *built == generation)
+                    .map(|(_, resolver)| Arc::clone(resolver));
+                drop(state);
+                match settled {
+                    Some(resolver) => resolver,
+                    None => build(catalog),
+                }
+            }
+        };
+        // The evaluation hook fires once the resolver is in hand, with no
+        // lock held, as it does for [`Self::evaluation_read`].
+        if let Some(hook) = &self.evaluation_pause {
+            hook();
+        }
+        Ok((read, extracted, resolver))
+    }
+
+    /// The shared body of the two evaluation reads: pin a private connection
+    /// to the published generation (which must be `expected` when one is
+    /// given) and copy out what the caller needs, all under the guard.
+    fn pin_evaluation<T>(
+        &self,
+        expected: Option<Generation>,
+        fire_hook: bool,
+        under_guard: impl FnOnce(&crate::LiveGraph) -> T,
+    ) -> Result<(EvaluationRead<'_>, T), IndexError> {
         // The checkout (and an open, when the pool is empty) happens before
         // the guard: opening a connection checks the cache's metadata, which
         // a publication never needs to wait for.
@@ -372,17 +473,20 @@ impl IndexReader {
             reader: self,
             connection: Some(self.check_out_evaluation_connection()?),
             open: false,
-            generation: expected,
+            generation: expected.unwrap_or(Generation::new(0)),
         };
         let published = read_published(&self.published)?;
         let generation = published.generation.ok_or(IndexError::IndexUnavailable)?;
-        if generation != expected {
-            return Err(IndexError::LiveStateStale(format!(
-                "the resolver is at {} but the publication is at {}",
-                expected.get(),
-                generation.get()
-            )));
+        if let Some(expected) = expected {
+            if generation != expected {
+                return Err(IndexError::LiveStateStale(format!(
+                    "the resolver is at {} but the publication is at {}",
+                    expected.get(),
+                    generation.get()
+                )));
+            }
         }
+        read.generation = generation;
         let graph = published
             .graph
             .as_deref()
@@ -409,8 +513,10 @@ impl IndexReader {
         }
         let extracted = under_guard(graph);
         drop(published);
-        if let Some(hook) = &self.evaluation_pause {
-            hook();
+        if fire_hook {
+            if let Some(hook) = &self.evaluation_pause {
+                hook();
+            }
         }
         Ok((read, extracted))
     }
