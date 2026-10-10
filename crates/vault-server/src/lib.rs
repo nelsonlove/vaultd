@@ -1411,6 +1411,7 @@ impl Server {
                     &self.views,
                     self.types_epoch(),
                     || self.property_types(),
+                    vault_bases::Clock::system(),
                     params,
                 ) {
                     Ok(answer) => ResponseEnvelope::success(id, Response::EvaluateBase(answer)),

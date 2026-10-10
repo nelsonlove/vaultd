@@ -1,20 +1,23 @@
 //! `evaluate_base` and `list_bases`.
 //!
 //! A view's result is computed once per (base, view, `this_path`,
-//! generation, types epoch) and its pages are cut from that one computation, so a page
-//! never disagrees with its neighbour about `now()` or `random()`. The store
-//! is a least-recently-used cache of at most `--bases-cache-entries`
-//! results, and the first request at a newer generation drops every older
-//! one. A cursor carries the instant its result was computed at, so a page
-//! whose result was evicted is recomputed at that same instant (the same
-//! `now()`, and the same `random()` sequence, which is seeded from it).
+//! generation, types epoch, and the local day for a view that reads
+//! `today()`) and its pages are cut from that one computation, so a page
+//! never disagrees with its neighbour about `today()` or `random()`. A view
+//! that reads `now()` or `relative()` is never stored: each fresh request
+//! evaluates it at its own instant. The store is a least-recently-used cache
+//! of at most `--bases-cache-entries` results, and the first request at a
+//! newer generation drops every older one. A cursor carries the instant its
+//! result was computed at, so a page whose result is not in the store is
+//! recomputed at that same instant (the same `now()`, and the same
+//! `random()` sequence, which is seeded from it).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use vault_bases::view::CompileError;
+use vault_bases::view::{ClockReads, CompileError};
 use vault_core::VaultPath;
 use vault_index::{BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, IndexError, IndexReader};
 use vault_protocol::{
@@ -39,6 +42,11 @@ pub(crate) struct CacheKey {
     /// `.obsidian/types.json` is no generation, but it retypes cells, so an
     /// answer cached under an older epoch is never served again.
     pub types_epoch: u64,
+    /// For a view that reads `today()` (and not `now()`), the local date it
+    /// was computed on (`Clock::local_day`), so a request on another day
+    /// misses; `None` for a view that reads no clock. A view that reads the
+    /// instant is never stored.
+    pub day: Option<i64>,
 }
 
 /// One evaluation, with the clock it ran under so every page renders its
@@ -79,6 +87,11 @@ pub(crate) struct BaseCache {
     /// How many evaluations this cache could not answer. Test-only.
     #[cfg(test)]
     misses: std::sync::atomic::AtomicUsize,
+    /// Run once, on the next miss, after the generation was read and before
+    /// the evaluation pins one. Test-only: it lands a publication in that
+    /// window.
+    #[cfg(test)]
+    before_evaluate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Default for BaseCache {
@@ -95,7 +108,17 @@ impl BaseCache {
             entries: Mutex::new(Entries::default()),
             #[cfg(test)]
             misses: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_evaluate: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_evaluate_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_evaluate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
@@ -236,6 +259,7 @@ pub(crate) fn evaluate_base(
     tracker: &ViewTracker,
     types_epoch: u64,
     types: impl FnOnce() -> BTreeMap<String, vault_bases::PropertyType>,
+    now: vault_bases::Clock,
     params: EvaluateBaseParams,
 ) -> Result<EvaluateBaseResponse, ProtocolError> {
     let limit = limit(params.limit)?;
@@ -280,10 +304,23 @@ pub(crate) fn evaluate_base(
         // newer types under an older epoch is only ever a needless miss,
         // never a stale hit.
         types_epoch,
+        day: None,
+    };
+    // A view's clock reads are known only from its answer, so both shapes
+    // of key are asked: the clock-free one, then the one for the local day
+    // of the instant this request reads at (its cursor's, on a page).
+    let mut at = now.clone();
+    if let Some(instant) = instant {
+        at.now_ms = instant;
+    }
+    let day_key = CacheKey {
+        day: Some(at.local_day()),
+        ..key.clone()
     };
     // A page is cut only from a result computed at its cursor's instant.
     let hit = cache
         .get(&key)
+        .or_else(|| cache.get(&day_key))
         .filter(|hit| instant.is_none_or(|at| hit.clock.now_ms == at));
     let cached = match hit {
         Some(hit) => hit,
@@ -292,10 +329,18 @@ pub(crate) fn evaluate_base(
             cache
                 .misses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut clock = vault_bases::Clock::system();
-            if let Some(at) = instant {
-                clock.now_ms = at;
+            #[cfg(test)]
+            {
+                let hook = cache
+                    .before_evaluate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
+            let clock = at;
             let types = types();
             let answer = reader
                 .evaluate_base(
@@ -309,13 +354,27 @@ pub(crate) fn evaluate_base(
                 )
                 .map_err(query_error)?;
             let entry = Arc::new(Cached { answer, clock });
+            let computed = entry.answer.generation.get();
             // Keyed by the generation the answer was computed at, which a
             // publication between the status read and the evaluation moves.
-            let key = CacheKey {
-                generation: entry.answer.generation.get(),
-                ..key
+            // A page recomputed at its cursor's older instant is stored only
+            // under the cursor's own generation: at a newer one it is refused
+            // below, and a fresh request there must read its own instant.
+            let day = match entry.answer.dependencies.reads_clock {
+                ClockReads::Never => Some(None),
+                ClockReads::Day => Some(Some(entry.clock.local_day())),
+                ClockReads::Instant => None,
             };
-            cache.put(key, Arc::clone(&entry));
+            if let Some(day) = day {
+                if instant.is_none() || computed == current {
+                    let key = CacheKey {
+                        generation: computed,
+                        day,
+                        ..key
+                    };
+                    cache.put(key, Arc::clone(&entry));
+                }
+            }
             tracker.record(
                 &path,
                 &entry.answer.view.name,
@@ -446,6 +505,7 @@ mod tests {
             this_path: None,
             generation,
             types_epoch: 0,
+            day: None,
         }
     }
 
@@ -537,6 +597,10 @@ mod tests {
                 "R.base",
                 "formulas:\n  r: 'random()'\nviews:\n  - type: table\n    name: T\n    order: [formula.r, n]\n    sort:\n      - property: formula.r\n        direction: ASC\n  - type: table\n    name: U\n",
             ),
+            (
+                "C.base",
+                "formulas:\n  d: 'today()'\n  t: 'now()'\n  r: 'date(\"2026-01-01\").relative()'\nviews:\n  - type: table\n    name: Day\n    order: [formula.d]\n  - type: table\n    name: Now\n    order: [formula.t, formula.d]\n  - type: table\n    name: Rel\n    order: [formula.r]\n  - type: table\n    name: Plain\n    order: [n]\n",
+            ),
         ] {
             std::fs::write(vault.path().join(path), body).unwrap();
         }
@@ -569,9 +633,34 @@ mod tests {
                 &self.tracker,
                 0,
                 BTreeMap::new,
+                vault_bases::Clock::system(),
                 EvaluateBaseParams {
                     path: "R.base".into(),
                     view: view.map(str::to_string),
+                    this_path: None,
+                    cursor,
+                    limit,
+                },
+            )
+        }
+
+        fn ask_at(
+            &self,
+            view: &str,
+            cursor: Option<String>,
+            limit: Option<u32>,
+            now_ms: i64,
+        ) -> Result<EvaluateBaseResponse, ProtocolError> {
+            evaluate_base(
+                &self.reader,
+                &self.cache,
+                &self.tracker,
+                0,
+                BTreeMap::new,
+                vault_bases::Clock::fixed(now_ms, "UTC"),
+                EvaluateBaseParams {
+                    path: "C.base".into(),
+                    view: Some(view.to_string()),
                     this_path: None,
                     cursor,
                     limit,
@@ -656,5 +745,130 @@ mod tests {
         assert_eq!(fixture.reader.evaluation_pool_len_for_test(), idle);
         fixture.ask(Some("T"), None, None).unwrap();
         assert_eq!(fixture.reader.evaluation_pool_len_for_test(), idle);
+    }
+
+    /// 2026-10-09T23:59:00Z, and two minutes later, the next UTC day.
+    const BEFORE_MIDNIGHT: i64 = 1_791_590_340_000;
+    const AFTER_MIDNIGHT: i64 = BEFORE_MIDNIGHT + 120_000;
+
+    fn first_cell(answer: &EvaluateBaseResponse) -> vault_protocol::CellDto {
+        answer.rows[0].cells[0].clone()
+    }
+
+    /// The final review's M2: a view that reads `today()` is answered from
+    /// the cache within one local day, and a request after midnight at the
+    /// same generation misses and reads the new day.
+    #[test]
+    fn a_view_reading_today_misses_after_midnight() {
+        let fixture = fixture(DEFAULT_BASE_CACHE_ENTRIES);
+        let first = fixture.ask_at("Day", None, None, BEFORE_MIDNIGHT).unwrap();
+        let again = fixture
+            .ask_at("Day", None, None, BEFORE_MIDNIGHT + 30_000)
+            .unwrap();
+        assert_eq!(fixture.misses(), 1, "the same day is a hit");
+        assert_eq!(first, again);
+        let next_day = fixture.ask_at("Day", None, None, AFTER_MIDNIGHT).unwrap();
+        assert_eq!(fixture.misses(), 2, "the next day misses");
+        assert_eq!(next_day.generation, first.generation);
+        assert_ne!(first_cell(&next_day), first_cell(&first), "today() moved");
+    }
+
+    /// The final review's M2 for `now()` (and `relative()`, which reads the
+    /// instant): such a view is evaluated on every request, never served
+    /// from the cache; its pages still read the instant their cursor binds.
+    #[test]
+    fn a_view_reading_now_is_never_served_from_the_cache() {
+        let fixture = fixture(DEFAULT_BASE_CACHE_ENTRIES);
+        let first = fixture
+            .ask_at("Now", None, Some(1), BEFORE_MIDNIGHT)
+            .unwrap();
+        let later = fixture
+            .ask_at("Now", None, Some(1), BEFORE_MIDNIGHT + 1_000)
+            .unwrap();
+        assert_eq!(fixture.misses(), 2, "a fresh request recomputes");
+        assert_ne!(first_cell(&later), first_cell(&first), "now() moved");
+        let second = fixture
+            .ask_at("Now", first.next_cursor.clone(), Some(1), AFTER_MIDNIGHT)
+            .unwrap();
+        assert_eq!(
+            first_cell(&second),
+            first_cell(&first),
+            "a page reads the instant its cursor binds"
+        );
+        fixture.ask_at("Rel", None, None, BEFORE_MIDNIGHT).unwrap();
+        fixture.ask_at("Rel", None, None, BEFORE_MIDNIGHT).unwrap();
+        assert_eq!(fixture.misses(), 5, "relative() reads the instant too");
+        assert_eq!(fixture.cache.len(), 0, "none of them was stored");
+    }
+
+    /// A view that reads no clock keeps its cached answer across midnight.
+    #[test]
+    fn a_view_reading_no_clock_is_cached_across_days() {
+        let fixture = fixture(DEFAULT_BASE_CACHE_ENTRIES);
+        fixture
+            .ask_at("Plain", None, None, BEFORE_MIDNIGHT)
+            .unwrap();
+        fixture.ask_at("Plain", None, None, AFTER_MIDNIGHT).unwrap();
+        assert_eq!(fixture.misses(), 1);
+    }
+
+    /// The final review's L1: a page recomputed at its cursor's instant whose
+    /// evaluation lands on a newer generation (a publication between the
+    /// status read and the pin) is refused `generation_mismatch` and never
+    /// stored, so a fresh request at the newer generation recomputes at its
+    /// own instant instead of reading the old instant's answer.
+    #[test]
+    fn a_page_recomputed_at_an_old_instant_is_never_stored_under_a_newer_generation() {
+        let Fixture {
+            vault,
+            _index,
+            service,
+            reader,
+            cache,
+            tracker,
+        } = fixture(1);
+        let ask = |view: &str, cursor: Option<String>, limit: Option<u32>, now_ms: i64| {
+            evaluate_base(
+                &reader,
+                &cache,
+                &tracker,
+                0,
+                BTreeMap::new,
+                vault_bases::Clock::fixed(now_ms, "UTC"),
+                EvaluateBaseParams {
+                    path: "C.base".into(),
+                    view: Some(view.to_string()),
+                    this_path: None,
+                    cursor,
+                    limit,
+                },
+            )
+        };
+        let page = ask("Plain", None, Some(1), BEFORE_MIDNIGHT).unwrap();
+        // Evict Plain's answer, so the next page is a recompute.
+        ask("Day", None, None, BEFORE_MIDNIGHT).unwrap();
+        let service = std::sync::Mutex::new(service);
+        let vault_root = vault.path().to_path_buf();
+        cache.before_evaluate_for_test(Box::new(move || {
+            std::fs::write(vault_root.join("D.md"), "x\n").unwrap();
+            service
+                .lock()
+                .unwrap()
+                .refresh_paths(
+                    [VaultPath::new("D.md").unwrap()].into(),
+                    vault_index::ChangeCause::Watcher,
+                )
+                .unwrap();
+        }));
+        let error = ask("Plain", page.next_cursor, Some(1), AFTER_MIDNIGHT).unwrap_err();
+        assert_eq!(error.code, ErrorCode::GenerationMismatch);
+        let misses = cache.misses.load(std::sync::atomic::Ordering::SeqCst);
+        let fresh = ask("Plain", None, None, AFTER_MIDNIGHT).unwrap();
+        assert_eq!(fresh.generation, page.generation + 1);
+        assert_eq!(
+            cache.misses.load(std::sync::atomic::Ordering::SeqCst),
+            misses + 1,
+            "the fresh request at the newer generation recomputed"
+        );
     }
 }
