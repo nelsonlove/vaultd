@@ -1106,7 +1106,11 @@ fn source_files() -> Vec<PathBuf> {
     }
     let mut files = Vec::new();
     walk(&repo().join("crates"), &["rs"], &mut files);
-    walk(&repo().join("host/scripts"), &["js", "mjs", "ts"], &mut files);
+    walk(
+        &repo().join("host/scripts"),
+        &["js", "mjs", "ts"],
+        &mut files,
+    );
     files.sort();
     files
 }

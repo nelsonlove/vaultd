@@ -1421,9 +1421,12 @@ fn a_property_prefilter_admits_what_coercion_makes_equal() {
             "A.md",
             MemoryFile::note().property("due", text("2026-10-01T00:00")),
         )
-        .with("B.md", MemoryFile::note().property("due", text("2026-10-02")));
-    let compiled = compile_view(&parse_base(&table(r#"due == "2026-10-01""#)).unwrap(), None)
-        .unwrap();
+        .with(
+            "B.md",
+            MemoryFile::note().property("due", text("2026-10-02")),
+        );
+    let compiled =
+        compile_view(&parse_base(&table(r#"due == "2026-10-01""#)).unwrap(), None).unwrap();
     assert!(!compiled.prefilters().is_empty());
     assert_eq!(ctx_paths(&dated, &compiled.without_prefilters()), ["A.md"]);
     assert_eq!(ctx_paths(&dated, &compiled), ["A.md"]);

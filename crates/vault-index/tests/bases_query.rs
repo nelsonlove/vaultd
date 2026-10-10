@@ -1329,16 +1329,16 @@ fn check_parity(vault: &ParityVault) -> Result<(), TestCaseError> {
         .collect();
     let types =
         vault_index::parse_property_types(&format!("{{\"types\":{{{}}}}}", declared.join(",")));
-    for k in 0..PARITY_KEYS.len() {
-        for l in 0..PARITY_LITERALS.len() {
+    for (k, key) in PARITY_KEYS.iter().enumerate() {
+        for (l, literal) in PARITY_LITERALS.iter().enumerate() {
             let narrowed = typed_rows(&service, "Q.base", &format!("P{k}_{l}"), &types);
             let full = typed_rows(&service, "Q.base", &format!("T{k}_{l}"), &types);
             prop_assert_eq!(
                 narrowed,
                 full,
                 "{} == {} with types {:?}",
-                PARITY_KEYS[k],
-                PARITY_LITERALS[l],
+                key,
+                literal,
                 types
             );
         }

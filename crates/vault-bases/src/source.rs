@@ -154,9 +154,7 @@ pub fn equality_narrowing<'a>(
 pub(crate) fn may_equal(held: &PropertyValue, narrowing: &Narrowing<'_>) -> bool {
     match (held, narrowing) {
         (PropertyValue::Null, _) => false,
-        (PropertyValue::String(have), Narrowing::Text(want)) => {
-            !plain_text(have) || have == want
-        }
+        (PropertyValue::String(have), Narrowing::Text(want)) => !plain_text(have) || have == want,
         (PropertyValue::Integer(have), Narrowing::Number(want)) => *have as f64 == *want,
         (PropertyValue::Float(have), Narrowing::Number(want)) => have == want,
         // A list, a mapping, a scalar of another kind, or no narrowing: the
@@ -598,7 +596,11 @@ mod tests {
             equality_narrowing("Status", &literal, &types),
             Narrowing::Text("p")
         );
-        for kind in [PropertyType::Date, PropertyType::DateTime, PropertyType::Tags] {
+        for kind in [
+            PropertyType::Date,
+            PropertyType::DateTime,
+            PropertyType::Tags,
+        ] {
             types.insert("status".to_string(), kind);
             assert_eq!(
                 equality_narrowing("Status", &literal, &types),
