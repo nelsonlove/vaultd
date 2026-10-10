@@ -22,7 +22,29 @@ Each harness series is three daemon runs (`--repeat 3`) of 200 samples (50 for t
 | The per-commit staleness rule, 50 bases | under 1 ms | 0.050 ms (runs 0.051, 0.050) | 0.049 ms (runs 0.048, 0.049) | met |
 | Reconciliation of a vault with no base, against phase 7 | within 5 percent | cold build +7.4 to +11.8 percent (missed); one-note `write_note` -1.7 percent | cold build -0.1 to +3.1 percent; 100-note burst +1.6 and +4.0 percent; one-note `write_note` +0.7 percent | met (after the fix round) |
 
-The after series' loads at the start of each run: bases-5 0.49 1.07 1.34, 1.06 1.16 1.37, 1.12 1.17 1.37; bases-6 0.93 1.05 1.25, 1.02 1.06 1.25, 1.09 1.08 1.25. The filtered page is 0.9 ms faster after the fix round because property reads are now memoized per evaluation (item 5 below).
+The after series' loads at the start of each run: bases-5 0.49 1.07 1.34, 1.06 1.16 1.37, 1.12 1.17 1.37; bases-6 0.93 1.05 1.25, 1.02 1.06 1.25, 1.09 1.08 1.25. Per run after the fix round (p50 / p95 / min, ms):
+
+| Run | Load at start (1, 5, 15 min) | filtered | whole-vault | cache hit | base change | note change |
+| --- | --- | --- | --- | --- | --- | --- |
+| bases-5 run 1 | 0.49 1.07 1.34 | 6.596 / 6.946 / 6.490 | 66.554 / 71.082 / 65.791 | 0.110 / 0.143 / 0.102 | 10.144 / 12.192 / 8.620 | 10.216 / 11.824 / 8.676 |
+| bases-5 run 2 | 1.06 1.16 1.37 | 6.636 / 7.135 / 6.483 | 66.919 / 68.011 / 65.822 | 0.105 / 0.127 / 0.097 | 10.074 / 11.857 / 8.460 | 10.217 / 11.625 / 8.695 |
+| bases-5 run 3 | 1.12 1.17 1.37 | 6.693 / 7.149 / 6.502 | 67.601 / 68.538 / 66.074 | 0.107 / 0.131 / 0.101 | 10.010 / 11.140 / 8.568 | 10.139 / 11.346 / 8.635 |
+| bases-6 run 1 | 0.93 1.05 1.25 | 6.650 / 7.031 / 6.545 | 66.608 / 68.204 / 66.071 | 0.104 / 0.127 / 0.093 | 9.960 / 11.506 / 8.481 | 10.078 / 11.379 / 8.594 |
+| bases-6 run 2 | 1.02 1.06 1.25 | 6.594 / 6.925 / 6.471 | 66.597 / 68.779 / 65.592 | 0.104 / 0.127 / 0.094 | 10.156 / 11.547 / 8.699 | 10.206 / 11.460 / 8.680 |
+| bases-6 run 3 | 1.09 1.08 1.25 | 6.693 / 7.120 / 6.516 | 67.308 / 69.142 / 65.833 | 0.105 / 0.131 / 0.097 | 10.147 / 11.690 / 8.856 | 10.217 / 12.124 / 8.687 |
+
+The filtered page is 0.9 ms faster after the fix round; the property memo (item 5 below) is the one engine change on its path that could account for it, but the before and after series differ in more than that one respect, so the attribution is plausible, not proven.
+
+The no-base `write_note` after the fix round, the harness on the same 10,000-note fixture, alternated:
+
+| Series | `write_note` p50 per run (ms) |
+| --- | --- |
+| head-3 | 10.133, 10.144, 10.164 |
+| main-3 | 10.081, 9.502, 10.084 |
+| head-4 | 10.114, 10.068, 10.129 |
+| main-4 | 10.039, 10.035, 10.178 |
+
+Medians of six run p50s: 10.131 against 10.060 ms (+0.7 percent).
 
 ## Fix round 1 — before and after
 
@@ -41,7 +63,7 @@ Two fixes, tried in the ruled order, `vault-bench` alternated head, main:
 | b: the scalar columns folded into `properties` (schema v5), plus a | frontmatter | 1481.9 (1472.5), 1499.1 (1483.1) | 1454.8 (1436.0), 1453.5 (1430.4) | +1.9, +3.1 percent | 1.27 1.52 1.47 / 2.64 2.02 1.68; 1.41 1.79 1.62 / 1.08 1.55 1.55 |
 | b | synthetic | 1417.7 (1401.0), 1410.9 (1398.1) | 1418.8 (1389.8), 1399.9 (1379.2) | -0.1, +0.8 percent | 1.07 1.41 1.49 / 0.89 1.32 1.45; 1.09 1.37 1.46 / 0.88 1.24 1.39 |
 
-Step a alone closed a third of the gap (the indexes and the per-row prepare); the rest was the second row per property itself (its own primary-key b-tree and row write). Step b removes the row: `properties` gains `key_fold`, `kind`, `string_value` and `number_value`, and its three secondary indexes (`properties_by_key`, `_by_string`, `_by_number`) are dropped before the cold build's bulk load and created again after it, inside the same transaction. The 100-note burst after step b: 20.5 and 20.1 ms against 20.2 and 19.4 ms (+1.6, +4.0 percent; before: +10 percent). Warm start, one-file refresh, verified refresh and every other `--live` case stay within the run-to-run spread. The schema is version 5; a version 4 (or older) cache is rebuilt, never migrated (`a_genuine_version_four_cache_is_replaced_by_schema_five`). The scalar-mirror oracle now checks that every `properties` row's scalar columns classify its own value; it, the drift oracle and the live oracle stay green.
+The cold-build bound is met at the instrument's resolution, not with margin: the delta between the same two binaries on the same vault moved from +0.4 to +5.7 percent between two paired `vault-bench` runs (the no-frontmatter pairs), so +1.9 to +3.1 percent is inside the instrument's run-to-run spread. Step a alone closed a third of the gap (the indexes and the per-row prepare); the rest was the second row per property itself (its own primary-key b-tree and row write). Step b removes the row: `properties` gains `key_fold`, `kind`, `string_value` and `number_value`, and its three secondary indexes (`properties_by_key`, `_by_string`, `_by_number`) are dropped before the cold build's bulk load and created again after it, inside the same transaction. The 100-note burst after step b: 20.5 and 20.1 ms against 20.2 and 19.4 ms (+1.6, +4.0 percent; before: +10 percent). Warm start, one-file refresh, verified refresh and every other `--live` case stay within the run-to-run spread. The schema is version 5; a version 4 (or older) cache is rebuilt, never migrated (`a_genuine_version_four_cache_is_replaced_by_schema_five`). The scalar-mirror oracle now checks that every `properties` row's scalar columns classify its own value; it, the drift oracle and the live oracle stay green.
 
 ### 2. `get_note`: `prepare_cached` in the diagnostics union
 
@@ -56,15 +78,18 @@ The harness after-loads: head-3 1.05 1.16 1.28, main-3 1.11 1.17 1.27, head-4 1.
 
 ### 3. `LiveStateStale` under fast publishes
 
-`evaluate_base` now pins its snapshot first and takes the resolver for exactly that generation: under the same guard it takes the shared resolver if it is built for the pinned generation, waits (with no lock held) for a build already in flight for it, or copies the resolution catalog and builds the resolver after the guard is released, then installs it for that generation unless a newer one is there. The snapshot stays pinned while the resolver builds, so a publication landing meanwhile cannot make the resolver, the base and the rows disagree. A refusal that remains possible (a commit landing between the snapshot and the guard, or a foreign writer) is retried with backoff (1 ms doubling to 32 ms) for up to 2 s before the typed error.
+`evaluate_base` now pins its snapshot first and takes the resolver for exactly that generation: under the same guard it takes the shared resolver if it is built for the pinned generation, waits (with no lock held, bounded by the evaluation's deadline and by the 2 s build patience, and copying nothing) for a build already in flight for it, refusing the attempt as stale if that build never settles, or copies the resolution catalog and builds the resolver after the guard is released, then installs it for that generation unless a newer one is there. The snapshot stays pinned while the resolver builds, so a publication landing meanwhile cannot make the resolver, the base and the rows disagree. A refusal that remains possible (a commit landing between the snapshot and the guard, or a foreign writer) is retried with backoff (1 ms doubling to 32 ms) for up to 2 s before the typed error.
 
 | Measurement | Before | After |
 | --- | --- | --- |
 | whole-vault evaluations refused under one publish every 7 ms, one evaluating thread (`bases_timing`, 4 phases per run) | 3 to 6 of 9 to 11 per phase (30 to 55 percent), two runs | 0 of 7 or 8 per phase, four runs (timing-3 to timing-6) |
 | the same, four evaluating threads | 1 or 2 of 13 to 18 per phase | 0 of 16 to 18 per phase |
 | publish p50 with one / four evaluations in flight | 0.48 to 0.52 / 1.34 to 1.46 ms | 0.47 to 0.61 / 1.31 to 1.65 ms |
+| publish p95 / max, no reader | 2.16 to 2.59 / 2.53 to 4.70 ms | 1.78 to 2.75 / 2.65 to 4.67 ms |
+| publish p95 / max, one evaluation in flight | 0.57 to 1.12 / 1.26 to 1.87 ms | 0.60 to 0.99 / 1.16 to 2.11 ms |
+| publish p95 / max, four evaluations in flight | 1.80 to 2.14 / 2.24 to 2.41 ms | 1.58 to 2.95 / 1.88 to 7.14 ms |
 
-`a_whole_vault_evaluation_answers_while_the_writer_publishes_every_seven_ms` (3,000 notes, 10 s, debug build) asserts that every evaluation answers and that each answer's row count is exactly its generation's; it fails on the old shape (resolver first, pin second: mutation exit 101). Loads at the four timing runs' starts: 1.11 1.19 1.35, 1.01 1.27 1.29, 2.21 1.65 1.58, 0.89 1.12 1.33.
+`a_whole_vault_evaluation_answers_while_the_writer_publishes_every_seven_ms` (3,000 notes, 10 s, debug build) asserts that every evaluation answers and that each answer's row count is exactly its generation's; it fails on the old shape (resolver first, pin second: mutation exit 101). It runs 10 s, so it is ignored by default. Two deterministic tests pin the rest: `an_evaluations_resolver_belongs_to_the_generation_it_pinned` parks a read after its pin, publishes the note a frontmatter link names, and asserts the parked answer is at the old generation with the link still unresolved (it fails when the evaluation takes the newest resolver: exit 101); `an_evaluation_that_never_holds_still_answers_live_state_stale_within_its_budget` forces every attempt stale and asserts the typed `LiveStateStale` after 1.9 to 3 s (it fails when the retry ignores the budget: exit 101). The worst publish max after, 7.14 ms with four evaluations in flight (timing-4, load 1.01 1.27 1.29 at start), is one sample of 41; the other seven phases with four evaluations stay at or under 4.79 ms. Loads at the four timing runs' starts: 1.11 1.19 1.35, 1.01 1.27 1.29, 2.21 1.65 1.58, 0.89 1.12 1.33.
 
 ### 4. The attachment backlinks arm
 

@@ -850,7 +850,9 @@ fn every_evaluation_path_returns_its_pooled_connection() {
 /// the target's file name (ASCII case folded, as SQLite's `lower` folds it)
 /// instead of scanning every unresolved reference. A different-case spelling
 /// and a folder-qualified one still find the attachment; a name that only
-/// contains the attachment's name does not.
+/// contains the attachment's name does not. The backlinks are read back
+/// whole, so a lost spelling is seen (fix round 2: a key left unfolded
+/// dropped `Notes/Folder.md`, and a `length > 0` filter could not tell).
 #[test]
 fn attachment_backlinks_match_by_name_without_case_and_never_by_substring() {
     let files = [
@@ -861,13 +863,46 @@ fn attachment_backlinks_match_by_name_without_case_and_never_by_substring() {
         ("Images/Photo.PNG", "png"),
         (
             "Q.base",
-            "views:\n  - type: table\n    name: Linked\n    filters: 'file.backlinks.length > 0'\n  - type: table\n    name: Backlinkers\n    filters: 'file.hasLink(\"Images/Photo.PNG\")'\n",
+            "views:\n  - type: table\n    name: Linked\n    filters: 'file.backlinks.length > 0'\n    order: [file.backlinks]\n  - type: table\n    name: Backlinkers\n    filters: 'file.hasLink(\"Images/Photo.PNG\")'\n",
         ),
     ];
     let (service, _vault, _index) = service(&files);
     assert_eq!(
         rows(&service, "Q.base", Some("Linked"), None),
         vec!["Images/Photo.PNG"]
+    );
+    let types = BTreeMap::new();
+    let answer = service
+        .reader()
+        .unwrap()
+        .evaluate_base(
+            &BaseQuery {
+                path: &vp("Q.base"),
+                view: Some("Linked"),
+                this_path: None,
+                types: &types,
+            },
+            &Clock::fixed(NOW, "UTC"),
+        )
+        .unwrap();
+    let Ok(Value::List(backlinks)) = &answer.result.rows[0].cells[0] else {
+        panic!(
+            "the backlinks cell is a list: {:?}",
+            answer.result.rows[0].cells[0]
+        );
+    };
+    let mut from: Vec<String> = backlinks
+        .iter()
+        .map(|link| match link {
+            Value::Link(link) => link.target.clone(),
+            other => panic!("a backlink is a link: {other:?}"),
+        })
+        .collect();
+    from.sort();
+    assert_eq!(
+        from,
+        ["Notes/Folder.md", "Notes/Lower.md"],
+        "exactly the two spellings that resolve to the attachment"
     );
     // The backlinks agree with the links from the other end.
     assert_eq!(
@@ -881,8 +916,11 @@ fn attachment_backlinks_match_by_name_without_case_and_never_by_substring() {
 /// writer publishes one new note every 7 ms; every request answers, and each
 /// answer is one generation's: its row count is exactly the files that
 /// generation held (the base, the starting notes, one more per publication
-/// since).
+/// since). Ignored by default (it runs 10 s); run it with
+/// `TMPDIR="$PWD/target/tmp" cargo test -p vault-index --test bases_query --
+/// --ignored a_whole_vault_evaluation_answers`.
 #[test]
+#[ignore = "runs for 10 s; run with --ignored"]
 fn a_whole_vault_evaluation_answers_while_the_writer_publishes_every_seven_ms() {
     const START: usize = 3_000;
     let vault = TempDir::new_in(common::scratch_root()).unwrap();
@@ -956,5 +994,126 @@ fn a_whole_vault_evaluation_answers_while_the_writer_publishes_every_seven_ms() 
         refused.len(),
         answered + refused.len(),
         refused
+    );
+}
+
+/// Task 14 fix round 2: an evaluation's resolver is the pinned generation's.
+/// A note's frontmatter `up: "[[Target]]"` is unresolved at the generation an
+/// evaluation pins; `Target.md` is published while the evaluation is parked
+/// after the pin; the answer is at the old generation and still shows the
+/// link unresolved. A resolver taken from the newer generation would resolve
+/// it beside the old generation's rows.
+#[test]
+fn an_evaluations_resolver_belongs_to_the_generation_it_pinned() {
+    let files = [
+        ("A.md", "---\nup: \"[[Target]]\"\n---\n"),
+        (
+            "Q.base",
+            "views:\n  - type: table\n    name: T\n    filters: 'file.ext == \"md\"'\n    order: [up]\n",
+        ),
+    ];
+    let (mut service, vault, _index) = service(&files);
+    let up_resolved = |reader: &IndexReader| {
+        let types = BTreeMap::new();
+        let answer = reader
+            .evaluate_base(
+                &BaseQuery {
+                    path: &vp("Q.base"),
+                    view: None,
+                    this_path: None,
+                    types: &types,
+                },
+                &Clock::fixed(NOW, "UTC"),
+            )
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        let row = answer
+            .result
+            .rows
+            .iter()
+            .find(|row| row.path.as_str() == "A.md")
+            .expect("A.md is a row");
+        let resolved = match &row.cells[0] {
+            Ok(Value::Link(link)) => link.resolved.clone(),
+            other => panic!("`up` is a link: {other:?}"),
+        };
+        (answer.generation.get(), resolved)
+    };
+    // Built once for this generation, so the parked read takes it ready.
+    let (before, resolved) = up_resolved(&service.reader().unwrap());
+    assert_eq!(resolved, None, "no Target yet");
+
+    let mut reader = service.reader().unwrap();
+    let (parked, release) = parking(&mut reader);
+    let evaluation = thread::spawn(move || up_resolved(&reader));
+    parked
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the evaluation parks after its pin");
+    fs::write(vault.path().join("Target.md"), "target\n").unwrap();
+    service
+        .refresh_paths(BTreeSet::from([vp("Target.md")]), ChangeCause::Watcher)
+        .unwrap();
+    // The newer generation's resolver exists before the parked read goes on.
+    let (after, resolved_after) = up_resolved(&service.reader().unwrap());
+    assert_eq!(after, before + 1);
+    assert_eq!(
+        resolved_after,
+        Some(vp("Target.md")),
+        "the new generation resolves it"
+    );
+    release.send(()).unwrap();
+    let (generation, resolved) = evaluation.join().unwrap();
+    assert_eq!(
+        generation, before,
+        "the parked read answers at its pinned generation"
+    );
+    assert_eq!(
+        resolved, None,
+        "the parked read resolves with its own generation's resolver"
+    );
+}
+
+/// Task 14 fix round 2: an evaluation that is refused as stale on every
+/// attempt gives up with the typed error once its 2 s budget runs out,
+/// instead of retrying forever. The `recv_timeout` is a hang detector.
+#[test]
+fn an_evaluation_that_never_holds_still_answers_live_state_stale_within_its_budget() {
+    let (service, _vault, _index) = service(&PARKED_VAULT);
+    let mut reader = service.reader().unwrap();
+    reader.force_stale_evaluations_for_test();
+    let (done_tx, done_rx) = mpsc::channel();
+    let started = std::time::Instant::now();
+    thread::spawn(move || {
+        let types = BTreeMap::new();
+        let answer = reader.evaluate_base(
+            &BaseQuery {
+                path: &vp("Q.base"),
+                view: None,
+                this_path: None,
+                types: &types,
+            },
+            &Clock::fixed(NOW, "UTC"),
+        );
+        let _ = done_tx.send(answer.map(|answer| answer.generation.get()));
+    });
+    let answer = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the evaluation gives up within its budget");
+    let took = started.elapsed();
+    assert!(
+        matches!(
+            answer,
+            Err(BaseQueryError::Index(
+                vault_index::IndexError::LiveStateStale(_)
+            ))
+        ),
+        "{answer:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(1_900),
+        "it retried for its budget: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "it stopped at its budget: {took:?}"
     );
 }

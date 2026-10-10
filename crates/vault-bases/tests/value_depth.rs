@@ -118,6 +118,34 @@ fn long_folds_and_unique_are_linear() {
     assert!(took < Duration::from_secs(2), "{took:?}");
 }
 
+/// Task 14 fix round 2: an object records its depth when it is built, too.
+/// Objects reach a program only from frontmatter (an expression cannot spell
+/// an object literal), so the depth is pinned through a nested mapping: one
+/// `levels` deep, wrapped in a list.
+#[test]
+fn an_object_from_frontmatter_carries_its_depth_into_a_wrap() {
+    fn nested(levels: usize) -> PropertyValue {
+        let mut value = PropertyValue::Integer(1);
+        for _ in 0..levels {
+            value = PropertyValue::Mapping(vec![(no_span("k".to_string()), no_span(value))]);
+        }
+        value
+    }
+    on_a_one_mebibyte_stack(|| {
+        let with = |levels: usize| {
+            MemorySource::new().with("Row.md", MemoryFile::note().property("m", nested(levels)))
+        };
+        let fits = eval(&with(MAX_VALUE_DEPTH - 1), "[m]").unwrap();
+        assert_eq!(depth(&fits), MAX_VALUE_DEPTH);
+        assert_eq!(
+            eval(&with(MAX_VALUE_DEPTH), "[m]"),
+            Err(EvalError::ValueTooDeep {
+                max: MAX_VALUE_DEPTH
+            })
+        );
+    });
+}
+
 /// Task 14 fix round: a fold that reads a wide property on every step, or
 /// wraps it on every step, is linear. The property is converted once per
 /// evaluation (memoized), and wrapping reads the depth the list carries

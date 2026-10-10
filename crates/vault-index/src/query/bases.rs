@@ -117,12 +117,12 @@ fn source_error(error: impl std::fmt::Display) -> SourceError {
     SourceError(error.to_string())
 }
 
-/// The row source over one pinned read: a connection inside a read
-/// transaction at the evaluated generation.
 /// Unresolved references by the lowercased file name they target:
 /// `(note, raw target)` each.
 type UnresolvedByName = HashMap<String, Vec<(String, String)>>;
 
+/// The row source over one pinned read: a connection inside a read
+/// transaction at the evaluated generation.
 struct IndexRowSource<'c> {
     connection: &'c Connection,
     resolver: Arc<Resolver>,
@@ -816,7 +816,7 @@ impl IndexReader {
         let deadline = std::time::Instant::now() + EVALUATION_BUDGET;
         let mut pause = EVALUATION_BACKOFF;
         loop {
-            let started = self.evaluation_read_resolving(|graph| {
+            let started = self.evaluation_read_resolving(deadline, |graph| {
                 let record = graph
                     .base(query.path)
                     .map(|record| (record.file.clone(), record.error.clone()));

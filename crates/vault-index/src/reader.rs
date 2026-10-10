@@ -178,6 +178,10 @@ pub struct IndexReader {
     /// while it runs. A leaf lock, held only to check one out or back in.
     evaluation_connections: Mutex<Vec<Connection>>,
     evaluation_pause: Option<PauseHook>,
+    /// Test-only: every evaluation read is refused as stale, so a test can
+    /// prove that `evaluate_base` gives up with the typed error when its
+    /// budget runs out.
+    forced_stale: bool,
 }
 
 /// How many idle private connections a reader keeps for evaluations. More
@@ -240,6 +244,7 @@ impl IndexReader {
             resolver_build_pause: None,
             evaluation_connections: Mutex::new(Vec::new()),
             evaluation_pause: None,
+            forced_stale: false,
         })
     }
 
@@ -350,6 +355,15 @@ impl IndexReader {
         self.evaluation_pause = Some(hook);
     }
 
+    /// Refuse every evaluation read this reader starts as stale
+    /// (`LiveStateStale`), as a generation that never holds still would.
+    /// Test-only: it is what proves `evaluate_base` answers the typed error
+    /// once its retry budget runs out instead of retrying forever.
+    #[doc(hidden)]
+    pub fn force_stale_evaluations_for_test(&mut self) {
+        self.forced_stale = true;
+    }
+
     /// Open a long read on a private connection, pinned to the published
     /// generation: the eighth shape at the top of this module.
     ///
@@ -382,15 +396,27 @@ impl IndexReader {
     /// building the resolver first and pinning second lost to a writer
     /// publishing every 7 ms on 30 to 55 percent of whole-vault
     /// evaluations.)
+    ///
+    /// A wait for another read's build is bounded by `deadline` (and by
+    /// `BUILD_PATIENCE`); a wait that ends with no resolver for the pinned
+    /// generation is refused as stale, so the caller pins again and retries
+    /// within its own budget.
     pub(crate) fn evaluation_read_resolving<T>(
         &self,
+        deadline: std::time::Instant,
         under_guard: impl FnOnce(&crate::LiveGraph) -> T,
     ) -> Result<(EvaluationRead<'_>, T, Arc<Resolver>), IndexError> {
+        if self.forced_stale {
+            return Err(IndexError::LiveStateStale(
+                "evaluations are refused as stale by a test".into(),
+            ));
+        }
         enum Source {
             Ready(Arc<Resolver>),
             /// Another read is building this generation's resolver: wait for
-            /// it, and build from the copy only if it never settles.
-            Wait(Vec<vault_core::ResolutionNote>),
+            /// it. No catalog is copied: the builder's resolver serves this
+            /// read too, and a wait that never settles is refused as stale.
+            Wait,
             /// This read claimed the build.
             Build(Vec<vault_core::ResolutionNote>),
         }
@@ -401,9 +427,7 @@ impl IndexReader {
                     Some((built, resolver)) if *built == generation => {
                         Source::Ready(Arc::clone(resolver))
                     }
-                    _ if state.building == Some(generation) => {
-                        Source::Wait(resolution_catalog(graph))
-                    }
+                    _ if state.building == Some(generation) => Source::Wait,
                     _ => {
                         state.building = Some(generation);
                         Source::Build(resolution_catalog(graph))
@@ -426,14 +450,14 @@ impl IndexReader {
         let resolver = match source {
             Source::Ready(resolver) => resolver,
             Source::Build(catalog) => build(catalog),
-            Source::Wait(catalog) => {
+            Source::Wait => {
+                let patience = BUILD_PATIENCE
+                    .min(deadline.saturating_duration_since(std::time::Instant::now()));
                 let state = self.resolvers.lock()?;
                 let (state, _) = self
                     .resolvers
                     .settled
-                    .wait_timeout_while(state, BUILD_PATIENCE, |state| {
-                        state.building == Some(generation)
-                    })
+                    .wait_timeout_while(state, patience, |state| state.building == Some(generation))
                     .map_err(|error| {
                         IndexError::Storage(format!("resolver slot is poisoned: {error}"))
                     })?;
@@ -445,7 +469,12 @@ impl IndexReader {
                 drop(state);
                 match settled {
                     Some(resolver) => resolver,
-                    None => build(catalog),
+                    None => {
+                        return Err(IndexError::LiveStateStale(format!(
+                            "the resolver build for generation {} did not settle in time",
+                            generation.get()
+                        )));
+                    }
                 }
             }
         };
