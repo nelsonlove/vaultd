@@ -961,7 +961,10 @@ fn committed_captures_name_only_generated_paths() {
 /// The corpus half of the ruling's check: no committed capture or capture
 /// fixture holds the name of any file or folder the copy took from the real
 /// vault (5 characters or more, outside `Captures/`), read at test time from
-/// `MANIFEST.json` and the local corpus captures, never written anywhere.
+/// `MANIFEST.json` and the local corpus captures, never written anywhere;
+/// and no comment or string literal of a source file in `crates/` or
+/// `host/scripts/` holds a distinctive one (the final review's L2). A hit
+/// is reported by file and length, never by the name.
 #[test]
 #[ignore = "needs the hand-made corpus under target/tmp/bases-corpus"]
 fn committed_files_hold_no_corpus_name() {
@@ -1013,6 +1016,8 @@ fn committed_files_hold_no_corpus_name() {
         "Templates",
         "Script",
         "types",
+        // A public specification's name, cited by the parser's comments.
+        "CommonMark",
     ] {
         real.remove(generic);
     }
@@ -1030,5 +1035,142 @@ fn committed_files_hold_no_corpus_name() {
             }
         }
     }
+    // The final review's L2: the Task 13 leak was in code comments, so the
+    // comments and string literals of every source file in `crates/` and
+    // `host/scripts/` are read too. Only those: an identifier is code's own
+    // English, not a quoted name. A top-level area folder (`NN-NN Name`)
+    // names an area, not a note, and the copy script and the guard above
+    // name one in order to exclude it.
+    // Source prose is English, so a name that is one plain word (`Memory`,
+    // `paths`) is not evidence: only a name of several words, or one word
+    // with an inner capital, digit or mark (`SomeType`, `some-tag`), is
+    // looked for.
+    real.retain(|name| {
+        let bytes = name.as_bytes();
+        let area = bytes.len() > 6
+            && bytes[..2].iter().all(u8::is_ascii_digit)
+            && bytes[2] == b'-'
+            && bytes[3..5].iter().all(u8::is_ascii_digit)
+            && bytes[5] == b' ';
+        let distinctive = name
+            .chars()
+            .skip(1)
+            .any(|c| c.is_uppercase() || !c.is_alphabetic());
+        distinctive && !area
+    });
+    for file in source_files() {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let javascript = file
+            .extension()
+            .is_some_and(|ext| ext == "js" || ext == "mjs" || ext == "ts");
+        for quoted in comments_and_strings(&text, javascript) {
+            if let Some(name) = real.iter().find(|name| quoted.contains(name.as_str())) {
+                hits.push(format!(
+                    "{} holds a corpus name in a comment or string ({} characters)",
+                    file.display(),
+                    name.chars().count()
+                ));
+                break;
+            }
+        }
+    }
+    hits.dedup();
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// Every Rust source under `crates/` and every script under `host/scripts/`,
+/// fixtures and build output excluded.
+fn source_files() -> Vec<PathBuf> {
+    fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_dir() {
+                if !matches!(
+                    name.to_str(),
+                    Some("target" | "node_modules" | "fixtures" | "dist")
+                ) {
+                    walk(&path, extensions, out);
+                }
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&repo().join("crates"), &["rs"], &mut files);
+    walk(&repo().join("host/scripts"), &["js", "mjs", "ts"], &mut files);
+    files.sort();
+    files
+}
+
+/// The comments and string literals of a source file, each as one text: a
+/// small lexer, wide where it is unsure (an unterminated literal runs to the
+/// end of the file, which only reads more). Rust's `'` is a lifetime or a
+/// character, never a string; JavaScript's `'` and `` ` `` open strings.
+fn comments_and_strings(text: &str, javascript: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    let collect = |from: usize, to: usize| chars[from..to.min(chars.len())].iter().collect();
+    while at < chars.len() {
+        let c = chars[at];
+        let next = chars.get(at + 1).copied();
+        if c == '/' && next == Some('/') {
+            let end = (at..chars.len())
+                .find(|&i| chars[i] == '\n')
+                .unwrap_or(chars.len());
+            out.push(collect(at + 2, end));
+            at = end;
+        } else if c == '/' && next == Some('*') {
+            let end = (at + 2..chars.len().saturating_sub(1))
+                .find(|&i| chars[i] == '*' && chars[i + 1] == '/')
+                .unwrap_or(chars.len());
+            out.push(collect(at + 2, end));
+            at = end + 2;
+        } else if !javascript && c == 'r' && matches!(next, Some('"' | '#')) {
+            // A raw string: `r"…"` or `r#"…"#`, any number of `#`.
+            let hashes = chars[at + 1..].iter().take_while(|&&h| h == '#').count();
+            let open = at + 1 + hashes;
+            if chars.get(open) != Some(&'"') {
+                at += 1;
+                continue;
+            }
+            let close: String = std::iter::once('"')
+                .chain(std::iter::repeat_n('#', hashes))
+                .collect();
+            let close: Vec<char> = close.chars().collect();
+            let end = (open + 1..chars.len())
+                .find(|&i| chars[i..].starts_with(&close))
+                .unwrap_or(chars.len());
+            out.push(collect(open + 1, end));
+            at = end + close.len();
+        } else if !javascript && c == '\'' {
+            // A character literal (`'"'`, `'\''`, `'\u{22}'`) is skipped
+            // whole, so its quote opens no string; a lifetime is one `'`.
+            let close = if next == Some('\\') {
+                (at + 3..chars.len().min(at + 12)).find(|&i| chars[i] == '\'')
+            } else {
+                (chars.get(at + 2) == Some(&'\'')).then_some(at + 2)
+            };
+            at = close.map_or(at + 1, |close| close + 1);
+        } else if c == '"' || (javascript && (c == '\'' || c == '`')) {
+            let mut end = at + 1;
+            while end < chars.len() && chars[end] != c {
+                end += if chars[end] == '\\' { 2 } else { 1 };
+            }
+            out.push(collect(at + 1, end));
+            at = end + 1;
+        } else {
+            at += 1;
+        }
+    }
+    out
 }
