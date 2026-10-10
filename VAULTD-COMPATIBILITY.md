@@ -84,7 +84,7 @@ The captures also settled the cases the pages leave open, among them loose equal
 
 - whether a sort key no column shows is ignored, and whether all-empty sort keys keep collated path order (`view sort:hidden_key`);
 - whether text `contains`, `startsWith` and list `contains` ignore case, and whether list `contains` matches a `#tag` item (`string contains:case`, `string startsWith:case`, `list contains:hash_item`);
-- a method on an empty string, `unique()` over mixed kinds, and `==` between two mappings (`string method:on_empty`, `list unique:mixed_kinds`, `object eq:mappings`);
+- a method on an empty string, `unique()` over mixed kinds, whether `unique()` keeps every `NaN` (vaultd treats `NaN` as never a duplicate), and `==` between two mappings (`string method:on_empty`, `list unique:mixed_kinds`, `list unique:nan`, `object eq:mappings`);
 - whether a view name in an embed matches case-sensitively (`view:case`, which needs the rendered `![[probes.base#Sort_Default]]` against `#sort_default`; the resolver matches exactly today);
 - a non-finite float inside a view option (`base:query` does not show options; no probe exists yet);
 - the corpus views that read `this` (they need a rendered capture that scrolls the table);
