@@ -16,8 +16,8 @@ use vault_bases::view::{
     ColumnDecl, CompileError, ViewDependencies, ViewResult, compile_view, evaluate_view,
 };
 use vault_bases::{
-    BaseParseError, Clock, FileFacts, FileKind, LinkFact, Prefilter, PropertyType, RowSource,
-    ScalarLiteral, SourceError, ViewDecl,
+    BaseParseError, Clock, FileFacts, FileKind, LinkFact, Narrowing, Prefilter, PropertyType,
+    RowSource, ScalarLiteral, SourceError, ViewDecl,
 };
 use vault_core::{LinkTarget, PropertyValue, Resolution, Resolver, SourceSpan, VaultPath};
 
@@ -355,30 +355,22 @@ impl IndexRowSource<'_> {
             .transpose()
     }
 
-    /// Whether the declared types may turn `key`'s text into something a
-    /// string never equals (a date): such a row must reach the full filter.
-    /// Matched case-insensitively, which only ever admits more rows.
-    fn may_be_typed_date(&self, key: &str) -> bool {
-        let fold = key.to_lowercase();
-        self.types.iter().any(|(declared, kind)| {
-            matches!(kind, PropertyType::Date | PropertyType::DateTime)
-                && declared.to_lowercase() == fold
-        })
-    }
-
-    /// The `PropertyEquals` narrowing, by the rule on
-    /// [`Prefilter::PropertyEquals`]: a note is skipped only when it lacks
-    /// the key, holds `null` under it, or holds a scalar of the literal's own
-    /// kind that differs from it. A list, a mapping and a scalar of another
-    /// kind are always admitted, and so is text the full filter may read as
-    /// something other than text (a wikilink, or a date by declared type).
-    /// The key is matched folded, a superset of the exact key the filter
-    /// reads.
+    /// The `PropertyEquals` narrowing, by the one rule both row sources
+    /// share, [`vault_bases::equality_narrowing`]: a note that lacks the key
+    /// or holds `null` under it is skipped; beyond that, only a number that
+    /// differs from a number literal, or [`vault_bases::plain_text`] that
+    /// differs from a plain text literal, on a key whose declared type does
+    /// not change equality. Every other note reaches the full filter. The
+    /// key is matched folded, a superset of the exact key the filter reads.
+    ///
+    /// `plain_text` is written here in SQL as its own definition: text is
+    /// not plain when it starts with `#`, holds `[[`, or holds two `-`. The
+    /// index's `kind` (`'date'` for date-looking text) is not consulted for
+    /// it, because the evaluator's date reader is wider than that column.
     ///
     /// Written as a `UNION ALL` of probes so each is served by an index: the
-    /// equal-value probe by `properties_by_string` or
-    /// `properties_by_number` (`key_fold` and the value), the
-    /// other-kind and wikilink probes by the `key_fold` prefix.
+    /// equal-value probe by `properties_by_string` or `properties_by_number`
+    /// (`key_fold` and the value), the rest by the `key_fold` prefix.
     fn property_equals(
         &self,
         key: &str,
@@ -386,48 +378,34 @@ impl IndexRowSource<'_> {
         arguments: &mut Vec<Argument>,
     ) -> String {
         let fold = key.to_lowercase();
-        let (equal, other) = match value {
-            ScalarLiteral::String(want) => {
-                arguments.push(Argument::Text(fold.clone()));
-                arguments.push(Argument::Text(want.clone()));
-                let other = if self.may_be_typed_date(key) {
-                    // A date-typed key: every text row reaches the filter.
-                    "'number', 'boolean', 'list', 'object', 'string', 'date'"
-                } else {
-                    "'number', 'boolean', 'list', 'object'"
-                };
-                ("string_value = ?", other)
+        let probes = match vault_bases::equality_narrowing(key, value, self.types) {
+            Narrowing::None => {
+                arguments.push(Argument::Text(fold));
+                "SELECT note_path FROM properties WHERE key_fold = ? AND kind <> 'null'".to_string()
             }
-            ScalarLiteral::Number(want) => {
+            Narrowing::Number(want) => {
                 arguments.push(Argument::Text(fold.clone()));
-                arguments.push(Argument::Real(*want));
-                (
-                    "number_value = ?",
-                    "'string', 'date', 'boolean', 'list', 'object'",
-                )
+                arguments.push(Argument::Real(want));
+                arguments.push(Argument::Text(fold));
+                "SELECT note_path FROM properties WHERE key_fold = ? AND number_value = ? \
+                 UNION ALL SELECT note_path FROM properties WHERE key_fold = ? \
+                 AND kind IN ('string', 'date', 'boolean', 'list', 'object')"
+                    .to_string()
             }
-            ScalarLiteral::Boolean(want) => {
+            Narrowing::Text(want) => {
                 arguments.push(Argument::Text(fold.clone()));
-                arguments.push(Argument::Real(if *want { 1.0 } else { 0.0 }));
-                (
-                    "number_value = ?",
-                    "'string', 'date', 'number', 'list', 'object'",
-                )
+                arguments.push(Argument::Text(want.to_string()));
+                arguments.push(Argument::Text(fold.clone()));
+                arguments.push(Argument::Text(fold));
+                "SELECT note_path FROM properties WHERE key_fold = ? AND string_value = ? \
+                 UNION ALL SELECT note_path FROM properties WHERE key_fold = ? \
+                 AND kind IN ('number', 'boolean', 'list', 'object') \
+                 UNION ALL SELECT note_path FROM properties WHERE key_fold = ? \
+                 AND kind IN ('string', 'date') AND (substr(string_value, 1, 1) = '#' \
+                 OR instr(string_value, '[[') > 0 OR string_value LIKE '%-%-%')"
+                    .to_string()
             }
         };
-        arguments.push(Argument::Text(fold.clone()));
-        let mut probes = format!(
-            "SELECT note_path FROM properties WHERE key_fold = ? AND {equal} \
-             UNION ALL SELECT note_path FROM properties WHERE key_fold = ? AND kind IN ({other})"
-        );
-        if matches!(value, ScalarLiteral::String(_)) {
-            // A frontmatter wikilink is a link to the filter, never text.
-            arguments.push(Argument::Text(fold));
-            probes.push_str(
-                " UNION ALL SELECT note_path FROM properties WHERE key_fold = ? \
-                 AND kind IN ('string', 'date') AND instr(string_value, '[[') > 0",
-            );
-        }
         format!(" AND t.path IN ({probes})")
     }
 

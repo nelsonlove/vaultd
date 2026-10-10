@@ -34,11 +34,13 @@ CREATE TABLE notes (
 -- (month lengths unchecked) — because the index knows no property types
 -- (those live in `.obsidian/types.json`); the row source applies the
 -- declared type at evaluation. The `key == literal` prefilter
--- (`query/bases.rs`) reads `kind`, `string_value` and `number_value`, and
--- skips a note only when the key is missing, `null`, or a scalar of the
--- literal's own kind that differs (`string` and `date` both count as text);
--- every other row reaches the full filter, so a coarse kind never drops a
--- row the filter would keep. The two value indexes serve that prefilter's
+-- (`query/bases.rs`) reads `kind`, `string_value` and `number_value` by the
+-- one narrowing rule `vault_bases::equality_narrowing` states: it skips a
+-- note only when the key is missing or `null`, or when both sides are
+-- numbers that differ, or both are plain text (not `#`-prefixed, no `[[`,
+-- no two `-`) that differs, on a key whose declared type does not change
+-- equality; every other row reaches the full filter, so a coarse kind never
+-- drops a row the filter would keep. The two value indexes serve that prefilter's
 -- equal-value probe (pinned by `EXPLAIN QUERY PLAN` in
 -- `tests/bases_query.rs`). The cold build drops the three secondary indexes
 -- before its bulk load and creates them again after it (`store.rs`).

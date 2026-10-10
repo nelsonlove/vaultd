@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use proptest::prelude::*;
 use tempfile::TempDir;
 use vault_bases::eval::EvalContext;
 use vault_bases::view::{compile_view, evaluate_view};
@@ -336,9 +337,9 @@ fn a_property_prefilter_never_skips_a_list_a_mapping_or_another_kind() {
             &none
         ),
         vec![
-            "flag.md", "list.md", "map.md", "match.md", "one.md", "upper.md", "wiki.md"
+            "day.md", "flag.md", "list.md", "map.md", "match.md", "one.md", "upper.md", "wiki.md"
         ],
-        "text: lists, mappings, numbers, booleans, a wikilink and the folded key reach the filter"
+        "text: lists, mappings, numbers, booleans, a wikilink, date-shaped text and the folded key reach the filter"
     );
     assert_eq!(
         candidates(
@@ -375,7 +376,34 @@ fn a_property_prefilter_never_skips_a_list_a_mapping_or_another_kind() {
             "day.md", "flag.md", "list.md", "map.md", "match.md", "one.md", "other.md", "upper.md",
             "wiki.md"
         ],
-        "a date-typed key: every text row reaches the filter, which decides or errors"
+        "a date-typed key: every row holding the key reaches the filter, which decides or errors"
+    );
+    let tagged: BTreeMap<String, PropertyType> =
+        vault_index::parse_property_types(r#"{"types":{"status":"tags"}}"#);
+    assert_eq!(
+        candidates(
+            &service,
+            &[equals("status", ScalarLiteral::String("p".into()))],
+            &tagged
+        ),
+        vec![
+            "day.md", "flag.md", "list.md", "map.md", "match.md", "one.md", "other.md", "upper.md",
+            "wiki.md"
+        ],
+        "a tags-typed key narrows nothing beyond a missing key and a null"
+    );
+    assert_eq!(
+        candidates(
+            &service,
+            &[equals("status", ScalarLiteral::String("#p".into()))],
+            &none
+        ),
+        candidates(
+            &service,
+            &[equals("status", ScalarLiteral::Boolean(true))],
+            &none
+        ),
+        "a `#` literal narrows nothing beyond a missing key and a null"
     );
 
     // The memory source's rule, with the exact key: the index is a superset.
@@ -451,8 +479,10 @@ fn folder_tag_and_extension_prefilters_narrow_exactly() {
     );
 }
 
-/// The equal-value probe of each `PropertyEquals` literal is served by its
-/// value index, not by the `key_fold` prefix alone.
+/// The equal-value probe of a narrowing `PropertyEquals` literal (a number
+/// or plain text) is served by its value index, not by the `key_fold`
+/// prefix alone. A boolean literal narrows nothing (the final fix round's
+/// rule), so it has no equal-value probe.
 #[test]
 fn the_value_indexes_serve_the_property_prefilter() {
     let (service, _vault, _index) = service(&[
@@ -477,11 +507,6 @@ fn the_value_indexes_serve_the_property_prefilter() {
     assert!(
         number.contains("properties_by_number (key_fold=? AND number_value=?)"),
         "{number}"
-    );
-    let flag = plan(equals("n", ScalarLiteral::Boolean(true)));
-    assert!(
-        flag.contains("properties_by_number (key_fold=? AND number_value=?)"),
-        "{flag}"
     );
 }
 
@@ -1116,4 +1141,219 @@ fn an_evaluation_that_never_holds_still_answers_live_state_stale_within_its_budg
         took < Duration::from_secs(3),
         "it stopped at its budget: {took:?}"
     );
+}
+
+/// The rows `view` answers over the index with declared `types`.
+fn typed_rows(
+    service: &IndexService,
+    base: &str,
+    view: &str,
+    types: &BTreeMap<String, PropertyType>,
+) -> Vec<String> {
+    let answer = service
+        .reader()
+        .unwrap()
+        .evaluate_base(
+            &BaseQuery {
+                path: &vp(base),
+                view: Some(view),
+                this_path: None,
+                types,
+            },
+            &Clock::fixed(NOW, "UTC"),
+        )
+        .unwrap_or_else(|error| panic!("{view}: {error:?}"));
+    answer
+        .result
+        .rows
+        .iter()
+        .map(|row| row.path.as_str().to_string())
+        .collect()
+}
+
+/// The final review's H1, first case: an untyped date text names the same
+/// instant as the literal in another spelling, so the filter keeps the row,
+/// and the `PropertyEquals` prefilter must not skip it.
+#[test]
+fn a_date_text_in_another_spelling_reaches_the_filter() {
+    let (service, _vault, _index) = service(&[
+        ("A.md", "---\ndue: 2026-10-01T00:00\n---\n"),
+        ("B.md", "---\ndue: 2026-10-02\n---\n"),
+        (
+            "Q.base",
+            "views:\n  - type: table\n    name: P\n    filters: 'due == \"2026-10-01\"'\n  - type: table\n    name: Twin\n    filters: '!(!(due == \"2026-10-01\"))'\n",
+        ),
+    ]);
+    let none = BTreeMap::new();
+    assert_eq!(typed_rows(&service, "Q.base", "Twin", &none), vec!["A.md"]);
+    assert_eq!(typed_rows(&service, "Q.base", "P", &none), vec!["A.md"]);
+}
+
+/// The final review's H1, second case: a key typed `tags` reads `alpha` as
+/// `#alpha`, so `tags == "#alpha"` keeps the row.
+#[test]
+fn a_tags_typed_value_reaches_the_filter_with_its_hash() {
+    let (service, _vault, _index) = service(&[
+        ("A.md", "---\ntags: alpha\n---\n"),
+        ("B.md", "---\ntags: beta\n---\n"),
+        (
+            "Q.base",
+            "views:\n  - type: table\n    name: P\n    filters: 'tags == \"#alpha\"'\n  - type: table\n    name: Twin\n    filters: '!(!(tags == \"#alpha\"))'\n",
+        ),
+    ]);
+    let types = vault_index::parse_property_types(r#"{"types":{"tags":"tags"}}"#);
+    assert_eq!(typed_rows(&service, "Q.base", "Twin", &types), vec!["A.md"]);
+    assert_eq!(typed_rows(&service, "Q.base", "P", &types), vec!["A.md"]);
+}
+
+/// Frontmatter values the parity property draws from: date text in several
+/// spellings, `#` text, text, numbers, booleans, lists, empties, a wikilink.
+const PARITY_VALUES: &[&str] = &[
+    "2026-10-01",
+    "2026-10-01T00:00",
+    "\"2026-10-01 00:00:00\"",
+    "2026-10-01T00:00:00Z",
+    "2026-10-01T00:00:00.000",
+    "\" 2026-10-01\"",
+    "2026-10-02",
+    "alpha",
+    "\"#alpha\"",
+    "Alpha",
+    "a-b-c",
+    "1",
+    "1.0",
+    "2",
+    "\"1\"",
+    "true",
+    "false",
+    "[alpha]",
+    "[\"#alpha\"]",
+    "[]",
+    "[2026-10-01]",
+    "",
+    "\"\"",
+    "\"[[N0]]\"",
+];
+
+/// Literals the parity property compares against, as written in a filter.
+const PARITY_LITERALS: &[&str] = &[
+    "\"2026-10-01\"",
+    "\"2026-10-01T00:00\"",
+    "\"2026-10-01 00:00:00\"",
+    "\"alpha\"",
+    "\"#alpha\"",
+    "\"Alpha\"",
+    "\"a-b-c\"",
+    "\"1\"",
+    "1",
+    "1.5",
+    "2",
+    "true",
+    "\"N0\"",
+    "\"N0.md\"",
+];
+
+const PARITY_KEYS: &[&str] = &["due", "tags", "plain", "Kind", "kind"];
+
+const PARITY_TYPES: &[Option<&str>] = &[
+    None,
+    Some("date"),
+    Some("datetime"),
+    Some("tags"),
+    Some("text"),
+    Some("number"),
+    Some("checkbox"),
+    Some("multitext"),
+];
+
+/// A generated vault: per note, per key, a value index or nothing (the key
+/// absent); per key, a declared type index.
+type ParityVault = (Vec<Vec<Option<usize>>>, Vec<usize>);
+
+fn parity_vault() -> impl Strategy<Value = ParityVault> {
+    (
+        proptest::collection::vec(
+            proptest::collection::vec(
+                proptest::option::weighted(0.7, 0..PARITY_VALUES.len()),
+                PARITY_KEYS.len(),
+            ),
+            1..6,
+        ),
+        proptest::collection::vec(0..PARITY_TYPES.len(), PARITY_KEYS.len()),
+    )
+}
+
+/// One view per (key, literal) with the extractable `key == literal`, and
+/// its twin `!(!(key == literal))`, from which no prefilter can be lifted.
+fn parity_base() -> String {
+    let mut base = String::from("views:\n");
+    for (k, key) in PARITY_KEYS.iter().enumerate() {
+        for (l, literal) in PARITY_LITERALS.iter().enumerate() {
+            let filter = format!("{key} == {literal}");
+            base.push_str(&format!(
+                "  - type: table\n    name: P{k}_{l}\n    filters: '{filter}'\n  - type: table\n    name: T{k}_{l}\n    filters: '!(!({filter}))'\n"
+            ));
+        }
+    }
+    base
+}
+
+fn check_parity(vault: &ParityVault) -> Result<(), TestCaseError> {
+    let (notes, kinds) = vault;
+    let mut files: Vec<(String, String)> = notes
+        .iter()
+        .enumerate()
+        .map(|(n, values)| {
+            let mut body = String::from("---\n");
+            for (k, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    body.push_str(&format!("{}: {}\n", PARITY_KEYS[k], PARITY_VALUES[*value]));
+                }
+            }
+            body.push_str("---\n");
+            (format!("N{n}.md"), body)
+        })
+        .collect();
+    files.push(("Q.base".to_string(), parity_base()));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+    let (service, _vault, _index) = service(&borrowed);
+    let declared: Vec<String> = kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(k, kind)| {
+            PARITY_TYPES[*kind].map(|kind| format!("\"{}\":\"{kind}\"", PARITY_KEYS[k]))
+        })
+        .collect();
+    let types =
+        vault_index::parse_property_types(&format!("{{\"types\":{{{}}}}}", declared.join(",")));
+    for k in 0..PARITY_KEYS.len() {
+        for l in 0..PARITY_LITERALS.len() {
+            let narrowed = typed_rows(&service, "Q.base", &format!("P{k}_{l}"), &types);
+            let full = typed_rows(&service, "Q.base", &format!("T{k}_{l}"), &types);
+            prop_assert_eq!(
+                narrowed,
+                full,
+                "{} == {} with types {:?}",
+                PARITY_KEYS[k],
+                PARITY_LITERALS[l],
+                types
+            );
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+    /// The final review's H1 and L3, at the index: over generated vaults
+    /// with typed and untyped keys, a view evaluated with its prefilters
+    /// answers exactly the rows the same filter answers with no prefilter.
+    #[test]
+    fn a_property_prefilter_never_changes_the_rows_the_filter_keeps(vault in parity_vault()) {
+        check_parity(&vault)?;
+    }
 }

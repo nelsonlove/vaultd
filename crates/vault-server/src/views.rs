@@ -131,7 +131,9 @@ impl Default for ViewTracker {
 /// Whether `path`, with `facts` at the current generation, passes one
 /// prefilter. A superset of the index row source's own narrowing for the
 /// same prefilter (`PropertyEquals` asks only for the key), which is the
-/// direction that can only add events.
+/// direction that can only add events. It depends on that narrowing never
+/// admitting a note without the key: `vault_bases::equality_narrowing`
+/// states it, and `vault-index`'s `bases_query` property test pins it.
 fn passes(prefilter: &Prefilter, path: &VaultPath, facts: &PrefilterFacts) -> bool {
     match prefilter {
         Prefilter::InFolder(folder) => {
