@@ -94,7 +94,23 @@ pub struct ViewDependencies {
     pub reads_links: bool,
     pub reads_backlinks: bool,
     pub reads_this: bool,
-    pub reads_properties: bool,
+    /// How much of the clock the view reads: a cached answer is good for as
+    /// long as what it read holds still.
+    pub reads_clock: ClockReads,
+}
+
+/// What a view reads of the clock, least to most. `random()` is not a clock
+/// read: its sequence is seeded from the instant an answer is computed at
+/// and fixed with that answer.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ClockReads {
+    /// Nothing: the answer holds for the whole generation.
+    #[default]
+    Never,
+    /// The local date (`today()`): the answer holds for one local day.
+    Day,
+    /// The instant (`now()`, `relative()`): the answer holds for no time.
+    Instant,
 }
 
 /// A compiled filter tree. A statement carries its tree height, the depth
@@ -255,6 +271,11 @@ fn scan(
             if name == "link" || name == "file" {
                 deps.reads_links = true;
             }
+            match name.as_str() {
+                "now" => deps.reads_clock = deps.reads_clock.max(ClockReads::Instant),
+                "today" => deps.reads_clock = deps.reads_clock.max(ClockReads::Day),
+                _ => {}
+            }
             scan_all(args, deps, formulas)?;
         }
         Expr::Method {
@@ -266,34 +287,29 @@ fn scan(
             if matches!(name.as_str(), "hasLink" | "linksTo" | "asFile") {
                 deps.reads_links = true;
             }
-            if name == "hasProperty" {
-                deps.reads_properties = true;
+            if name == "relative" {
+                deps.reads_clock = ClockReads::Instant;
             }
             scan(target, deps, formulas)?;
             scan_all(args, deps, formulas)?;
         }
         Expr::Member { target, name } => {
-            match target.as_ref() {
-                Expr::Identifier(root) if root == "formula" => {
-                    deps.reads_formulas = true;
-                    formulas.insert(name.clone());
-                }
-                Expr::Identifier(root) if root == "note" => deps.reads_properties = true,
-                _ => {}
+            if matches!(target.as_ref(), Expr::Identifier(root) if root == "formula") {
+                deps.reads_formulas = true;
+                formulas.insert(name.clone());
             }
             match name.as_str() {
                 "links" | "embeds" => deps.reads_links = true,
                 "backlinks" => deps.reads_backlinks = true,
-                "properties" => deps.reads_properties = true,
                 _ => {}
             }
             scan(target, deps, formulas)?;
         }
-        Expr::Identifier(name) => match name.as_str() {
-            "this" => deps.reads_this = true,
-            "file" | "formula" | "values" | "value" | "index" | "acc" => {}
-            _ => deps.reads_properties = true,
-        },
+        Expr::Identifier(name) => {
+            if name == "this" {
+                deps.reads_this = true;
+            }
+        }
         Expr::Index { target, index } => {
             scan(target, deps, formulas)?;
             scan(index, deps, formulas)?;
@@ -321,11 +337,10 @@ fn note_ref(reference: &PropertyRef, deps: &mut ViewDependencies, formulas: &mut
             deps.reads_formulas = true;
             formulas.insert(name.clone());
         }
-        PropertyRef::Note(_) => deps.reads_properties = true,
+        PropertyRef::Note(_) => {}
         PropertyRef::File(field) => match field.as_str() {
             "links" | "embeds" => deps.reads_links = true,
             "backlinks" => deps.reads_backlinks = true,
-            "properties" => deps.reads_properties = true,
             _ => {}
         },
     }

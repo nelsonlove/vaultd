@@ -391,7 +391,25 @@ fn dependencies_name_what_the_staleness_rule_needs() {
         "file.hasLink in the global filter"
     );
     assert!(!dependencies.reads_backlinks);
-    assert!(dependencies.reads_properties);
+}
+
+/// The final review's M2: what a view reads of the clock, through filters,
+/// formulas (transitively) and summaries.
+#[test]
+fn dependencies_name_what_the_view_reads_of_the_clock() {
+    use vault_bases::view::ClockReads;
+    let reads = |base: &str, view: &str| {
+        compile_view(&parse_base(base).unwrap(), Some(view))
+            .unwrap()
+            .dependencies()
+            .reads_clock
+    };
+    let base = "formulas:\n  d: 'today()'\n  n: 'now() - \"1d\"'\n  via: 'formula.d'\n  rel: 'file.mtime.relative()'\nviews:\n  - type: table\n    name: Plain\n    order: [file.name]\n  - type: table\n    name: Day\n    order: [formula.via]\n  - type: table\n    name: Both\n    order: [formula.d, formula.n]\n  - type: table\n    name: Rel\n    order: [formula.rel]\n  - type: table\n    name: Filter\n    filters: 'file.mtime > today()'\n";
+    assert_eq!(reads(base, "Plain"), ClockReads::Never);
+    assert_eq!(reads(base, "Day"), ClockReads::Day, "through a formula");
+    assert_eq!(reads(base, "Both"), ClockReads::Instant);
+    assert_eq!(reads(base, "Rel"), ClockReads::Instant);
+    assert_eq!(reads(base, "Filter"), ClockReads::Day);
 }
 
 // ---------------------------------------------------------------------------

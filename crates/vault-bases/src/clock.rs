@@ -31,4 +31,11 @@ impl Clock {
                 .unwrap_or_else(|error| panic!("unknown time zone {zone:?}: {error}")),
         }
     }
+
+    /// The local date, as the instant of its midnight in this clock's zone:
+    /// exactly what `today()` answers, so two clocks agree on it exactly when
+    /// `today()` would.
+    pub fn local_day(&self) -> i64 {
+        crate::dates::start_of_day(self.now_ms, self).epoch_ms
+    }
 }
