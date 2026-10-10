@@ -201,7 +201,15 @@ export type ReferenceKindDto = "markdown_link" | "wikilink" | "markdown_embed" |
 /** Where a reference was written: in the body, or inside a frontmatter property. */
 export type ReferenceOriginDto = "body" | "property";
 
-export type SubpathDto = { kind: "heading"; value: string } | { kind: "block"; value: string };
+/**
+ * A subpath on a reference or a resolution. `view` names a view of a `.base`
+ * target (phase 8). A daemon may add kinds: code that switches on `kind` must
+ * treat one it does not know as unknown, never as an error.
+ */
+export type SubpathDto =
+  | { kind: "heading"; value: string }
+  | { kind: "block"; value: string }
+  | { kind: "view"; value: string };
 
 /**
  * `ResolutionDto`, **internally** tagged on `kind` — the variant's fields sit
