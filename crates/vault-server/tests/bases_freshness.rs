@@ -405,10 +405,13 @@ fn clause_six_a_row_whose_link_target_appears_is_stale() {
 
 #[test]
 fn the_cache_hits_at_one_generation_and_misses_at_the_next() {
+    // `random()` is seeded from the instant an answer is computed at and
+    // fixed with it, so a repeat is the cached answer exactly when it is
+    // equal. (`now()` no longer tells: a view reading it is never cached.)
     let (vault, _index, mut daemon) = setup();
     std::fs::write(
         vault.path().join("Now.base"),
-        "formulas:\n  at: 'now().format(\"x\")'\nviews:\n  - type: table\n    name: T\n    filters: 'file.path == \"Books/B.md\"'\n    order: [formula.at]\n",
+        "formulas:\n  at: 'random()'\nviews:\n  - type: table\n    name: T\n    filters: 'file.path == \"Books/B.md\"'\n    order: [formula.at]\n",
     )
     .unwrap();
     daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
@@ -438,7 +441,7 @@ fn the_cache_hits_at_one_generation_and_misses_at_the_next() {
     assert_eq!(third.0, first.0 + 1);
     assert_ne!(
         third.1, first.1,
-        "a new generation recomputes, so now() moved"
+        "a new generation recomputes, so random() was seeded again"
     );
 }
 
@@ -760,7 +763,7 @@ fn the_cache_entries_flag_is_parsed_bounded_and_applied() {
     std::fs::write(vault.path().join("A.md"), "---\nn: 1\n---\n").unwrap();
     std::fs::write(
         vault.path().join("Now.base"),
-        "formulas:\n  at: 'now().format(\"x\")'\nviews:\n  - type: table\n    name: T\n    order: [formula.at]\n  - type: table\n    name: U\n",
+        "formulas:\n  at: 'random()'\nviews:\n  - type: table\n    name: T\n    order: [formula.at]\n  - type: table\n    name: U\n",
     )
     .unwrap();
     let ask = |daemon: &mut Daemon, view: &str| -> String {
