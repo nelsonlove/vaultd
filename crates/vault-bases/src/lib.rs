@@ -28,7 +28,8 @@ pub use file::{
     parse_base,
 };
 pub use source::{
-    FileFacts, FileKind, LinkFact, MemoryFile, MemorySource, Prefilter, PropertyType, RowSource,
-    ScalarLiteral, SourceError, SourceLog, extension, no_span, number, text,
+    FileFacts, FileKind, LinkFact, MemoryFile, MemorySource, Narrowing, Prefilter, PropertyType,
+    RowSource, ScalarLiteral, SourceError, SourceLog, equality_narrowing, extension, no_span,
+    number, plain_text, text, type_changes_equality,
 };
 pub use value::{DateValue, DurationValue, LinkValue, MAX_VALUE_DEPTH, Nested, RegexpValue, Value};

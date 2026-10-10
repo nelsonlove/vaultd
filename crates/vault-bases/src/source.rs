@@ -70,32 +70,97 @@ pub enum Prefilter {
     /// `file.ext == "…"`: the extension without its dot, compared exactly.
     Ext(String),
     /// `key == literal` on a note property, `literal` truthy (a non-empty
-    /// string, a non-zero number, `true`). A row source must admit every
-    /// note that carries `key` with a list or mapping value, and every note
-    /// whose scalar value is of another kind than `literal`: the full filter
-    /// decides those. It may skip a note that lacks `key`, holds `null`, or
-    /// holds a scalar of the literal's own kind that differs from it.
+    /// string, a non-zero number, `true`). A row source narrows by
+    /// [`equality_narrowing`] and nothing else: it may always skip a note
+    /// that lacks `key` or holds `null` under it (null never equals a truthy
+    /// literal), and beyond that only where equality is provably exact under
+    /// every coercion the evaluator applies — both sides numbers, or both
+    /// [`plain_text`], on a key whose declared type does not change what
+    /// `==` compares. Every other note reaches the full filter.
     ///
     /// Captured (Task 13), `==` is true across kinds: numeric text equals a
     /// number, a one-item list its item's text, a date text naming the same
-    /// instant. Lists and other kinds are admitted, so all but one of those
-    /// pairs reach the full filter. The one gap: a property whose text names
-    /// the same instant as the literal in another spelling (`2025-01-01`
-    /// against `"2025-01-01 00:00"`) is a scalar of the literal's kind that
-    /// differs, and may be skipped.
+    /// instant in another spelling (an untyped key's date-shaped text is a
+    /// date), and a `tags`-typed value carries a `#`. The narrowing rule
+    /// admits each of those pairs.
     PropertyEquals { key: String, value: ScalarLiteral },
 }
 
+/// What a `PropertyEquals` prefilter may skip beyond a missing key or a
+/// `null`, by [`equality_narrowing`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Narrowing<'a> {
+    /// Nothing more: every note that holds the key with a value is admitted.
+    None,
+    /// A note whose value is a number other than this one.
+    Number(f64),
+    /// A note whose value is [`plain_text`] other than this text.
+    Text(&'a str),
+}
+
+/// Whether a declared property type changes what `==` compares: a date or
+/// datetime type reads text as a date, and a tags type puts a `#` on each
+/// item (`functions::typed_property`).
+pub fn type_changes_equality(kind: PropertyType) -> bool {
+    matches!(
+        kind,
+        PropertyType::Date | PropertyType::DateTime | PropertyType::Tags
+    )
+}
+
+/// Text `==` compares as text and nothing else, on an untyped key or one
+/// whose type does not change equality: not date-shaped (the evaluator
+/// reads an untyped key's date-shaped text as a date, and a date equals any
+/// text naming the same instant), not `#`-prefixed, and holding no `[[`
+/// (a frontmatter wikilink is a link, equal to its target's text).
+///
+/// "Date-shaped" is taken wide, as any text holding two `-`: every text the
+/// evaluator's date reader accepts has a `year-month-day` day, so this
+/// admits all of them, needs no clock or zone, and is the same test the
+/// index writes in SQL (`LIKE '%-%-%'`), so the two row sources apply one
+/// rule rather than two that must agree.
+pub fn plain_text(text: &str) -> bool {
+    !(text.starts_with('#') || text.contains("[[") || text.matches('-').nth(1).is_some())
+}
+
+/// The one narrowing rule for `key == literal`, shared by every row source
+/// (the index's SQL and [`MemorySource`]): `types` are the declared
+/// property types, matched without case (a superset of the evaluator's
+/// exact-then-folded lookup). A key with a declared type that changes
+/// equality narrows nothing; a number literal narrows numbers; a plain text
+/// literal narrows plain text; anything else narrows nothing.
+pub fn equality_narrowing<'a>(
+    key: &str,
+    literal: &'a ScalarLiteral,
+    types: &BTreeMap<String, PropertyType>,
+) -> Narrowing<'a> {
+    let fold = key.to_lowercase();
+    let typed = types
+        .iter()
+        .any(|(declared, kind)| type_changes_equality(*kind) && declared.to_lowercase() == fold);
+    if typed {
+        return Narrowing::None;
+    }
+    match literal {
+        ScalarLiteral::Number(want) => Narrowing::Number(*want),
+        ScalarLiteral::String(want) if plain_text(want) => Narrowing::Text(want),
+        _ => Narrowing::None,
+    }
+}
+
 /// Whether a note property holding `held` may satisfy `key == literal`, by
-/// the rule on [`Prefilter::PropertyEquals`].
-pub(crate) fn may_equal(held: &PropertyValue, literal: &ScalarLiteral) -> bool {
-    match (held, literal) {
+/// the rule on [`Prefilter::PropertyEquals`] (`narrowing` from
+/// [`equality_narrowing`]).
+pub(crate) fn may_equal(held: &PropertyValue, narrowing: &Narrowing<'_>) -> bool {
+    match (held, narrowing) {
         (PropertyValue::Null, _) => false,
-        (PropertyValue::String(have), ScalarLiteral::String(want)) => have == want,
-        (PropertyValue::Integer(have), ScalarLiteral::Number(want)) => *have as f64 == *want,
-        (PropertyValue::Float(have), ScalarLiteral::Number(want)) => have == want,
-        (PropertyValue::Boolean(have), ScalarLiteral::Boolean(want)) => have == want,
-        // A list, a mapping, or a scalar of another kind: the filter decides.
+        (PropertyValue::String(have), Narrowing::Text(want)) => {
+            !plain_text(have) || have == want
+        }
+        (PropertyValue::Integer(have), Narrowing::Number(want)) => *have as f64 == *want,
+        (PropertyValue::Float(have), Narrowing::Number(want)) => have == want,
+        // A list, a mapping, a scalar of another kind, or no narrowing: the
+        // filter decides.
         _ => true,
     }
 }
@@ -351,10 +416,12 @@ impl MemorySource {
                 })
             }),
             Prefilter::Ext(ext) => crate::source::extension(path) == ext.as_str(),
-            Prefilter::PropertyEquals { key, value } => file
-                .properties
-                .iter()
-                .any(|(have, held)| have == key && may_equal(held, value)),
+            Prefilter::PropertyEquals { key, value } => {
+                let narrowing = equality_narrowing(key, value, &self.types);
+                file.properties
+                    .iter()
+                    .any(|(have, held)| have == key && may_equal(held, &narrowing))
+            }
         }
     }
 }
@@ -485,5 +552,71 @@ impl RowSource for MemorySource {
                 .find(|(declared, _)| declared.to_lowercase() == folded)
                 .map(|(_, kind)| *kind)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every text the evaluator reads as a date is not plain, in any zone,
+    /// so a plain-text narrowing never skips a date the filter keeps.
+    #[test]
+    fn date_text_is_never_plain() {
+        let zones = ["UTC", "America/Los_Angeles", "Asia/Kolkata"];
+        for text in [
+            "2026-10-01",
+            " 2026-10-01 ",
+            "2026-10-01T00:00",
+            "2026-10-01 00:00:00",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00.5+05:30",
+            "2026-10-01T00:00:00-0700",
+        ] {
+            for zone in zones {
+                let clock = crate::Clock::fixed(0, zone);
+                assert!(
+                    crate::dates::parse_date_text(text, &clock).is_some(),
+                    "{text:?} reads as a date"
+                );
+            }
+            assert!(!plain_text(text), "{text:?}");
+        }
+        for text in ["#alpha", "[[A]]", "see [[A]]"] {
+            assert!(!plain_text(text), "{text:?}");
+        }
+        for text in ["alpha", "2026", "a-b", "1", ""] {
+            assert!(plain_text(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_type_that_changes_equality_narrows_nothing() {
+        let literal = ScalarLiteral::String("p".into());
+        let mut types = BTreeMap::new();
+        assert_eq!(
+            equality_narrowing("Status", &literal, &types),
+            Narrowing::Text("p")
+        );
+        for kind in [PropertyType::Date, PropertyType::DateTime, PropertyType::Tags] {
+            types.insert("status".to_string(), kind);
+            assert_eq!(
+                equality_narrowing("Status", &literal, &types),
+                Narrowing::None
+            );
+        }
+        types.insert("status".to_string(), PropertyType::Text);
+        assert_eq!(
+            equality_narrowing("Status", &literal, &types),
+            Narrowing::Text("p")
+        );
+        assert_eq!(
+            equality_narrowing("s", &ScalarLiteral::Boolean(true), &types),
+            Narrowing::None
+        );
+        assert_eq!(
+            equality_narrowing("s", &ScalarLiteral::String("2026-10-01".into()), &types),
+            Narrowing::None
+        );
     }
 }

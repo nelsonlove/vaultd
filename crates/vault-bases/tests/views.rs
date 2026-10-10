@@ -1393,6 +1393,34 @@ fn ctx_paths(source: &MemorySource, compiled: &vault_bases::view::CompiledView) 
         .collect()
 }
 
+/// The final review's H1 over the memory source: an untyped date text in
+/// another spelling, and a `tags`-typed value read with its `#`, are kept by
+/// the filter, so the `PropertyEquals` prefilter must admit them.
+#[test]
+fn a_property_prefilter_admits_what_coercion_makes_equal() {
+    let dated = MemorySource::new()
+        .with(
+            "A.md",
+            MemoryFile::note().property("due", text("2026-10-01T00:00")),
+        )
+        .with("B.md", MemoryFile::note().property("due", text("2026-10-02")));
+    let compiled = compile_view(&parse_base(&table(r#"due == "2026-10-01""#)).unwrap(), None)
+        .unwrap();
+    assert!(!compiled.prefilters().is_empty());
+    assert_eq!(ctx_paths(&dated, &compiled.without_prefilters()), ["A.md"]);
+    assert_eq!(ctx_paths(&dated, &compiled), ["A.md"]);
+
+    let tagged = MemorySource::new()
+        .typed("tags", PropertyType::Tags)
+        .with("A.md", MemoryFile::note().property("tags", text("alpha")))
+        .with("B.md", MemoryFile::note().property("tags", text("beta")));
+    let compiled =
+        compile_view(&parse_base(&table(r##"tags == "#alpha""##)).unwrap(), None).unwrap();
+    assert!(!compiled.prefilters().is_empty());
+    assert_eq!(ctx_paths(&tagged, &compiled.without_prefilters()), ["A.md"]);
+    assert_eq!(ctx_paths(&tagged, &compiled), ["A.md"]);
+}
+
 /// The review's R4: a negated statement lifts no prefilter.
 #[test]
 fn a_negated_statement_lifts_no_prefilter() {
