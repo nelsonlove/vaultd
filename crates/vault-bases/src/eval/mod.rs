@@ -7,7 +7,8 @@
 
 pub mod coerce;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use vault_core::{PropertyValue, VaultPath};
 
@@ -80,6 +81,13 @@ pub struct EvalContext<'a> {
     pub this_path: &'a VaultPath,
     pub formulas: &'a dyn Formulas,
     random_state: Cell<u64>,
+    /// Each `(file, key)` property this evaluation has read, typed and with
+    /// its links resolved. A property cannot change within one evaluation
+    /// (one generation), and a list or object value clones in O(1), so a
+    /// formula that reads `xs` on every step of a fold converts it once,
+    /// not once per step (Task 14 fix round: `xs.reduce(xs.length, 0)`
+    /// took 5.4 s at 20,000 items, quadratic in the conversion).
+    properties: RefCell<HashMap<(VaultPath, String), Value>>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -97,6 +105,7 @@ impl<'a> EvalContext<'a> {
             formulas: &NoFormulas,
             // Any non-zero seed; xorshift never leaves zero once off it.
             random_state: Cell::new((clock.now_ms as u64) | 1),
+            properties: RefCell::new(HashMap::new()),
         }
     }
 
@@ -115,6 +124,7 @@ impl<'a> EvalContext<'a> {
             this_path: self.this_path,
             formulas: self.formulas,
             random_state: Cell::new(self.random_state.get()),
+            properties: RefCell::new(self.properties.borrow().clone()),
         }
     }
 
@@ -235,12 +245,18 @@ pub(crate) fn row_property(
 /// A note property of `path`, by exact key, typed and with its frontmatter
 /// links resolved from `path`. Missing (or not a note) is `null`.
 fn file_property(ctx: &EvalContext<'_>, path: &VaultPath, key: &str) -> Result<Value, EvalError> {
+    let memo_key = (path.clone(), key.to_string());
+    if let Some(known) = ctx.properties.borrow().get(&memo_key) {
+        return Ok(known.clone());
+    }
     let properties = ctx.source.properties(path)?;
-    Ok(properties
+    let value = properties
         .iter()
         .find(|(have, _)| have == key)
         .map(|(_, value)| functions::typed_property(ctx, Some(path), key, value))
-        .unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    ctx.properties.borrow_mut().insert(memo_key, value.clone());
+    Ok(value)
 }
 
 /// `this.<name>`: the syntax page says `this` "points to properties of the

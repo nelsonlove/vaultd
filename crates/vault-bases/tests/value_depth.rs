@@ -118,6 +118,24 @@ fn long_folds_and_unique_are_linear() {
     assert!(took < Duration::from_secs(2), "{took:?}");
 }
 
+/// Task 14 fix round: a fold that reads a wide property on every step, or
+/// wraps it on every step, is linear. The property is converted once per
+/// evaluation (memoized), and wrapping reads the depth the list carries
+/// instead of walking it; before, 20,000 items took 5.4 s in release.
+#[test]
+fn reading_or_wrapping_a_wide_property_on_every_step_is_linear() {
+    let (wrapped, read, took) = on_a_one_mebibyte_stack(|| {
+        let source = note_with(20_000);
+        let started = Instant::now();
+        let wrapped = eval(&source, "xs.reduce([xs], []).length");
+        let read = eval(&source, "xs.reduce(xs.length, 0)");
+        (wrapped, read, started.elapsed())
+    });
+    assert_eq!(wrapped, Ok(Value::Number(1.0)));
+    assert_eq!(read, Ok(Value::Number(20_000.0)));
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
 /// Timings for the report (run with `--ignored --nocapture`), on a large
 /// stack so the old code's deep copies could finish for comparison.
 #[test]
@@ -173,8 +191,10 @@ fn time_deep_reduce_and_wide_rewrap() {
         let (deep, deep_min) = time("xs.reduce([acc], [])");
         // Wide: the whole `xs` re-wrapped on every step.
         let (wide, wide_min) = time("xs.reduce([xs], []).length");
+        // The stage split: `xs` read on every step with no wrap at all.
+        let (read, read_min) = time("xs.reduce(xs.length, 0)");
         println!(
-            "n={count} deep reduce p50 {deep:.3} ms (min {deep_min:.3}); wide re-wrap p50 {wide:.3} ms (min {wide_min:.3})"
+            "n={count} deep reduce p50 {deep:.3} ms (min {deep_min:.3}); wide re-wrap p50 {wide:.3} ms (min {wide_min:.3}); read xs every step p50 {read:.3} ms (min {read_min:.3})"
         );
     }
 }

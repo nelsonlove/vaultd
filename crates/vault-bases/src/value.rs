@@ -68,10 +68,11 @@ pub enum Value {
     Date(DateValue),
     Duration(DurationValue),
     /// Shared storage: cloning a list (binding it to `acc`, reading a
-    /// local) is O(1), never a deep copy. Build one with [`Value::list`].
-    List(Arc<Vec<Value>>),
+    /// local) is O(1), never a deep copy. Build one with [`Value::list`],
+    /// which also records how deep it nests.
+    List(Arc<Nested<Vec<Value>>>),
     /// Shared like [`Value::List`]; build one with [`Value::object`].
-    Object(Arc<Vec<(String, Value)>>),
+    Object(Arc<Nested<Vec<(String, Value)>>>),
     Link(LinkValue),
     File(VaultPath),
     Regexp(RegexpValue),
@@ -89,37 +90,81 @@ pub enum Value {
 /// [`crate::eval::EvalError::ValueTooDeep`], an error cell.
 pub const MAX_VALUE_DEPTH: usize = 64;
 
+/// A list's items or an object's entries, with how many levels the value
+/// nests (one for this level plus the deepest item's), computed once when
+/// it is built. Reads go through `Deref`, so `items.iter()`, `items.len()`
+/// and `items[i]` work as on the `Vec`. Wrapping a value one level deeper
+/// checks this number instead of walking the value, so a fold that wraps a
+/// wide list on every step stays linear (Task 14 fix round: the walk made
+/// `xs.reduce([xs], [])` quadratic, 5.4 s at 20,000 items).
+#[derive(Clone, Debug)]
+pub struct Nested<T> {
+    items: T,
+    depth: usize,
+}
+
+impl<T> Nested<T> {
+    /// How many levels this list or object nests (at least 1).
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+}
+
+impl<T> std::ops::Deref for Nested<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.items
+    }
+}
+
+/// Structural equality is the items' (the depth follows from them).
+impl<T: PartialEq> PartialEq for Nested<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
 impl Value {
     /// A list value.
     pub fn list(items: Vec<Value>) -> Value {
-        Value::List(Arc::new(items))
+        let depth = 1 + items.iter().map(Value::depth).max().unwrap_or(0);
+        Value::List(Arc::new(Nested { items, depth }))
     }
 
     /// An object value, its entries in order.
     pub fn object(entries: Vec<(String, Value)>) -> Value {
-        Value::Object(Arc::new(entries))
+        let depth = 1 + entries
+            .iter()
+            .map(|(_, value)| value.depth())
+            .max()
+            .unwrap_or(0);
+        Value::Object(Arc::new(Nested {
+            items: entries,
+            depth,
+        }))
+    }
+
+    /// How many levels this value nests: a scalar none, a list or an object
+    /// its recorded depth, a link with a display one more than its display.
+    /// O(1) for lists and objects; a link walks only its display chain,
+    /// which wrapping bounds by [`MAX_VALUE_DEPTH`].
+    pub fn depth(&self) -> usize {
+        match self {
+            Value::List(items) => items.depth(),
+            Value::Object(entries) => entries.depth(),
+            Value::Link(link) => link
+                .display
+                .as_ref()
+                .map_or(0, |display| 1 + display.depth()),
+            _ => 0,
+        }
     }
 
     /// Whether this value nests more than `levels` levels (a scalar nests
-    /// none). One call per level, stopping as soon as the answer is known,
-    /// so the walk never goes deeper than `levels + 1`.
+    /// none). Reads the recorded depth; walks nothing.
     pub fn nests_deeper_than(&self, levels: usize) -> bool {
-        match self {
-            Value::List(items) => {
-                levels == 0 || items.iter().any(|item| item.nests_deeper_than(levels - 1))
-            }
-            Value::Object(entries) => {
-                levels == 0
-                    || entries
-                        .iter()
-                        .any(|(_, item)| item.nests_deeper_than(levels - 1))
-            }
-            Value::Link(link) => match &link.display {
-                Some(display) => levels == 0 || display.nests_deeper_than(levels - 1),
-                None => false,
-            },
-            _ => false,
-        }
+        self.depth() > levels
     }
 
     /// The name `isType` compares against, and the `kind` a cell carries.
