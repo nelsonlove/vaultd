@@ -321,3 +321,58 @@ fn the_socket_transport_is_documented_where_its_users_look() {
         &["--listen [PATH]", "--engine", "--leave-engine-running"],
     );
 }
+
+#[test]
+fn bases_evaluation_is_documented_where_its_users_look() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "### `evaluate_base`",
+            "### `list_bases`",
+            "### `views_invalidated`",
+            "## Bases",
+            "The cell model",
+            "False positives are accepted; false negatives are a defect",
+            "`{\"kind\":\"view\",\"value\":\"Table\"}`",
+            "a subpath's `kind`",
+        ],
+    );
+    assert_document_contains("README.md", &["evaluate_base", "`.base`"]);
+    assert_document_contains(
+        "VAULTD-COMPATIBILITY.md",
+        &["Bases parity", "captured", "uncaptured"],
+    );
+    assert_document_contains(
+        "docs/design/semantic-read-path.md",
+        &["Bases evaluation landed in phase 8"],
+    );
+    assert_document_contains(
+        "docs/performance/bases-evaluation-baseline.md",
+        &["20 ms", "100 ms", "1 ms", "5 percent"],
+    );
+}
+
+#[test]
+fn every_bases_error_code_is_documented_exactly_once() {
+    let document = read_document("docs/protocol.md");
+    let errors = document
+        .split_once("\n## Errors\n")
+        .expect("an Errors section")
+        .1;
+    let errors = match errors.split_once("\n## ") {
+        Some((section, _)) => section,
+        None => errors,
+    };
+    for code in [
+        "base_invalid",
+        "view_not_found",
+        "expression_invalid",
+        "unsupported_function",
+    ] {
+        let definitions = errors
+            .lines()
+            .filter(|line| line.starts_with(&format!("- `{code}`")))
+            .count();
+        assert_eq!(definitions, 1, "`{code}` is defined {definitions} times");
+    }
+}

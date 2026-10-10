@@ -28,10 +28,23 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 
 - `vault-core`: semantic types and runtime ports
 - `vault-protocol`: stable external contract
+- `vault-index`: the persistent SQLite index, reconciliation, and the reads served from it
+- `vault-watch`: the debounced filesystem watcher
+- `vault-bases`: the Obsidian Bases file model, expression language and view evaluator, pure Rust with no I/O
 - `vault-server`: daemon composition and its two transports, stdio and a Unix domain socket
 - `host/`: a Node/TypeScript npm workspace, outside the Cargo workspace — the headless Obsidian plugin host and the `vaultd-host` binary. Built and tested on its own (`npm --prefix host run build`, `npm --prefix host test`); it supervises a `vaultd` child rather than linking against the crates.
 
 ## Current milestone
+
+### On the branch `feat/bases-evaluation`: Bases evaluation
+
+**Not merged.** `vaultd` now evaluates Obsidian Bases. A `.base` file is an indexed file kind beside `.md`, parsed and reconciled in the same generation as any other change; a base that does not parse is still indexed, listed with its YAML position and reported as a `malformed_base` diagnostic. Links resolve to a base and to its views: `![[Books.base#Table]]` resolves with a `view` subpath, and an undeclared view is `missing_subpath`. Two new requests answer from the current generation: `evaluate_base` returns one view's rows as paths plus typed cells (the daemon renders nothing), paged and cached per generation, and `list_bases` pages every base with its view names and parse status. A new event, `views_invalidated`, tells subscribers which views a committed generation may have changed, by a coarse rule whose false positives are accepted and whose false negatives are defects. Property types come from the vault's `.obsidian/types.json`. One new flag:
+
+```
+--bases-cache-entries <1..=4096>   evaluated views kept per generation (default 64; requires --vault)
+```
+
+The wire contract — the two operations, the cell model, base targets and the view subpath, the staleness rule and the four new error codes — is `docs/protocol.md`'s **Bases** section and its `evaluate_base`, `list_bases` and `views_invalidated` entries. The design and its rulings are `docs/design/bases-evaluation.md`; the measured numbers against its six targets (all met after the fix rounds) are `docs/performance/bases-evaluation-baseline.md`; what parity with Obsidian means, what was captured from a running Obsidian and what still needs a capture, is the **Bases parity** section of `VAULTD-COMPATIBILITY.md`.
 
 ### On the branch `feat/headless-plugin-host`: the headless Obsidian plugin host
 
@@ -157,9 +170,10 @@ Run `cargo test --workspace --all-targets` and `cargo clippy --workspace --all-t
 
 Six suites use `proptest`. `PROPTEST_CASES` is honoured by all of them, including the ones written as `ProptestConfig::with_cases(N)`: `proptest!` passes any config expression through proptest's own `contextualize_config`, which re-applies the environment variable on top of whatever it was given. An earlier note in this repository claimed `with_cases` swallowed the variable and that the suites needed migrating — that claim was disproved against proptest 1.11.0's source, and the measurement behind it compared two runs that both had the variable set. **There is nothing to migrate.** `crates/vault-index/tests/frontmatter_patch.rs`'s `cases()` helper is equivalent to `with_cases(256)`, kept only because it states the default at the call site.
 
-### Known flaky tests (both pre-existing, both load-dependent)
+### Known flaky tests (all pre-existing, all load-dependent)
 
-Two tests measure wall-clock time and fail when other multi-second tests run beside them. Both pass in isolation. **Re-run a failure on its own before treating it as a regression** — `cargo test -p vault-server --test <suite> <test_name> -- --exact`.
+Three tests measure wall-clock time and fail when other multi-second tests run beside them. All three pass in isolation. **Re-run a failure on its own before treating it as a regression** — `cargo test -p <crate> --test <suite> <test_name> -- --exact`.
 
 - `vault-server/tests/subscriptions.rs::a_subscriber_that_never_drains_is_bounded_against_a_live_runtime` — fails with "the marker must name the newest committed generation". The test waits on `published_status`, but notice *delivery* into the channel lags publication, so the final drain can run before the last notice arrives and the lag marker then names an older generation. **Fix sketch:** after reading `final_generation`, block on `notices.recv_timeout` until a notice naming it arrives, then drain.
 - `vault-server/tests/runtime.rs::only_the_configured_threads_are_started` — fails the 5 s bound in `bounded_shutdown`. Measured 2026-09-08 on an Apple M2: 10.8 s in the full workspace run **and** 10.8 s again when only `--test runtime` ran, so its own suite's 22 siblings are load enough; run alone it passes 3/3. The bound exists to catch a shutdown that waits out a whole 60 s reconcile interval, which is a two-order-of-magnitude difference from what is being measured. **Fix sketch:** bound the shutdown against the configured interval rather than a fixed 5 s wall-clock figure, so the assertion keeps its signal and stops measuring the machine's load.
+- `vault-watch/tests/filesystem_smoke.rs::create_modify_delete_a_markdown_file_eventually_surfaces_a_paths_hint` — fails with "expected a Paths hint … within the deadline" in a loaded whole-workspace run (seen in phase 8, Task 14); `cargo test -p vault-watch --test filesystem_smoke` passes on its own. The test waits a fixed deadline for the operating system's file events. **Fix sketch:** not yet worked out; a longer deadline only hides it.

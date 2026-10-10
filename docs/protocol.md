@@ -19,7 +19,10 @@ Runtime tuning. Each of these requires `--vault`, exactly as `--index` does, and
 --watch-debounce-ms <10..=5000>     # event coalescing window, default 100
 --reconcile-interval-seconds <N>    # periodic complete reconciliation, default 60; 0 disables it
 --read-only                         # refuse every operation that writes into the vault
+--bases-cache-entries <1..=4096>    # evaluated Bases views kept per generation, default 64
 ```
+
+`--bases-cache-entries` bounds the least-recently-used store of evaluated views that `evaluate_base` pages are cut from (see **Bases** below). Every entry of an older generation is dropped on the first request at a newer one, so the bound applies to one generation's worth of views.
 
 `--read-only` refuses every mutating operation — the eight note and folder verbs, the raw `write_file`, and a rename's link repair — with `read_only`, before any path is touched. Reads, snapshot sessions, reconciliation, and the watcher are unaffected: the daemon still indexes what other writers do, it simply never writes itself. The `.obsidian` zone is included; a read-only daemon writes nothing anywhere in the vault. The flag is fixed at startup and there is no operation that changes it.
 
@@ -131,6 +134,16 @@ Applies the same resolution rules used during reconciliation to a destination st
 {"version":1,"id":"r","outcome":{"status":"ok","value":{"type":"resolve_link","value":{"generation":3,"resolution":{"kind":"missing_subpath","target":"Other.md","subpath":{"kind":"heading","value":"Heading"}}}}}}
 ```
 
+A destination that reaches a `.base` file resolves to it, and a subpath on a base is a view name matched exactly: `Views.base#Table` resolves to `{"kind":"resolved","target":"Views.base","subpath":{"kind":"view","value":"Table"}}` when the base declares a view named `Table`, and to `missing_subpath` with the same `view` subpath when it does not. **Bases** below has the whole rule.
+
+```json
+{"version":1,"id":"rv","request":{"method":"resolve_link","params":{"source_path":"Home.md","destination":"Views.base#Table"}}}
+```
+
+```json
+{"version":1,"id":"rv","outcome":{"status":"ok","value":{"type":"resolve_link","value":{"generation":3,"resolution":{"kind":"resolved","target":"Views.base","subpath":{"kind":"view","value":"Table"}}}}}}
+```
+
 ### `get_backlinks`
 
 Source references ordered by source path and span. References whose file resolves but whose heading or block is missing remain backlinks to the resolved file.
@@ -203,6 +216,50 @@ Ends a subscription. Events already queued for it reach the client *before* this
 
 ```json
 {"version":1,"id":"u","outcome":{"status":"ok","value":{"type":"unsubscribe","value":{"subscription_id":"sub-1"}}}}
+```
+
+### `evaluate_base`
+
+Evaluates one view of a `.base` file at the current generation and answers its rows. `path` names the base; `view` names a view (absent means the first declared view, as Obsidian opens a base); `this_path` names the note that embeds the base (absent means the base itself — what `this` is); `cursor` and `limit` page the rows like every collection operation (default 100, from 1 to 1000; 0 or more than 1000 is `invalid_cursor`).
+
+The answer carries the `generation`; the `view` as declared (`type`, `name`, and in `options` every other key the view declares, in declared order); the `columns` (the view's `order`, each with its `property`, the `display_name` its `properties` entry declares or `null`, and that entry's other `settings` in declared order); the page of `rows` (each a `path`, a `kind` of `note` or `file`, a `group` cell present exactly when the view groups, and `cells`, one per column in column order); the `summaries`, an object from name to typed cell, where the name is the key the view's own `summaries` map declares it under, so `summaries: {note.price: Average}` answers `"note.price": <cell>`; `total_rows`, the number of rows in the whole answer; and `next_cursor`.
+
+`options` and `settings` are **ordered lists of `{key, value}` entries**, not JSON objects, so neither declared order nor a repeated key is lost; each `value` has the shape a property value has in `get_note` (`{"kind":"string","value":"medium"}`, `{"kind":"integer","value":120}`, a `sequence`, a `mapping`). A non-finite float in an option travels as a `float` whose text is `nan`, `infinity` or `-infinity`, as it does in a property.
+
+The daemon renders nothing: a client turns cells into a table, cards, a list or a board. Every view type — `table`, `cards`, `list`, `kanban`, `map`, and a plugin's own — evaluates to the same row data; an unknown type is passed through as declared. The cells are described under **The cell model** below.
+
+```json
+{"version":1,"id":"e","request":{"method":"evaluate_base","params":{"path":"Books.base","view":"Table","this_path":"Home.md","limit":2}}}
+```
+
+```json
+{"version":1,"id":"e","outcome":{"status":"ok","value":{"type":"evaluate_base","value":{"generation":7,"view":{"type":"table","name":"Table","options":[{"key":"rowHeight","value":{"kind":"string","value":"medium"}}]},"columns":[{"property":"file.name","display_name":null,"settings":[]},{"property":"note.price","display_name":"Price","settings":[{"key":"width","value":{"kind":"integer","value":120}}]}],"rows":[{"path":"Books/Ulysses.md","kind":"note","cells":[{"kind":"string","value":"Ulysses"},{"kind":"number","value":30}]},{"path":"Books/Dune.md","kind":"note","cells":[{"kind":"string","value":"Dune"},{"kind":"number","value":10}]}],"summaries":{"note.price":{"kind":"number","value":14.333333333333334}},"total_rows":3,"next_cursor":"eyJnZW5lcmF0aW9uIjo3fQ"}}}}
+```
+
+**One computation per view and generation.** A result is computed once per (base, view, `this_path`, generation, declared property types) and every page is cut from that one computation, so `now()`, `today()` and `random()` cannot move between pages. The computation is kept in a bounded least-recently-used store (`--bases-cache-entries`, default 64); every entry of an older generation is dropped on the first request at a newer one, and an entry computed under older property types is never served again (see **Property types** below).
+
+**The cursor** binds the generation, the base, the view, `this_path`, the row position, and the instant the result was computed at. A cursor presented with another base, view or `this_path` is `invalid_cursor`; a cursor from an older generation is `generation_mismatch` with `current_generation`. A page whose result has left the store is computed again at the cursor's instant, so it sees the same `now()` and the same `random()` sequence (which is seeded from the instant) as the pages before it.
+
+**`now()` and `today()` are frozen within a generation.** A re-ask at the same generation is answered from the store with the old instant, and no event marks the clock or the day turning over, so a view whose filter reads `now()` or `today()` keeps its answer on a quiet vault until the next generation (or until the store evicts it).
+
+**A metadata-only touch is not a generation.** A note whose modification time moved while its bytes did not publishes no generation, so a view that reads that note's `file.mtime` or `file.ctime` keeps its answer until the next generation.
+
+**An evaluation blocks only its own connection.** It runs on the requesting connection's dispatcher and takes no lease. It pins a generation under the publication guard on a private read connection from the reader's pool, then evaluates with the guard released: a publication is never held up by an evaluation, and other reads on the same reader still answer. A long evaluation delays that connection's next request, never another connection and never reconciliation. When the live state moves while the pin is being taken, the pin is retried with backoff for up to two seconds; past that the request answers `storage_failure`.
+
+**Re-ask an answer older than the newest `generation_committed` you have seen.** A client that evaluates on one connection and subscribes on another can receive a newer generation's `views_invalidated` events before its own evaluation is recorded, and those events were decided without its rows. Comparing the answer's `generation` with the newest `generation_committed` it has seen closes that gap.
+
+Refusals: a `path` with no indexed base is `not_found`; a base that does not parse is `base_invalid`; an undeclared view is `view_not_found`; a filter that does not parse is `expression_invalid`, and one that calls a function or method this build does not implement is `unsupported_function`; a `this_path` that is not an existing note is `invalid_request`; health-only mode is `index_unavailable`. A formula or a base summary that does not compile does **not** refuse the view: its column is an error cell in every row, and the summary an error cell.
+
+### `list_bases`
+
+Pages every `.base` file the index holds, in path order, with its declared view names and its parse status: `parsed`, or `parse_failed` with the YAML parser's `message` and the `span` it points at. A base that does not parse is still listed, with no views. Paging follows the collection rule above.
+
+```json
+{"version":1,"id":"lb","request":{"method":"list_bases","params":{"cursor":null,"limit":100}}}
+```
+
+```json
+{"version":1,"id":"lb","outcome":{"status":"ok","value":{"type":"list_bases","value":{"generation":7,"items":[{"path":"Books.base","status":{"state":"parsed"},"views":["Table","Cards"]},{"path":"Broken.base","status":{"state":"parse_failed","message":"did not find expected ',' or ']'","span":{"start":7,"end":7}},"views":[]}],"next_cursor":null}}}}
 ```
 
 ## Mutations
@@ -504,6 +561,50 @@ Releases the session and its pinned transaction. A session identifier this proce
 {"version":1,"id":"c","outcome":{"status":"ok","value":{"type":"close_snapshot","value":{"snapshot_id":"snap-1"}}}}
 ```
 
+## Bases
+
+`vaultd` evaluates Obsidian Bases: `evaluate_base` and `list_bases` above, and the `views_invalidated` event under **Events**. The design and its rulings are in `docs/design/bases-evaluation.md`; the measurements are in `docs/performance/bases-evaluation-baseline.md`; what parity with Obsidian means, and what was captured, is in `VAULTD-COMPATIBILITY.md`.
+
+### How a base is indexed
+
+A `.base` file is an indexed file kind beside `.md`. It is parsed and reconciled in the same generation as any other change, on the watcher route and on a complete reconciliation alike, and a write, rename, copy or delete of a `.base` through this daemon answers `semantic: true` with the generation that holds it. A base that does not parse is still indexed and still resolves: `list_bases` lists it as `parse_failed` with the YAML position, `evaluate_base` answers `base_invalid`, and `get_diagnostics` reports a `malformed_base` diagnostic under its path. Renaming a base repairs the links to it, as renaming a note does.
+
+### Base targets and the view subpath
+
+A link whose target reaches a `.base` file resolves to that file. A subpath on a base is a view name, matched exactly: `![[Books.base#Table]]` resolves with subpath `{"kind":"view","value":"Table"}` when the base declares that view. An undeclared view is `missing_subpath` with the `view` subpath and a `missing_view` diagnostic; a block subpath on a base (`#^id`) is `missing_subpath`. A reference keeps its *parsed* subpath as `heading`, because the parser cannot know what the target is — only the *resolution* names a view. When a note and a base share a stem, `![[stem]]` resolves to `stem.md`, as Obsidian does.
+
+### The cell model
+
+A cell is a typed JSON object tagged by `kind`. The fourteen kinds the server emits, and the one it never does:
+
+- `null` — no value (a missing property, an empty result).
+- `string` — `value` is text.
+- `number` — `value` is a finite JSON number; a whole number below 2^53 is written as an integer (`60`, not `60.0`). A non-finite number has no JSON number, so it travels as a `string` cell holding JavaScript's text: `NaN`, `Infinity`, `-Infinity`.
+- `boolean` — `value` is `true` or `false`.
+- `date` — `value` is ISO 8601 in the daemon's zone, `YYYY-MM-DD` without a time and `YYYY-MM-DDTHH:mm:ss.SSS±HH:MM` with one; `has_time` says which.
+- `duration` — `value` is milliseconds and `months` the calendar months kept apart from them (a month has no fixed length in milliseconds).
+- `list` — `value` is a list of cells.
+- `object` — `value` is an ordered list of `{key, value}` entries, each `value` a cell, the way a property mapping is carried.
+- `link` — `target` is the link's target text, `display` a cell or `null`, and `resolved` the vault path it resolves to or `null`.
+- `file` — `path` is a vault path.
+- `image`, `icon`, `html` — `value` is the argument the expression passed; the client renders it.
+- `error` — `message` says why. The expression failed on this row (a type error, a missing method), or the formula the column reads does not compile; the row stays, as Obsidian shows an error cell rather than dropping the row.
+- `unknown` — the client-side catch-all for a kind this build has not heard of. The server never emits it.
+
+A regular expression value has no cell kind of its own; it travels as a `string` cell `/source/flags`. A cell nests at most 32 levels deep: the value at the cap becomes an `error` cell and the levels above it are kept, so every answer stays inside the 128-level reading limit of common JSON decoders.
+
+A view's sort is a transitive total order over every cell kind: booleans (false before true), then numbers, then dates, then text by collation, with empty values and error cells last in both directions; in a key whose every non-empty value is a boolean, an empty value sorts as `false`. This is ruling 8 of the design, and it differs from Obsidian's own comparator only where a key mixes kinds (`VAULTD-COMPATIBILITY.md` names the cases).
+
+### Property types
+
+The types a property is declared with come from the vault's `.obsidian/types.json`, read through the configuration zone when a view is computed (not on a store hit). Keys match without case. A missing or unreadable file means no declared types. A change to that file is not a generation, but it retypes cells, so the daemon keeps a types epoch: a change through this daemon's `write_file`, or an external edit the watcher names, bumps it before the `config_changed` event is sent, every stored answer computed under the old epoch is never served again, and every view the daemon knows gets a `views_invalidated` right behind the `config_changed`.
+
+### The language
+
+The whole published Bases reference is implemented: every type, operator, global function, method and field on Obsidian's pages, `this`, formulas, base and view summaries, and the view declarations. A view is evaluated in this order: the prefilters an index serves (`file.inFolder`, `file.hasTag`, `file.ext ==` and scalar property equality at the top of the filter tree), then the base's and the view's filters as one conjunction, then formulas (memoized per row), then `sort` (stable), then `limit`, then `groupBy`, then summaries over the surviving rows. `this` is the note `this_path` names, or the base itself when it is absent.
+
+Where the published pages and a runtime capture of Obsidian disagree, the capture wins; where neither fixes a behaviour, a provisional rule answers and is listed for re-capture in `VAULTD-COMPATIBILITY.md`, and in the one case no rule was chosen (`keys()` and `values()` of an object holding an integer-like key beside others) the answer is an error cell naming the case. A formula that does not parse, or calls an unknown function or method, is an error cell in its column (ruling 7); a filter that does is a request-level `expression_invalid` or `unsupported_function`, because there are no rows to show. The parser refuses what Obsidian cannot parse: exponent literals, a method on a bare number literal, object literals, a regular-expression literal JavaScript refuses, and a raw line or paragraph separator inside a string. Regular expressions are limited to what the Rust `regex` crate expresses: a look-behind parses and is an error when evaluated.
+
 ## Transports
 
 The daemon serves the same newline-delimited JSON over two doors.
@@ -584,10 +685,33 @@ The generation moved in a way no per-path change set describes: an incremental c
 
 This daemon's own `write_file` or `create_folder` landed inside `.obsidian/`. It carries **no generation**: nothing in the zone is indexed, so no generation contains it, and a client re-reads the named path with `read_file` (or lists it again) rather than applying a delta. `path` is the path the write *landed on*, not the one the request spelled, so a host can match the notice to the file or folder it knows even when a symlink or a case-folded name reached the zone. A `create_folder` of a zone folder that was already there announces itself too — the notice means "re-read this path", not "a delta happened".
 
-The zone is not watched — it is a dot-directory, and the scanner and the watcher skip it — so an edit made by anything other than this daemon raises no event at all. A host that shares the zone with other writers polls or watches it itself.
+The zone is not watched — it is a dot-directory, and the scanner and the watcher skip it — so an edit made by anything other than this daemon raises no event at all, with one exception: the watcher passes exactly `.obsidian/types.json`, the declared property types Bases evaluation reads, and an external edit of it raises `config_changed` like a write through this daemon. That exception holds only when a watcher event names the file: a watcher overflow or a complete reconciliation does not announce it, and neither does a delete or a move of `types.json` through this daemon. A host that shares the zone with other writers polls or watches it itself.
+
+A `config_changed` for `.obsidian/types.json` retypes every view, so every view the daemon knows is named by a `views_invalidated` right behind it (see **Bases**, **Property types**).
 
 ```json
 {"version":1,"subscription_id":"sub-1","event":{"type":"config_changed","value":{"path":".obsidian/app.json"}}}
+```
+
+### `views_invalidated`
+
+A view may have changed at `generation`; re-ask `evaluate_base` for it. One event per (base, view), whatever embeddings (`this_path`) a client holds, queued right behind the `generation_committed` it follows (or behind a `config_changed` for `.obsidian/types.json`), through the same per-subscription queues and bounds as every event. Every connection computes the rule for every committed generation, subscribed or not, so it never misses a base created while no client listened; the answer is memoized per generation, so many connections pay for it once, and it runs on the dispatcher, never on the coordinator. One generation can stale more views than a subscriber queue holds, so the events are queued half a queue at a time and drained in between rather than collapsing onto a `subscriber_lag` marker.
+
+The rule is coarse and cheap enough to run on every commit. A view is stale at generation G when
+
+1. its base's path is in G's change set (a deleted folder counts for every base under it); or
+2. a changed path is among the rows the view last answered, for any `this_path` (a deleted folder counts for every row under it); or
+3. a changed path that exists at G passes every one of the view's prefilters (a view with none passes every path); or
+4. the view reads formulas or backlinks and any note changed, or it reads links (`file()`, `link()`, `asFile()`, `file.links`) and any file changed, because links reach attachments; or
+5. the view reads `this` and any file changed; or
+6. a note whose references re-resolved to a different answer at G counts as changed for clauses 2 to 5.
+
+A deleted path that is not a note may have been a folder holding notes, so it counts as a changed note for clauses 4 and 5. False positives are accepted; false negatives are a defect. Known false positives: a change that passes a view's prefilters or touches one of its rows without changing its result, a formula-reading view and a note it never reads, a dispatcher so far behind that the memo no longer holds its generation (it then names every view it knows, every view any client was answered, and every view a newer decision named), and the second epoch bump when the watcher sees this daemon's own `types.json` write again.
+
+No `views_invalidated` accompanies a `resync_required`, which carries no change set: a client re-reads everything then, views included. A generation whose change set exceeds the 1024-path detail limit is followed by `resync_required { oversized_change_set }` and no `views_invalidated` for the same reason. The rule does not cover the clock: see `now()` and `today()` under `evaluate_base`.
+
+```json
+{"version":1,"subscription_id":"sub-1","event":{"type":"views_invalidated","value":{"base":"Books.base","view":"Table","generation":8}}}
 ```
 
 ### Bounds
@@ -658,6 +782,15 @@ The write path and the snapshot sessions add ten more. Every one of them means *
 - `snapshot_not_found` — a session identifier this process never issued, or one already closed or reclaimed after its idle timeout.
 - `too_many_snapshots` — the concurrency cap (4) is reached; close a session and retry.
 
+Bases evaluation adds four, each naming what it refused:
+
+- `base_invalid` — the base does not parse; the message carries the YAML position.
+- `view_not_found` — the base declares no view by that name; the message lists the declared views.
+- `expression_invalid` — a filter the view reads does not parse; the message names the expression and the position.
+- `unsupported_function` — a filter the view reads calls a function or method this build does not implement; the message names it.
+
+A failure inside one row's cell is not an error at all — it is an error cell, and the row stays. A formula or a base summary that does not parse, or calls an unknown function, is an error cell in every row too, not `expression_invalid` or `unsupported_function`: only a filter refuses the request, because a filter that cannot run leaves no rows to show. `evaluate_base` also answers `not_found` for a path with no indexed base and `invalid_request` for a `this_path` that names no note.
+
 `unknown` is reserved as a client-side catch-all for a code this build has not heard of. The server never emits it.
 
 Errors never contain raw SQL, internal cache paths, or backtraces.
@@ -701,4 +834,4 @@ The reserved `subscribe` family is no longer reserved: it landed as `subscribe_e
 
 Adding optional fields is backward-compatible. Adding operations is backward-compatible for servers and clients that reject unknown tagged variants cleanly. Renaming fields, changing meanings, or removing variants requires a new protocol version.
 
-**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, a tree entry's `kind`, or a `read_dir` entry's `kind` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. **The two raw path reads documented beside them, `read_file` and `read_dir`, reject unknown keys too** — the exception is the whole family under "Mutations" above, not the writes within it, so that a client cannot send one spelling to `write_file` and a quietly different one to `read_file`. Each takes a single `path` and has no optional key to be tolerant about; loosening this later would be additive, which is why the strict side is the safe one to start on. Every other read's parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in one of those reads' params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.
+**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, a tree entry's `kind`, a `read_dir` entry's `kind`, a subpath's `kind`, a cell's `kind`, a row's `kind`, or a base's status `state` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One asymmetry: a subpath of an unknown kind decodes as `Unknown` with its value discarded, and that `Unknown` is **not serialised again** — re-encoding a decoded response that holds one is an error, where every other `Unknown` above re-encodes as `"unknown"`. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. **The two raw path reads documented beside them, `read_file` and `read_dir`, reject unknown keys too** — the exception is the whole family under "Mutations" above, not the writes within it, so that a client cannot send one spelling to `write_file` and a quietly different one to `read_file`. Each takes a single `path` and has no optional key to be tolerant about; loosening this later would be additive, which is why the strict side is the safe one to start on. Every other read's parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in one of those reads' params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.

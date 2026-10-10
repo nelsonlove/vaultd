@@ -289,3 +289,5 @@ The phase is complete when:
 ## Deferred follow-on
 
 The next architectural phase may persist the graph in SQLite, reconcile watcher events, and expose read operations through the versioned protocol. That phase consumes `ParsedNote`, `SemanticGraph`, and diagnostics; it does not change the storage-authority decision.
+
+Bases evaluation landed in phase 8; see `docs/design/bases-evaluation.md`.

@@ -50,10 +50,11 @@ pub enum ErrorCode {
     /// The base declares no view of that name; the message names the views
     /// it does declare.
     ViewNotFound,
-    /// A filter, formula or summary expression the view reads does not
-    /// parse.
+    /// A filter the view reads does not parse. A formula or a summary that
+    /// does not parse is an error cell instead, not this code.
     ExpressionInvalid,
-    /// The view calls a function this evaluator does not implement.
+    /// A filter the view reads calls a function or method this evaluator
+    /// does not implement. In a formula or a summary it is an error cell.
     UnsupportedFunction,
     /// A code this build does not know. Never produced by this server.
     Unknown,

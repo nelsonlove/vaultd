@@ -133,14 +133,16 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
     // structural facets, absent from the first) and `create_folder` inside the
     // `.obsidian` zone (whose `generation` key is absent, not zero). A count
     // regression here means an operation lost its documented example, not just
-    // that a JSON block became unparseable.
+    // that a JSON block became unparseable. Bases evaluation adds a pair each
+    // for `evaluate_base` and `list_bases`, a second `resolve_link` pair (a
+    // base target with a `view` subpath), and the `views_invalidated` event.
     assert_eq!(
-        requests, 29,
-        "expected 29 request examples, see docs/protocol.md"
+        requests, 32,
+        "expected 32 request examples, see docs/protocol.md"
     );
     assert_eq!(
-        responses, 32,
-        "expected 32 response examples (29 success + 3 error), see docs/protocol.md"
+        responses, 35,
+        "expected 35 response examples (32 success + 3 error), see docs/protocol.md"
     );
-    assert_eq!(events, 4, "expected 4 event examples, see docs/protocol.md");
+    assert_eq!(events, 5, "expected 5 event examples, see docs/protocol.md");
 }

@@ -35,13 +35,71 @@ Four divergences are recorded rather than claimed away: `vaultd` does not persis
 
 Resolution follows the documented forms; undocumented Obsidian resolution behavior is returned as an explicit ambiguous or unresolved result rather than guessed, and no full compatibility claim is made for it.
 
+## Bases parity
+
+**Contract:** for a view of a `.base` file, `evaluate_base` answers the rows Obsidian shows, in Obsidian's order, and cells whose text is the text Obsidian shows, except where a deviation below is named. The daemon renders nothing; parity is about row data and cell text, never about layout. The wire contract is `docs/protocol.md`'s **Bases** section; the design and its rulings are `docs/design/bases-evaluation.md`.
+
+**How it was captured.** Parity is pinned against **observed Obsidian 1.13.7** behaviour, captured at runtime on **2026-10-09** (Task 13 of phase 8), never derived from `app.asar`. A copy script took a real vault's bases and the notes they read into a scratch vault under `target/tmp` (163 bases and 2,356 files; it never descends into a guarded private folder, and from the settings it copies only `.obsidian/types.json`); the vault's owner opened that scratch vault once in Obsidian, and a capture script drove the `obsidian` CLI (`base:query format=json`, plus the rendered table for groups, summaries and `this`) against it, checking the vault path before every call. Two sets came out:
+
+- **Synthetic captures, committed:** 857 views of generated `Captures/` bases, one family base per function family plus probe bases, under `crates/vault-server/tests/fixtures/bases-captures/`. A test fails if any committed capture names a path the generator did not produce.
+- **Corpus captures, local only:** 339 views of that real vault's bases, under `$XDG_DATA_HOME/vaultd/bases-captures/corpus/`. They hold note names and property values, so they stay out of the repository (ruled 2026-10-08); the corpus replay skips, saying why, when the folder is absent.
+
+`crates/vault-server/tests/bases_replay.rs` evaluates every captured view through `evaluate_base` and diffs rows and cell text against the capture. The function-family fixture rows (`crates/vault-bases/tests/fixtures/captures/*.jsonl`, 377 rows) carry a `source` of `captured` (334), `provisional` (36) or `published` (7, the rows that read `this`, which `base:query` cannot capture); none is `uncaptured`.
+
+**What fixes a behaviour.** The published pages fix the language's surface: every type, operator, function, method and field, and the view declarations. The captures fix every behaviour they exercised, and where a published sentence and a capture disagreed, the capture won. These published rows were contradicted:
+
+| Row | Published | Captured |
+| --- | --- | --- |
+| `1 / 0` | error | `Infinity` |
+| `1 % 0` | error | `NaN` |
+| `[].isTruthy()` | true | false (an empty list or object is falsy) |
+| `escapeHTML` on `'` | `&#39;` | `'` kept |
+| `image(url)` | the URL | `![](url)` |
+| `toString` of a list | `1,a` | `1, a` |
+| list `contains` | strict (`[1,2].contains("1")` false) | loose `==` (true) |
+| list `mean` skipping non-numbers | 2 | 1.3333333333333333 (the numbers' total over every item) |
+| `containsAll` with no argument | error | true |
+| `link("Other")` and its display rows | `Other` | `[[Other]]` |
+| `asFile()` of a URL link | empty | error |
+| `file("Other.md").name`, `file.name` | with `.md` | the base name for a note (`.md` dropped) |
+| `file.links.length` | 2 | 3 (embeds are links) |
+| `file.backlinks[0].name` | `Other.md` | error (a backlink is a link, which has no `name`) |
+| `asLink(display)`, a frontmatter link's display | the display | `[[target\|display]]` |
+| `date - date` | a number of milliseconds | a duration (`a day`; its `milliseconds` field is 86400000) |
+| `duration * number` | 36000000 | a duration (`10 hours`) |
+| `date("bad")`, `duration("soon")` | error | empty |
+| `format("W")` | an unsupported-token error | `41` (the ISO week); unknown letters are literal |
+| a method on a missing value | error | empty |
+| adding exactly 24 hours to a date | exactly 24 hours | whole days keep the wall-clock time across a daylight-saving change, `"24h"` too; `"25h"` is a day plus an exact hour |
+
+The captures also settled the cases the pages leave open, among them loose equality across kinds, comparison with numeric text, string and list methods on edge inputs, date text in frontmatter read as a date unless `types.json` declares it text, `types.json` keys matched without case, `relative()` wording (Moment's), Moment `format()` tokens, the average summary dividing by every row, `limit` counting sorted rows before grouping, an empty `or:` keeping every row, and a filter error excluding its row.
+
+**Two rulings deviate from Obsidian on purpose** (design rulings 7 and 8, 2026-10-09). R1: a formula Obsidian cannot parse, or one calling an unknown function, is an error cell in its column, as in Obsidian, and the parser refuses the same forms Obsidian does; the replay counts vaultd's error cell against Obsidian's empty cell as a match. R2: a view's sort is a transitive total order, where Obsidian's comparator ties a boolean with every truthy value and orders a number against text by its text; 74 synthetic views that mix kinds in a sort key differ from Obsidian in row order only, and are listed in `deviations.json` as "R2: total order by ruling".
+
+**Every other named deviation** is in `crates/vault-server/tests/fixtures/bases-captures/deviations.json` (78 entries: the 74 R2 views, and four more): a value nested 70 levels deep shows an empty cell in Obsidian and an error cell in vaultd, whose guard is 64 levels; a look-behind regular expression works in Obsidian (JavaScript) and is an argument error in vaultd, whose `regex` crate has none; and two collation views, where names equal but for case, an accent or a zero-width character keep Obsidian's file-list order, which no collation reproduces. The corpus replay has 19 local deviations: vault-core's tag parser disagrees with Obsidian on `#5/`, `#15/` and `#1f` (13 views), vault-core does not record a `![x](/a/b.gif)` embed (1 view), and two views tie among the generated notes.
+
+**`this` is only partly captured.** In `base:query`, `this` is null, so the 61 corpus views that read `this` are skipped by the replay; the synthetic probe views prove that in an opened base `this` is the base, and the seven `this` fixture rows stay `published`.
+
+**Left uncaptured, and why.** The scratch vault was closed after the third capture round, so the probes written for these are in the generator but have not run; the rows they settle stay `provisional`, each with a `why` naming its probe:
+
+- whether a sort key no column shows is ignored, and whether all-empty sort keys keep collated path order (`view sort:hidden_key`);
+- whether text `contains`, `startsWith` and list `contains` ignore case, and whether list `contains` matches a `#tag` item (`string contains:case`, `string startsWith:case`, `list contains:hash_item`);
+- a method on an empty string, `unique()` over mixed kinds, and `==` between two mappings (`string method:on_empty`, `list unique:mixed_kinds`, `object eq:mappings`);
+- whether a view name in an embed matches case-sensitively (`view:case`, which needs the rendered `![[probes.base#Sort_Default]]` against `#sort_default`; the resolver matches exactly today);
+- a non-finite float inside a view option (`base:query` does not show options; no probe exists yet);
+- the corpus views that read `this` (they need a rendered capture that scrolls the table);
+- whether a `Sum` of no numbers is empty or 0 (`summary:sum_empty`; the rendered footer showed no Sum);
+- `keys()` and `values()` of an object holding an integer-like key beside others: Obsidian 1.13.7 cannot parse an object literal, so nothing could probe it, and vaultd answers an error cell naming the case.
+
+**Documented limits.** No rendering of any kind. Map views evaluate to rows; their geodata and tiles are not served. A `fileclass-table` view, a plugin's, is passed through as declared, with no plugin semantics. `random()` is seeded per evaluation from the evaluation's instant, so it is stable across the pages of one answer and not across clients or generations. Property types come only from `.obsidian/types.json`. Regular expressions are limited to what the Rust `regex` crate expresses (a look-behind is an argument error when evaluated, told apart by the crate's error text). Collation approximates ICU for Latin text only. `now()` and `today()` are frozen within a generation, and no event marks the day turning over.
+
 ## Tier 2 — Behavioral and interface compatibility
 
 **Target contract:** Provide documented operations for note lookup, search, resolution, backlinks, compare-and-swap mutation, recoverable transactions, events, CLI commands, and `obsidian://` URI handling. Protocol support is declared per operation and version.
 
 **Current status:** protocol version 1 executes `health`, `get_vault_info`, `list_notes`, `get_note`, `resolve_link`, `get_backlinks`, `list_references`, `get_diagnostics`, `refresh_index`, `subscribe_events`, and `unsubscribe` against a persistent SQLite index kept live by a filesystem watcher; the filesystem remains authoritative and the index is derived from it, never the other way round. Subscriptions deliver bounded **post-commit** events — the generation an event names is already committed and readable — and every overflow degrades into a `resync_required` marker rather than a lost change.
 
-Compare-and-swap mutation is now implemented: `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, and the raw `write_file`/`read_file` pair, each with typed refusals that change nothing, preconditions checked against the bytes on disk, and a response sent only after the generation containing the write has published — so a client reads its own write at the generation it was handed. Rename repairs inbound links in that same generation, preserving each reference's spelling. Bulk reads are implemented as **snapshot sessions**: `open_snapshot`, `snapshot_tree`, `snapshot_notes`, and `close_snapshot` page a whole vault from one pinned read transaction, coherent at a single generation across the file tree and the semantic rows alike. Two per-path reads answer the same questions about a handful of paths rather than a whole vault: `get_note` takes an `include` naming the structural facets (`sections`, `list_items`), and `get_tree_entries` returns tree rows for exactly the paths a client names, reporting the rest as `absent` rather than as an error. The raw `write_file`/`read_file` pair now has a third member beside them: `read_dir` lists one directory's immediate entries — hidden folders and the configuration zones included, the empty path naming the vault root — which is the only way a client can enumerate installed plugins, since the tree index excludes hidden paths by design and `read_file` reads only regular files. `--read-only` refuses every write, the `.obsidian` zone included.
+Compare-and-swap mutation is now implemented: `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, and the raw `write_file`/`read_file` pair, each with typed refusals that change nothing, preconditions checked against the bytes on disk, and a response sent only after the generation containing the write has published — so a client reads its own write at the generation it was handed. Rename repairs inbound links in that same generation, preserving each reference's spelling. Bulk reads are implemented as **snapshot sessions**: `open_snapshot`, `snapshot_tree`, `snapshot_notes`, and `close_snapshot` page a whole vault from one pinned read transaction, coherent at a single generation across the file tree and the semantic rows alike. Two per-path reads answer the same questions about a handful of paths rather than a whole vault: `get_note` takes an `include` naming the structural facets (`sections`, `list_items`), and `get_tree_entries` returns tree rows for exactly the paths a client names, reporting the rest as `absent` rather than as an error. The raw `write_file`/`read_file` pair now has a third member beside them: `read_dir` lists one directory's immediate entries — hidden folders and the configuration zones included, the empty path naming the vault root — which is the only way a client can enumerate installed plugins, since the tree index excludes hidden paths by design and `read_file` reads only regular files. `--read-only` refuses every write, the `.obsidian` zone included. Obsidian Bases are evaluated by `evaluate_base`, listed by `list_bases`, and kept fresh by the `views_invalidated` event (on the branch `feat/bases-evaluation`); what parity means for them is the **Bases parity** section above.
 
 **Creating a folder inside the `.obsidian` zone is now possible**, which closes the gap earlier revisions of this document and `docs/protocol.md` recorded as the follow-up "Create folders inside the `.obsidian` zone". `create_folder` serves the configuration zone and every hidden folder as a raw create: no generation is published (the `generation` key is absent, not zero), and a `config_changed` event announces it when the folder landed inside `.obsidian/`. A plugin host can therefore make `.obsidian/plugins/<id>/` and its own configuration directory and then write into them. `delete_folder` and `rename_folder` still refuse both — making a directory is undone by removing it, while emptying `.trash/` or removing `.git/` is not — and every other containment gate on `create_folder` is unchanged, including the refusal of an ordinary-looking path that *resolves* onto an unindexable one.
 
