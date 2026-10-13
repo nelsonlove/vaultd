@@ -28,10 +28,27 @@ const REPO = resolve(__dirname, "..", "..");
 const SCRATCH = join(REPO, "target", "tmp");
 // A private folder the copy never reads. VAULTD_CORPUS_GUARDED must name it;
 // there is no default, so a run that forgets it stops instead of reading it.
-const GUARDED = process.env.VAULTD_CORPUS_GUARDED;
-if (!GUARDED) {
-  console.error("bases-corpus-copy: set VAULTD_CORPUS_GUARDED to the vault folder the copy must never read");
-  process.exit(2);
+// The value is vault-relative: it is trimmed, a leading `./` and trailing
+// `/` are dropped, and an absolute path or a `..` segment is refused. main()
+// also refuses to run unless the folder exists under --from, so a typo stops
+// the copy instead of silently guarding nothing.
+const GUARDED = normaliseGuarded(process.env.VAULTD_CORPUS_GUARDED);
+
+function normaliseGuarded(raw) {
+  const refuse = (why) => {
+    console.error(`bases-corpus-copy: VAULTD_CORPUS_GUARDED ${why}`);
+    process.exit(2);
+  };
+  if (raw === undefined || raw.trim() === "") refuse("must name the vault folder the copy must never read");
+  let value = raw.trim();
+  if (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)) refuse(`must be relative to the vault, not ${JSON.stringify(raw)}`);
+  while (value.startsWith("./")) value = value.slice(2);
+  value = value.replace(/\/+$/, "");
+  const segments = value.split("/");
+  if (value === "" || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    refuse(`must be a plain vault-relative folder path, not ${JSON.stringify(raw)}`);
+  }
+  return value;
 }
 
 function parseArgs(argv) {
@@ -91,6 +108,10 @@ function tagsOf(text) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
+  const guardedDir = join(options.from, GUARDED);
+  if (!existsSync(guardedDir) || !statSync(guardedDir).isDirectory()) {
+    throw new Error(`VAULTD_CORPUS_GUARDED names ${JSON.stringify(GUARDED)}, which is not a folder under ${options.from}; refusing to run`);
+  }
   if (existsSync(options.to) && readdirSync(options.to).length > 0) {
     if (!options.fresh) throw new Error(`${options.to} is not empty; pass --fresh to replace it`);
     rmSync(options.to, { recursive: true, force: true });

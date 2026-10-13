@@ -22,7 +22,7 @@
 - One commit per task on `feat/bases-evaluation`; trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` only. **Never push, never merge.**
 - Prose in this plan and in every document it writes is one paragraph per line, never hard-wrapped; Rust doc comments follow the crate's wrapped style.
 - Gate before every Rust commit: the touched crates' tests, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, each with its exit code. Gate before every host-script commit: `npm --prefix host run lint`.
-- No agent and no script started by this plan reads anything under the guarded private folder of the vault (`Private/`); the corpus-copy script excludes that subtree unconditionally (Task 13).
+- No agent and no script started by this plan reads anything under the guarded private folder of the vault (the folder `VAULTD_CORPUS_GUARDED` names); the corpus-copy script excludes that subtree unconditionally and refuses to run without it (Task 13).
 
 ## Review Focus
 
@@ -11113,7 +11113,7 @@ COMMIT
 
 This is the task that turns "published" and "uncaptured" into "captured". Five stages, two of them the maintainer's:
 
-1. **Copy (the maintainer runs it, by hand).** `host/scripts/bases-corpus-copy.js` reads the maintainer's `.base` files and the notes they name from the live vault and writes them under `target/tmp/bases-corpus/`, with a manifest of what it copied and why. It is the **only** program in this phase that touches `~/vault`, it only reads there, and it never descends into `Private/`.
+1. **Copy (the maintainer runs it, by hand).** `host/scripts/bases-corpus-copy.js` reads the maintainer's `.base` files and the notes they name from the live vault and writes them under `target/tmp/bases-corpus/`, with a manifest of what it copied and why. It is the **only** program in this phase that touches `~/vault`, it only reads there, and it never descends into the folder `VAULTD_CORPUS_GUARDED` names.
 2. **Generate (the implementer).** `host/scripts/bases-capture.js generate` writes `Captures/` into the corpus: one base per function family, one view and one note per fixture row, and a probe base for the view-level questions (filter errors, default order, mixed-type sort, `Stddev`, limit before group, view-name case, hyphenated identifiers).
 3. **Open (the maintainer, once).** The maintainer opens `target/tmp/bases-corpus` as a vault in Obsidian on the desktop machine ("Open folder as vault"), lets it finish indexing, and says so.
 4. **Capture (the implementer).** `host/scripts/bases-capture.js capture` drives the `obsidian` CLI against that vault only — every call guarded by a check that the CLI is pointed at the corpus path — and saves each view's `base:query` output verbatim, plus the clock and zone the capture ran under.
@@ -11121,7 +11121,7 @@ This is the task that turns "published" and "uncaptured" into "captured". Five s
 
 **How the implementer waits for the maintainer.** At stage 1 and again at stage 3 the implementer stops and reports `BLOCKED` to the controller with the exact text below; the controller relays it; the implementer resumes when the controller passes the maintainer's go-ahead back. It never runs stage 1 itself and never opens a vault.
 
-- Stage 1 text: *"Please run, in this worktree: `node host/scripts/bases-corpus-copy.js --from ~/vault --to target/tmp/bases-corpus` — it reads your vault's `.base` files and the notes they name, skips `Private/`, writes only under `target/tmp/bases-corpus/`, and prints what it copied. Look at `target/tmp/bases-corpus/MANIFEST.json` and tell me it is fine to use."*
+- Stage 1 text: *"Please run, in this worktree: `VAULTD_CORPUS_GUARDED=<private folder> node host/scripts/bases-corpus-copy.js --from ~/vault --to target/tmp/bases-corpus` — it reads your vault's `.base` files and the notes they name, skips the folder `VAULTD_CORPUS_GUARDED` names (it refuses to run without one, or when that folder does not exist), writes only under `target/tmp/bases-corpus/`, and prints what it copied. Look at `target/tmp/bases-corpus/MANIFEST.json` and tell me it is fine to use."*
 - Stage 3 text: *"Please open `<absolute path of target/tmp/bases-corpus>` in Obsidian on the desktop machine with Open folder as vault, wait until indexing finishes, leave it open, and tell me it is open."*
 
 **Files:**
@@ -11166,7 +11166,7 @@ Create `host/scripts/bases-corpus-copy.js`:
  * The one program in the Bases phase that reads the live vault. It is run by
  * hand, by the vault's owner, and it only ever reads there:
  *
- *   node host/scripts/bases-corpus-copy.js --from ~/vault --to target/tmp/bases-corpus
+ *   VAULTD_CORPUS_GUARDED=<private folder> node host/scripts/bases-corpus-copy.js --from ~/vault --to target/tmp/bases-corpus
  *
  * What it reads: every `.base` file under --from (skipping dot-directories
  * and the guarded private folder, unconditionally), every `.md` note's text (to find
@@ -11186,9 +11186,30 @@ const { dirname, join, relative, resolve, sep } = require("node:path");
 
 const REPO = resolve(__dirname, "..", "..");
 const SCRATCH = join(REPO, "target", "tmp");
-// A private folder the copy never reads. Set VAULTD_CORPUS_GUARDED to name
-// your own; the default is a placeholder.
-const GUARDED = process.env.VAULTD_CORPUS_GUARDED || "Private";
+// A private folder the copy never reads. VAULTD_CORPUS_GUARDED must name it;
+// there is no default, so a run that forgets it stops instead of reading it.
+// The value is vault-relative: it is trimmed, a leading `./` and trailing
+// `/` are dropped, and an absolute path or a `..` segment is refused. main()
+// also refuses to run unless the folder exists under --from, so a typo stops
+// the copy instead of silently guarding nothing.
+const GUARDED = normaliseGuarded(process.env.VAULTD_CORPUS_GUARDED);
+
+function normaliseGuarded(raw) {
+  const refuse = (why) => {
+    console.error(`bases-corpus-copy: VAULTD_CORPUS_GUARDED ${why}`);
+    process.exit(2);
+  };
+  if (raw === undefined || raw.trim() === "") refuse("must name the vault folder the copy must never read");
+  let value = raw.trim();
+  if (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)) refuse(`must be relative to the vault, not ${JSON.stringify(raw)}`);
+  while (value.startsWith("./")) value = value.slice(2);
+  value = value.replace(/\/+$/, "");
+  const segments = value.split("/");
+  if (value === "" || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    refuse(`must be a plain vault-relative folder path, not ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
 
 function parseArgs(argv) {
   const out = { maxPerSet: 200, fresh: false };
@@ -11247,6 +11268,10 @@ function tagsOf(text) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
+  const guardedDir = join(options.from, GUARDED);
+  if (!existsSync(guardedDir) || !statSync(guardedDir).isDirectory()) {
+    throw new Error(`VAULTD_CORPUS_GUARDED names ${JSON.stringify(GUARDED)}, which is not a folder under ${options.from}; refusing to run`);
+  }
   if (existsSync(options.to) && readdirSync(options.to).length > 0) {
     if (!options.fresh) throw new Error(`${options.to} is not empty; pass --fresh to replace it`);
     rmSync(options.to, { recursive: true, force: true });
@@ -11547,7 +11572,7 @@ Nothing is committed yet: the task commits once, at Step 10, with the scripts, t
 
 - [ ] **Step 3: Stage 1 — the maintainer copies**
 
-Stop. Report `BLOCKED` with the stage 1 text above. When the controller relays the maintainer's go-ahead, check: `ls target/tmp/bases-corpus/MANIFEST.json; echo "exit=$?"` — `exit=0`; and `grep -c '"Private/' target/tmp/bases-corpus/MANIFEST.json; echo "exit=$?"` — prints `0` (`exit=1` from `grep` meaning no match is the success).
+Stop. Report `BLOCKED` with the stage 1 text above. When the controller relays the maintainer's go-ahead, check: `ls target/tmp/bases-corpus/MANIFEST.json; echo "exit=$?"` — `exit=0`; and `grep -c "\"$VAULTD_CORPUS_GUARDED/" target/tmp/bases-corpus/MANIFEST.json; echo "exit=$?"` — prints `0` (`exit=1` from `grep` meaning no match is the success).
 
 - [ ] **Step 4: Stage 2 — generate**
 
@@ -11883,7 +11908,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 COMMIT
 ```
 
-The scratch corpus itself is never committed (`target/` is ignored); the captures under `crates/vault-server/tests/fixtures/bases-captures/` are, as the spec says. Before `git add`, check that no capture names a path under `Private/`: `grep -rl "Private/" crates/vault-server/tests/fixtures/bases-captures; echo "exit=$?"` must print nothing (`exit=1`).
+The scratch corpus itself is never committed (`target/` is ignored); the captures under `crates/vault-server/tests/fixtures/bases-captures/` are, as the spec says. Before `git add`, check that no capture names a path under the guarded folder: `grep -rl "$VAULTD_CORPUS_GUARDED/" crates/vault-server/tests/fixtures/bases-captures; echo "exit=$?"` must print nothing (`exit=1`).
 
 ---
 ### Task 14: Performance — the harness's `--base` case, the staleness-rule measurement, and the baseline document
