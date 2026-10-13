@@ -6,7 +6,7 @@
  * The one program in the Bases phase that reads the live vault. It is run by
  * hand, by the vault's owner, and it only ever reads there:
  *
- *   node host/scripts/bases-corpus-copy.js --from ~/vault --to target/tmp/bases-corpus
+ *   VAULTD_CORPUS_GUARDED=<private folder> node host/scripts/bases-corpus-copy.js --from ~/vault --to target/tmp/bases-corpus
  *
  * What it reads: every `.base` file under --from (skipping dot-directories
  * and the guarded private folder, unconditionally), every `.md` note's text (to find
@@ -26,9 +26,13 @@ const { dirname, join, relative, resolve, sep } = require("node:path");
 
 const REPO = resolve(__dirname, "..", "..");
 const SCRATCH = join(REPO, "target", "tmp");
-// A private folder the copy never reads. Set VAULTD_CORPUS_GUARDED to name
-// your own; the default is a placeholder.
-const GUARDED = process.env.VAULTD_CORPUS_GUARDED || "Private";
+// A private folder the copy never reads. VAULTD_CORPUS_GUARDED must name it;
+// there is no default, so a run that forgets it stops instead of reading it.
+const GUARDED = process.env.VAULTD_CORPUS_GUARDED;
+if (!GUARDED) {
+  console.error("bases-corpus-copy: set VAULTD_CORPUS_GUARDED to the vault folder the copy must never read");
+  process.exit(2);
+}
 
 function parseArgs(argv) {
   const out = { maxPerSet: 200, fresh: false };
