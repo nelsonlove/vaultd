@@ -1,6 +1,7 @@
 {
   "name": "vaultd-host-workspace",
   "private": true,
+  "license": "MIT",
   "workspaces": ["packages/*"],
   "engines": { "node": ">=24.0.0" },
   "scripts": {

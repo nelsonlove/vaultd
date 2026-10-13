@@ -3,6 +3,7 @@ name = "vault-bases"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [features]
 # The capture-fixture reader and the cell-text renderer. Off in production

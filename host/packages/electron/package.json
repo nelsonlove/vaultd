@@ -2,6 +2,7 @@
   "name": "electron",
   "version": "0.0.0-headless",
   "private": true,
+  "license": "MIT",
   "type": "commonjs",
   "main": "index.js",
   "dependencies": {
