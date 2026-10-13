@@ -631,7 +631,7 @@ With `--listen`, end of file on standard input ends **stdio alone** and the daem
 
 **Measured against the design's four performance targets** (`docs/performance/vaultd-socket-transport-baseline.md`): connection setup was 0.139 ms median against a target under 5 ms p50 — met. A warm `get_note` round trip over the socket was 0.981× the same round trip over stdio (medians 0.119 ms against 0.121 ms) against a target within 10 percent — met; the first measurement of this phase missed it at 2.16×, the mechanism was that `connection::write_output` wrote straight to an unbuffered socket instead of a buffered one, and the fix — wrapping that sink in a `BufWriter` for every transport — landed in the same phase. A `write_note` round trip was 0.987× stdio — met. A `get_note` beside a peer that has stopped reading was 1.003× the same read with no stalled peer (median of three run ratios) — met. And a connection costs exactly the four threads a stdio connection already costs, on both transports — met, with no new thread per connection.
 
-Reaching the daemon from another machine is done by forwarding the socket over SSH.
+Reaching the daemon from another machine is done by forwarding the socket over SSH (for example `ssh -N -L <local socket>:<remote socket> <host>`).
 
 ## Events
 
