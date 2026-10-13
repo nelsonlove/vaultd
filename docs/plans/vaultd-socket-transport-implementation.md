@@ -6001,7 +6001,7 @@ COMMIT
 
 ### Task 13: Documentation — the Transports section and the two amendments
 
-Four documents, one source comment the phase made false, and one test that will not let three of them drift.
+Three documents, one source comment the phase made false, and one test that will not let three of them drift.
 
 **Files:**
 
