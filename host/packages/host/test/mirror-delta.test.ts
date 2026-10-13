@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { MirrorHarness, harness_ref } from "../src/testing/mirror-harness";
+import { MirrorHarness, harness_ref, linkEdges } from "../src/testing/mirror-harness";
 import type { GenerationCommittedEventDto, RuntimeEventDto } from "../src/client/protocol";
 import type { MirrorChangeBatch } from "../src/mirror/types";
 
@@ -542,7 +542,7 @@ describe("Mirror deltas", () => {
         { path: "Y.md", revision: "blake3:y1" },
       ],
     });
-    expect(harness.mirror.resolvedLinks()).toEqual({ "X.md": { "Y.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "X.md": { "Y.md": 1 } });
 
     const applying = harness.mirror.applyEvent(
       committed({
@@ -562,8 +562,8 @@ describe("Mirror deltas", () => {
     await applying;
 
     expect([...asked]).toEqual(["X.md"]);
-    expect(harness.mirror.resolvedLinks()).toEqual({});
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "X.md": { Y: 1 } });
     expect(harness.mirror.backlinks("Y.md")).toHaveLength(0);
     expect(harness.mirror.note("X.md")?.outgoing[0]?.resolution.kind).toBe("unresolved");
   });
@@ -586,7 +586,7 @@ describe("Mirror deltas", () => {
         },
       ],
     });
-    expect(harness.mirror.unresolvedLinks()).toEqual({
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({
       "X.md": { Y: 1 },
       "Deep/Z.md": { "Sub/Y.md": 1 },
     });
@@ -618,8 +618,8 @@ describe("Mirror deltas", () => {
     // The created path, its unseen ancestor, and both referrers: one found by
     // basename (`Y`) and one by full path (`Sub/Y.md`).
     expect([...asked].sort()).toEqual(["Deep/Z.md", "Sub", "Sub/Y.md", "X.md"]);
-    expect(harness.mirror.unresolvedLinks()).toEqual({});
-    expect(harness.mirror.resolvedLinks()).toEqual({
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({
       "X.md": { "Sub/Y.md": 1 },
       "Deep/Z.md": { "Sub/Y.md": 1 },
     });
@@ -641,7 +641,7 @@ describe("Mirror deltas", () => {
         { path: "A/N.md", revision: "blake3:n1" },
       ],
     });
-    expect(harness.mirror.resolvedLinks()).toEqual({ "Src.md": { "A/N.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "Src.md": { "A/N.md": 1 } });
 
     // A second file of the same name. `[[N]]` now names two things, and the
     // daemon answers `ambiguous` — a different answer for a note the change set
@@ -679,7 +679,7 @@ describe("Mirror deltas", () => {
     // The daemon orders the candidates and the mirror takes the first, as
     // Obsidian does — so the edge stays visible to the graph rather than
     // vanishing because a reader could follow it two ways.
-    expect(harness.mirror.resolvedLinks()).toEqual({ "Src.md": { "A/N.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "Src.md": { "A/N.md": 1 } });
     expect(harness.mirror.backlinks("A/N.md")).toHaveLength(1);
   });
 
@@ -702,7 +702,7 @@ describe("Mirror deltas", () => {
         { path: "Y.md", revision: "blake3:y1" },
       ],
     });
-    expect(harness.mirror.resolvedLinks()).toEqual({ "X.md": { "Y.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "X.md": { "Y.md": 1 } });
 
     const applying = harness.mirror.applyEvent(
       committed({
@@ -718,8 +718,8 @@ describe("Mirror deltas", () => {
     await applying;
 
     expect([...asked]).toEqual(["X.md"]);
-    expect(harness.mirror.resolvedLinks()).toEqual({});
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "X.md": { "The Long Alias": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "X.md": { "The Long Alias": 1 } });
   });
 
   it("finds a referrer of a deleted path by link text when the backlink index cannot", async () => {
@@ -806,8 +806,8 @@ describe("Mirror deltas", () => {
 
     expect([...second]).toEqual(["X.md"]);
     expect(harness.mirror.entry("Y.md")).toBeUndefined();
-    expect(harness.mirror.resolvedLinks()).toEqual({});
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "X.md": { Y: 1 } });
   });
 
   it("consults link text for every path under a deleted folder, not only the folder", async () => {
@@ -1065,8 +1065,8 @@ describe("Mirror deltas", () => {
     expect(harness.mirror.entry("X.md")).toBeUndefined();
     // The invariant, stated as the oracle states it: nothing resolved names a
     // path the mirror does not hold.
-    expect(harness.mirror.resolvedLinks()).toEqual({});
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "A.md": { T: 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "A.md": { T: 1 } });
     expect([...(await third)]).toEqual(["A.md"]);
   });
 
@@ -1117,7 +1117,7 @@ describe("Mirror deltas", () => {
     expect(harness.mirror.entry("P.md")).toBeUndefined();
     expect(harness.mirror.entry("X.md")).toBeUndefined();
     expect(harness.mirror.entry("K.md")).toBeUndefined();
-    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
     // Nothing needed a re-hydration: every removal was applied as a removal.
     expect(harness.mirror.lastResyncReason()).toBeNull();
     expect(batches).toHaveLength(1);
@@ -1159,7 +1159,7 @@ describe("Mirror deltas", () => {
     expect(harness.methodsSeen().filter((method) => method === "get_tree_entries")).toHaveLength(1);
     expect(harness.mirror.lastResyncReason()).toBeNull();
     expect(harness.mirror.entry("P.md")?.revision).toBe("blake3:p2");
-    expect(harness.mirror.resolvedLinks()).toEqual({ "X.md": { "P.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "X.md": { "P.md": 1 } });
   });
 
   it("escalates when a held referrer the plan never replaced still resolves into a removal", async () => {
@@ -1200,7 +1200,7 @@ describe("Mirror deltas", () => {
     await applying;
 
     expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
-    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
     expect(await rehydrated).toBe(true);
   }, 20_000);
 
@@ -1229,7 +1229,7 @@ describe("Mirror deltas", () => {
         { path: "Y.md", revision: "blake3:y1" },
       ],
     });
-    expect(harness.mirror.resolvedLinks()).toEqual({ "A.md": { "Y.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "A.md": { "Y.md": 1 } });
 
     // **`missing_subpath` is filed under a target**, and so is the first
     // candidate of an `ambiguous`. `resolvedLinks`, the backlink index and the
@@ -1271,7 +1271,7 @@ describe("Mirror deltas", () => {
     await applying;
 
     expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
-    expect(harness.mirror.resolvedLinks()).toEqual({});
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
   }, 20_000);
 
   it("installs one row for a path two passes both answered", async () => {
@@ -1401,8 +1401,8 @@ describe("Mirror deltas", () => {
     await applying;
 
     expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
-    expect(harness.mirror.resolvedLinks()).toEqual({});
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "A.md": { T1: 1, T2: 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "A.md": { T1: 1, T2: 1 } });
   });
 
   it("walks a chain of late removals one round per link, and asks each path once", async () => {
@@ -1463,8 +1463,8 @@ describe("Mirror deltas", () => {
     expect(harness.pendingRequests()).toHaveLength(0);
     expect(harness.mirror.entry("X.md")).toBeUndefined();
     expect(harness.mirror.entry("P.md")).toBeUndefined();
-    expect(harness.mirror.resolvedLinks()).toEqual({ "Q.md": { "Other/P.md": 1 } });
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "Q.md": { X: 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "Q.md": { "Other/P.md": 1 } });
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "Q.md": { X: 1 } });
   });
 
   it("escalates when the *late-removal loop* pushes the refetch past the path limit", async () => {
@@ -1520,8 +1520,8 @@ describe("Mirror deltas", () => {
 
     expect(harness.mirror.lastResyncReason()).toBe("refetch_oversized");
     expect(harness.mirror.entry("X.md")).toBeUndefined();
-    expect(harness.mirror.resolvedLinks()).toEqual({});
-    expect(harness.mirror.unresolvedLinks()).toEqual({
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({
       "R1.md": { X: 1 },
       "R2.md": { X: 1 },
       "R3.md": { X: 1 },

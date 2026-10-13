@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { Mirror } from "../src/mirror/mirror";
+import { linkEdges } from "../src/testing/mirror-harness";
 import { defaultHostConfig } from "../src/config";
 import type { GenerationResponse, MutationResponse, RuntimeEventDto } from "../src/client/protocol";
 import type { HostConfig } from "../src/config";
@@ -123,7 +124,8 @@ describe.skipIf(!BINARY_EXISTS)("mirror deltas against a real vaultd", () => {
     expect(mirror.note("A.md")!.listItems.some((item) => item.task !== undefined)).toBe(true);
     // The link went away, so the backlink went with it.
     expect(mirror.backlinks("B.md")).toHaveLength(0);
-    expect(mirror.resolvedLinks()["A.md"]).toBeUndefined();
+    // A links nowhere now, and is still a key: Obsidian keys every note.
+    expect(mirror.resolvedLinks()["A.md"]).toEqual({});
     // The tree row moved too — `get_note` reports neither size nor mtime, and
     // `TFile.stat` is served from what `get_tree_entries` answered.
     expect(mirror.entry("A.md")!.size).toBe(42);
@@ -340,7 +342,7 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
   it("refetches the referrer when this host deletes a link target", async () => {
     const config = xLinksY();
     const { supervisor, mirror, events, failures } = await subscribed(config);
-    expect(mirror.resolvedLinks()).toEqual({ "X.md": { "Y.md": 1 } });
+    expect(linkEdges(mirror.resolvedLinks())).toEqual({ "X.md": { "Y.md": 1 } });
 
     const response = await supervisor
       .client()
@@ -360,8 +362,8 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
       .map((event) => event.value as { changes: unknown; affected_reference_count: number });
     expect(changed.some((value) => value.affected_reference_count > 0)).toBe(true);
 
-    expect(mirror.resolvedLinks()).toEqual({});
-    expect(mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
+    expect(linkEdges(mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(mirror.unresolvedLinks())).toEqual({ "X.md": { Y: 1 } });
     expect(mirror.backlinks("Y.md")).toHaveLength(0);
     await expectNoDrift(mirror, config, () => supervisor.client(), "Y.md");
     expect(failures).toEqual([]);
@@ -381,7 +383,7 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
     );
 
     await expectNoDrift(mirror, config, () => supervisor.client(), "Y.md");
-    expect(mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
+    expect(linkEdges(mirror.unresolvedLinks())).toEqual({ "X.md": { Y: 1 } });
     expect(failures).toEqual([]);
   }, 60_000);
 
@@ -389,7 +391,7 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
     const config = xLinksY();
     rmSync(join(config.vaultRoot, "Y.md"));
     const { supervisor, mirror, failures } = await subscribed(config);
-    expect(mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
+    expect(linkEdges(mirror.unresolvedLinks())).toEqual({ "X.md": { Y: 1 } });
 
     // The single most ordinary thing that happens in a vault, and the shape the
     // review called out: after it, the host's graph must not still say the link
@@ -402,8 +404,8 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
       30_000,
     );
 
-    expect(mirror.resolvedLinks()).toEqual({ "X.md": { "Y.md": 1 } });
-    expect(mirror.unresolvedLinks()).toEqual({});
+    expect(linkEdges(mirror.resolvedLinks())).toEqual({ "X.md": { "Y.md": 1 } });
+    expect(linkEdges(mirror.unresolvedLinks())).toEqual({});
     expect(mirror.backlinks("Y.md")).toHaveLength(1);
     await expectNoDrift(mirror, config, () => supervisor.client(), "Y.md");
     expect(failures).toEqual([]);
@@ -425,8 +427,8 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
       30_000,
     );
 
-    expect(mirror.resolvedLinks()).toEqual({});
-    expect(mirror.unresolvedLinks()).toEqual({ "X.md": { Y: 1 } });
+    expect(linkEdges(mirror.resolvedLinks())).toEqual({});
+    expect(linkEdges(mirror.unresolvedLinks())).toEqual({ "X.md": { Y: 1 } });
     await expectNoDrift(mirror, config, () => supervisor.client(), "Y.md");
     expect(failures).toEqual([]);
   }, 60_000);
@@ -475,7 +477,7 @@ describe.skipIf(!BINARY_EXISTS)("mirror referrers against a real vaultd", () => 
     mirror.onApplyError((error) => {
       failures.push(error instanceof Error ? error : new Error(String(error)));
     });
-    expect(mirror.resolvedLinks()).toEqual({
+    expect(linkEdges(mirror.resolvedLinks())).toEqual({
       "Mid.md": { "Tail.md": 1 },
       "Ref.md": { "Mid.md": 1 },
     });

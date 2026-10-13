@@ -233,7 +233,9 @@ export interface MirrorQuery {
   note(path: string): MirrorNoteRow | undefined;
   /** `undefined` until the note's source has been read — see `warmPositions`. */
   positions(path: string): PositionIndex | undefined;
+  /** Every note is a key, `{}` when it links nowhere: Obsidian's own shape. */
   resolvedLinks(): Readonly<Record<string, Readonly<Record<string, number>>>>;
+  /** Every note is a key, `{}` when it has no unresolved link. */
   unresolvedLinks(): Readonly<Record<string, Readonly<Record<string, number>>>>;
   /** Every reference from anywhere in the vault that resolves to `path`. */
   backlinks(path: string): readonly ReferenceDto[];

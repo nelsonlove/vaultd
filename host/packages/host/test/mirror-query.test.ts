@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { MirrorHarness, harness_ref } from "../src/testing/mirror-harness";
+import { MirrorHarness, harness_ref, linkEdges } from "../src/testing/mirror-harness";
 import { locate, span } from "../src/mirror/positions";
 import type { ReferenceDto } from "../src/client/protocol";
 
@@ -128,8 +128,8 @@ describe("Mirror link tables", () => {
       ],
     });
 
-    expect(harness.mirror.resolvedLinks()).toEqual({ "A.md": { "B.md": 3 } });
-    expect(harness.mirror.unresolvedLinks()).toEqual({ "A.md": { Ghost: 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "A.md": { "B.md": 3 } });
+    expect(linkEdges(harness.mirror.unresolvedLinks())).toEqual({ "A.md": { Ghost: 1 } });
     expect(harness.mirror.backlinks("B.md")).toHaveLength(3);
     expect(harness.mirror.backlinks("Ghost.md")).toEqual([]);
   });
@@ -173,7 +173,7 @@ describe("Mirror link tables", () => {
     expect(harness.mirror.backlinks("C.md").map((reference) => reference.source_path).sort()).toEqual(
       ["A.md", "B.md"],
     );
-    expect(harness.mirror.resolvedLinks()).toEqual({ "A.md": { "C.md": 1 }, "B.md": { "C.md": 1 } });
+    expect(linkEdges(harness.mirror.resolvedLinks())).toEqual({ "A.md": { "C.md": 1 }, "B.md": { "C.md": 1 } });
   });
 });
 

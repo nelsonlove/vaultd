@@ -644,16 +644,28 @@ class MirrorState implements MirrorSink {
     return paths ? [...paths] : [];
   }
 
+  /**
+   * Every note is a key, an empty `{}` when it links nowhere.
+   *
+   * That is Obsidian's own shape — `resolveLinks` writes both tables for every
+   * note it resolves — and plugins read "every Markdown file is a key" as the
+   * link index being ready: vault-mcp's `linkIndexReady()` does, and answered
+   * `index_loading` forever on any vault with one link-less note before this.
+   * The key set follows {@link notes}, and the cache stays right because every
+   * road that adds or removes a note row goes through `installLinks` or
+   * `removeLinks`, which both move {@link linkEpoch}.
+   */
   resolvedLinks(): Readonly<Record<string, Readonly<Record<string, number>>>> {
     if (this.resolvedCache?.epoch === this.linkEpoch) return this.resolvedCache.value;
-    const value = materialize(this.resolvedBySource);
+    const value = materialize(this.notes.keys(), this.resolvedBySource);
     this.resolvedCache = { epoch: this.linkEpoch, value };
     return value;
   }
 
+  /** Keyed by every note, as {@link resolvedLinks} is. */
   unresolvedLinks(): Readonly<Record<string, Readonly<Record<string, number>>>> {
     if (this.unresolvedCache?.epoch === this.linkEpoch) return this.unresolvedCache.value;
-    const value = materialize(this.unresolvedBySource);
+    const value = materialize(this.notes.keys(), this.unresolvedBySource);
     this.unresolvedCache = { epoch: this.linkEpoch, value };
     return value;
   }
@@ -2308,10 +2320,16 @@ function stampOf(entry: MirrorEntry): string {
 }
 
 function materialize(
+  notes: Iterable<string>,
   source: ReadonlyMap<string, Map<string, number>>,
 ): Record<string, Record<string, number>> {
+  // `Object.fromEntries`, never `value[path] = …`: a note named `__proto__`
+  // would set the prototype rather than a key.
   const value: Record<string, Record<string, number>> = Object.fromEntries(
-    [...source].map(([path, counts]) => [path, Object.fromEntries(counts)]),
+    Array.from(notes, (path) => {
+      const counts = source.get(path);
+      return [path, counts ? Object.fromEntries(counts) : {}];
+    }),
   );
   return value;
 }

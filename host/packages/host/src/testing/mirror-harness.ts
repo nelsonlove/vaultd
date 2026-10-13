@@ -287,6 +287,22 @@ export async function answerHydrationOn(
 }
 
 /**
+ * A link table with the notes that link nowhere left out.
+ *
+ * Both tables key every note, an empty `{}` for a link-less one, because
+ * Obsidian's do (`test/mirror-link-keys.test.ts` pins that). A case about which
+ * edges a delta moved reads this instead, so its expectation names the edges
+ * and not every bystander note in its fixture.
+ */
+export function linkEdges(
+  table: Readonly<Record<string, Readonly<Record<string, number>>>>,
+): Record<string, Readonly<Record<string, number>>> {
+  return Object.fromEntries(
+    Object.entries(table).filter(([, counts]) => Object.keys(counts).length > 0),
+  );
+}
+
+/**
  * A resolved (or unresolved) wikilink from `sourcePath`.
  *
  * `resolvedTarget` of `null` builds an unresolved reference, which is what puts
