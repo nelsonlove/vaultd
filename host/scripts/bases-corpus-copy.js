@@ -75,8 +75,12 @@ function parseArgs(argv) {
   return out;
 }
 
-/** Every file under root, vault-relative, skipping dot-directories and the guarded area. */
-function walk(root) {
+/**
+ * Every file under root, vault-relative, skipping dot-directories and the guarded area.
+ * The guarded folder is matched by name and by identity (device and inode), because
+ * macOS folder names ignore case and Unicode form: "private" names "Private" on disk.
+ */
+function walk(root, guardedStat) {
   const files = [];
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -84,7 +88,11 @@ function walk(root) {
       const full = join(dir, entry.name);
       const rel = relative(root, full).split(sep).join("/");
       if (rel === GUARDED || rel.startsWith(`${GUARDED}/`)) continue;
-      if (entry.isDirectory()) visit(full);
+      if (entry.isDirectory()) {
+        const here = statSync(full);
+        if (here.dev === guardedStat.dev && here.ino === guardedStat.ino) continue;
+        visit(full);
+      }
       else if (entry.isFile()) files.push(rel);
     }
   };
@@ -116,7 +124,7 @@ function main() {
     if (!options.fresh) throw new Error(`${options.to} is not empty; pass --fresh to replace it`);
     rmSync(options.to, { recursive: true, force: true });
   }
-  const files = walk(options.from);
+  const files = walk(options.from, statSync(guardedDir));
   const notes = files.filter((f) => f.endsWith(".md"));
   const bases = files.filter((f) => f.endsWith(".base"));
   const text = new Map();
