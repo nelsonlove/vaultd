@@ -1,0 +1,5 @@
+default-misspellings.md is the default misspellings list shipped by the Obsidian Linter plugin (https://github.com/platers/obsidian-linter, src/utils/default-misspellings.md), copied here unchanged.
+
+Its entries are taken from the codespell dictionary (https://github.com/codespell-project/codespell, codespell_lib/data/dictionary.txt). The codespell project states that its dictionary files are derivative works of English Wikipedia and are released under the Creative Commons Attribution-ShareAlike 3.0 licence: https://creativecommons.org/licenses/by-sa/3.0/
+
+This file is therefore distributed under CC BY-SA 3.0, not under the MIT licence of the plugin bundle beside it or of vaultd.

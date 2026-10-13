@@ -5,7 +5,7 @@ Eight real community plugins, each with the input vault they ran against, the bu
 ```
 <plugin-id>/
   vault/          the input vault
-  plugin/         main.js + manifest.json (+ styles.css) COPIED from the capture vault
+  plugin/         main.js + manifest.json (+ styles.css) COPIED from the capture vault, + the plugin's LICENSE
   expected/       the vault tree after the action, byte-for-byte
   scenario.json   the same action as data
 ```
