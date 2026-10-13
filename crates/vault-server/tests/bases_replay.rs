@@ -83,6 +83,41 @@ fn corpus_captures_dir() -> PathBuf {
     data.join("vaultd/bases-captures/corpus")
 }
 
+/// The folder names a committed capture must never spell: the placeholder
+/// the docs use, the folder `VAULTD_CORPUS_GUARDED` names when it is set,
+/// and the folder the local corpus manifest says the copy excluded.
+fn guarded_names() -> Vec<String> {
+    let mut names = vec!["Private/".to_string()];
+    let mut add = |raw: &str| {
+        let mut name = raw.trim();
+        while let Some(rest) = name.strip_prefix("./") {
+            name = rest;
+        }
+        let name = name.trim_end_matches('/');
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    };
+    if let Ok(value) = std::env::var("VAULTD_CORPUS_GUARDED") {
+        add(&value);
+    }
+    let manifest = repo().join("target/tmp/bases-corpus/MANIFEST.json");
+    if let Ok(text) = std::fs::read_to_string(&manifest) {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&text).expect("the corpus manifest is JSON");
+        if let Some(excluded) = manifest["excluded"].as_str() {
+            // Written by the copy script as `<folder>/ and every
+            // dot-directory, unconditionally`.
+            if let Some((folder, _)) = excluded.split_once(" and every dot-directory") {
+                add(folder);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// One row object of `base:query`, its keys in the order written.
 struct OrderedRow(Vec<(String, serde_json::Value)>);
 
@@ -914,10 +949,11 @@ fn committed_captures_name_only_generated_paths() {
             );
         }
     }
+    let guarded = guarded_names();
     let mut offending = Vec::new();
     for file in &files {
         let text = std::fs::read_to_string(file).unwrap();
-        if text.contains("Private/") {
+        if guarded.iter().any(|name| text.contains(name.as_str())) {
             offending.push(format!("{}: names the guarded area", file.display()));
         }
         for document in &json_documents(file, &text) {
@@ -1039,8 +1075,8 @@ fn committed_files_hold_no_corpus_name() {
     // comments and string literals of every source file in `crates/` and
     // `host/scripts/` are read too. Only those: an identifier is code's own
     // English, not a quoted name. A top-level area folder (`NN-NN Name`)
-    // names an area, not a note, and the copy script and the guard above
-    // name one in order to exclude it.
+    // names a whole section of the vault, not a note, so it is not counted
+    // as a leaked name; the guarded folder is checked by name above.
     // Source prose is English, so a name that is one plain word (`Memory`,
     // `paths`) is not evidence: only a name of several words, or one word
     // with an inner capital, digit or mark (`SomeType`, `some-tag`), is
