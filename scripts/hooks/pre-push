@@ -1,0 +1,59 @@
+#!/bin/sh
+# Pre-push guard for the public repository (github.com/nelsonlove/vaultd).
+#
+# The public main is a scrubbed rewrite of an older private history, which is kept
+# only under the tag private-history-2026-10-13 in the private clone. This hook
+# refuses a push to GitHub when:
+#   1. the pushed history holds any commit of the private history (the root commit
+#      is the only one both histories share), or
+#   2. a commit new to GitHub adds a line with a private detail (see pattern below).
+# Pushes to any other remote are not checked.
+#
+# Install in the private clone: cp scripts/hooks/pre-push .git/hooks/pre-push
+
+remote_url="$2"
+case "$remote_url" in
+  *github.com*) ;;
+  *) exit 0 ;;
+esac
+
+zero=0000000000000000000000000000000000000000
+tag=refs/tags/private-history-2026-10-13
+# Written in pieces so this file does not match its own pattern.
+# Claude Code session links are refused too: they were scrubbed from the history,
+# so commits for this repository leave out the Claude-Session trailer.
+pattern="80-8""9|[Dd]iv""orce|/Users/nel""son|forg""ejo|tail""net|ts""\.net|claude\.ai/code/""session"
+
+old_tip=$(git rev-parse -q --verify "$tag^{commit}") || {
+  echo "pre-push: the tag $tag is missing, so the private history cannot be checked; refusing." >&2
+  exit 1
+}
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+# Every private commit except the shared root.
+git rev-list "$old_tip" --not $(git rev-list --max-parents=0 "$old_tip") | sort > "$tmp/old"
+
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  git rev-list "$local_sha" | sort > "$tmp/pushed"
+  hits=$(comm -12 "$tmp/old" "$tmp/pushed" | wc -l | tr -d ' ')
+  if [ "$hits" != 0 ]; then
+    echo "pre-push: $local_ref holds $hits commit(s) of the private history; refusing the push to GitHub." >&2
+    status=1
+    continue
+  fi
+  if [ "$remote_sha" = "$zero" ]; then
+    range="$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  # Added lines in the diffs, and every line of the commit messages.
+  leaks=$( { git log -p --format='commit %h %s' "$range" | grep -E '^\+'; git log --format='%h %B' "$range"; } | grep -E "$pattern")
+  if [ -n "$leaks" ]; then
+    echo "pre-push: new commits on $local_ref add private details; refusing the push to GitHub:" >&2
+    echo "$leaks" | head -20 >&2
+    status=1
+  fi
+done
+exit $status
