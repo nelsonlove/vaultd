@@ -99,6 +99,28 @@ impl CompiledQuery {
             .filter(|item| !reads_text(item, Domain::Default))
             .all(|item| holds(item, doc, Domain::Default))
     }
+
+    /// The tag-scope key of the first top-level conjunct that is a positive
+    /// `tag:` term (not under OR or NOT), when it is not empty. Every
+    /// document the query matches holds a tag whose fold is this key or
+    /// starts with it plus `/`, so a source may skip the tags of every
+    /// other document before [`Self::prefilter`] (which rejects them).
+    pub fn required_tag_key(&self) -> Option<&str> {
+        let conjuncts = match self.root.as_ref()? {
+            Compiled::And(items) => items.as_slice(),
+            single => std::slice::from_ref(single),
+        };
+        conjuncts.iter().find_map(|item| match item {
+            Compiled::Scoped {
+                domain: Domain::Tag,
+                query,
+            } => match query.as_ref() {
+                Compiled::Term(term) if !term.tag_key.is_empty() => Some(term.tag_key.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
 }
 
 /// Compiles `query` with the request's case toggle.

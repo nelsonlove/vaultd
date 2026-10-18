@@ -5,7 +5,8 @@
 //! (`IndexReader::evaluation_read_current`); the scan itself runs with no lock
 //! held. The tree rows (and the tag rows, when the query reads tags) narrow
 //! the candidates through the compiled query's metadata prefilter before any
-//! note body is read, and a body is read only for a surviving note, only when
+//! note body is read (a required `tag:` term narrows the tag rows in SQL
+//! first), and a body is read only for a surviving note, only when
 //! the query reads text, evaluated at once and dropped. Nothing is cached
 //! here and nothing is written.
 
@@ -40,6 +41,8 @@ pub struct SearchAnswer {
     pub hits: Vec<FileHit>,
     /// Note bodies read for this answer: a work counter, for tests and the baseline.
     pub texts_read: usize,
+    /// Tag rows read for this answer: a work counter, for tests and the baseline.
+    pub tag_rows_read: usize,
 }
 
 /// The line holding a match, cut to at most [`MAX_LINE_TEXT_BYTES`] around
@@ -242,6 +245,7 @@ fn scan(
         generation: read.generation,
         hits: Vec::new(),
         texts_read: 0,
+        tag_rows_read: 0,
     };
     if compiled.is_empty() {
         return Ok(answer);
@@ -249,11 +253,20 @@ fn scan(
     let connection = read.connection();
     let needs = compiled.needs();
     let rows = file_rows(connection)?;
+    // With a required tag, a note holding none of the tag or its
+    // descendants fails the prefilter whatever its other tags, so only the
+    // notes that hold one have their tags read (every row of each).
+    let required_tag = if narrow {
+        compiled.required_tag_key()
+    } else {
+        None
+    };
     let tags = if needs.tags {
-        tag_rows(connection)?
+        tag_rows(connection, required_tag)?
     } else {
         Vec::new()
     };
+    answer.tag_rows_read = tags.iter().map(|(_, facts)| facts.len()).sum();
     let tags_of = |row: &FileRow| -> &[TagFact] {
         tags.binary_search_by(|(path, _)| path.as_str().cmp(row.path.as_str()))
             .map_or(&[][..], |at| tags[at].1.as_slice())
@@ -393,12 +406,30 @@ fn file_rows(connection: &rusqlite::Connection) -> Result<Vec<FileRow>, IndexErr
 /// binary-search it), each note's tags in ordinal order. One path string per
 /// note, not per row, and each fact carries the stored `comparison_key` as
 /// its fold, so a search folds no tag.
-fn tag_rows(connection: &rusqlite::Connection) -> Result<Vec<(String, Vec<TagFact>)>, IndexError> {
-    let mut statement = connection.prepare(
+///
+/// With `required` (a folded tag key), only the notes holding a tag whose
+/// stored `comparison_key` is the key or starts with the key plus `/` are
+/// read, through `tags_lookup`: `[key + "/", key + "0")` is exactly the
+/// keys with that prefix under the binary collation (`0` follows `/`).
+fn tag_rows(
+    connection: &rusqlite::Connection,
+    required: Option<&str>,
+) -> Result<Vec<(String, Vec<TagFact>)>, IndexError> {
+    let (filter, bounds) = match required {
+        None => ("", Vec::new()),
+        Some(key) => (
+            "WHERE note_path IN (\
+             SELECT note_path FROM tags WHERE comparison_key = ?1 \
+             UNION SELECT note_path FROM tags \
+             WHERE comparison_key >= ?2 AND comparison_key < ?3) ",
+            vec![key.to_owned(), format!("{key}/"), format!("{key}0")],
+        ),
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT note_path, value, comparison_key, span_start, span_end FROM tags \
-         ORDER BY note_path, ordinal",
-    )?;
-    let mut rows = statement.query([])?;
+         {filter}ORDER BY note_path, ordinal"
+    ))?;
+    let mut rows = statement.query(rusqlite::params_from_iter(bounds))?;
     let mut tags: Vec<(String, Vec<TagFact>)> = Vec::new();
     while let Some(row) = rows.next()? {
         let path = row.get_ref(0)?.as_str().map_err(stored_path)?;

@@ -377,3 +377,69 @@ fn a_tag_span_outside_the_text_is_caught_in_debug() {
     let doc = MemoryDocument::note("a.md", "x").with_tag("work", 0..9);
     let _ = evaluate(&compiled, &doc);
 }
+
+fn required_tag(query: &str) -> Option<String> {
+    compile(&parse_query(query).unwrap(), false)
+        .unwrap()
+        .required_tag_key()
+        .map(str::to_owned)
+}
+
+#[test]
+fn a_required_tag_key_is_a_positive_top_level_tag_conjunct() {
+    assert_eq!(required_tag("tag:#Work").as_deref(), Some("work"));
+    assert_eq!(
+        required_tag("tag:work/Meeting").as_deref(),
+        Some("work/meeting")
+    );
+    assert_eq!(required_tag("meeting tag:#work").as_deref(), Some("work"));
+    assert_eq!(
+        required_tag("match-case:(tag:Work)").as_deref(),
+        Some("work")
+    );
+    assert_eq!(
+        required_tag("tag:a tag:b").as_deref(),
+        Some("a"),
+        "the first"
+    );
+}
+
+#[test]
+fn no_required_tag_key_under_or_or_not_or_for_an_empty_key() {
+    assert_eq!(required_tag("tag:work OR meeting"), None);
+    assert_eq!(required_tag("(tag:work OR tag:home) meeting"), None);
+    assert_eq!(required_tag("-tag:work"), None);
+    assert_eq!(required_tag("-(-tag:work)"), None);
+    assert_eq!(required_tag("meeting"), None);
+    assert_eq!(required_tag("tag:#"), None, "an empty key matches nothing");
+    assert_eq!(required_tag(""), None);
+}
+
+/// The contract the index relies on: whenever the query holds for a
+/// document, one of its tags is the key or a descendant of it.
+#[test]
+fn every_hit_of_a_query_with_a_required_tag_holds_that_tag() {
+    let docs = [
+        MemoryDocument::note("a.md", "#work").with_tag("work", 0..5),
+        MemoryDocument::note("b.md", "#work/meeting").with_tag("work/meeting", 0..13),
+        MemoryDocument::note("c.md", "#workshop").with_tag("workshop", 0..9),
+        MemoryDocument::note("d.md", "#myjob/work").with_tag("myjob/work", 0..11),
+        MemoryDocument::note("e.md", "#WORK").with_tag("WORK", 0..5),
+    ];
+    for query in ["tag:work", "x tag:#Work", "tag:WORK -tag:work/meeting"] {
+        let compiled = compile(&parse_query(query).unwrap(), false).unwrap();
+        let key = compiled.required_tag_key().expect(query);
+        let descendant = format!("{key}/");
+        for doc in &docs {
+            if evaluate(&compiled, doc).is_some() {
+                assert!(
+                    doc.tags
+                        .iter()
+                        .any(|tag| tag.folded == key || tag.folded.starts_with(&descendant)),
+                    "{query}: {}",
+                    doc.path.as_str()
+                );
+            }
+        }
+    }
+}

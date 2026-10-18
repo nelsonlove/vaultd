@@ -443,6 +443,7 @@ mod tests {
             generation: Generation::new(generation),
             hits,
             texts_read: 0,
+            tag_rows_read: 0,
         })
     }
 

@@ -175,6 +175,59 @@ fn only_candidate_bodies_are_read() {
     assert_eq!(read("file:Kickoff"), 0, "no text is needed");
 }
 
+/// A required `tag:` term reads only the tag rows of the notes that hold
+/// the tag or a descendant (all of each such note's rows), case-folded; a
+/// tag under OR or NOT reads every row. The answer never changes.
+#[test]
+fn a_required_tag_narrows_the_tag_rows_read() {
+    let (service, _vault, _index) = service(&[
+        ("a.md", b"#work\n#other\n"),
+        ("b.md", b"#Work/Meeting\n"),
+        ("c.md", b"#workshop\n"),
+        ("d.md", b"#myjob/work\n"),
+        ("e.md", b"#home\n"),
+        ("f.md", b"meeting\n"),
+    ]);
+    let reader = service.reader().unwrap();
+    let run = |q: &str| {
+        let compiled = compile(&parse_query(q).unwrap(), false).unwrap();
+        let request = SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::FileNameAsc,
+        };
+        let narrowed = reader.search(&request).unwrap();
+        let full = reader.search_unnarrowed_for_test(&request).unwrap();
+        assert_eq!(narrowed.hits, full.hits, "{q}");
+        let paths: Vec<String> = narrowed
+            .hits
+            .iter()
+            .map(|h| h.path.as_str().to_string())
+            .collect();
+        (paths, narrowed.tag_rows_read)
+    };
+    assert_eq!(run("tag:#WORK"), (vec!["a.md".into(), "b.md".into()], 3));
+    assert_eq!(run("tag:work/meeting"), (vec!["b.md".into()], 1));
+    assert_eq!(run("tag:work tag:other"), (vec!["a.md".into()], 3));
+    assert_eq!(run("tag:work -tag:other"), (vec!["b.md".into()], 3));
+    assert_eq!(run("tag:work meeting"), (vec!["b.md".into()], 3));
+    assert_eq!(run("tag:nothing"), (vec![], 0));
+    assert_eq!(
+        run("tag:work OR tag:home"),
+        (vec!["a.md".into(), "b.md".into(), "e.md".into()], 6),
+        "a tag under OR is not narrowed"
+    );
+    assert_eq!(
+        run("-tag:work meeting"),
+        (vec!["f.md".into()], 6),
+        "a negated tag is not narrowed"
+    );
+    assert_eq!(
+        run("meeting"),
+        (vec!["b.md".into(), "f.md".into()], 0),
+        "no tags needed"
+    );
+}
+
 #[test]
 fn the_sort_reads_tree_times() {
     // The times are set before the first build: a metadata-only touch
