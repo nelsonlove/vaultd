@@ -70,7 +70,7 @@ What the sources state:
 
 Provisional parse rules. The parser (Task 1) follows the lexical rules of the plan where [S1] is silent; these edges follow from those rules, Obsidian's behaviour on them is unverified, and the parity harness settles them:
 
-- P19. An empty phrase `""` and an empty regex `//` parse as terms; what an empty needle matches is decided by the matcher and the evaluator (Tasks 2 and 3), never by a search that loops or reports a span at every position.
+- P19. An empty phrase `""` and an empty regex `//` parse as terms; what an empty needle matches is decided by the matcher and the evaluator (Tasks 2 and 3), never by a search that loops or reports a span at every position. The matcher (Task 2) rules that an empty text needle matches nothing: `Needle::find_all` answers no spans and `is_match` answers false, whatever the case mode (pinned by `an_empty_needle_matches_nothing`); the empty regex is Task 11's.
 - P20. A slash term whose last segment is only JavaScript flag letters reads as a regex: `/tmp/my` is the regex `tmp` with the flags `my`, while `/usr/local` is a word.
 - P21. Repeated flag letters parse (`/a/gg`); whether they are refused is left to the regex compiler.
 - P22. A regex can span whitespace: in `a / b / c` the middle term is the regex ` b `.

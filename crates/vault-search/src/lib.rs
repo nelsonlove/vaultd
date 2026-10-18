@@ -4,6 +4,7 @@
 
 mod parse;
 mod query;
+pub mod text;
 
 pub use parse::{MAX_DEPTH, parse_query};
 pub use query::*;
