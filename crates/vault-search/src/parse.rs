@@ -385,6 +385,9 @@ impl Parser {
             value = Some(self.property_value(opener)?);
         }
         self.skip_ws();
+        if self.peek() == Some(')') {
+            return Err(self.error(self.at, "unmatched `)`"));
+        }
         if self.peek() != Some(']') {
             return Err(self.error(opener, "unmatched `[`"));
         }

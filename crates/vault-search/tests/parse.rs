@@ -308,6 +308,8 @@ fn malformed_queries_are_refused_with_a_position() {
         ("file:", 0),
         ("a file: b", 2),
         ("[duration:<five]", 10),
+        ("[a)]", 2),
+        ("[x:a)]", 4),
     ] {
         let error = parse_query(text).expect_err(text);
         assert_eq!(error.position, position, "{text:?}: {error:?}");
