@@ -1,6 +1,7 @@
 use vault_protocol::{
-    DocumentKindDto, ErrorCode, ProtocolError, Request, RequestEnvelope, Response,
-    ResponseEnvelope, ResponseOutcome, SearchContextDto, SearchParams, SearchSortDto,
+    ContentMatchDto, DocumentKindDto, ErrorCode, LocDto, ProtocolError, Request, RequestEnvelope,
+    Response, ResponseEnvelope, ResponseOutcome, SearchContextDto, SearchParams, SearchSortDto,
+    SpanDto,
 };
 
 const REQUEST: &str = r#"{"version":1,"id":"q","request":{"method":"search","params":{"query":"meeting -work tag:#project","limit":1}}}"#;
@@ -101,4 +102,54 @@ fn every_document_kind_round_trips() {
             kind
         );
     }
+}
+
+/// An error from before `position` existed decodes with it absent and
+/// re-encodes byte for byte, with no `position` key.
+#[test]
+fn an_error_without_position_round_trips_unchanged() {
+    let wire = r#"{"code":"invalid_cursor","message":"x"}"#;
+    let error: ProtocolError = serde_json::from_str(wire).unwrap();
+    assert_eq!(error.position, None);
+    assert_eq!(serde_json::to_string(&error).unwrap(), wire);
+}
+
+/// `context: none` decodes, and a match without line text round-trips with
+/// both skipped keys absent.
+#[test]
+fn context_none_and_a_match_without_line_text_round_trip() {
+    let request = r#"{"version":1,"id":"q","request":{"method":"search","params":{"query":"a","context":"none"}}}"#;
+    let envelope: RequestEnvelope = serde_json::from_str(request).unwrap();
+    let Request::Search(params) = envelope.request else {
+        panic!("a search request")
+    };
+    assert_eq!(params.context, SearchContextDto::None);
+    assert_eq!(
+        serde_json::to_value(SearchContextDto::None).unwrap(),
+        serde_json::json!("none")
+    );
+
+    let wire = r#"{"span":{"start":0,"end":1},"start":{"line":0,"col":0,"offset":0},"end":{"line":0,"col":1,"offset":1}}"#;
+    let decoded: ContentMatchDto = serde_json::from_str(wire).unwrap();
+    assert_eq!(
+        decoded,
+        ContentMatchDto {
+            span: SpanDto { start: 0, end: 1 },
+            start: LocDto {
+                line: 0,
+                col: 0,
+                offset: 0
+            },
+            end: LocDto {
+                line: 0,
+                col: 1,
+                offset: 1
+            },
+            line_text: None,
+            line_text_start: None,
+        }
+    );
+    let text = serde_json::to_string(&decoded).unwrap();
+    assert_eq!(text, wire);
+    assert!(!text.contains("line_text"));
 }
