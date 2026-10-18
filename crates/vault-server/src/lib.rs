@@ -4,7 +4,9 @@ pub mod connection;
 mod convert;
 pub mod fixture_row;
 pub mod listener;
+mod paging;
 pub mod runtime;
+mod search;
 pub mod service;
 pub mod signals;
 pub mod stdio;
@@ -12,6 +14,7 @@ pub mod subscriptions;
 mod views;
 
 pub use bases::DEFAULT_BASE_CACHE_ENTRIES;
+pub use search::{DEFAULT_SEARCH_CACHE_ENTRIES, MAX_STORED_MATCHES};
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -79,6 +82,10 @@ pub struct Server {
     /// `evaluate_base` result are cut from one computation. Bounded by
     /// `--bases-cache-entries`.
     base_cache: bases::BaseCache,
+    /// Search answers at the current generation, so the pages of one
+    /// `search` answer are cut from one computation. Bounded by
+    /// `--search-cache-entries`.
+    search_cache: search::SearchCache,
     /// What each view last answered and every base's views, for the
     /// `views_invalidated` staleness rule each dispatcher runs.
     views: views::ViewTracker,
@@ -275,6 +282,7 @@ impl Server {
             socket_path: None,
             engine: None,
             base_cache: bases::BaseCache::default(),
+            search_cache: search::SearchCache::default(),
             views: views::ViewTracker::default(),
         }
     }
@@ -303,6 +311,7 @@ impl Server {
             socket_path: None,
             engine: Some(engine),
             base_cache: bases::BaseCache::default(),
+            search_cache: search::SearchCache::default(),
             views: views::ViewTracker::default(),
         }
     }
@@ -401,6 +410,12 @@ impl Server {
     /// dropping whatever it held.
     pub fn set_base_cache_entries(&mut self, entries: usize) {
         self.base_cache = bases::BaseCache::with_capacity(entries);
+    }
+
+    /// Bound the search answer cache to `entries` answers (at least one),
+    /// dropping whatever it held.
+    pub fn set_search_cache_entries(&mut self, entries: usize) {
+        self.search_cache = search::SearchCache::with_capacity(entries);
     }
 
     /// The views one committed generation may have changed, one event each,
@@ -1433,15 +1448,13 @@ impl Server {
                     Err(error) => ResponseEnvelope::error(id, error),
                 },
             },
-            // The wire type lands before the operation does; until the
-            // operation is wired, `search` is refused as an unknown method was.
-            Request::Search(_) => ResponseEnvelope::error(
-                id,
-                ProtocolError::new(
-                    ErrorCode::InvalidRequest,
-                    "invalid request: `search` is not served by this build",
-                ),
-            ),
+            Request::Search(params) => match reader {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(reader) => match search::search(reader, &self.search_cache, params) {
+                    Ok(answer) => ResponseEnvelope::success(id, Response::Search(answer)),
+                    Err(error) => ResponseEnvelope::error(id, error),
+                },
+            },
             Request::SnapshotNotes(params) => {
                 if !self.may_use_session(connection, &params.snapshot_id) {
                     return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));

@@ -1286,6 +1286,7 @@ dependencies = [
  "vault-core",
  "vault-index",
  "vault-protocol",
+ "vault-search",
  "vault-watch",
  "xdg",
 ]

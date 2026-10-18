@@ -15,17 +15,16 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use vault_bases::view::{ClockReads, CompileError};
 use vault_core::VaultPath;
-use vault_index::{BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, IndexError, IndexReader};
+use vault_index::{BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, IndexReader};
 use vault_protocol::{
     BaseStatusDto, BaseSummaryDto, ColumnDto, ErrorCode, EvaluateBaseParams, EvaluateBaseResponse,
     ListBasesParams, OptionEntryDto, PageResponse, ProtocolError, RowDto, RowKindDto, ViewDto,
 };
 
 use crate::convert;
+use crate::paging::{self, generation_mismatch, invalid_cursor};
 use crate::views::ViewTracker;
 
 /// How many evaluated views the cache keeps by default
@@ -182,27 +181,6 @@ struct Cursor {
     instant: i64,
 }
 
-/// The refusals a page meets, worded exactly as every other pager's.
-fn invalid_cursor(message: String) -> ProtocolError {
-    convert::index_error(IndexError::InvalidCursor(message))
-}
-
-fn generation_mismatch(cursor: u64, current: u64) -> ProtocolError {
-    convert::index_error(IndexError::GenerationMismatch { cursor, current })
-}
-
-fn decode(cursor: &str) -> Result<Cursor, ProtocolError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
-        .map_err(|failure| invalid_cursor(format!("invalid encoding: {failure}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|failure| invalid_cursor(format!("invalid payload: {failure}")))
-}
-
-fn encode(cursor: &Cursor) -> String {
-    URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor).expect("a cursor serializes"))
-}
-
 /// Every refusal an evaluation can meet, with its wire code.
 pub(crate) fn query_error(value: BaseQueryError) -> ProtocolError {
     match value {
@@ -241,19 +219,6 @@ pub(crate) fn query_error(value: BaseQueryError) -> ProtocolError {
     }
 }
 
-/// The protocol's page rule: default 100, from 1 to 1000, `invalid_cursor`
-/// outside it.
-fn limit(limit: Option<u32>) -> Result<usize, ProtocolError> {
-    let limit = limit.unwrap_or(vault_index::DEFAULT_PAGE_LIMIT);
-    if limit == 0 || limit > vault_index::MAX_PAGE_LIMIT {
-        return Err(invalid_cursor(format!(
-            "limit must be between 1 and {}",
-            vault_index::MAX_PAGE_LIMIT
-        )));
-    }
-    Ok(limit as usize)
-}
-
 pub(crate) fn evaluate_base(
     reader: &IndexReader,
     cache: &BaseCache,
@@ -263,7 +228,7 @@ pub(crate) fn evaluate_base(
     now: vault_bases::Clock,
     params: EvaluateBaseParams,
 ) -> Result<EvaluateBaseResponse, ProtocolError> {
-    let limit = limit(params.limit)?;
+    let limit = paging::page_limit(params.limit)?;
     let path = crate::parse_path(&params.path)?;
     let this_path = params
         .this_path
@@ -280,7 +245,7 @@ pub(crate) fn evaluate_base(
     let (offset, instant) = match &params.cursor {
         None => (0, None),
         Some(cursor) => {
-            let cursor = decode(cursor)?;
+            let cursor: Cursor = paging::decode_cursor(cursor)?;
             if cursor.base != params.path
                 || cursor.view != params.view
                 || cursor.this_path != params.this_path
@@ -443,7 +408,7 @@ pub(crate) fn evaluate_base(
             .collect(),
         total_rows: rows.len() as u64,
         next_cursor: (next < rows.len()).then(|| {
-            encode(&Cursor {
+            paging::encode_cursor(&Cursor {
                 generation,
                 base: params.path.clone(),
                 view: params.view.clone(),

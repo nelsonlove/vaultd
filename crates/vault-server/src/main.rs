@@ -60,6 +60,15 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..=4096),
     )]
     bases_cache_entries: u64,
+    /// How many search answers to keep for the current generation. Older
+    /// generations are always dropped; this bounds one generation's worth.
+    #[arg(
+        long,
+        default_value_t = vault_server::DEFAULT_SEARCH_CACHE_ENTRIES as u64,
+        requires = "vault",
+        value_parser = clap::value_parser!(u64).range(1..=1024),
+    )]
+    search_cache_entries: u64,
 }
 
 impl Cli {
@@ -121,6 +130,8 @@ fn configured_server(cli: &Cli) -> Result<ConfiguredServer, Box<dyn Error>> {
     let (mut server, notices) = Server::start(config, cli.runtime_options())?;
     // In range by the parser (1 to 4096), so the conversion cannot fail.
     server.set_base_cache_entries(usize::try_from(cli.bases_cache_entries)?);
+    // In range by the parser (1 to 1024), so the conversion cannot fail.
+    server.set_search_cache_entries(usize::try_from(cli.search_cache_entries)?);
     Ok((server, Some(notices), Some(canonical_vault_root)))
 }
 
