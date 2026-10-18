@@ -47,7 +47,7 @@ What the sources state:
 - **Match spans in the API.** `SearchResult { score, matches }`, where `matches` is a list of `[start, end]` pairs [S2]; positions in Obsidian's own APIs count JavaScript string (UTF-16) units, which is also what the host's position index converts to (`host/packages/host/src/mirror/positions.ts`).
 - **Programmatic access.** There is no public API for vault-wide search [S2]; the search view's plugin instance has `openGlobalSearch(query)` [S4, S6] and `getGlobalSearchQuery()` [S6].
 
-**UNVERIFIED, to be settled by the parity harness.** Each of these is implemented as a provisional rule, named `P1` to `P18`, and listed in `VAULTD-COMPATIBILITY.md` until a capture settles it:
+**UNVERIFIED, to be settled by the parity harness.** Each of these is implemented as a provisional rule, named `P1` to `P23`, and listed in `VAULTD-COMPATIBILITY.md` until a capture settles it:
 
 - P1. Plain terms match by substring, not by whole word (the help says "matched independently", never "whole word").
 - P2. A plain term or phrase matches a note's path as well as its content (the help's tip implies the paths and file names of notes and canvases are searched by default), and whether that is the whole path or the file name.
@@ -67,6 +67,14 @@ What the sources state:
 - P16. Canvas content means the `text` of text nodes (and whether file and link node labels count).
 - P17. Excluded files are the `userIgnoreFilters` of `.obsidian/app.json`, matched as path prefixes or as `/regex/`.
 - P18. What a match span is for a plain term in a path, and whether a file name match is reported separately from content matches.
+
+Provisional parse rules. The parser (Task 1) follows the lexical rules of the plan where [S1] is silent; these edges follow from those rules, Obsidian's behaviour on them is unverified, and the parity harness settles them:
+
+- P19. An empty phrase `""` and an empty regex `//` parse as terms; what an empty needle matches is decided by the matcher and the evaluator (Tasks 2 and 3), never by a search that loops or reports a span at every position.
+- P20. A slash term whose last segment is only JavaScript flag letters reads as a regex: `/tmp/my` is the regex `tmp` with the flags `my`, while `/usr/local` is a word.
+- P21. Repeated flag letters parse (`/a/gg`); whether they are refused is left to the regex compiler.
+- P22. A regex can span whitespace: in `a / b / c` the middle term is the regex ` b `.
+- P23. A `"` inside a word is part of the word (`a"b` is one word), not the start of a phrase.
 
 ## What the Obsidian CLI and vault-mcp offer
 
@@ -116,9 +124,9 @@ pub enum Node {
     Or(Vec<Node>),
     Not(Box<Node>),
     Term(Term),                                  // a word, phrase or regex, in the default scope
-    Scoped { scope: Scope, query: Box<Node> },   // file: path: content: tag: line: block: section: task*:
-    Case { sensitive: bool, query: Box<Node> },  // match-case: ignore-case:
-    Property { name: Box<Node>, value: Option<PropertyValueQuery> },
+    Scoped { scope: Scope, query: Box<Node>, at: Range<usize> },   // file: path: content: tag: line: block: section: task*:
+    Case { sensitive: bool, query: Box<Node>, at: Range<usize> },  // match-case: ignore-case:
+    Property { name: Box<Node>, value: Option<PropertyValueQuery>, at: Range<usize> },
 }
 pub enum Pattern { Text(String), Regex { source: String, flags: String } }
 pub struct Term { pub pattern: Pattern, pub phrase: bool, pub at: Range<usize> }
