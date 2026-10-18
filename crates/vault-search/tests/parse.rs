@@ -455,3 +455,39 @@ fn normalize(query: Query) -> Query {
         root: query.root.map(flat),
     }
 }
+
+/// Parse, print, parse again: the second tree equals the first, positions
+/// aside.
+fn assert_round_trips(text: &str) {
+    let first = parse_query(text)
+        .unwrap_or_else(|error| panic!("{text:?}: {error:?}"))
+        .strip_positions();
+    let printed = first.to_string();
+    let again = parse_query(&printed)
+        .unwrap_or_else(|error| panic!("{text:?} printed as {printed:?}: {error:?}"))
+        .strip_positions();
+    assert_eq!(again, first, "{text:?} printed as {printed:?}");
+}
+
+#[test]
+fn a_group_inside_brackets_keeps_the_bracket_rules() {
+    assert_eq!(
+        parsed("[x:(file:a)]"),
+        property(
+            word("x"),
+            Some(PropertyValueQuery::Query(Box::new(word("file:a"))))
+        ),
+        "no operator inside brackets, even inside a group"
+    );
+    assert_eq!(
+        parsed("[status:(Draft OR Published)]"),
+        parsed("[status:Draft OR Published]")
+    );
+    assert!(
+        parse_query("[x:(-[y])]").is_err(),
+        "no property inside brackets, even inside a group: `]` ends the word `[y`"
+    );
+    assert_round_trips("[x:(file:a)]");
+    assert_round_trips("[status:(Draft OR Published)]");
+    assert_round_trips("[x:(a b) OR c]");
+}

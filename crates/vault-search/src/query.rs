@@ -170,7 +170,7 @@ impl fmt::Display for Query {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.root {
             None => Ok(()),
-            Some(node) => write_node(f, node, Context::Top),
+            Some(node) => write_node(f, node, Context::Top, false),
         }
     }
 }
@@ -182,15 +182,36 @@ enum Context {
     Tight,
 }
 
-fn write_node(f: &mut fmt::Formatter<'_>, node: &Node, context: Context) -> fmt::Result {
+/// `in_value` is true inside a property's value, where the parser
+/// recognizes no operator and `:` is an ordinary word character.
+fn write_node(
+    f: &mut fmt::Formatter<'_>,
+    node: &Node,
+    context: Context,
+    in_value: bool,
+) -> fmt::Result {
     match node {
-        Node::Or(items) => write_joined(f, items, " OR ", Context::InOr, context != Context::Top),
-        Node::And(items) => write_joined(f, items, " ", Context::Tight, context == Context::Tight),
+        Node::Or(items) => write_joined(
+            f,
+            items,
+            " OR ",
+            Context::InOr,
+            context != Context::Top,
+            in_value,
+        ),
+        Node::And(items) => write_joined(
+            f,
+            items,
+            " ",
+            Context::Tight,
+            context == Context::Tight,
+            in_value,
+        ),
         Node::Not(inner) => {
             f.write_str("-")?;
-            write_node(f, inner, Context::Tight)
+            write_node(f, inner, Context::Tight, in_value)
         }
-        Node::Term(term) => write_term(f, term),
+        Node::Term(term) => write_term(f, term, in_value),
         Node::Scoped { scope, query, .. } => {
             write!(f, "{}:", scope.name())?;
             write_operand(f, query)
@@ -207,7 +228,7 @@ fn write_node(f: &mut fmt::Formatter<'_>, node: &Node, context: Context) -> fmt:
         }
         Node::Property { name, value, .. } => {
             f.write_str("[")?;
-            write_node(f, name, Context::Top)?;
+            write_node(f, name, Context::Top, false)?;
             match value {
                 None => {}
                 Some(PropertyValueQuery::Null) => f.write_str(":null")?,
@@ -215,7 +236,7 @@ fn write_node(f: &mut fmt::Formatter<'_>, node: &Node, context: Context) -> fmt:
                 Some(PropertyValueQuery::Greater(n)) => write!(f, ":>{n}")?,
                 Some(PropertyValueQuery::Query(q)) => {
                     f.write_str(":")?;
-                    write_node(f, q, Context::Top)?;
+                    write_node(f, q, Context::Top, true)?;
                 }
             }
             f.write_str("]")
@@ -229,6 +250,7 @@ fn write_joined(
     separator: &str,
     child: Context,
     parenthesize: bool,
+    in_value: bool,
 ) -> fmt::Result {
     if parenthesize {
         f.write_str("(")?;
@@ -237,7 +259,7 @@ fn write_joined(
         if index > 0 {
             f.write_str(separator)?;
         }
-        write_node(f, item, child)?;
+        write_node(f, item, child, in_value)?;
     }
     if parenthesize {
         f.write_str(")")?;
@@ -248,19 +270,19 @@ fn write_joined(
 /// An operator's operand: a term bare, anything else in parentheses.
 fn write_operand(f: &mut fmt::Formatter<'_>, node: &Node) -> fmt::Result {
     match node {
-        Node::Term(term) => write_term(f, term),
+        Node::Term(term) => write_term(f, term, false),
         other => {
             f.write_str("(")?;
-            write_node(f, other, Context::Top)?;
+            write_node(f, other, Context::Top, false)?;
             f.write_str(")")
         }
     }
 }
 
-fn write_term(f: &mut fmt::Formatter<'_>, term: &Term) -> fmt::Result {
+fn write_term(f: &mut fmt::Formatter<'_>, term: &Term, in_value: bool) -> fmt::Result {
     match &term.pattern {
         Pattern::Regex { source, flags } => write!(f, "/{source}/{flags}"),
-        Pattern::Text(text) if !term.phrase && is_safe_word(text) => f.write_str(text),
+        Pattern::Text(text) if !term.phrase && is_safe_word(text, in_value) => f.write_str(text),
         Pattern::Text(text) => {
             f.write_str("\"")?;
             for c in text.chars() {
@@ -274,12 +296,15 @@ fn write_term(f: &mut fmt::Formatter<'_>, term: &Term) -> fmt::Result {
     }
 }
 
-/// Text the parser reads back as this one bare word.
-fn is_safe_word(text: &str) -> bool {
+/// Text the parser reads back as this one bare word. Inside a property's
+/// value `:` is an ordinary word character.
+fn is_safe_word(text: &str, in_value: bool) -> bool {
     !text.is_empty()
-        && !text
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '"' | ':' | '\\'))
+        && !text.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(c, '(' | ')' | '[' | ']' | '"' | '\\')
+                || (c == ':' && !in_value)
+        })
         && !text.starts_with('-')
         && !text.starts_with('/')
         && text != "OR"

@@ -23,15 +23,33 @@ const OPERATORS: [&str; 12] = [
 /// Where a sub-expression stops, beyond whitespace and parentheses.
 #[derive(Clone, Copy, PartialEq)]
 enum Within {
-    Top,
-    Group,
+    /// Outside `[…]`, at the top level or in a group: operators and
+    /// properties are recognized, and `]` and `:` are word characters.
+    Plain,
+    /// A property's name: `]` and `:` end a word and the expression.
     PropertyName,
+    /// A property's value: `]` ends a word and the expression.
     PropertyValue,
+    /// A group anywhere inside `[…]`: still no operator or property, and
+    /// `]` ends a word, but `:` is a word character.
+    PropertyGroup,
 }
 
 impl Within {
     fn in_property(self) -> bool {
-        matches!(self, Within::PropertyName | Within::PropertyValue)
+        matches!(
+            self,
+            Within::PropertyName | Within::PropertyValue | Within::PropertyGroup
+        )
+    }
+
+    /// The context inside a group opened here.
+    fn group(self) -> Within {
+        if self.in_property() {
+            Within::PropertyGroup
+        } else {
+            Within::Plain
+        }
     }
 }
 
@@ -51,7 +69,7 @@ pub fn parse_query(text: &str) -> Result<Query, QueryError> {
     if p.done() {
         return Ok(Query { root: None });
     }
-    let root = p.or_expr(Within::Top)?;
+    let root = p.or_expr(Within::Plain)?;
     p.skip_ws();
     if !p.done() {
         return Err(p.error(p.at, "unmatched `)`"));
@@ -181,7 +199,7 @@ impl Parser {
     fn primary(&mut self, within: Within) -> Result<Node, QueryError> {
         let start = self.at;
         match self.peek() {
-            Some('(') => self.group(),
+            Some('(') => self.group(within),
             Some('[') if !within.in_property() => self.property(),
             Some('"') => self.phrase().map(Node::Term),
             Some('/') => Ok(Node::Term(self.regex_or_word(within))),
@@ -196,7 +214,7 @@ impl Parser {
         }
     }
 
-    fn group(&mut self) -> Result<Node, QueryError> {
+    fn group(&mut self, within: Within) -> Result<Node, QueryError> {
         let opener = self.at;
         self.at += 1;
         self.deeper(opener)?;
@@ -207,7 +225,7 @@ impl Parser {
         if self.done() {
             return Err(self.error(opener, "unmatched `(`"));
         }
-        let inner = self.or_expr(Within::Group)?;
+        let inner = self.or_expr(within.group())?;
         self.skip_ws();
         if self.peek() != Some(')') {
             return Err(self.error(opener, "unmatched `(`"));
@@ -250,7 +268,7 @@ impl Parser {
             return Err(self.error(start, "an operator needs a term after it"));
         }
         let operand = match self.peek() {
-            Some('(') => self.group()?,
+            Some('(') => self.group(within)?,
             Some('"') => Node::Term(self.phrase()?),
             Some('/') => Node::Term(self.regex_or_word(within)),
             _ => Node::Term(self.word(within)),
