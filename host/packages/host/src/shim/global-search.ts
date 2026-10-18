@@ -60,8 +60,12 @@ export class GlobalSearchInstance {
   }
 
   /** Obsidian's method: make `query` the current search and run it. */
-  openGlobalSearch(query: string): void {
+  openGlobalSearch(input: string): void {
     recordUse("GlobalSearchInstance.openGlobalSearch");
+    // A plugin is untyped JavaScript and may pass a number or `undefined`.
+    // Obsidian puts whatever it gets into a text box, which makes it a string;
+    // the engine's `search` would refuse a non-string `query` outright.
+    const query = String(input);
     this.sequence += 1;
     const mine = this.sequence;
     this.current = { query, answer: null, error: null };

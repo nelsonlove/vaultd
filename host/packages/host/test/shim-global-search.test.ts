@@ -46,6 +46,16 @@ describe("GlobalSearchInstance", () => {
     expect(calls.map((c) => (c.params as { query: string }).query)).toEqual(["meeting", "meeting tag:#work"]);
   });
 
+  it("coerces a non-string query from a plugin to a string, as a search box would", async () => {
+    const { client, calls } = recordingClient(ANSWER);
+    const search = new GlobalSearchInstance({ client });
+    (search.openGlobalSearch as (query: unknown) => void)(42);
+    expect(search.getGlobalSearchQuery()).toBe("42");
+    await search.settled();
+    expect(calls).toEqual([{ method: "search", params: { query: "42", limit: 100 } }]);
+    expect(search.state().query).toBe("42");
+  });
+
   it("keeps a refused query as state with its error, and never throws into the plugin", async () => {
     const { client } = recordingClient(new Error("query_invalid: unmatched `)` (at character 3)"));
     const search = new GlobalSearchInstance({ client });

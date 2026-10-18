@@ -80,7 +80,7 @@ export interface EventEnvelope {
 // ---------------------------------------------------------------------------
 
 /**
- * `vault_protocol::ProtocolError`. All three tails are `skip_serializing_if =
+ * `vault_protocol::ProtocolError`. All four tails are `skip_serializing_if =
  * "Option::is_none"`, so an absent key is the common case.
  *
  * `current_revision` is the one the plan sketch omitted: a `revision_conflict`
@@ -125,6 +125,10 @@ export type ErrorCode =
   | "read_only"
   | "snapshot_not_found"
   | "too_many_snapshots"
+  | "base_invalid"
+  | "view_not_found"
+  | "expression_invalid"
+  | "unsupported_function"
   | "query_invalid"
   | "unsupported_operator"
   | (string & {});

@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { BINARY, BINARY_EXISTS, cleanupRealDaemons, scratchRoot } from "./real-daemon";
 import { defaultHostConfig, systemClock } from "../src/config";
 import { startHost } from "../src/host";
-import { HostTestClient } from "../src/testing/host-harness";
+import { HostCallFailed, HostTestClient } from "../src/testing/host-harness";
 import type { GlobalSearchInstance } from "../src/shim/global-search";
 import type { HostConfig } from "../src/config";
 import type { RunningHost } from "../src/host";
@@ -69,6 +69,16 @@ describe.skipIf(!BINARY_EXISTS)("global-search over a real daemon", () => {
 
     const searched = await client.call<SearchAnswer>("host.search", { query: "meeting" });
     expect(searched.items.map((item) => item.path).sort()).toEqual(["A.md", "B.md"]);
+
+    // The engine's refusal reaches a host client unchanged: its code, and the
+    // character position the parser stopped at.
+    const refused = await client.call("host.search", { query: "a b)" }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(refused).toBeInstanceOf(HostCallFailed);
+    expect((refused as HostCallFailed).code).toBe("query_invalid");
+    expect(typeof ((refused as HostCallFailed).body as { position?: unknown }).position).toBe("number");
 
     const opened = client.nextEvent("host.search_opened");
     const instance = running.assembly.app.internalPlugins.getPluginById("global-search")
