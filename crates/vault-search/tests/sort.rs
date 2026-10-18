@@ -74,6 +74,30 @@ fn equal_names_tie_by_path_in_both_directions() {
 }
 
 #[test]
+fn name_orders_compare_the_base_name_then_the_extension() {
+    // P15: the base name without its extension first, so `Note` sorts
+    // before `Note 2` although a space sorts before `.`.
+    let paths = ["Note 2.md", "Note.md"];
+    assert_eq!(
+        sorted(&paths, SortOrder::FileNameAsc, &[]),
+        ["Note.md", "Note 2.md"]
+    );
+    assert_eq!(
+        sorted(&paths, SortOrder::FileNameDesc, &[]),
+        ["Note 2.md", "Note.md"]
+    );
+    let paths = ["a.png", "a.md"];
+    assert_eq!(
+        sorted(&paths, SortOrder::FileNameAsc, &[]),
+        ["a.md", "a.png"]
+    );
+    assert_eq!(
+        sorted(&paths, SortOrder::FileNameDesc, &[]),
+        ["a.png", "a.md"]
+    );
+}
+
+#[test]
 fn time_orders_tie_by_path() {
     let paths = ["p3.md", "p1.md", "p2.md"];
     let times = [("p1.md", 3, 10), ("p2.md", 1, 30), ("p3.md", 3, 20)];

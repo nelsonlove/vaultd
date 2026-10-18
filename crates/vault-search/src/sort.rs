@@ -27,13 +27,17 @@ pub struct Times {
     pub ctime_ms: i64,
 }
 
-/// Sorts `hits` in `order`. The name orders compare file names with the
-/// Bases collation (`localeCompare`, numeric, locale `en`; P15); every order
-/// breaks ties by path, ascending in both directions.
+/// Sorts `hits` in `order`. The name orders compare the base name (the file
+/// name without its extension), then the extension, each with the Bases
+/// collation (`localeCompare`, numeric, locale `en`; P15); every order breaks
+/// ties by path, ascending in both directions.
 pub fn sort_hits(hits: &mut [FileHit], order: SortOrder, times: &dyn Fn(&VaultPath) -> Times) {
     let by_path = |a: &FileHit, b: &FileHit| a.path.as_str().cmp(b.path.as_str());
-    let by_name =
-        |a: &FileHit, b: &FileHit| collate_strictly(file_name(&a.path), file_name(&b.path));
+    let by_name = |a: &FileHit, b: &FileHit| {
+        let (a_base, a_ext) = split_extension(file_name(&a.path));
+        let (b_base, b_ext) = split_extension(file_name(&b.path));
+        collate_strictly(a_base, b_base).then_with(|| collate_strictly(a_ext, b_ext))
+    };
     let by_time = |a: &FileHit, b: &FileHit, key: fn(Times) -> i64| -> Ordering {
         key(times(&a.path)).cmp(&key(times(&b.path)))
     };
@@ -54,5 +58,14 @@ pub fn sort_hits(hits: &mut [FileHit], order: SortOrder, times: &dyn Fn(&VaultPa
         SortOrder::CreatedAsc => {
             hits.sort_by(|a, b| by_time(a, b, ctime).then_with(|| by_path(a, b)))
         }
+    }
+}
+
+/// A file name's base name and extension, split at its last `.`; a name
+/// whose only `.` is its first character (`.hidden`) is all base name.
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(at) if at > 0 => (&name[..at], &name[at + 1..]),
+        _ => (name, ""),
     }
 }
