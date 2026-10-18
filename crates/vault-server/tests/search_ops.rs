@@ -216,6 +216,86 @@ fn the_match_case_toggle_and_the_sorts_reach_the_engine() {
 }
 
 #[test]
+fn a_cursor_presented_with_the_other_match_case_is_refused() {
+    let (vault, index) = meeting_vault();
+    let mut daemon = started(&vault, &index);
+    let first = answer(&mut daemon, r#"{"query":"meeting","limit":1}"#);
+    let cursor = first.next_cursor.unwrap();
+    let refused = err(
+        &mut daemon,
+        &search(&format!(
+            r#"{{"query":"meeting","match_case":true,"limit":1,"cursor":"{cursor}"}}"#
+        )),
+    );
+    assert_eq!(refused.code, ErrorCode::InvalidCursor);
+}
+
+fn run(arguments: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_vaultd"))
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run vaultd")
+}
+
+/// The knob is refused outside 1 to 1024 and without a vault, and with one
+/// entry a second query evicts the first answer, whose second page is then
+/// computed again at the same generation and still answers.
+#[test]
+fn the_search_cache_entries_flag_is_bounded_and_an_evicted_page_still_answers() {
+    let (vault, index) = meeting_vault();
+    let vault_arg = vault.path().to_str().unwrap().to_string();
+    let index_arg = index
+        .path()
+        .join("index.sqlite3")
+        .to_str()
+        .unwrap()
+        .to_string();
+    for bad in ["0", "1025", "-1", "many"] {
+        let output = run(&[
+            "--vault",
+            &vault_arg,
+            "--index",
+            &index_arg,
+            "--no-watch",
+            "--search-cache-entries",
+            bad,
+        ]);
+        assert!(!output.status.success(), "{bad} is refused");
+        assert!(
+            output.stdout.is_empty(),
+            "a refused invocation writes no protocol output"
+        );
+    }
+    let output = run(&["--search-cache-entries", "8"]);
+    assert!(!output.status.success(), "the flag requires --vault");
+
+    let mut daemon = Daemon::start(&[
+        "--vault",
+        &vault_arg,
+        "--index",
+        &index_arg,
+        "--no-watch",
+        "--reconcile-interval-seconds",
+        "0",
+        "--search-cache-entries",
+        "1",
+    ]);
+    daemon.call(r#"{"version":1,"id":"r","request":{"method":"refresh_index","params":{}}}"#);
+    let first = answer(&mut daemon, r#"{"query":"meeting","limit":2}"#);
+    let cursor = first.next_cursor.clone().expect("a second page");
+    answer(&mut daemon, r#"{"query":"work"}"#);
+    let second = answer(
+        &mut daemon,
+        &format!(r#"{{"query":"meeting","limit":2,"cursor":"{cursor}"}}"#),
+    );
+    assert_eq!(paths(&second), ["Notes/Standup.md"]);
+    assert_eq!(second.generation, first.generation);
+}
+
+#[test]
 fn health_only_mode_is_index_unavailable() {
     let mut daemon = Daemon::start(&[]);
     assert_eq!(

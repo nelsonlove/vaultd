@@ -276,6 +276,93 @@ fn line_context_is_read_at_the_answers_generation() {
     }
 }
 
+/// The fix round's I1: the context read pins its generation under the
+/// publication guard and reads the bodies with no lock held, so a
+/// publication completes while a page's contexts are being read, and the
+/// contexts are still the pinned generation's.
+#[test]
+#[allow(clippy::single_range_in_vec_init)]
+fn a_publication_completes_while_a_pages_contexts_are_read() {
+    let (mut service, vault, _index) = service(&[("a.md", b"x\nThe meeting ran long.\n")]);
+    let mut reader = service.reader().unwrap();
+    let generation = reader.published_status().unwrap().generation.unwrap();
+    let (rendezvous, hook) = common::rendezvous("contexts");
+    reader.pause_evaluations_for_test(hook);
+    let reading =
+        thread::spawn(move || reader.match_contexts(generation, &[(vp("a.md"), vec![6..13])]));
+    rendezvous.arrived();
+    fs::write(vault.path().join("a.md"), "changed\n").unwrap();
+    service.refresh(false).unwrap();
+    assert!(
+        service
+            .reader()
+            .unwrap()
+            .published_status()
+            .unwrap()
+            .generation
+            > Some(generation),
+        "the publication completed while the contexts were being read"
+    );
+    rendezvous.release();
+    let contexts = reading.join().unwrap().unwrap();
+    assert_eq!(
+        contexts,
+        vec![vec![MatchContext {
+            line_text: "The meeting ran long.".into(),
+            line_text_start: 2
+        }]],
+        "the contexts are the pinned generation's"
+    );
+}
+
+/// The fix round's I2: `search_with_contexts` reads a page's contexts on
+/// the scan's own pinned read, so a publication landing after the pin
+/// cannot make the contexts disagree with the hits or refuse them.
+#[test]
+fn a_page_s_contexts_are_read_on_the_scan_s_own_pin() {
+    let (mut service, vault, _index) = service(&[
+        ("a.md", b"x\nThe meeting ran long.\n"),
+        ("b.md", b"meeting\n"),
+        ("c.md", b"no\nmeeting here\n"),
+    ]);
+    let mut reader = service.reader().unwrap();
+    let before = reader.published_status().unwrap().generation;
+    let (rendezvous, hook) = common::rendezvous("scan");
+    reader.pause_evaluations_for_test(hook);
+    let searching = thread::spawn(move || {
+        let compiled = compile(&parse_query("meeting").unwrap(), false).unwrap();
+        reader.search_with_contexts(
+            &SearchQuery {
+                compiled: &compiled,
+                sort: SortOrder::FileNameAsc,
+            },
+            1..5,
+        )
+    });
+    rendezvous.arrived();
+    fs::write(vault.path().join("b.md"), "gone\n").unwrap();
+    fs::write(vault.path().join("c.md"), "gone\n").unwrap();
+    service.refresh(false).unwrap();
+    rendezvous.release();
+    let (answer, contexts) = searching.join().unwrap().unwrap();
+    assert_eq!(Some(answer.generation), before);
+    assert_eq!(answer.hits.len(), 3, "the pinned generation's hits");
+    assert_eq!(
+        contexts,
+        vec![
+            vec![MatchContext {
+                line_text: "meeting".into(),
+                line_text_start: 0
+            }],
+            vec![MatchContext {
+                line_text: "meeting here".into(),
+                line_text_start: 3
+            }],
+        ],
+        "one list per hit of the page, clamped to the answer, from the pinned bodies"
+    );
+}
+
 /// A fixed vault with overlapping words, tags, names and attachments, and
 /// random queries over them: narrowing must never change the answer.
 #[test]

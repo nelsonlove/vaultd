@@ -25,8 +25,8 @@ use crate::paging::{self, generation_mismatch, invalid_cursor};
 /// How many answers the cache keeps by default (`--search-cache-entries`).
 pub const DEFAULT_SEARCH_CACHE_ENTRIES: usize = 16;
 
-/// An answer holding more stored content matches than this is not cached;
-/// each of its pages is computed again.
+/// An answer whose hits, content matches and path matches together number
+/// more than this is not cached; each of its pages is computed again.
 pub const MAX_STORED_MATCHES: usize = 200_000;
 
 /// What one answer is computed for. Task 15 adds the exclusion epoch.
@@ -83,12 +83,14 @@ impl Default for SearchCache {
     }
 }
 
-/// How many content matches an answer stores, across every hit.
-fn stored_matches(answer: &SearchAnswer) -> usize {
+/// What an answer weighs against [`MAX_STORED_MATCHES`]: one per hit, per
+/// content match and per path match, so an answer of many files with no
+/// content matches is bounded too.
+fn stored_weight(answer: &SearchAnswer) -> usize {
     answer
         .hits
         .iter()
-        .map(|hit| hit.content_matches.len())
+        .map(|hit| 1 + hit.content_matches.len() + hit.path_matches.len())
         .sum()
 }
 
@@ -115,10 +117,10 @@ impl SearchCache {
         Some(hit)
     }
 
-    /// Store `value` under `key`, unless it holds more than
-    /// [`MAX_STORED_MATCHES`] content matches.
+    /// Store `value` under `key`, unless its hits, content matches and path
+    /// matches together number more than [`MAX_STORED_MATCHES`].
     pub(crate) fn put(&self, key: CacheKey, value: Arc<SearchAnswer>) {
-        if stored_matches(&value) > MAX_STORED_MATCHES {
+        if stored_weight(&value) > MAX_STORED_MATCHES {
             return;
         }
         let mut entries = self.lock();
@@ -228,6 +230,41 @@ pub(crate) fn search(
     let query = parse_query(&params.query).map_err(|e| query_error(&CompileError::Invalid(e)))?;
     let compiled = compile(&query, params.match_case).map_err(|e| query_error(&e))?;
     let sort = sort_order(params.sort);
+    // A fresh request names no generation, so a publication that moves the
+    // generation between its answer and its contexts is no reason to refuse
+    // it: it is asked again, a bounded number of times. A miss reads the
+    // contexts on the scan's own pin and cannot race; only a cached answer
+    // whose generation moved before its contexts were pinned can, and the
+    // next attempt then misses.
+    let mut attempt = 1;
+    loop {
+        match page(reader, cache, &params, &compiled, sort, limit) {
+            Err(refused)
+                if params.cursor.is_none()
+                    && refused.code == ErrorCode::GenerationMismatch
+                    && attempt < FRESH_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            answered => return answered,
+        }
+    }
+}
+
+/// How many times a fresh request is answered before a generation that
+/// keeps moving under it is refused.
+const FRESH_ATTEMPTS: usize = 3;
+
+/// One attempt at a page: the cursor, the answer (cached or computed) and
+/// the page cut from it.
+fn page(
+    reader: &IndexReader,
+    cache: &SearchCache,
+    params: &SearchParams,
+    compiled: &CompiledQuery,
+    sort: SortOrder,
+    limit: usize,
+) -> Result<SearchResponse, ProtocolError> {
     let current = reader
         .published_status()
         .map_err(convert::index_error)?
@@ -250,17 +287,22 @@ pub(crate) fn search(
         }
     };
 
-    let answer = match cache.get(&CacheKey::new(&compiled, sort, current)) {
-        Some(answer) => answer,
+    let line = params.context == SearchContextDto::Line;
+    // On a miss with `context: line`, the page's contexts come with the
+    // answer, read on the scan's own pin.
+    let (answer, mut contexts) = match cache.get(&CacheKey::new(compiled, sort, current)) {
+        Some(answer) => (answer, None),
         None => {
-            let answer = Arc::new(
-                reader
-                    .search(&SearchQuery {
-                        compiled: &compiled,
-                        sort,
-                    })
-                    .map_err(convert::index_error)?,
-            );
+            let query = SearchQuery { compiled, sort };
+            let (answer, contexts) = if line {
+                let (answer, contexts) = reader
+                    .search_with_contexts(&query, start..start.saturating_add(limit))
+                    .map_err(convert::index_error)?;
+                (answer, Some(contexts))
+            } else {
+                (reader.search(&query).map_err(convert::index_error)?, None)
+            };
+            let answer = Arc::new(answer);
             let computed = answer.generation.get();
             // A page must come from its cursor's generation: a publication
             // between the status read and the pin moved it.
@@ -268,37 +310,37 @@ pub(crate) fn search(
                 return Err(generation_mismatch(current, computed));
             }
             // Keyed by the generation the answer was computed at.
-            cache.put(
-                CacheKey::new(&compiled, sort, computed),
-                Arc::clone(&answer),
-            );
-            answer
+            cache.put(CacheKey::new(compiled, sort, computed), Arc::clone(&answer));
+            (answer, contexts)
         }
     };
+    if start > answer.hits.len() {
+        return Err(invalid_cursor(format!(
+            "the cursor's position {start} is past the answer's {} files",
+            answer.hits.len()
+        )));
+    }
 
     let page: Vec<&vault_search::FileHit> = answer.hits.iter().skip(start).take(limit).collect();
-    let contexts = match params.context {
-        SearchContextDto::None => None,
-        SearchContextDto::Line => {
-            let wanted: Vec<_> = page
-                .iter()
-                .map(|hit| {
-                    (
-                        hit.path.clone(),
-                        hit.content_matches
-                            .iter()
-                            .map(|found| found.span.clone())
-                            .collect(),
-                    )
-                })
-                .collect();
-            Some(
-                reader
-                    .match_contexts(answer.generation, &wanted)
-                    .map_err(convert::index_error)?,
-            )
-        }
-    };
+    if line && contexts.is_none() {
+        let wanted: Vec<_> = page
+            .iter()
+            .map(|hit| {
+                (
+                    hit.path.clone(),
+                    hit.content_matches
+                        .iter()
+                        .map(|found| found.span.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        contexts = Some(
+            reader
+                .match_contexts(answer.generation, &wanted)
+                .map_err(convert::index_error)?,
+        );
+    }
     let next = start + page.len();
     let generation = answer.generation.get();
     Ok(SearchResponse {
@@ -415,14 +457,212 @@ mod tests {
         );
         assert!(cache.get(&key("big", 1)).is_none());
         assert_eq!(cache.len(), 0);
+        // One hit and its matches weigh one each: exactly the bound is stored.
         cache.put(
             key("bound", 1),
-            answer(1, vec![hit("a.md", MAX_STORED_MATCHES)]),
+            answer(1, vec![hit("a.md", MAX_STORED_MATCHES - 1)]),
         );
         assert!(
             cache.get(&key("bound", 1)).is_some(),
             "exactly the bound is stored"
         );
+    }
+
+    /// The fix round's M1: hits and path matches weigh against the bound as
+    /// content matches do, so a `file:` query over a huge vault is not
+    /// stored for having no content matches.
+    #[test]
+    fn hits_and_path_matches_weigh_against_the_stored_bound() {
+        let cache = SearchCache::with_capacity(8);
+        let many: Vec<FileHit> = (0..=MAX_STORED_MATCHES)
+            .map(|at| hit(&format!("{at}.png"), 0))
+            .collect();
+        cache.put(key("files", 1), answer(1, many));
+        assert_eq!(cache.len(), 0, "more hits than the bound are not stored");
+        let mut named = hit("a.md", MAX_STORED_MATCHES - 1);
+        named.path_matches.push(0..1);
+        cache.put(key("named", 1), answer(1, vec![named]));
+        assert_eq!(cache.len(), 0, "a path match tips it over the bound");
+    }
+
+    /// The fix round's M3: a cursor whose position is past the end of its
+    /// answer is refused, not answered as an empty page.
+    #[test]
+    fn a_cursor_past_the_end_is_invalid_cursor() {
+        let fixture = Fixture::new(&[("a.md", "meeting\n"), ("b.md", "meeting\n")]);
+        let first = fixture.ask("meeting", None, Some(1)).unwrap();
+        let at_end = Cursor::encode(
+            first.generation,
+            "meeting",
+            false,
+            SearchSortDto::FileNameAsc,
+            2,
+        );
+        let empty = fixture.ask("meeting", Some(at_end), Some(1)).unwrap();
+        assert!(
+            empty.items.is_empty(),
+            "the end itself is an empty last page"
+        );
+        let past = Cursor::encode(
+            first.generation,
+            "meeting",
+            false,
+            SearchSortDto::FileNameAsc,
+            3,
+        );
+        let refused = fixture.ask("meeting", Some(past), Some(1)).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidCursor);
+    }
+
+    /// A scratch directory under the workspace's `target/tmp`, never the
+    /// system temporary directory.
+    fn scratch() -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::TempDir::new_in(root.canonicalize().unwrap()).unwrap()
+    }
+
+    struct Fixture {
+        vault: tempfile::TempDir,
+        _index: tempfile::TempDir,
+        service: vault_index::IndexService,
+        reader: IndexReader,
+        cache: SearchCache,
+    }
+
+    impl Fixture {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let vault = scratch();
+            let index = scratch();
+            for (path, body) in files {
+                std::fs::write(vault.path().join(path), body).unwrap();
+            }
+            let config = vault_index::IndexConfig::explicit(
+                vault.path(),
+                index.path().join("index.sqlite3"),
+            )
+            .unwrap();
+            let mut service = vault_index::IndexService::open(config).unwrap();
+            service.refresh(false).unwrap();
+            let reader = service.reader().unwrap();
+            Self {
+                vault,
+                _index: index,
+                service,
+                reader,
+                cache: SearchCache::default(),
+            }
+        }
+
+        fn ask(
+            &self,
+            query: &str,
+            cursor: Option<String>,
+            limit: Option<u32>,
+        ) -> Result<SearchResponse, ProtocolError> {
+            ask(&self.reader, &self.cache, query, cursor, limit)
+        }
+    }
+
+    fn ask(
+        reader: &IndexReader,
+        cache: &SearchCache,
+        query: &str,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<SearchResponse, ProtocolError> {
+        search(
+            reader,
+            cache,
+            SearchParams {
+                query: query.into(),
+                cursor,
+                limit,
+                ..SearchParams::default()
+            },
+        )
+    }
+
+    /// Write `name` and publish it: one new generation.
+    fn publish(vault: &std::path::Path, service: &mut vault_index::IndexService, name: &str) {
+        std::fs::write(vault.join(name), "meeting\n").unwrap();
+        service
+            .refresh_paths(
+                [VaultPath::new(name).unwrap()].into(),
+                vault_index::ChangeCause::Watcher,
+            )
+            .unwrap();
+    }
+
+    /// The fix round's I2, deterministically: every pin is followed at once
+    /// by a publication, so every scan's generation has moved on before its
+    /// first page's contexts are read. A fresh `context: line` request still
+    /// answers, at the generation it pinned, with its line text.
+    #[test]
+    fn a_fresh_search_answers_when_every_pin_is_followed_by_a_publication() {
+        let Fixture {
+            vault,
+            _index,
+            service,
+            mut reader,
+            cache,
+        } = Fixture::new(&[("a.md", "x\nmeeting\n")]);
+        let service = Mutex::new(service);
+        let root = vault.path().to_path_buf();
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&published);
+        reader.pause_evaluations_for_test(Arc::new(move || {
+            let at = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut service = service.lock().unwrap();
+            publish(&root, &mut service, &format!("n{at}.md"));
+        }));
+        for _ in 0..3 {
+            let found = ask(&reader, &cache, "meeting", None, Some(1)).unwrap();
+            assert_eq!(found.items.len(), 1);
+            assert_eq!(
+                found.items[0].content_matches[0].line_text.as_deref(),
+                Some("meeting")
+            );
+        }
+        assert!(
+            published.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "a publication followed every pin"
+        );
+    }
+
+    /// The fix round's I2 under a real writer: a thread publishes in a loop
+    /// while fresh `context: line` requests, hits and misses both, keep
+    /// answering.
+    #[test]
+    fn a_fresh_search_answers_under_a_steady_stream_of_publications() {
+        let Fixture {
+            vault,
+            _index,
+            mut service,
+            reader,
+            cache,
+        } = Fixture::new(&[("a.md", "x\nmeeting\n"), ("b.md", "meeting\n")]);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let root = vault.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let mut at = 0;
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                publish(&root, &mut service, &format!("n{}.md", at % 8));
+                at += 1;
+            }
+            at
+        });
+        for round in 0..200 {
+            let query = if round % 2 == 0 { "meeting" } else { "x" };
+            if let Err(refused) = ask(&reader, &cache, query, None, Some(2)) {
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                panic!("round {round}: {refused:?}");
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let publications = writer.join().unwrap();
+        assert!(publications > 0, "the writer published while we searched");
     }
 
     #[test]

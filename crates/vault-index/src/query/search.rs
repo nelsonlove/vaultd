@@ -124,11 +124,74 @@ impl IndexReader {
         query: &SearchQuery<'_>,
         narrow: bool,
     ) -> Result<SearchAnswer, IndexError> {
+        let read = self.pin_current()?;
+        scan(&read, query, narrow)
+    }
+
+    /// [`Self::search`], and the line contexts of the hits in `page` (an
+    /// index range into the sorted hits, clamped to them), read on the
+    /// scan's own pinned read: one list per page hit, in order, each in the
+    /// order of that hit's content matches. A publication landing after the
+    /// pin cannot make the contexts disagree with the hits.
+    pub fn search_with_contexts(
+        &self,
+        query: &SearchQuery<'_>,
+        page: Range<usize>,
+    ) -> Result<(SearchAnswer, Vec<Vec<MatchContext>>), IndexError> {
+        let read = self.pin_current()?;
+        let answer = scan(&read, query, true)?;
+        let end = page.end.min(answer.hits.len());
+        let start = page.start.min(end);
+        let wanted: Vec<(VaultPath, Vec<Range<usize>>)> = answer.hits[start..end]
+            .iter()
+            .map(|hit| {
+                (
+                    hit.path.clone(),
+                    hit.content_matches
+                        .iter()
+                        .map(|found| found.span.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        let contexts = contexts_on(read.connection(), &wanted)?;
+        Ok((answer, contexts))
+    }
+
+    /// One context per requested span, in request order, read at `generation`.
+    ///
+    /// The evaluation-read shape: only the pin runs under the publication
+    /// guard, and the bodies are read and line-indexed on the pinned private
+    /// connection with no lock held, so a publication or another read never
+    /// waits for a page's contexts. Refused with `GenerationMismatch` when
+    /// `generation` is no longer the published one. A path with no note row
+    /// at that generation answers an empty list: a page's notes are the
+    /// answer's own, so that is a defect the caller reports, not a refusal
+    /// here.
+    pub fn match_contexts(
+        &self,
+        generation: Generation,
+        wanted: &[(VaultPath, Vec<Range<usize>>)],
+    ) -> Result<Vec<Vec<MatchContext>>, IndexError> {
+        let read = self.pin_current()?;
+        if read.generation != generation {
+            return Err(IndexError::GenerationMismatch {
+                cursor: generation.get(),
+                current: read.generation.get(),
+            });
+        }
+        contexts_on(read.connection(), wanted)
+    }
+
+    /// Pin a private connection to the published generation. A refusal
+    /// because the generation moved under the pin is asked again with
+    /// backoff for up to [`SEARCH_BUDGET`].
+    fn pin_current(&self) -> Result<EvaluationRead<'_>, IndexError> {
         let deadline = Instant::now() + SEARCH_BUDGET;
         let mut pause = SEARCH_BACKOFF;
         loop {
             match self.evaluation_read_current(|_| ()) {
-                Ok((read, ())) => return scan(&read, query, narrow),
+                Ok((read, ())) => return Ok(read),
                 Err(error @ IndexError::LiveStateStale(_)) => {
                     if Instant::now() + pause > deadline {
                         return Err(error);
@@ -140,47 +203,32 @@ impl IndexReader {
             }
         }
     }
+}
 
-    /// One context per requested span, in request order, read at `generation`.
-    ///
-    /// Refused with `GenerationMismatch` when `generation` is no longer the
-    /// published one. A path with no note row at that generation answers an
-    /// empty list: a page's notes are the answer's own, so that is a defect
-    /// the caller reports, not a refusal here.
-    pub fn match_contexts(
-        &self,
-        generation: Generation,
-        wanted: &[(VaultPath, Vec<Range<usize>>)],
-    ) -> Result<Vec<Vec<MatchContext>>, IndexError> {
-        self.read(|transaction, current| {
-            if current != generation {
-                return Err(IndexError::GenerationMismatch {
-                    cursor: generation.get(),
-                    current: current.get(),
-                });
-            }
-            let mut statement =
-                transaction.prepare("SELECT source_bytes FROM notes WHERE path = ?1")?;
-            let mut contexts = Vec::with_capacity(wanted.len());
-            for (path, spans) in wanted {
-                let source: Option<Vec<u8>> = statement
-                    .query_row(params![path.as_str()], |row| row.get(0))
-                    .optional()?;
-                let Some(source) = source else {
-                    contexts.push(Vec::new());
-                    continue;
-                };
-                let text = utf8(&source, path)?;
-                let lines = LineIndex::new(text);
-                let mut cut = Vec::with_capacity(spans.len());
-                for span in spans {
-                    cut.push(line_context(text, &lines, span, path)?);
-                }
-                contexts.push(cut);
-            }
-            Ok(contexts)
-        })
+/// The line contexts of `wanted`, read on `connection` (a pinned read).
+fn contexts_on(
+    connection: &rusqlite::Connection,
+    wanted: &[(VaultPath, Vec<Range<usize>>)],
+) -> Result<Vec<Vec<MatchContext>>, IndexError> {
+    let mut statement = connection.prepare("SELECT source_bytes FROM notes WHERE path = ?1")?;
+    let mut contexts = Vec::with_capacity(wanted.len());
+    for (path, spans) in wanted {
+        let source: Option<Vec<u8>> = statement
+            .query_row(params![path.as_str()], |row| row.get(0))
+            .optional()?;
+        let Some(source) = source else {
+            contexts.push(Vec::new());
+            continue;
+        };
+        let text = utf8(&source, path)?;
+        let lines = LineIndex::new(text);
+        let mut cut = Vec::with_capacity(spans.len());
+        for span in spans {
+            cut.push(line_context(text, &lines, span, path)?);
+        }
+        contexts.push(cut);
     }
+    Ok(contexts)
 }
 
 /// The scan proper, outside every lock, on the pinned connection.
