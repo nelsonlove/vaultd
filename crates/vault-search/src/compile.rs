@@ -3,7 +3,7 @@
 //! name, and the facets a document must carry are computed.
 
 use crate::document::{DocumentKind, SearchDocument};
-use crate::evaluate::{Domain, holds, scope_domain};
+use crate::evaluate::{Domain, holds, reaches_file};
 use crate::query::{Node, Pattern, Query, QueryError, Scope, Term};
 use crate::text::{Needle, fold_js};
 
@@ -40,7 +40,11 @@ pub(crate) enum Compiled {
     Or(Vec<Compiled>),
     Not(Box<Compiled>),
     Term(CompiledTerm),
-    Scoped { scope: Scope, query: Box<Compiled> },
+    /// A scope operator, resolved to the domain its operand is matched in.
+    Scoped {
+        domain: Domain,
+        query: Box<Compiled>,
+    },
 }
 
 #[derive(Debug)]
@@ -80,12 +84,12 @@ impl CompiledQuery {
     /// `path:`, `tag:`) rejects the document, or the file universe excludes
     /// it. Never reads `text()`.
     pub fn prefilter(&self, doc: &dyn SearchDocument) -> bool {
-        if doc.kind() == DocumentKind::File && !self.reaches_files {
+        let Some(root) = &self.root else {
+            return false;
+        };
+        if doc.kind() == DocumentKind::File && !(self.reaches_files && reaches_file(root, doc)) {
             return false;
         }
-        let Some(root) = &self.root else {
-            return true;
-        };
         let conjuncts = match root {
             Compiled::And(items) => items.as_slice(),
             single => std::slice::from_ref(single),
@@ -126,18 +130,24 @@ fn lower(node: &Node, sensitive: bool) -> Result<Compiled, CompileError> {
             sensitive, query, ..
         } => lower(query, *sensitive)?,
         Node::Term(term) => Compiled::Term(lower_term(term, sensitive)?),
-        Node::Scoped { scope, query, at } => match scope {
-            Scope::File | Scope::Path | Scope::Content | Scope::Tag => Compiled::Scoped {
-                scope: *scope,
+        Node::Scoped { scope, query, at } => {
+            let domain = match scope {
+                Scope::File => Domain::Name,
+                Scope::Path => Domain::Path,
+                Scope::Content => Domain::Content,
+                Scope::Tag => Domain::Tag,
+                other => {
+                    return Err(CompileError::Unsupported {
+                        what: format!("`{}:`", other.name()),
+                        position: at.start,
+                    });
+                }
+            };
+            Compiled::Scoped {
+                domain,
                 query: Box::new(lower(query, sensitive)?),
-            },
-            other => {
-                return Err(CompileError::Unsupported {
-                    what: format!("`{}:`", other.name()),
-                    position: at.start,
-                });
             }
-        },
+        }
         Node::Property { at, .. } => {
             return Err(CompileError::Unsupported {
                 what: "property search".into(),
@@ -182,11 +192,11 @@ fn survey(
             }
         }
         Compiled::Not(inner) => survey(inner, domain, !positive, needs, reaches_files),
-        Compiled::Scoped { scope, query } => {
-            if positive && matches!(scope, Scope::File | Scope::Path) {
+        Compiled::Scoped { domain, query } => {
+            if positive && matches!(domain, Domain::Name | Domain::Path) {
                 *reaches_files = true;
             }
-            survey(query, scope_domain(*scope), positive, needs, reaches_files);
+            survey(query, *domain, positive, needs, reaches_files);
         }
         Compiled::Term(_) => match domain {
             Domain::Default | Domain::Content => needs.text = true,
@@ -208,7 +218,7 @@ fn reads_text(node: &Compiled, domain: Domain) -> bool {
             items.iter().any(|item| reads_text(item, domain))
         }
         Compiled::Not(inner) => reads_text(inner, domain),
-        Compiled::Scoped { scope, query } => reads_text(query, scope_domain(*scope)),
+        Compiled::Scoped { domain, query } => reads_text(query, *domain),
         Compiled::Term(_) => matches!(domain, Domain::Default | Domain::Content),
     }
 }

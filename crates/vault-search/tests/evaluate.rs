@@ -314,3 +314,53 @@ fn the_prefilter_rejects_only_on_metadata_and_never_reads_text() {
         "the file universe"
     );
 }
+
+#[test]
+fn an_attachment_is_a_candidate_only_when_a_positive_file_or_path_term_holds_for_it() {
+    let docs = [
+        MemoryDocument::note("n.md", "bar"),
+        MemoryDocument::file("img/x.png"),
+        MemoryDocument::file("img/y.png"),
+    ];
+    // P10: `-foo` holds for every attachment, but only `x.png` is named by
+    // the positive `file:` term.
+    assert_eq!(paths("file:x OR -foo", &docs), ["n.md", "img/x.png"]);
+    let compiled = compile(&parse_query("file:x OR -foo").unwrap(), false).unwrap();
+    assert!(!compiled.prefilter(&MemoryDocument::file("img/y.png")));
+    assert!(compiled.prefilter(&MemoryDocument::file("img/x.png")));
+}
+
+#[test]
+fn a_double_negation_is_positive_for_spans_as_for_needs() {
+    let docs = [MemoryDocument::note("img/notes.md", "cat")];
+    assert_eq!(hits("-(-path:img)", &docs)[0].path_matches, vec![0..3]);
+    let tagged = [MemoryDocument::note("t.md", "#work").with_tag("work", 0..5)];
+    assert_eq!(spans(&hits("-(-tag:work)", &tagged)[0]), vec![0..5]);
+}
+
+#[test]
+fn the_prefilter_rejects_everything_for_an_empty_query() {
+    let compiled = compile(&parse_query("").unwrap(), false).unwrap();
+    assert!(!compiled.prefilter(&MemoryDocument::note("a.md", "x")));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "needs")]
+fn a_source_that_omits_the_text_a_query_needs_is_caught_in_debug() {
+    let compiled = compile(&parse_query("x").unwrap(), false).unwrap();
+    let doc = MemoryDocument {
+        text: None,
+        ..MemoryDocument::note("a.md", "")
+    };
+    let _ = evaluate(&compiled, &doc);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "tag span")]
+fn a_tag_span_outside_the_text_is_caught_in_debug() {
+    let compiled = compile(&parse_query("x").unwrap(), false).unwrap();
+    let doc = MemoryDocument::note("a.md", "x").with_tag("work", 0..9);
+    let _ = evaluate(&compiled, &doc);
+}
