@@ -23,6 +23,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 trash.workspace = true
 vault-bases = { path = "../vault-bases" }
+vault-search = { path = "../vault-search" }
 vault-core = { path = "../vault-core" }
 walkdir.workspace = true
 xdg.workspace = true

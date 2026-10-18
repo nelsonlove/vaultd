@@ -1247,6 +1247,7 @@ dependencies = [
  "trash",
  "vault-bases",
  "vault-core",
+ "vault-search",
  "walkdir",
  "xdg",
 ]

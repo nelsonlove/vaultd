@@ -1,0 +1,333 @@
+mod common;
+
+use std::fs;
+use std::thread;
+
+use proptest::prelude::*;
+use proptest::test_runner::{Config, TestRunner};
+use tempfile::TempDir;
+use vault_core::VaultPath;
+use vault_index::{IndexConfig, IndexError, IndexService, MatchContext, SearchQuery};
+use vault_search::{DocumentKind, SortOrder, compile, parse_query};
+
+fn vp(path: &str) -> VaultPath {
+    VaultPath::new(path).unwrap()
+}
+
+fn service(files: &[(&str, &[u8])]) -> (IndexService, TempDir, TempDir) {
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    for (path, body) in files {
+        let full = vault.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, body).unwrap();
+    }
+    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).unwrap();
+    let mut service = IndexService::open(config).unwrap();
+    service.refresh(false).unwrap();
+    (service, vault, index)
+}
+
+fn found(service: &IndexService, query: &str) -> Vec<(String, DocumentKind)> {
+    let compiled = compile(&parse_query(query).unwrap(), false).unwrap();
+    let answer = service
+        .reader()
+        .unwrap()
+        .search(&SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::FileNameAsc,
+        })
+        .unwrap();
+    answer
+        .hits
+        .into_iter()
+        .map(|h| (h.path.as_str().to_string(), h.kind))
+        .collect()
+}
+
+const KICKOFF: &[u8] = b"The meeting ran long.\n#project\n";
+
+#[test]
+fn search_answers_notes_and_attachments_at_the_published_generation() {
+    let (service, _vault, _index) = service(&[
+        ("Notes/Kickoff.md", KICKOFF),
+        ("Notes/Other.md", b"work\n"),
+        ("img/cat.png", b"\x89PNG"),
+    ]);
+    assert_eq!(
+        found(&service, "meeting"),
+        [("Notes/Kickoff.md".to_string(), DocumentKind::Note)]
+    );
+    assert_eq!(
+        found(&service, "file:.png"),
+        [("img/cat.png".to_string(), DocumentKind::File)]
+    );
+    let compiled = compile(&parse_query("meeting").unwrap(), false).unwrap();
+    let reader = service.reader().unwrap();
+    let answer = reader
+        .search(&SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::FileNameAsc,
+        })
+        .unwrap();
+    assert_eq!(
+        Some(answer.generation),
+        reader.published_status().unwrap().generation
+    );
+    assert_eq!(answer.hits[0].content_matches[0].span, 4..11);
+}
+
+#[test]
+fn body_and_frontmatter_tags_come_from_the_index() {
+    let (service, _vault, _index) = service(&[("t.md", b"---\ntags: [alpha]\n---\n#beta\n")]);
+    assert_eq!(found(&service, "tag:alpha").len(), 1);
+    assert_eq!(found(&service, "tag:#beta").len(), 1);
+    assert!(
+        found(&service, "tag:alp").is_empty(),
+        "a tag is matched whole, not by substring"
+    );
+}
+
+#[test]
+fn a_tag_only_query_reports_located_spans_and_reads_only_tagged_bodies() {
+    let (service, _vault, _index) = service(&[
+        ("Notes/Kickoff.md", KICKOFF),
+        ("Notes/Other.md", b"meeting\n"),
+    ]);
+    let compiled = compile(&parse_query("tag:#project").unwrap(), false).unwrap();
+    let answer = service
+        .reader()
+        .unwrap()
+        .search(&SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::FileNameAsc,
+        })
+        .unwrap();
+    let first = &answer.hits[0].content_matches[0];
+    // "The meeting ran long.\n" is 22 bytes; a body tag's span includes its `#`.
+    assert_eq!(first.span, 22..30);
+    assert_eq!((first.start.line, first.start.col), (1, 0));
+    assert_eq!(answer.texts_read, 1, "the untagged note's body is not read");
+}
+
+#[test]
+fn a_note_with_no_stored_body_searches_as_empty_text() {
+    // An `.md` file that is not UTF-8 is diagnosed and its body is not stored.
+    let (service, _vault, _index) =
+        service(&[("bad.md", b"meeting \xff\n"), ("good.md", b"meeting\n")]);
+    let paths: Vec<String> = found(&service, "meeting")
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    assert_eq!(paths, ["good.md"]);
+    assert_eq!(
+        found(&service, "file:bad").len(),
+        1,
+        "it is still found by its name"
+    );
+}
+
+#[test]
+fn only_candidate_bodies_are_read() {
+    let (service, _vault, _index) = service(&[
+        ("Notes/Kickoff.md", KICKOFF),
+        ("Notes/Other.md", b"meeting\n"),
+        ("Notes/Third.md", b"meeting\n"),
+    ]);
+    let reader = service.reader().unwrap();
+    let read = |q: &str| {
+        let compiled = compile(&parse_query(q).unwrap(), false).unwrap();
+        reader
+            .search(&SearchQuery {
+                compiled: &compiled,
+                sort: SortOrder::FileNameAsc,
+            })
+            .unwrap()
+            .texts_read
+    };
+    assert_eq!(read("file:Kickoff meeting"), 1);
+    assert_eq!(read("meeting"), 3);
+    assert_eq!(read("file:Kickoff"), 0, "no text is needed");
+}
+
+#[test]
+fn the_sort_reads_tree_times() {
+    // The times are set before the first build: a metadata-only touch
+    // publishes no generation, so setting them afterwards would not reach
+    // the index.
+    let vault = TempDir::new_in(common::scratch_root()).unwrap();
+    let index = TempDir::new_in(common::scratch_root()).unwrap();
+    for (name, seconds) in [("a.md", 300), ("b.md", 100), ("c.md", 200)] {
+        let path = vault.path().join(name);
+        fs::write(&path, "x").unwrap();
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0),
+        )
+        .unwrap();
+    }
+    let config = IndexConfig::explicit(vault.path(), index.path().join("index.sqlite3")).unwrap();
+    let mut service = IndexService::open(config).unwrap();
+    service.refresh(false).unwrap();
+    let compiled = compile(&parse_query("x").unwrap(), false).unwrap();
+    let answer = service
+        .reader()
+        .unwrap()
+        .search(&SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::ModifiedDesc,
+        })
+        .unwrap();
+    let order: Vec<&str> = answer.hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(order, ["a.md", "c.md", "b.md"]);
+}
+
+#[test]
+fn a_publication_completes_while_a_search_is_in_flight() {
+    let (mut service, vault, _index) = service(&[("a.md", b"meeting\n")]);
+    let mut reader = service.reader().unwrap();
+    let before = reader.published_status().unwrap().generation;
+    let (rendezvous, hook) = common::rendezvous("search");
+    reader.pause_evaluations_for_test(hook);
+    let searching = thread::spawn(move || {
+        let compiled = compile(&parse_query("meeting").unwrap(), false).unwrap();
+        reader
+            .search(&SearchQuery {
+                compiled: &compiled,
+                sort: SortOrder::FileNameAsc,
+            })
+            .unwrap()
+    });
+    rendezvous.arrived();
+    fs::write(vault.path().join("b.md"), "meeting\n").unwrap();
+    service.refresh(false).unwrap();
+    rendezvous.release();
+    let answer = searching.join().unwrap();
+    assert_eq!(
+        Some(answer.generation),
+        before,
+        "the search answers the generation it pinned"
+    );
+    assert_eq!(answer.hits.len(), 1, "and none of the newer one's rows");
+}
+
+#[test]
+// One span per path is the point here: each `vec![a..b]` is a list of one
+// span, not a list of the range's numbers.
+#[allow(clippy::single_range_in_vec_init)]
+fn line_context_is_read_at_the_answers_generation() {
+    let long = format!("{}needle{}\n", "x".repeat(1000), "é".repeat(500));
+    let (mut service, vault, _index) = service(&[
+        ("a.md", b"a\nThe meeting ran long.\n"),
+        ("b.md", long.as_bytes()),
+    ]);
+    let reader = service.reader().unwrap();
+    let generation = reader.published_status().unwrap().generation.unwrap();
+    let contexts = reader
+        .match_contexts(
+            generation,
+            &[(vp("a.md"), vec![6..13]), (vp("b.md"), vec![1000..1006])],
+        )
+        .unwrap();
+    assert_eq!(
+        contexts[0],
+        vec![MatchContext {
+            line_text: "The meeting ran long.".into(),
+            line_text_start: 2
+        }]
+    );
+    let cut = &contexts[1][0];
+    assert!(cut.line_text.len() <= vault_index::MAX_LINE_TEXT_BYTES);
+    assert!(cut.line_text.contains("needle"));
+    assert!(cut.line_text_start > 0 && long.is_char_boundary(cut.line_text_start));
+    fs::write(vault.path().join("a.md"), "changed\n").unwrap();
+    service.refresh(false).unwrap();
+    match reader.match_contexts(generation, &[(vp("a.md"), vec![0..1])]) {
+        Err(IndexError::GenerationMismatch { cursor, current }) => {
+            assert_eq!(cursor, generation.get());
+            assert!(current > cursor);
+        }
+        other => panic!("expected GenerationMismatch, got {other:?}"),
+    }
+}
+
+/// A fixed vault with overlapping words, tags, names and attachments, and
+/// random queries over them: narrowing must never change the answer.
+#[test]
+fn narrowing_never_drops_a_file_the_query_keeps() {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let words = ["alpha", "beta", "gamma", "Alpha", "BETA"];
+    let tags = ["work", "work/meeting", "myjob/work", "Home"];
+    for i in 0..40 {
+        let body = format!(
+            "{} {}\n#{}\n",
+            words[i % 5],
+            words[(i * 3) % 5],
+            tags[i % 4]
+        );
+        files.push((
+            format!(
+                "{}/{}-{i}.md",
+                ["notes", "img", "Work"][i % 3],
+                words[(i * 7) % 5]
+            ),
+            body.into_bytes(),
+        ));
+    }
+    for i in 0..10 {
+        files.push((format!("img/{}-{i}.png", words[i % 5]), vec![0]));
+    }
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let (service, _vault, _index) = service(&borrowed);
+    let reader = service.reader().unwrap();
+    let leaf = prop::sample::select(vec![
+        "alpha",
+        "beta",
+        "gam",
+        "file:alpha",
+        "file:.png",
+        "file:img",
+        "path:img",
+        "path:work",
+        "tag:work",
+        "tag:#work/meeting",
+        "tag:home",
+        "content:beta",
+        "match-case:Alpha",
+        "ignore-case:BETA",
+    ]);
+    let query =
+        prop::collection::vec((leaf, any::<bool>(), any::<bool>()), 1..4).prop_map(|items| {
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(i, (leaf, negate, or))| {
+                    let joiner = if i == 0 {
+                        ""
+                    } else if or {
+                        " OR "
+                    } else {
+                        " "
+                    };
+                    format!("{joiner}{}{leaf}", if negate { "-" } else { "" })
+                })
+                .collect::<String>()
+        });
+    let mut runner = TestRunner::new(Config::with_cases(256));
+    runner
+        .run(&query, |text| {
+            let compiled = compile(&parse_query(&text).unwrap(), false).unwrap();
+            let request = SearchQuery {
+                compiled: &compiled,
+                sort: SortOrder::FileNameAsc,
+            };
+            let narrowed = reader.search(&request).unwrap().hits;
+            let full = reader.search_unnarrowed_for_test(&request).unwrap().hits;
+            prop_assert_eq!(narrowed, full, "{}", text);
+            Ok(())
+        })
+        .unwrap();
+}
