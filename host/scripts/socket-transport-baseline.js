@@ -58,8 +58,12 @@
  *                    each printing the `total_files` of its first answer so an empty answer is
  *                    visible: search_uncached (context "none"; the daemon runs with
  *                    --search-cache-entries 1 and the harness alternates QUERY with a twin, the
- *                    same query with the case of its last ASCII letter flipped, whose canonical
- *                    spelling differs and whose answer is the same, so every sample computes);
+ *                    same query with the case of its last ASCII letter in a plain word flipped,
+ *                    whose canonical spelling differs and whose answer is the same, so every
+ *                    sample computes. A plain word is a word, a phrase's text or an operator's
+ *                    operand (`tag:#grouP-3`), never an operator name, `OR`, a `[property]` or a
+ *                    regex, so the twin parses as QUERY does; a query with no such letter, with
+ *                    `match-case:` or with a regex is refused);
  *                    search_cached (QUERY again and again at one generation, context "none");
  *                    and search_cached_line (the same with context "line", which reads its
  *                    page's lines from SQLite on every request, cached or not). A run whose twin
@@ -317,20 +321,62 @@ function prose(seed, bytes) {
 }
 
 /**
- * QUERY with the case of its last ASCII letter flipped: a different
- * canonical spelling (the cache key), the same answer under the default
- * `match_case: false`, and the same work. The harness checks the second half
- * of that claim on every run (equal `total_files`).
+ * QUERY with the case of its last ASCII letter *in a plain word* flipped: a
+ * different canonical spelling (the cache key), the same answer under the
+ * default `match_case: false`, and the same work. The harness checks the
+ * answer half of that claim on every run (equal `total_files`), which
+ * catches only a count change, so the flip is kept where it cannot change
+ * the parse: a word, a phrase's text, or an operator's operand, never an
+ * operator name (`filE:` is a word, not `file:`), `OR`, a `[property]` or a
+ * regex. A query holding `match-case:` or a regex, or no plain letter, is
+ * refused.
  */
 function searchTwin(query) {
-  for (let at = query.length - 1; at >= 0; at -= 1) {
-    const c = query[at];
-    if (/[A-Za-z]/.test(c)) {
-      const flipped = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase();
-      return `${query.slice(0, at)}${flipped}${query.slice(at + 1)}`;
+  const refuse = (why) => {
+    throw new Error(`--search ${JSON.stringify(query)} ${why}; it cannot make an uncached twin`);
+  };
+  if (query.includes("match-case:")) refuse("holds match-case:, where a flipped letter changes the answer");
+  const plain = new Array(query.length).fill(false);
+  const letter = (c) => /[A-Za-z]/.test(c);
+  const breaks = (c) => c === undefined || /\s/.test(c) || c === "(" || c === ")";
+  let at = 0;
+  while (at < query.length) {
+    if (breaks(query[at])) {
+      at += 1;
+    } else if (query[at] === "[") {
+      // A property, with its nested brackets: never touched.
+      let depth = 0;
+      do {
+        if (query[at] === "[") depth += 1;
+        if (query[at] === "]") depth -= 1;
+        at += 1;
+      } while (at < query.length && depth > 0);
+    } else {
+      if (query[at] === "-") at += 1;
+      const operator = /^[a-z-]+:/.exec(query.slice(at));
+      if (operator) at += operator[0].length;
+      if (query[at] === '"') {
+        for (at += 1; at < query.length && query[at] !== '"'; at += 1) {
+          if (query[at] === "\\") at += 1;
+          else plain[at] = letter(query[at]);
+        }
+        at += 1;
+      } else if (query[at] === "/") {
+        refuse("holds a regex, which may read a flipped letter differently");
+      } else {
+        const start = at;
+        while (!breaks(query[at])) at += 1;
+        if (operator || query.slice(start, at) !== "OR") {
+          for (let i = start; i < at; i += 1) plain[i] = letter(query[i]);
+        }
+      }
     }
   }
-  throw new Error(`--search ${JSON.stringify(query)} has no ASCII letter to make an uncached twin from`);
+  const last = plain.lastIndexOf(true);
+  if (last < 0) refuse("has no ASCII letter in a plain word");
+  const c = query[last];
+  const flipped = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase();
+  return `${query.slice(0, last)}${flipped}${query.slice(last + 1)}`;
 }
 
 // --- The daemon --------------------------------------------------------------
