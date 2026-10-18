@@ -883,8 +883,17 @@ impl IndexService {
             .collect();
         let removed_set: BTreeSet<VaultPath> = removed.iter().cloned().collect();
 
-        let mut all_notes: Vec<ParsedNote> =
-            replaced.iter().map(|(note, _)| note.clone()).collect();
+        // The replaced notes move into the graph rather than being cloned
+        // into it: the graph keeps every note it was built from, so the rows
+        // below are written from the graph's own copies. A cold build of a
+        // large vault would otherwise hold every parsed note twice.
+        let mut replaced_fingerprints: Vec<(VaultPath, FileFingerprint)> =
+            Vec::with_capacity(replaced.len());
+        let mut all_notes: Vec<ParsedNote> = Vec::with_capacity(replaced.len());
+        for (note, fingerprint) in replaced {
+            replaced_fingerprints.push((note.source.path().clone(), fingerprint));
+            all_notes.push(note);
+        }
         for path in first.entries.keys() {
             if replaced_paths.contains(path) || removed_set.contains(path) {
                 continue;
@@ -949,6 +958,22 @@ impl IndexService {
         if first != second {
             return Err(IndexError::VaultChangedDuringRefresh);
         }
+
+        let replaced = replaced_fingerprints
+            .iter()
+            .map(|(path, fingerprint)| {
+                report
+                    .graph
+                    .note(path)
+                    .map(|note| (note, *fingerprint))
+                    .ok_or_else(|| {
+                        IndexError::Storage(format!(
+                            "replaced note missing from the built graph: {}",
+                            path.as_str()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Write every row of the new snapshot with NO barrier held. The
         // transaction stays open, so under WAL none of it is visible to any

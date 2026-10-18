@@ -96,7 +96,7 @@ pub(crate) struct PublishMetrics {
 /// Everything one compare-and-swap publication replaces.
 pub(crate) struct Publication<'a> {
     pub expected: Option<Generation>,
-    pub notes: &'a [(ParsedNote, FileFingerprint)],
+    pub notes: &'a [(&'a ParsedNote, FileFingerprint)],
     pub deleted: &'a [VaultPath],
     pub fingerprint_updates: &'a [(VaultPath, FileFingerprint)],
     pub graph: &'a SemanticGraph,
