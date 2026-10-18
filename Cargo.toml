@@ -38,3 +38,9 @@ saphyr = { version = "0.0.12", default-features = false }
 tempfile = "3.23"
 trash = "5.2"
 walkdir = "2.5"
+
+# markdown-rs 1.0.0, vendored to carry one performance fix until it is
+# released upstream. See vendor/markdown/VENDORED.md for what changed, why,
+# and how to drop it.
+[patch.crates-io]
+markdown = { path = "vendor/markdown" }
