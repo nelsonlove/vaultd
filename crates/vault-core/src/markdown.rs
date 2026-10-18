@@ -286,8 +286,30 @@ fn extract_sections(tree: &Node, body_start: usize, text: &str) -> Vec<Section> 
 /// not the whole document), so it undercounts by the frontmatter's line
 /// count whenever frontmatter is present. Counting newlines in the full
 /// document text up to the absolute offset sidesteps that mismatch entirely.
-fn line_of(text: &str, byte_offset: usize) -> u32 {
-    text[..byte_offset].matches('\n').count() as u32
+///
+/// The newline offsets are found once per note and each lookup is a binary
+/// search. Counting from the top of the text on every call — the old
+/// `text[..offset].matches('\n').count()` — made list extraction quadratic
+/// in note length: a 2 MB note of 40,000 list items re-read about 40 GB.
+struct LineStarts {
+    newlines: Vec<usize>,
+}
+
+impl LineStarts {
+    fn new(text: &str) -> Self {
+        let newlines = text
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index))
+            .collect();
+        Self { newlines }
+    }
+
+    /// The number of newlines strictly before `byte_offset`.
+    fn line_of(&self, byte_offset: usize) -> u32 {
+        self.newlines
+            .partition_point(|&newline| newline < byte_offset) as u32
+    }
 }
 
 /// A task-list marker: a list/ordered marker immediately followed by a
@@ -322,7 +344,8 @@ fn detect_task_char(text: &str, span: SourceSpan) -> Option<char> {
 /// `crates/vault-core/src/semantic.rs::ListItemParent`).
 fn extract_list_items(tree: &Node, body_start: usize, text: &str) -> Vec<ListItem> {
     let mut items = Vec::new();
-    walk_for_list_items(tree, body_start, text, None, &mut items);
+    let lines = LineStarts::new(text);
+    walk_for_list_items(tree, body_start, text, &lines, None, &mut items);
     items
 }
 
@@ -411,6 +434,7 @@ fn walk_for_list_items(
     node: &Node,
     body_start: usize,
     text: &str,
+    lines: &LineStarts,
     parent_item_line: Option<u32>,
     items: &mut Vec<ListItem>,
 ) {
@@ -420,7 +444,7 @@ fn walk_for_list_items(
             list_position.is_some(),
             "a List node produced by to_mdast from real source text always has a position"
         );
-        let list_start_line = list_position.map_or(0, |span| line_of(text, span.start()));
+        let list_start_line = list_position.map_or(0, |span| lines.line_of(span.start()));
         for child in &list.children {
             if !matches!(child, Node::ListItem(_)) {
                 continue;
@@ -433,7 +457,7 @@ fn walk_for_list_items(
             let Some(span) = item_position else {
                 continue;
             };
-            let item_line = line_of(text, span.start());
+            let item_line = lines.line_of(span.start());
             let parent = match parent_item_line {
                 None => ListItemParent::Root { list_start_line },
                 Some(parent_line) => ListItemParent::Item {
@@ -460,7 +484,14 @@ fn walk_for_list_items(
             if let Some(grandchildren) = child.children() {
                 for grandchild in grandchildren {
                     let next_parent_line = matches!(grandchild, Node::List(_)).then_some(item_line);
-                    walk_for_list_items(grandchild, body_start, text, next_parent_line, items);
+                    walk_for_list_items(
+                        grandchild,
+                        body_start,
+                        text,
+                        lines,
+                        next_parent_line,
+                        items,
+                    );
                 }
             }
         }
@@ -468,7 +499,7 @@ fn walk_for_list_items(
     }
     if let Some(children) = node.children() {
         for child in children {
-            walk_for_list_items(child, body_start, text, parent_item_line, items);
+            walk_for_list_items(child, body_start, text, lines, parent_item_line, items);
         }
     }
 }
@@ -739,5 +770,76 @@ pub(crate) fn has_uri_scheme(target: &str) -> bool {
             chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference answer the line index must reproduce: newlines strictly
+    /// before the offset.
+    fn naive_line_of(text: &str, byte_offset: usize) -> u32 {
+        text[..byte_offset].matches('\n').count() as u32
+    }
+
+    #[test]
+    fn line_starts_agree_with_counting_newlines_at_every_offset() {
+        for text in [
+            "",
+            "a",
+            "\n",
+            "\n\n",
+            "a\nb",
+            "a\r\nb\n",
+            "ü\nß\n\nx",
+            "\nab\n",
+        ] {
+            let lines = LineStarts::new(text);
+            for offset in 0..=text.len() {
+                if !text.is_char_boundary(offset) {
+                    continue;
+                }
+                assert_eq!(
+                    lines.line_of(offset),
+                    naive_line_of(text, offset),
+                    "offset {offset} in {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A long imported note is mostly list items. Their start lines must cost
+    /// one pass over the note, not one scan from the top per item: the
+    /// per-item scan made this walk quadratic in note length, and a first
+    /// index over a vault with a few multi-megabyte notes spent minutes here.
+    ///
+    /// The tree is built outside the timed region, so only the walk is
+    /// measured. At 40,000 items in about 2 MB the old scan read about 40 GB
+    /// (seconds even with SIMD memchr); the linear walk takes milliseconds.
+    #[test]
+    fn list_item_extraction_is_linear_in_note_length() {
+        let mut text = String::new();
+        for index in 0..40_000 {
+            let indent = "  ".repeat(index % 3);
+            text.push_str(&format!(
+                "{indent}- item {index} with a few words of text in it\n"
+            ));
+        }
+        assert!(text.len() > 1_800_000);
+        let tree = to_mdast(&text, &parse_options()).expect("list parses");
+        let start = std::time::Instant::now();
+        let items = extract_list_items(&tree, 0, &text);
+        let elapsed = start.elapsed();
+        assert_eq!(items.len(), 40_000);
+        match items[39_998].parent {
+            ListItemParent::Item { parent_start_line } => assert_eq!(parent_start_line, 39_997),
+            ListItemParent::Root { .. } => panic!("item 39998 is nested"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "list item extraction took {elapsed:?} for {} bytes",
+            text.len()
+        );
     }
 }
