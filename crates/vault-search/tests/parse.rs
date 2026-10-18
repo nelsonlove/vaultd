@@ -359,7 +359,7 @@ fn arb_leaf() -> impl Strategy<Value = Node> {
 fn arb_plain() -> impl Strategy<Value = Node> {
     // Inside a value `:` is a word character, and `<` or `>` at the start of
     // the value would read as a comparison unless the printer guards it.
-    let value_word = "[a-z0-9:<>]{1,6}"
+    let value_word = "[a-z0-9<>][a-z0-9:<>]{0,5}"
         .prop_filter("not a keyword", |w| w != "null")
         .prop_map(|w| word(&w));
     prop_oneof![arb_leaf(), value_word].prop_recursive(3, 12, 3, |inner| {
