@@ -172,6 +172,29 @@ proptest! {
         prop_assert_eq!(needle.find_all(&haystack), needle.find_all_reference(&haystack));
     }
 
+    /// `is_match` decides without collecting spans; it must answer exactly
+    /// whether `find_all` finds any, for both toggles, over ASCII and over
+    /// text whose fold changes length.
+    #[test]
+    fn is_match_equals_find_all_is_not_empty(
+        haystack in "[ -~\nİıK\u{212A}ßé😀σΣ]{0,120}",
+        needle in "[a-zA-Z0-9 İıK\u{212A}ßσΣ]{0,4}",
+        sensitive in any::<bool>(),
+    ) {
+        let needle = Needle::text(&needle, sensitive);
+        prop_assert_eq!(needle.is_match(&haystack), !needle.find_all(&haystack).is_empty());
+    }
+
+    #[test]
+    fn is_match_equals_find_all_is_not_empty_over_ascii(
+        haystack in "[ -~\n]{0,200}",
+        needle in "[ -~\u{212A}İ]{0,4}",
+        sensitive in any::<bool>(),
+    ) {
+        let needle = Needle::text(&needle, sensitive);
+        prop_assert_eq!(needle.is_match(&haystack), !needle.find_all(&haystack).is_empty());
+    }
+
     #[test]
     fn spans_are_char_boundaries_of_the_original_and_fold_to_the_needle(
         haystack in "[a-zA-Z İıK\u{212A}ßẞé\u{301}😀σΟ]{1,40}",

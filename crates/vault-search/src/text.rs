@@ -46,8 +46,29 @@ impl Needle {
 
     /// Whether the needle occurs anywhere in `haystack`; always the same
     /// answer as `!find_all(haystack).is_empty()`.
+    ///
+    /// It decides without collecting spans and, over ASCII text, without
+    /// folding a copy of the haystack: it stops at the first occurrence.
+    /// Deciding is most of a search's work (every candidate note, every
+    /// text term), and only a matching document's spans are collected.
     pub fn is_match(&self, haystack: &str) -> bool {
-        !self.find_all(haystack).is_empty()
+        if self.needle.is_empty() {
+            return false;
+        }
+        if self.sensitive {
+            return haystack.contains(self.needle.as_str());
+        }
+        if haystack.is_ascii() {
+            // Every ASCII character folds to one ASCII byte, so the folded
+            // haystack is the haystack lowercased byte by byte. A folded
+            // needle that is not ASCII cannot occur in it.
+            let needle = self.folded.as_bytes();
+            if !self.folded.is_ascii() {
+                return false;
+            }
+            return contains_ascii_folded(haystack.as_bytes(), needle);
+        }
+        fold_js(haystack).contains(self.folded.as_str())
     }
 
     /// The fold-and-map reference, for the fast-path property test.
@@ -75,6 +96,31 @@ impl Needle {
         }
         spans
     }
+}
+
+/// Whether `needle` (lowercase ASCII, not empty) occurs in `haystack`
+/// (ASCII) compared ASCII-case-insensitively.
+fn contains_ascii_folded(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some((&first, rest)) = needle.split_first() else {
+        return false;
+    };
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let last_start = haystack.len() - needle.len();
+    let mut at = 0;
+    while at <= last_start {
+        if haystack[at].to_ascii_lowercase() == first
+            && haystack[at + 1..at + needle.len()]
+                .iter()
+                .zip(rest)
+                .all(|(have, want)| have.to_ascii_lowercase() == *want)
+        {
+            return true;
+        }
+        at += 1;
+    }
+    false
 }
 
 /// JavaScript `toLowerCase`: Rust's `str::to_lowercase` applies the same
