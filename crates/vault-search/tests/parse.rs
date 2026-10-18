@@ -546,3 +546,130 @@ fn a_word_that_cannot_be_spelled_bare_comes_back_as_a_phrase() {
         )
     );
 }
+
+/// Every line of `PUBLISHED`, in order, with the tree it parses to.
+fn published_trees() -> Vec<(&'static str, Node)> {
+    let q = |n: Node| Some(PropertyValueQuery::Query(Box::new(n)));
+    let date = r"\d{4}-\d{2}-\d{2}";
+    vec![
+        (r#""star wars""#, phrase("star wars")),
+        (
+            r#""they said \"hello\" to each other""#,
+            phrase(r#"they said "hello" to each other"#),
+        ),
+        ("meeting work", and(vec![word("meeting"), word("work")])),
+        ("meeting OR work", or(vec![word("meeting"), word("work")])),
+        (
+            "meeting work OR meetup personal",
+            or(vec![
+                and(vec![word("meeting"), word("work")]),
+                and(vec![word("meetup"), word("personal")]),
+            ]),
+        ),
+        (
+            "meeting (work OR meetup) personal",
+            and(vec![
+                word("meeting"),
+                or(vec![word("work"), word("meetup")]),
+                word("personal"),
+            ]),
+        ),
+        (
+            "meeting -work",
+            and(vec![word("meeting"), not(word("work"))]),
+        ),
+        (
+            "meeting -work -meetup",
+            and(vec![
+                word("meeting"),
+                not(word("work")),
+                not(word("meetup")),
+            ]),
+        ),
+        (
+            "meeting -(work meetup)",
+            and(vec![
+                word("meeting"),
+                not(and(vec![word("work"), word("meetup")])),
+            ]),
+        ),
+        (
+            "meeting [duration:<5]",
+            and(vec![
+                word("meeting"),
+                property(word("duration"), Some(PropertyValueQuery::Less(5.0))),
+            ]),
+        ),
+        (
+            "meeting [duration:>5]",
+            and(vec![
+                word("meeting"),
+                property(word("duration"), Some(PropertyValueQuery::Greater(5.0))),
+            ]),
+        ),
+        (
+            "task:(call OR email)",
+            scoped(Scope::Task, or(vec![word("call"), word("email")])),
+        ),
+        ("file:.jpg", scoped(Scope::File, word(".jpg"))),
+        ("file:202209", scoped(Scope::File, word("202209"))),
+        (
+            r#"path:"Daily notes/2022-07""#,
+            scoped(Scope::Path, phrase("Daily notes/2022-07")),
+        ),
+        (
+            r#"content:"happy cat""#,
+            scoped(Scope::Content, phrase("happy cat")),
+        ),
+        ("match-case:HappyCat", case(true, word("HappyCat"))),
+        ("ignore-case:ikea", case(false, word("ikea"))),
+        ("tag:#work", scoped(Scope::Tag, word("#work"))),
+        (
+            "line:(mix flour)",
+            scoped(Scope::Line, and(vec![word("mix"), word("flour")])),
+        ),
+        (
+            "block:(dog cat)",
+            scoped(Scope::Block, and(vec![word("dog"), word("cat")])),
+        ),
+        (
+            "section:(dog cat)",
+            scoped(Scope::Section, and(vec![word("dog"), word("cat")])),
+        ),
+        ("task:call", scoped(Scope::Task, word("call"))),
+        ("task-todo:call", scoped(Scope::TaskTodo, word("call"))),
+        ("task-done:call", scoped(Scope::TaskDone, word("call"))),
+        ("[aliases]", property(word("aliases"), None)),
+        ("[aliases:Name]", property(word("aliases"), q(word("Name")))),
+        (
+            "[aliases:null]",
+            property(word("aliases"), Some(PropertyValueQuery::Null)),
+        ),
+        (
+            "[status:Draft OR Published]",
+            property(
+                word("status"),
+                q(or(vec![word("Draft"), word("Published")])),
+            ),
+        ),
+        (r"/\d{4}-\d{2}-\d{2}/", regex(date, "")),
+        (
+            r"path:/\d{4}-\d{2}-\d{2}/",
+            scoped(Scope::Path, regex(date, "")),
+        ),
+        ("embed OR search", or(vec![word("embed"), word("search")])),
+    ]
+}
+
+#[test]
+fn every_published_query_parses_to_its_tree() {
+    let trees = published_trees();
+    let texts: Vec<&str> = trees.iter().map(|(text, _)| *text).collect();
+    assert_eq!(
+        texts, PUBLISHED,
+        "the table covers every published line, in order"
+    );
+    for (text, tree) in trees {
+        assert_eq!(parsed(text), tree, "{text:?}");
+    }
+}
