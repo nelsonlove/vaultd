@@ -71,6 +71,34 @@ fn final_sigma_folds_as_javascript_does() {
         "\u{3c3}\u{3b1}",
         "a sigma before a letter is the medial form"
     );
+    // The Unicode Final_Sigma context JavaScript applies: a cased letter
+    // before (case-ignorable characters skipped), no cased letter after.
+    // Expected values checked with `node -e` on each input.
+    assert_eq!(
+        fold_js("\u{4e2d}\u{3a3}"),
+        "\u{4e2d}\u{3c3}",
+        "中 is alphabetic but not cased"
+    );
+    assert_eq!(
+        fold_js("\u{391}\u{3a3}\u{4e2d}"),
+        "\u{3b1}\u{3c2}\u{4e2d}",
+        "中 after the sigma is not cased"
+    );
+    assert_eq!(
+        fold_js("\u{391}'\u{3a3}"),
+        "\u{3b1}'\u{3c2}",
+        "the apostrophe is case-ignorable"
+    );
+    assert_eq!(
+        fold_js("\u{391}\u{3a3}\u{301}\u{392}"),
+        "\u{3b1}\u{3c3}\u{301}\u{3b2}",
+        "a combining mark is skipped before the next letter"
+    );
+    // The byte map stays on the original characters around a final sigma.
+    assert_eq!(
+        Needle::text("\u{3b1}\u{3c2}", false).find_all("\u{391}\u{3a3}\u{4e2d}"),
+        vec![0..4]
+    );
 }
 
 #[test]

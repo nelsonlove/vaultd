@@ -44,6 +44,8 @@ impl Needle {
         self.find_all_reference(haystack)
     }
 
+    /// Whether the needle occurs anywhere in `haystack`; always the same
+    /// answer as `!find_all(haystack).is_empty()`.
     pub fn is_match(&self, haystack: &str) -> bool {
         !self.find_all(haystack).is_empty()
     }
@@ -75,53 +77,31 @@ impl Needle {
     }
 }
 
-/// JavaScript `toLowerCase` per character, with the final-sigma rule.
+/// JavaScript `toLowerCase`: Rust's `str::to_lowercase` applies the same
+/// Unicode default lowercasing, including the Final_Sigma context (a cased
+/// letter before, case-ignorable characters skipped, no cased letter after).
 pub fn fold_js(text: &str) -> String {
-    let mut folded = String::with_capacity(text.len());
-    fold_each(text, |_, piece| folded.push_str(piece));
-    folded
+    text.to_lowercase()
 }
 
 /// The fold of `text` and, for each folded byte, the byte offset of the
-/// original character that produced it.
+/// original character that produced it. Each character's fold length does
+/// not depend on its context (the only contextual mapping is `Σ`, and both
+/// `σ` and `ς` are two bytes), so the map is built per character while the
+/// folded text comes from `fold_js`.
 fn fold_with_map(text: &str) -> (String, Vec<usize>) {
-    let mut folded = String::with_capacity(text.len());
-    let mut map = Vec::with_capacity(text.len());
-    fold_each(text, |at, piece| {
-        folded.push_str(piece);
-        map.extend(std::iter::repeat_n(at, piece.len()));
-    });
-    (folded, map)
-}
-
-/// Calls `emit(at, fold)` for every character of `text`, where `at` is the
-/// character's byte offset and `fold` its lowercase form. `Σ` becomes the
-/// final `ς` when the previous character is alphabetic and the next one is
-/// not (JavaScript's final-sigma context, approximated by `is_alphabetic`;
-/// P3 lists it for capture), and `σ` otherwise.
-fn fold_each(text: &str, mut emit: impl FnMut(usize, &str)) {
-    let mut previous: Option<char> = None;
-    let mut chars = text.char_indices().peekable();
-    let mut buffer = [0u8; 4];
-    while let Some((at, c)) = chars.next() {
-        if c == '\u{3a3}' {
-            let after_letter = previous.is_some_and(char::is_alphabetic);
-            let before_letter = chars.peek().is_some_and(|&(_, next)| next.is_alphabetic());
-            let sigma = if after_letter && !before_letter {
-                '\u{3c2}'
-            } else {
-                '\u{3c3}'
-            };
-            emit(at, sigma.encode_utf8(&mut buffer));
-        } else if c.is_ascii() {
-            emit(at, c.to_ascii_lowercase().encode_utf8(&mut buffer));
+    let folded = fold_js(text);
+    let mut map = Vec::with_capacity(folded.len());
+    for (at, c) in text.char_indices() {
+        let len: usize = if c.is_ascii() {
+            1
         } else {
-            let mut piece = String::new();
-            piece.extend(c.to_lowercase());
-            emit(at, &piece);
-        }
-        previous = Some(c);
+            c.to_lowercase().map(char::len_utf8).sum()
+        };
+        map.extend(std::iter::repeat_n(at, len));
     }
+    debug_assert_eq!(map.len(), folded.len());
+    (folded, map)
 }
 
 /// An Obsidian position: `line` zero-based, `col` and `offset` in UTF-16
