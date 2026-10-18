@@ -75,6 +75,11 @@ impl Entries {
 pub(crate) struct SearchCache {
     capacity: usize,
     entries: Mutex<Entries>,
+    /// Run once, on the next cached answer, after the cache answered and
+    /// before its page's contexts are pinned. Test-only: it lands a
+    /// publication in that window.
+    #[cfg(test)]
+    before_contexts: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Default for SearchCache {
@@ -100,7 +105,17 @@ impl SearchCache {
         Self {
             capacity: capacity.max(1),
             entries: Mutex::new(Entries::default()),
+            #[cfg(test)]
+            before_contexts: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_contexts_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
@@ -323,6 +338,17 @@ fn page(
 
     let page: Vec<&vault_search::FileHit> = answer.hits.iter().skip(start).take(limit).collect();
     if line && contexts.is_none() {
+        #[cfg(test)]
+        {
+            let hook = cache
+                .before_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let wanted: Vec<_> = page
             .iter()
             .map(|hit| {
@@ -627,6 +653,49 @@ mod tests {
         assert!(
             published.load(std::sync::atomic::Ordering::SeqCst) >= 3,
             "a publication followed every pin"
+        );
+    }
+
+    /// The re-ask loop, deterministically: an answer cached at generation N
+    /// is served, a publication to N+1 lands before its contexts are pinned,
+    /// and the fresh request still answers, from a second attempt that
+    /// computes the answer at N+1.
+    #[test]
+    fn a_cached_answer_whose_generation_moves_before_its_contexts_is_asked_again() {
+        let Fixture {
+            vault,
+            _index,
+            service,
+            reader,
+            cache,
+        } = Fixture::new(&[("a.md", "x\nmeeting\n")]);
+        let first = ask(&reader, &cache, "meeting", None, None).unwrap();
+        assert_eq!(cache.len(), 1, "the answer at N is cached");
+        let service = Mutex::new(service);
+        let root = vault.path().to_path_buf();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let firing = Arc::clone(&fired);
+        cache.before_contexts_for_test(Box::new(move || {
+            firing.store(true, std::sync::atomic::Ordering::SeqCst);
+            publish(&root, &mut service.lock().unwrap(), "b.md");
+        }));
+        let again = ask(&reader, &cache, "meeting", None, None).unwrap();
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the cached answer was served and the publication landed"
+        );
+        assert_eq!(again.generation, first.generation + 1, "answered at N+1");
+        assert_eq!(
+            again
+                .items
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.md", "b.md"]
+        );
+        assert_eq!(
+            again.items[0].content_matches[0].line_text.as_deref(),
+            Some("meeting")
         );
     }
 

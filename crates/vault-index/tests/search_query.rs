@@ -292,7 +292,20 @@ fn a_publication_completes_while_a_pages_contexts_are_read() {
         thread::spawn(move || reader.match_contexts(generation, &[(vp("a.md"), vec![6..13])]));
     rendezvous.arrived();
     fs::write(vault.path().join("a.md"), "changed\n").unwrap();
+    // A guard held across the hook would make the refresh wait for the
+    // hook's release timeout: it must return well inside it, with the
+    // context read still parked.
+    let started = std::time::Instant::now();
     service.refresh(false).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the publication waited {:?} for the parked context read",
+        started.elapsed()
+    );
+    assert!(
+        !reading.is_finished(),
+        "the context read is still parked when the publication returns"
+    );
     assert!(
         service
             .reader()
