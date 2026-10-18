@@ -401,6 +401,7 @@ export class HostHarness extends ShimHarness {
       queue: this.assembly.queue,
       errors: this.assembly.errors,
       policyRecorder: this.policyRecorder,
+      globalSearch: this.assembly.globalSearch,
     });
     // **Every service this assembly holds, unless a case asks otherwise.** A
     // host that had a service and did not put it on the socket would refuse the

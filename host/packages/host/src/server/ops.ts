@@ -57,6 +57,8 @@ import type { DispatchQueue } from "../runtime/queue";
 import type { EditorRange } from "../shim/editor";
 import type { Harvest, MenuContext } from "../shim/harvest";
 import type { HeadlessConfigDir } from "../pluginset/config-dir";
+import type { GlobalSearchInstance } from "../shim/global-search";
+import type { SearchResponse } from "../client/protocol";
 import type { HostConfig } from "../config";
 import type { HostErrors } from "../shim/errors";
 import type { LifecycleSequencer } from "../runtime/lifecycle";
@@ -132,6 +134,16 @@ export interface HostServerDeps {
    * there rather than an invented `"spawned"`.
    */
   readonly engineSource?: () => EngineSource | null;
+  /**
+   * The host's one `global-search` instance — the same object a plugin gets
+   * from `app.internalPlugins` when `core-plugins.json` enables it.
+   *
+   * Required, so the type checker names every place a server is built:
+   * `host.search_state` reads its state and the server relays its
+   * `host.search_opened`. A host whose vault disables `global-search` still
+   * has the object; nothing opens a search on it, so its state stays empty.
+   */
+  readonly globalSearch: GlobalSearchInstance;
 }
 
 /**
@@ -675,6 +687,28 @@ export class HostOps {
       // Before the write, so a typo creates nothing. See `get_plugin_config`.
       await this.assertInstalled(id);
       return toWirePluginConfigWrite(id, await configFailure(id, () => service.set(id, patch)));
+    });
+
+    // --- Search -----------------------------------------------------------------
+
+    // **Neither needs a steady host.** `host.search` is the engine's `search`,
+    // and `host.search_state` is the instance's own state, which is empty until
+    // a plugin opens a search — neither reads the loaded plugin set.
+    //
+    // `host.search` is a pass-through for a host client that holds no engine
+    // connection: the params go to the engine unchanged and its answer, or its
+    // refusal with its own code (`query_invalid` with `position`,
+    // `unsupported_operator`, `invalid_cursor`, `generation_mismatch`), comes
+    // back unchanged. Only `query` is checked here, because a request with no
+    // query is malformed whatever the engine would say about it.
+    table.set("host.search", async (params) => {
+      stringOf(params, "query");
+      return await this.deps.client.request<SearchResponse>("search", params);
+    });
+
+    table.set("host.search_state", () => {
+      const state = this.deps.globalSearch.state();
+      return Promise.resolve({ query: state.query, answer: state.answer, error: state.error });
     });
 
     // --- Compatibility (Task 20) ----------------------------------------------

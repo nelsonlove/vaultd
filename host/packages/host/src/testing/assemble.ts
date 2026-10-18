@@ -29,6 +29,7 @@ import { CommandRegistry } from "../shim/commands";
 import { HeadlessConfigDir } from "../pluginset/config-dir";
 import { FileManager } from "../shim/file-manager";
 import { InternalPluginRegistry } from "../shim/internal-plugins";
+import { GlobalSearchInstance } from "../shim/global-search";
 import { PluginRegistry } from "../shim/plugin-registry";
 import { ShimEventBus } from "../shim/events";
 import { MetadataCache } from "../shim/metadata-cache";
@@ -154,6 +155,16 @@ export interface HostAssembly {
    * `DryRunGate` reads a window of this log; it owns no second one.
    */
   readonly noticeLog: NoticeLog;
+  /**
+   * The host's one `global-search` instance.
+   *
+   * Built beside the {@link InternalPluginRegistry} it is handed to, which
+   * gives it to a plugin only while `core-plugins.json` enables it, and exposed
+   * here because the server needs the same object: `host.search_state` reads
+   * its state and `host.search_opened` relays its answers. One per host, so a
+   * search a plugin opens is the one a host client reads.
+   */
+  readonly globalSearch: GlobalSearchInstance;
   /**
    * The module object a plugin bundle resolves `obsidian` to.
    *
@@ -448,7 +459,8 @@ export function assembleShim(deps: {
   // before the first synchronous `getPluginById`; `commands` seeds
   // `editor:save-file` and is the map `Plugin.addCommand` delegates into.
   assignOnce(app, "plugins", new PluginRegistry());
-  const internalPlugins = new InternalPluginRegistry({ client, mirror, config });
+  const globalSearch = new GlobalSearchInstance({ client });
+  const internalPlugins = new InternalPluginRegistry({ client, mirror, config, globalSearch });
   assignOnce(app, "internalPlugins", internalPlugins);
   assignOnce(
     app,
@@ -507,6 +519,7 @@ export function assembleShim(deps: {
     coexistence,
     globals,
     noticeLog,
+    globalSearch,
   };
   // Last, and built from the assembly itself: the barrel binds this host's
   // clock into the timer functions a plugin calls, so a test advancing its own

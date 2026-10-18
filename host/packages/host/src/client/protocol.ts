@@ -93,6 +93,8 @@ export interface ProtocolErrorBody {
   supported_version?: number;
   current_generation?: number;
   current_revision?: string;
+  /** Accompanies `query_invalid`: the character position the parser stopped at. */
+  position?: number;
 }
 
 /** `vault_protocol::ErrorCode`, code for code, plus unknown-variant tolerance. */
@@ -123,6 +125,8 @@ export type ErrorCode =
   | "read_only"
   | "snapshot_not_found"
   | "too_many_snapshots"
+  | "query_invalid"
+  | "unsupported_operator"
   | (string & {});
 
 // ---------------------------------------------------------------------------
@@ -590,6 +594,80 @@ export interface SnapshotNotesParams {
 
 export interface CloseSnapshotParams {
   snapshot_id: string;
+}
+
+// ---------------------------------------------------------------------------
+// Search (`search.rs`)
+// ---------------------------------------------------------------------------
+
+/** `SearchSortDto`. The daemon's default is `file_name_asc`. */
+export type SearchSortDto =
+  | "file_name_asc"
+  | "file_name_desc"
+  | "modified_desc"
+  | "modified_asc"
+  | "created_desc"
+  | "created_asc";
+
+/** `SearchContextDto`: whether each content match carries its line. Default `line`. */
+export type SearchContextDto = "none" | "line";
+
+/**
+ * `SearchParams`. Every key but `query` is `serde(default)` on the daemon, so a
+ * client may omit any of them.
+ */
+export interface SearchParams {
+  query: string;
+  match_case?: boolean;
+  sort?: SearchSortDto;
+  context?: SearchContextDto;
+  cursor?: string | null;
+  limit?: number | null;
+}
+
+/** `DocumentKindDto`, with the unknown-variant tolerance the daemon's own decoder has. */
+export type DocumentKindDto = "note" | "canvas" | "file" | (string & {});
+
+/** Half-open UTF-16 code-unit offsets, as a JavaScript string indexes. */
+export interface Utf16SpanDto {
+  start: number;
+  end: number;
+}
+
+/** A position in a note: zero-based line, UTF-16 column, and UTF-16 offset. */
+export interface LocDto {
+  line: number;
+  col: number;
+  offset: number;
+}
+
+/**
+ * One match in a document's text. `span` is UTF-8 bytes into the source;
+ * `start` and `end` are UTF-16. The two line keys are skipped, not `null`, when
+ * the request asked for `context: "none"`.
+ */
+export interface ContentMatchDto {
+  span: SpanDto;
+  start: LocDto;
+  end: LocDto;
+  line_text?: string;
+  line_text_start?: number;
+}
+
+export interface SearchHitDto {
+  path: string;
+  kind: DocumentKindDto;
+  path_matches: Utf16SpanDto[];
+  content_matches: ContentMatchDto[];
+  matches_truncated: boolean;
+}
+
+export interface SearchResponse {
+  generation: number;
+  total_files: number;
+  total_matches: number;
+  items: SearchHitDto[];
+  next_cursor: string | null;
 }
 
 // ---------------------------------------------------------------------------

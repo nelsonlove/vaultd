@@ -114,7 +114,7 @@ describe.skipIf(!BINARY_EXISTS)("tag-wrangler harvest", () => {
     }
   }, 120_000);
 
-  it("degrades honestly when it reaches for global-search", async () => {
+  it("degrades honestly when it reaches for global-search without core-plugins.json enabling it", async () => {
     const host = await LiveHost.startWithGoldenPlugin("tag-wrangler", { "Tagged.md": "#beta\n" });
     try {
       const internal = host.app().internalPlugins.getPluginById("global-search");

@@ -2,14 +2,19 @@
  * `app.internalPlugins` — Obsidian's core plugins, as much of them as a vault's
  * config files can honestly answer for.
  *
- * **Two are reimplemented, the rest are present-but-absent.** `daily-notes` and
- * `bookmarks` are, from a plugin's point of view, config readers: what
+ * **Three are reimplemented, the rest are present-but-absent.** `daily-notes`
+ * and `bookmarks` are, from a plugin's point of view, config readers: what
  * rollover-daily-todos wants from `daily-notes` is `{ folder, format, template }`
  * out of `daily-notes.json`, and what a bookmark consumer wants is the tree out
  * of `bookmarks.json`. Both are files this host can read, so both are real.
- * Everything else a core plugin does — `file-explorer`'s tree, `global-search`'s
- * query box, `bases`, `file-recovery`, `properties`, `workspaces` — is a *view*,
- * and a headless host has none. Those report `enabled` truthfully from
+ * `global-search` is the third: its instance (`shim/global-search.ts`) has the
+ * two methods the corpus calls, `openGlobalSearch` and `getGlobalSearchQuery`,
+ * and opening a search runs it on the engine's `search` and makes it the host's
+ * current search, which host clients read — there is no pane to show it in. It
+ * is served only when `core-plugins.json` enables it, as Obsidian's is.
+ * Everything else a core plugin does — `file-explorer`'s tree, `bases`,
+ * `file-recovery`, `properties`, `workspaces` — is a *view*, and a headless host
+ * has none. Those report `enabled` truthfully from
  * `core-plugins.json` and hand back `instance: null`, which is exactly the
  * shape the consuming plugins already branch on: folder-notes' `getFileExplorer()`
  * early-returns on a falsy instance and disables its CSS features cleanly.
@@ -25,8 +30,10 @@
  * vault whose file has never been written is **uncaptured**, and `false` is the
  * least-harm reading: the file is the only record this host has, and claiming
  * `enabled` for a view that is certainly not there would be a second claim on
- * top of one it cannot back. Nothing downstream turns on it — `instance` is
- * `null` either way, so every consumer takes the same degraded branch.
+ * top of one it cannot back. For the view-only ids nothing downstream turns on
+ * it — `instance` is `null` either way, so every consumer takes the same
+ * degraded branch. For `global-search` it decides whether the instance is
+ * served at all, and `false` means a vault without the file gets none.
  *
  * **Config resolution is host-directory-first**, the same ladder
  * `Vault.getConfig` uses for `app.json`: `<hostConfigDir>/<name>` first,
@@ -51,6 +58,7 @@
  */
 
 import { declarePolicy, recordUse } from "./policy";
+import type { GlobalSearchInstance } from "./global-search";
 import { OBSIDIAN_CONFIG_DIR } from "../pluginset/config-dir";
 import type { HostConfig } from "../config";
 import type { Mirror } from "../mirror/mirror";
@@ -65,7 +73,7 @@ import type { RequestSink } from "../client/request-sink";
 export interface InternalPluginEntry {
   readonly id: string;
   readonly enabled: boolean;
-  /** The reimplemented pair's instance; `null` for everything else. */
+  /** A reimplemented core plugin's instance; `null` for everything else. */
   readonly instance: unknown;
 }
 
@@ -97,6 +105,12 @@ export interface InternalPluginDeps {
   readonly client: RequestSink;
   readonly mirror: Mirror;
   readonly config: HostConfig;
+  /**
+   * The host's one `global-search` instance, built beside this registry and
+   * also handed to the server, which reads its state and relays its event. The
+   * registry only decides whether a plugin is given it.
+   */
+  readonly globalSearch: GlobalSearchInstance;
 }
 
 /**
@@ -111,14 +125,13 @@ const DAILY_NOTES_DEFAULTS = { folder: "", format: "YYYY-MM-DD", template: "" } 
 /**
  * The core plugins this host reports present and cannot serve an instance for.
  *
- * Every one of them is a view. A seventh id — or any id at all that is not
- * `daily-notes` or `bookmarks` — falls to the same default; the list is written
- * out because these six are the ones the corpus actually asks for, and a reader
- * of this file is owed the names.
+ * Every one of them is a view. A sixth id — or any id at all that is not
+ * `daily-notes`, `bookmarks` or `global-search` — falls to the same default; the
+ * list is written out because these five are the ones the corpus actually asks
+ * for, and a reader of this file is owed the names.
  */
 const VIEW_ONLY = new Set<string>([
   "file-explorer",
-  "global-search",
   "bases",
   "file-recovery",
   "properties",
@@ -184,7 +197,7 @@ export class InternalPluginRegistry {
    * The entry for a core plugin, or `null` for an id this host has no opinion
    * about.
    *
-   * The six view-only ids and the two reimplemented ones are always present,
+   * The five view-only ids and the three reimplemented ones are always present,
    * whatever `core-plugins.json` says, so the calls the corpus actually makes
    * always get an entry. An id outside that set and outside the config file is
    * one this host has never heard of, and `null` — Obsidian's own answer for a
@@ -282,6 +295,14 @@ export class InternalPluginRegistry {
     for (const id of VIEW_ONLY) {
       next[id] ??= { id, enabled: false, instance: null };
     }
+    // Served only while enabled, as Obsidian's is: a disabled core plugin has
+    // no instance for a plugin to call.
+    const searchEnabled = enabled["global-search"] ?? false;
+    next["global-search"] = {
+      id: "global-search",
+      enabled: searchEnabled,
+      instance: searchEnabled ? this.deps.globalSearch : null,
+    };
     next["daily-notes"] = {
       id: "daily-notes",
       enabled: enabled["daily-notes"] ?? false,
