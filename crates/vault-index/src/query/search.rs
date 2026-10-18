@@ -442,6 +442,14 @@ fn tag_rows(
             folded: row.get(2)?,
             span: offset(3)?..offset(4)?,
         };
+        // `tag:` matches on the stored key, so it must be the fold the
+        // matcher would compute: `vault_core` writes it with
+        // `to_lowercase`, and `fold_js` is the matcher's fold.
+        debug_assert_eq!(
+            fact.folded,
+            vault_search::text::fold_js(&fact.value),
+            "the stored comparison_key of a tag in {path} is not fold_js of its value"
+        );
         match tags.last_mut() {
             Some((last, facts)) if last == path => facts.push(fact),
             _ => tags.push((path.to_owned(), vec![fact])),

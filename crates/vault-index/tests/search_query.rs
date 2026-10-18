@@ -228,6 +228,44 @@ fn a_required_tag_narrows_the_tag_rows_read() {
     );
 }
 
+/// The narrowing's range bounds and the stored fold hold for keys that are
+/// not ASCII: `Ü` and `Ï` fold to two-byte letters, and `İ` folds to `i`
+/// plus a combining dot (U+0307), so its stored key is longer than the
+/// letter and is not the key `i`.
+#[test]
+fn a_required_unicode_tag_narrows_on_the_stored_fold() {
+    let (service, _vault, _index) = service(&[
+        ("a.md", "#Ünï/x\n#other\n".as_bytes()),
+        ("b.md", "#ünï\n".as_bytes()),
+        ("c.md", "#ünïon\n".as_bytes()),
+        ("d.md", "#İ\n".as_bytes()),
+        ("e.md", b"#i\n"),
+        ("f.md", "#ÜNÏ0\n".as_bytes()),
+    ]);
+    let reader = service.reader().unwrap();
+    let run = |q: &str| {
+        let compiled = compile(&parse_query(q).unwrap(), false).unwrap();
+        let request = SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::FileNameAsc,
+        };
+        let narrowed = reader.search(&request).unwrap();
+        let full = reader.search_unnarrowed_for_test(&request).unwrap();
+        assert_eq!(narrowed.hits, full.hits, "{q}");
+        let paths: Vec<String> = narrowed
+            .hits
+            .iter()
+            .map(|h| h.path.as_str().to_string())
+            .collect();
+        (paths, narrowed.tag_rows_read)
+    };
+    assert_eq!(run("tag:#ÜNÏ"), (vec!["a.md".into(), "b.md".into()], 3));
+    assert_eq!(run("tag:ünï/X"), (vec!["a.md".into()], 2));
+    assert_eq!(run("tag:İ"), (vec!["d.md".into()], 1));
+    assert_eq!(run("tag:i"), (vec!["e.md".into()], 1));
+    assert_eq!(run("tag:#ünï0"), (vec!["f.md".into()], 1));
+}
+
 #[test]
 fn the_sort_reads_tree_times() {
     // The times are set before the first build: a metadata-only touch
