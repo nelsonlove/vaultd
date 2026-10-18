@@ -119,7 +119,10 @@ impl Parser {
     fn deeper(&mut self, opener: usize) -> Result<(), QueryError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return Err(self.error(opener, "the query nests more than 64 levels deep"));
+            return Err(self.error(
+                opener,
+                &format!("the query nests more than {MAX_DEPTH} levels deep"),
+            ));
         }
         Ok(())
     }

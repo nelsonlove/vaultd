@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use vault_search::{Node, Pattern, PropertyValueQuery, Query, Scope, Term, parse_query};
+use vault_search::{MAX_DEPTH, Node, Pattern, PropertyValueQuery, Query, Scope, Term, parse_query};
 
 fn word(text: &str) -> Node {
     Node::Term(Term {
@@ -319,7 +319,9 @@ fn malformed_queries_are_refused_with_a_position() {
         assert!(!error.message.is_empty());
     }
     let deep = format!("{}a{}", "(".repeat(65), ")".repeat(65));
-    assert_eq!(parse_query(&deep).expect_err("too deep").position, 64);
+    let error = parse_query(&deep).expect_err("too deep");
+    assert_eq!(error.position, 64);
+    assert!(error.message.contains(&MAX_DEPTH.to_string()), "{error:?}");
 }
 
 #[test]
