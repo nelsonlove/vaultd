@@ -180,8 +180,17 @@ fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.pragma_update(None, "cache_size", -WRITER_CACHE_KIB)?;
     Ok(())
 }
+
+/// The writer connection's page cache, in KiB. SQLite's default is 2 MiB.
+/// A cold build writes the whole vault in one transaction, and its secondary
+/// indexes take rows in random key order; with the default cache those pages
+/// are spilled to the WAL and read back over and over (a measured cold build
+/// of a 750 MB generated vault wrote a 3.7 GB WAL before committing). This is
+/// a ceiling, not an allocation: the cache only grows as pages are touched.
+const WRITER_CACHE_KIB: i64 = 256 * 1024;
 
 fn has_metadata_table(connection: &Connection) -> Result<bool, rusqlite::Error> {
     let count: u32 = connection.query_row(

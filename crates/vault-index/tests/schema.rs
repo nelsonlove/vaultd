@@ -70,6 +70,13 @@ fn schema_records_versions_identity_and_required_pragmas() {
     assert_eq!(identity, config.vault_identity);
     assert_eq!(foreign_keys, 1);
     assert_eq!(journal_mode.to_lowercase(), "wal");
+    // The writer's page cache: SQLite's 2 MiB default made a cold build of a
+    // large vault spill and re-read its index pages through the WAL (see
+    // `WRITER_CACHE_KIB` in `schema.rs`). Negative means KiB.
+    let cache_size: i64 = connection
+        .pragma_query_value(None, "cache_size", |row| row.get(0))
+        .expect("cache_size");
+    assert_eq!(cache_size, -256 * 1024);
     assert!(
         fs::metadata(&config.index_path)
             .expect("database exists")
