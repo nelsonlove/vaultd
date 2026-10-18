@@ -69,35 +69,82 @@ pub enum Scope {
     TaskDone,
 }
 
-const SCOPES: [(Scope, &str); 10] = [
-    (Scope::File, "file"),
-    (Scope::Path, "path"),
-    (Scope::Content, "content"),
-    (Scope::Tag, "tag"),
-    (Scope::Line, "line"),
-    (Scope::Block, "block"),
-    (Scope::Section, "section"),
-    (Scope::Task, "task"),
-    (Scope::TaskTodo, "task-todo"),
-    (Scope::TaskDone, "task-done"),
-];
-
 impl Scope {
     /// The operator's name as the query spells it, without the colon.
     pub fn name(self) -> &'static str {
-        SCOPES
-            .iter()
-            .find(|(scope, _)| *scope == self)
-            .map(|(_, name)| *name)
-            .expect("every scope has a name")
+        match self {
+            Scope::File => "file",
+            Scope::Path => "path",
+            Scope::Content => "content",
+            Scope::Tag => "tag",
+            Scope::Line => "line",
+            Scope::Block => "block",
+            Scope::Section => "section",
+            Scope::Task => "task",
+            Scope::TaskTodo => "task-todo",
+            Scope::TaskDone => "task-done",
+        }
     }
 
     /// The inverse of [`Scope::name`].
     pub fn from_name(name: &str) -> Option<Scope> {
-        SCOPES
-            .iter()
-            .find(|(_, known)| *known == name)
-            .map(|(scope, _)| *scope)
+        Some(match name {
+            "file" => Scope::File,
+            "path" => Scope::Path,
+            "content" => Scope::Content,
+            "tag" => Scope::Tag,
+            "line" => Scope::Line,
+            "block" => Scope::Block,
+            "section" => Scope::Section,
+            "task" => Scope::Task,
+            "task-todo" => Scope::TaskTodo,
+            "task-done" => Scope::TaskDone,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scope;
+
+    const ALL: [Scope; 10] = [
+        Scope::File,
+        Scope::Path,
+        Scope::Content,
+        Scope::Tag,
+        Scope::Line,
+        Scope::Block,
+        Scope::Section,
+        Scope::Task,
+        Scope::TaskTodo,
+        Scope::TaskDone,
+    ];
+
+    /// Fails to compile when a variant is added, so `ALL` is extended too.
+    #[allow(dead_code)]
+    fn every_variant_is_in_all(scope: Scope) {
+        match scope {
+            Scope::File
+            | Scope::Path
+            | Scope::Content
+            | Scope::Tag
+            | Scope::Line
+            | Scope::Block
+            | Scope::Section
+            | Scope::Task
+            | Scope::TaskTodo
+            | Scope::TaskDone => {}
+        }
+    }
+
+    #[test]
+    fn scope_names_round_trip_for_every_scope() {
+        for scope in ALL {
+            assert_eq!(Scope::from_name(scope.name()), Some(scope), "{scope:?}");
+        }
+        assert_eq!(Scope::from_name("match-case"), None);
+        assert_eq!(Scope::from_name("File"), None);
     }
 }
 

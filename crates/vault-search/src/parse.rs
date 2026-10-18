@@ -5,20 +5,13 @@ use crate::query::{Node, Pattern, PropertyValueQuery, Query, QueryError, Scope, 
 
 pub const MAX_DEPTH: usize = 64;
 
-const OPERATORS: [&str; 12] = [
-    "file",
-    "path",
-    "content",
-    "tag",
-    "line",
-    "block",
-    "section",
-    "task",
-    "task-todo",
-    "task-done",
-    "match-case",
-    "ignore-case",
-];
+/// What an operator name before `:` names: a scope, or `match-case:` /
+/// `ignore-case:`.
+#[derive(Clone, Copy)]
+enum Operator {
+    Scope(Scope),
+    Case { sensitive: bool },
+}
 
 /// Where a sub-expression stops, beyond whitespace and parentheses.
 #[derive(Clone, Copy, PartialEq)]
@@ -205,8 +198,8 @@ impl Parser {
             Some('/') => Ok(Node::Term(self.regex_or_word(within))),
             _ => {
                 if !within.in_property() {
-                    if let Some((name, after)) = self.operator_name() {
-                        return self.operator(name, start, after, within);
+                    if let Some((operator, after)) = self.operator_name() {
+                        return self.operator(operator, start, after, within);
                     }
                 }
                 Ok(Node::Term(self.word(within)))
@@ -236,7 +229,7 @@ impl Parser {
     }
 
     /// An operator name followed by `:`, and the position after the colon.
-    fn operator_name(&self) -> Option<(&'static str, usize)> {
+    fn operator_name(&self) -> Option<(Operator, usize)> {
         let mut end = self.at;
         while self
             .chars
@@ -249,15 +242,17 @@ impl Parser {
             return None;
         }
         let name: String = self.chars[self.at..end].iter().collect();
-        OPERATORS
-            .iter()
-            .find(|known| **known == name)
-            .map(|known| (*known, end + 1))
+        let operator = match name.as_str() {
+            "match-case" => Operator::Case { sensitive: true },
+            "ignore-case" => Operator::Case { sensitive: false },
+            other => Operator::Scope(Scope::from_name(other)?),
+        };
+        Some((operator, end + 1))
     }
 
     fn operator(
         &mut self,
-        name: &'static str,
+        operator: Operator,
         start: usize,
         after: usize,
         within: Within,
@@ -274,22 +269,13 @@ impl Parser {
             _ => Node::Term(self.word(within)),
         };
         let query = Box::new(operand);
-        Ok(match name {
-            "match-case" => Node::Case {
-                sensitive: true,
+        Ok(match operator {
+            Operator::Case { sensitive } => Node::Case {
+                sensitive,
                 query,
                 at,
             },
-            "ignore-case" => Node::Case {
-                sensitive: false,
-                query,
-                at,
-            },
-            other => Node::Scoped {
-                scope: Scope::from_name(other).expect("a known scope"),
-                query,
-                at,
-            },
+            Operator::Scope(scope) => Node::Scoped { scope, query, at },
         })
     }
 
