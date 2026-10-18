@@ -169,6 +169,7 @@ fn index_unavailable() -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -184,6 +185,7 @@ fn snapshot_not_found(snapshot_id: &str) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -196,6 +198,7 @@ fn runtime_not_ready(message: &str) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -223,6 +226,7 @@ pub(crate) fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     };
     if value.contains('\0') {
         return Err(invalid(value));
@@ -678,6 +682,7 @@ impl Server {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         })
     }
 
@@ -713,6 +718,7 @@ impl Server {
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             });
         };
         let indexed = !vault_index::is_unindexable(written);
@@ -761,6 +767,7 @@ impl Server {
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             });
         };
         match vault_index::is_unindexable_folder(written) {
@@ -791,6 +798,7 @@ impl Server {
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             });
         }
         paths.iter().map(|path| parse_path(path)).collect()
@@ -1425,6 +1433,15 @@ impl Server {
                     Err(error) => ResponseEnvelope::error(id, error),
                 },
             },
+            // The wire type lands before the operation does; until the
+            // operation is wired, `search` is refused as an unknown method was.
+            Request::Search(_) => ResponseEnvelope::error(
+                id,
+                ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "invalid request: `search` is not served by this build",
+                ),
+            ),
             Request::SnapshotNotes(params) => {
                 if !self.may_use_session(connection, &params.snapshot_id) {
                     return ResponseEnvelope::error(id, snapshot_not_found(&params.snapshot_id));

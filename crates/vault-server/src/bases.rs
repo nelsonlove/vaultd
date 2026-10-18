@@ -164,6 +164,7 @@ fn error(code: ErrorCode, message: impl Into<String>) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 

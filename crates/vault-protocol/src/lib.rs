@@ -4,6 +4,7 @@ mod error;
 mod events;
 mod mutations;
 mod operations;
+mod search;
 mod semantic;
 mod snapshots;
 
@@ -34,6 +35,10 @@ pub use operations::{
     PageResponse, PathPageParams, ReferenceStatusFilter, RefreshIndexParams, RefreshIndexResponse,
     Request, ResolveLinkParams, ResolveLinkResponse, Response, SubscribeEventsParams,
     SubscribeEventsResponse, UnsubscribeParams, UnsubscribeResponse,
+};
+pub use search::{
+    ContentMatchDto, DocumentKindDto, LocDto, SearchContextDto, SearchHitDto, SearchParams,
+    SearchResponse, SearchSortDto, Utf16SpanDto,
 };
 pub use semantic::{
     AliasDto, BlockDto, DiagnosticDto, HeadingDto, IndexStateDto, NoteDto, NoteSummaryDto,

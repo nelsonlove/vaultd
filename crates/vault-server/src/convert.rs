@@ -318,6 +318,7 @@ pub(crate) fn refresh_failure(value: RefreshFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         RefreshFailure::NotReady => ProtocolError {
             code: ErrorCode::RuntimeNotReady,
@@ -325,6 +326,7 @@ pub(crate) fn refresh_failure(value: RefreshFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         RefreshFailure::Failed(error) => index_error(error),
     }
@@ -339,6 +341,7 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     };
     match value {
         IndexError::InvalidPath(message) => {
@@ -455,6 +458,7 @@ pub(crate) fn mutation_error(value: vault_index::MutationError) -> ProtocolError
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     };
     match value {
         MutationError::RevisionConflict { current, .. } => {
@@ -523,6 +527,7 @@ pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: revision,
+            position: None,
         },
         MutationFailure::Overloaded => ProtocolError {
             code: ErrorCode::RuntimeOverloaded,
@@ -530,6 +535,7 @@ pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         MutationFailure::NotReady => ProtocolError {
             code: ErrorCode::RuntimeNotReady,
@@ -537,6 +543,7 @@ pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         MutationFailure::Failed(error) => index_error(error),
     }
@@ -549,6 +556,7 @@ fn invalid_request(message: &str) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -713,6 +721,7 @@ pub(crate) fn structural_facets(
                     supported_version: None,
                     current_generation: None,
                     current_revision: None,
+                    position: None,
                 });
             }
         }
@@ -843,6 +852,7 @@ pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ProtocolError> {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         })
 }
 
