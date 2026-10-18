@@ -409,9 +409,13 @@ impl Parser {
                 self.at += 1;
             }
             let text: String = self.chars[start..self.at].iter().collect();
-            let number: f64 = text
-                .parse()
-                .map_err(|_| self.error(op_at, "a comparison needs a number"))?;
+            // `f64::from_str` also takes `inf` and `nan`; a comparison needs
+            // a finite number (and `NaN != NaN` would break tree equality).
+            let number = text
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| self.error(op_at, "a comparison needs a number"))?;
             return Ok(if op == '<' {
                 PropertyValueQuery::Less(number)
             } else {
