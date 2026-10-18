@@ -54,6 +54,23 @@
  *                    base_cache_hit_ms, base_change_ms and note_change_ms. The daemon runs with
  *                    --bases-cache-entries 1 and the harness alternates twin views, so every
  *                    filtered and whole-vault sample evaluates rather than hits.
+ *   --search QUERY   also measure `search` for QUERY (repeatable). Per query, three series,
+ *                    each printing the `total_files` of its first answer so an empty answer is
+ *                    visible: search_uncached (context "none"; the daemon runs with
+ *                    --search-cache-entries 1 and the harness alternates QUERY with a twin, the
+ *                    same query with the case of its last ASCII letter flipped, whose canonical
+ *                    spelling differs and whose answer is the same, so every sample computes);
+ *                    search_cached (QUERY again and again at one generation, context "none");
+ *                    and search_cached_line (the same with context "line", which reads its
+ *                    page's lines from SQLite on every request, cached or not). A run whose twin
+ *                    answers a different total_files is refused. Any --search builds the fixture
+ *                    with the Bases fields plus the line `meeting notes` on every tenth note,
+ *                    so on 10,000 notes `meeting group` answers 1,000 files, `tag:#group-3`
+ *                    1,000 and `file:Note-0001` 100. The default --vault becomes
+ *                    target/tmp/search-baseline/n<notes>-p<prose-bytes>/vault.
+ *   --search-cache-entries N  the daemon's --search-cache-entries (default 1 with --search)
+ *   --prose-bytes N  with --search, about N bytes of seeded word salad per note (from a fixed
+ *                    list holding neither `meeting` nor `group`), on top of the other lines
  *   --keep-vault     measure an existing non-empty --vault outside target/ instead
  *                    of refusing it. **Not read-only**: the `write_note` case
  *                    creates `--samples` notes named `Bench-<label>-<run>-NNNNNN.md`
@@ -85,6 +102,7 @@ const REPO = resolve(__dirname, "..", "..");
 const DIST = join(REPO, "host", "packages", "host", "dist");
 const DEFAULT_ROOT = join(REPO, "target", "tmp", "socket-baseline");
 const BASES_ROOT = join(REPO, "target", "tmp", "bases-baseline");
+const SEARCH_ROOT = join(REPO, "target", "tmp", "search-baseline");
 
 // --- Flags -------------------------------------------------------------------
 
@@ -98,6 +116,8 @@ function parseArgs(argv) {
     keepVault: false,
     json: false,
     help: false,
+    searches: [],
+    proseBytes: 0,
   };
   const numeric = (raw, flag) => {
     const value = Number(raw);
@@ -123,6 +143,14 @@ function parseArgs(argv) {
       case "--out": out.out = resolve(next()); break;
       case "--binary": out.binary = resolve(next()); break;
       case "--base": out.base = resolve(next()); break;
+      case "--search": {
+        const query = next();
+        if (query.trim() === "") throw new Error("--search wants a non-empty query");
+        out.searches.push(query);
+        break;
+      }
+      case "--search-cache-entries": out.searchCacheEntries = numeric(next(), "--search-cache-entries"); break;
+      case "--prose-bytes": out.proseBytes = numeric(next(), "--prose-bytes"); break;
       case "--keep-vault": out.keepVault = true; break;
       case "--json": out.json = true; break;
       case "--help": case "-h": out.help = true; break;
@@ -140,7 +168,24 @@ function parseArgs(argv) {
   // A Bases run measures its own fixture (the plain notes plus `rank` and a
   // tag), so its vault, index and report never share a directory with the
   // plain run's.
-  const root = out.base ? BASES_ROOT : DEFAULT_ROOT;
+  if (out.base && out.searches.length > 0) {
+    throw new Error("--base and --search measure different fixtures; run them separately");
+  }
+  if (out.proseBytes > 0 && out.searches.length === 0) {
+    throw new Error("--prose-bytes shapes the search fixture; it needs --search");
+  }
+  if (out.searchCacheEntries !== undefined && out.searches.length === 0) {
+    throw new Error("--search-cache-entries needs --search");
+  }
+  if (out.searches.length > 0) out.searchCacheEntries ??= 1;
+  // A search run's fixture differs by size and prose, so each shape has its
+  // own directory: an existing fixture is reused, never rebuilt, and a reuse
+  // must never hand a 100,000-note run the 10,000-note vault.
+  const root = out.base
+    ? BASES_ROOT
+    : out.searches.length > 0
+      ? join(SEARCH_ROOT, `n${String(out.notes)}-p${String(out.proseBytes)}`)
+      : DEFAULT_ROOT;
   out.vault ??= join(root, "vault");
   out.index ??= join(root, `${out.transport}.sqlite3`);
   out.out ??= join(root, `${out.transport}.json`);
@@ -149,7 +194,9 @@ function parseArgs(argv) {
   // capped near 104 bytes on macOS, and the daemon refuses a longer one by
   // name; the OS tmpdir is not used because a scratch file of this run's
   // belongs with the rest of them.
-  out.socket ??= join(dirname(out.index), "b.sock");
+  // A search fixture's directory is one level deeper, so its socket sits at
+  // the search root, where a deep checkout still fits the cap.
+  out.socket ??= out.searches.length > 0 ? join(SEARCH_ROOT, "b.sock") : join(dirname(out.index), "b.sock");
   return out;
 }
 
@@ -212,18 +259,78 @@ function assertSafeToBuild(root) {
  * (`i % 100`) and a `#group-N` tag line (`i % 10`) in the body. Callers that
  * pass two arguments get the plain shape, byte for byte.
  */
-function buildVault(root, count, withBaseFields = false) {
+function buildVault(root, count, withBaseFields = false, search = null) {
   mkdirSync(root, { recursive: true });
   const pad = (n) => String(n).padStart(6, "0");
   for (let i = 0; i < count; i += 1) {
     const index = pad(i);
     const rank = withBaseFields ? `rank: ${String(i % 100)}\n` : "";
     const tag = withBaseFields ? `#group-${String(i % 10)}\n\n` : "";
+    const meeting = search && i % 10 === 0 ? "meeting notes\n\n" : "";
+    const words = search && search.proseBytes > 0 ? `${prose(i, search.proseBytes)}\n` : "";
     writeFileSync(
       join(root, `Note-${index}.md`),
-      `---\ntitle: Note ${index}\n${rank}---\n\n# Note ${index}\n\n${tag}[[Note-${pad((i + 1) % count)}]]\n`,
+      `---\ntitle: Note ${index}\n${rank}---\n\n# Note ${index}\n\n${tag}${meeting}${words}[[Note-${pad((i + 1) % count)}]]\n`,
     );
   }
+}
+
+/**
+ * The prose words: none holds `meeting`, `group` or `note`, so the answer
+ * counts of the documented queries do not move with `--prose-bytes`.
+ * `crates/vault-index/tests/search_timing.rs` uses the same list.
+ */
+const PROSE_WORDS = [
+  "the", "river", "lamp", "quietly", "under", "harbor", "stone", "seven", "winter", "basket",
+  "orange", "carry", "window", "between", "folded", "market", "silver", "paper", "early",
+  "garden", "across", "thunder", "small", "copper", "listen", "valley", "simple", "kettle",
+  "bright", "morning", "letter", "a", "of", "and", "with", "toward", "station", "maple",
+];
+
+/**
+ * About `bytes` bytes of word salad, seeded by `seed` (mulberry32), in
+ * paragraphs of about 400 bytes: the same bytes on every run.
+ */
+function prose(seed, bytes) {
+  let state = (Math.imul(seed, 0x9e3779b9) + 1) >>> 0;
+  const next = () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return (t ^ (t >>> 14)) >>> 0;
+  };
+  let out = "";
+  let line = 0;
+  while (out.length < bytes) {
+    const word = PROSE_WORDS[next() % PROSE_WORDS.length];
+    out += word;
+    line += word.length + 1;
+    if (line > 400) {
+      out += ".\n\n";
+      line = 0;
+    } else {
+      out += " ";
+    }
+  }
+  return `${out}\n`;
+}
+
+/**
+ * QUERY with the case of its last ASCII letter flipped: a different
+ * canonical spelling (the cache key), the same answer under the default
+ * `match_case: false`, and the same work. The harness checks the second half
+ * of that claim on every run (equal `total_files`).
+ */
+function searchTwin(query) {
+  for (let at = query.length - 1; at >= 0; at -= 1) {
+    const c = query[at];
+    if (/[A-Za-z]/.test(c)) {
+      const flipped = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase();
+      return `${query.slice(0, at)}${flipped}${query.slice(at + 1)}`;
+    }
+  }
+  throw new Error(`--search ${JSON.stringify(query)} has no ASCII letter to make an uncached twin from`);
 }
 
 // --- The daemon --------------------------------------------------------------
@@ -295,6 +402,9 @@ function spawnDaemon(options, socketPath, indexPath) {
   // One entry: the twin views alternate, so every measured evaluation is a
   // miss, while the cache-hit case asks one view again and again.
   if (options.base) args.push("--bases-cache-entries", "1");
+  if (options.searchCacheEntries !== undefined) {
+    args.push("--search-cache-entries", String(options.searchCacheEntries));
+  }
   return track(spawn(options.binary, args, { stdio: ["pipe", "pipe", "inherit"] }));
 }
 
@@ -496,6 +606,40 @@ async function measureRun(options, run) {
       }
     }
 
+    const searchTotals = {};
+    for (const query of options.searches) {
+      const twin = searchTwin(query);
+      const ask = (q, context) => client.request("search", { query: q, context, limit: 100 });
+      const totals = {};
+      const series = async (name, count, request) => {
+        const into = [];
+        for (let at = 0; at < count; at += 1) {
+          const started = hrtime.bigint();
+          const answer = await request(at);
+          into.push(ms(started));
+          if (at === 0) totals[name] = answer.total_files;
+        }
+        cases[`search[${query}] ${name}_ms`] = into;
+      };
+      // Warm, alternating, so the first measured sample is no colder than the rest.
+      for (let at = 0; at < 10; at += 1) await ask(at % 2 ? twin : query, "none");
+      const twinTotal = (await ask(twin, "none")).total_files;
+      await series("search_uncached", options.samples, (at) => ask(at % 2 ? twin : query, "none"));
+      if (twinTotal !== totals.search_uncached) {
+        throw new Error(
+          `the twin ${JSON.stringify(twin)} answers ${String(twinTotal)} files and ` +
+            `${JSON.stringify(query)} ${String(totals.search_uncached)}: the uncached series is void`,
+        );
+      }
+      // One query, asked again and again at one generation: every answer
+      // after the first is the cached one (capacity 1 holds exactly it).
+      await ask(query, "none");
+      await series("search_cached", options.samples, () => ask(query, "none"));
+      await ask(query, "line");
+      await series("search_cached_line", options.samples, () => ask(query, "line"));
+      searchTotals[query] = { twin, twin_total_files: twinTotal, total_files: totals };
+    }
+
     if (options.transport === "socket") await measureConnects(socketPath, options.samples, connectMs);
 
     return {
@@ -504,6 +648,7 @@ async function measureRun(options, run) {
       socket_path: info.socket_path ?? null,
       note_count: info.note_count,
       cases,
+      ...(options.searches.length > 0 ? { search_totals: searchTotals } : {}),
       environment: {
         node: process.version,
         platform: `${process.platform} ${process.arch}`,
@@ -568,7 +713,8 @@ async function main() {
   } else {
     assertSafeToBuild(options.vault);
     process.stdout.write(`baseline: building a ${String(options.notes)}-note fixture at ${options.vault}\n`);
-    buildVault(options.vault, options.notes, Boolean(options.base));
+    const search = options.searches.length > 0 ? { proseBytes: options.proseBytes } : null;
+    buildVault(options.vault, options.notes, Boolean(options.base) || search !== null, search);
   }
   mkdirSync(dirname(options.out), { recursive: true });
   mkdirSync(dirname(options.index), { recursive: true });
@@ -621,6 +767,11 @@ async function main() {
         BASE_CASES.filter((name) => name in report.cases)
           .map((name) => [name.replace(/_ms$/, "_p50_ms"), median(report.cases[name])]),
       ),
+      ...Object.fromEntries(
+        Object.keys(report.cases).filter((name) => name.startsWith("search["))
+          .map((name) => [name.replace(/_ms$/, "_p50_ms"), median(report.cases[name])]),
+      ),
+      ...(report.search_totals ? { search_totals: report.search_totals } : {}),
     })), null, 2)}\n`);
   } else {
     const show = (value) => (value === null ? "—" : `${value.toFixed(3)} ms`);
@@ -629,10 +780,22 @@ async function main() {
         `  ${options.transport} run ${String(report.run)}  connect p50 ${show(median(report.cases.connect_ms))}` +
           `  get_note p50 ${show(median(report.cases.get_note_ms))}` +
           `  write_note p50 ${show(median(report.cases.write_note_ms))}` +
-          `  load ${report.environment.load_average_after[0].toFixed(2)}\n`,
+          `  load ${report.environment.load_average_after[0].toFixed(2)}` +
+          `  load at start ${report.environment.load_average_before.map((value) => value.toFixed(2)).join(" ")}\n`,
       );
       for (const name of BASE_CASES.filter((name) => name in report.cases)) {
         process.stdout.write(`    ${name.replace(/_ms$/, "")} p50 ${show(median(report.cases[name]))}\n`);
+      }
+      for (const name of Object.keys(report.cases).filter((name) => name.startsWith("search["))) {
+        const query = name.slice("search[".length, name.lastIndexOf("] "));
+        const series = name.slice(name.lastIndexOf("] ") + 2).replace(/_ms$/, "");
+        const sorted = [...report.cases[name]].sort((a, b) => a - b);
+        const p95 = sorted[Math.min(sorted.length - 1, Math.round((sorted.length - 1) * 0.95))];
+        process.stdout.write(
+          `    ${name.replace(/_ms$/, "")} p50 ${show(median(report.cases[name]))}` +
+            `  p95 ${show(p95)}  min ${show(sorted[0])}` +
+            `  total_files ${String(report.search_totals[query].total_files[series])}\n`,
+        );
       }
     }
   }
@@ -647,6 +810,8 @@ module.exports = {
   assertSafeToBuild,
   buildVault,
   median,
+  prose,
+  searchTwin,
   ms,
   openSocketClient,
   realPathish,
