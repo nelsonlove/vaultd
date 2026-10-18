@@ -6,7 +6,7 @@ use vault_core::VaultPath;
 
 use crate::compile::{Compiled, CompiledQuery, CompiledTerm};
 use crate::document::{DocumentKind, SearchDocument, file_name};
-use crate::text::{LineIndex, Loc, fold_js, utf16_len};
+use crate::text::{LineIndex, Loc, utf16_len};
 
 /// 100, so a default page (100 files) with line text stays near 7 MB, inside
 /// the protocol's 16 MiB payload cap; 1000 would put it near 66 MB.
@@ -125,17 +125,17 @@ fn term_holds(term: &CompiledTerm, doc: &dyn SearchDocument, domain: Domain) -> 
         Domain::Tag => doc
             .tags()
             .iter()
-            .any(|tag| tag_matches(&term.tag_key, &tag.value)),
+            .any(|tag| tag_matches(&term.tag_key, &tag.folded)),
     }
 }
 
 /// P9: the tag itself or a descendant, ignoring case and a leading `#`. An
-/// empty key matches nothing (P19).
+/// empty key matches nothing (P19). `tag` is the tag's stored fold
+/// (`TagFact::folded`), so nothing is folded here.
 fn tag_matches(key: &str, tag: &str) -> bool {
     if key.is_empty() {
         return false;
     }
-    let tag = fold_js(tag);
     tag == key
         || (tag.len() > key.len() && tag.starts_with(key) && tag.as_bytes()[key.len()] == b'/')
 }
@@ -215,7 +215,7 @@ fn collect_term(
         Domain::Tag => out.content.extend(
             doc.tags()
                 .iter()
-                .filter(|tag| tag_matches(&term.tag_key, &tag.value))
+                .filter(|tag| tag_matches(&term.tag_key, &tag.folded))
                 .map(|tag| tag.span.clone()),
         ),
     }

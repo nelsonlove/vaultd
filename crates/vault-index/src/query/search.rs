@@ -252,12 +252,11 @@ fn scan(
     let tags = if needs.tags {
         tag_rows(connection)?
     } else {
-        HashMap::new()
+        Vec::new()
     };
     let tags_of = |row: &FileRow| -> &[TagFact] {
-        tags.get(row.path.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        tags.binary_search_by(|(path, _)| path.as_str().cmp(row.path.as_str()))
+            .map_or(&[][..], |at| tags[at].1.as_slice())
     };
 
     let kept: Vec<&FileRow> = rows
@@ -389,33 +388,33 @@ fn file_rows(connection: &rusqlite::Connection) -> Result<Vec<FileRow>, IndexErr
         .collect()
 }
 
-/// Every tag row, grouped by note in ordinal order.
-fn tag_rows(
-    connection: &rusqlite::Connection,
-) -> Result<HashMap<String, Vec<TagFact>>, IndexError> {
+/// Every note's tags, one entry per note in path order (`ORDER BY` with the
+/// default binary collation, which is `str`'s byte order, so the caller can
+/// binary-search it), each note's tags in ordinal order. One path string per
+/// note, not per row, and each fact carries the stored `comparison_key` as
+/// its fold, so a search folds no tag.
+fn tag_rows(connection: &rusqlite::Connection) -> Result<Vec<(String, Vec<TagFact>)>, IndexError> {
     let mut statement = connection.prepare(
-        "SELECT note_path, value, span_start, span_end FROM tags ORDER BY note_path, ordinal",
+        "SELECT note_path, value, comparison_key, span_start, span_end FROM tags \
+         ORDER BY note_path, ordinal",
     )?;
-    let raw = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut tags: HashMap<String, Vec<TagFact>> = HashMap::new();
-    for (path, value, start, end) in raw {
-        let offset = |value: i64| {
-            usize::try_from(value)
+    let mut rows = statement.query([])?;
+    let mut tags: Vec<(String, Vec<TagFact>)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let path = row.get_ref(0)?.as_str().map_err(stored_path)?;
+        let offset = |at: usize| -> Result<usize, IndexError> {
+            usize::try_from(row.get::<_, i64>(at)?)
                 .map_err(|_| IndexError::IncompatibleIndex(format!("negative tag span in {path}")))
         };
-        let span = offset(start)?..offset(end)?;
-        tags.entry(path.clone())
-            .or_default()
-            .push(TagFact { value, span });
+        let fact = TagFact {
+            value: row.get(1)?,
+            folded: row.get(2)?,
+            span: offset(3)?..offset(4)?,
+        };
+        match tags.last_mut() {
+            Some((last, facts)) if last == path => facts.push(fact),
+            _ => tags.push((path.to_owned(), vec![fact])),
+        }
     }
     Ok(tags)
 }

@@ -132,6 +132,19 @@ fn tag_matches_itself_and_its_descendants_but_not_a_suffix() {
     );
 }
 
+/// `tag:` matches the tag's stored fold (the index's `comparison_key`), not
+/// a fold computed per term: a fact whose `folded` names another tag is
+/// matched by that one.
+#[test]
+fn tag_matches_read_the_stored_fold() {
+    let mut doc = MemoryDocument::note("t.md", "#Work").with_tag("Work", 0..5);
+    assert_eq!(doc.tags[0].folded, "work", "with_tag folds as fold_js does");
+    doc.tags[0].folded = "elsewhere".into();
+    let docs = [doc];
+    assert!(paths("tag:work", &docs).is_empty());
+    assert_eq!(paths("tag:elsewhere", &docs), ["t.md"]);
+}
+
 #[test]
 fn the_case_toggle_and_the_case_operators() {
     let docs = [MemoryDocument::note("h.md", "HappyCat happycat")];

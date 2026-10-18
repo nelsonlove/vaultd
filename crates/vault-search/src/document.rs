@@ -12,11 +12,26 @@ pub enum DocumentKind {
     File,
 }
 
-/// One tag of a note: its value without `#`, and its byte span in the text.
+/// One tag of a note: its value without `#`, that value folded as
+/// JavaScript's `toLowerCase` folds it ([`crate::text::fold_js`], which is
+/// the index's stored `comparison_key`), and its byte span in the text.
+/// `tag:` matches on `folded`, so a search folds no tag.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TagFact {
     pub value: String,
+    pub folded: String,
     pub span: Range<usize>,
+}
+
+impl TagFact {
+    /// A tag whose fold is computed here.
+    pub fn new(value: &str, span: Range<usize>) -> Self {
+        TagFact {
+            value: value.to_owned(),
+            folded: crate::text::fold_js(value),
+            span,
+        }
+    }
 }
 
 /// What a query reads of one file.
@@ -61,10 +76,7 @@ impl MemoryDocument {
 
     /// The same document with one more tag.
     pub fn with_tag(mut self, value: &str, span: Range<usize>) -> Self {
-        self.tags.push(TagFact {
-            value: value.to_owned(),
-            span,
-        });
+        self.tags.push(TagFact::new(value, span));
         self
     }
 }
