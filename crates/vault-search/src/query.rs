@@ -224,6 +224,15 @@ impl fmt::Display for Query {
     }
 }
 
+/// A property's value query, printed as the value context spells it.
+struct PropertyValue<'a>(&'a Node);
+
+impl fmt::Display for PropertyValue<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_node(f, self.0, Context::Top, true)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Context {
     Top,
@@ -284,8 +293,14 @@ fn write_node(
                 Some(PropertyValueQuery::Less(n)) => write!(f, ":<{n}")?,
                 Some(PropertyValueQuery::Greater(n)) => write!(f, ":>{n}")?,
                 Some(PropertyValueQuery::Query(q)) => {
-                    f.write_str(":")?;
-                    write_node(f, q, Context::Top, true)?;
+                    // A value that starts with `<` or `>` would read back as
+                    // a comparison; in a group it reads back as this query.
+                    let value = PropertyValue(q).to_string();
+                    if value.starts_with(['<', '>']) {
+                        write!(f, ":({value})")?;
+                    } else {
+                        write!(f, ":{value}")?;
+                    }
                 }
             }
             f.write_str("]")

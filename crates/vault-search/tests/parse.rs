@@ -357,7 +357,12 @@ fn arb_leaf() -> impl Strategy<Value = Node> {
 /// property is recognized, so the value draws from terms and the boolean
 /// connectives only.
 fn arb_plain() -> impl Strategy<Value = Node> {
-    arb_leaf().prop_recursive(3, 12, 3, |inner| {
+    // Inside a value `:` is a word character, and `<` or `>` at the start of
+    // the value would read as a comparison unless the printer guards it.
+    let value_word = "[a-z0-9:<>]{1,6}"
+        .prop_filter("not a keyword", |w| w != "null")
+        .prop_map(|w| word(&w));
+    prop_oneof![arb_leaf(), value_word].prop_recursive(3, 12, 3, |inner| {
         prop_oneof![
             prop::collection::vec(inner.clone(), 2..4).prop_map(Node::And),
             prop::collection::vec(inner.clone(), 2..4).prop_map(Node::Or),
@@ -672,4 +677,21 @@ fn every_published_query_parses_to_its_tree() {
     for (text, tree) in trees {
         assert_eq!(parsed(text), tree, "{text:?}");
     }
+}
+
+/// A value word that starts with `<` or `>` is a word, not a comparison,
+/// and printing must not turn it into one.
+#[test]
+fn a_value_word_starting_with_a_comparison_sign_round_trips() {
+    assert_eq!(
+        parsed("[x:(<5)]"),
+        property(
+            word("x"),
+            Some(PropertyValueQuery::Query(Box::new(word("<5"))))
+        )
+    );
+    assert_round_trips("[x:(<5)]");
+    assert_round_trips("[x:(<5) a]");
+    assert_round_trips("[x:(>a OR b)]");
+    assert_round_trips("[x:a <5]");
 }
