@@ -20,9 +20,12 @@ Runtime tuning. Each of these requires `--vault`, exactly as `--index` does, and
 --reconcile-interval-seconds <N>    # periodic complete reconciliation, default 60; 0 disables it
 --read-only                         # refuse every operation that writes into the vault
 --bases-cache-entries <1..=4096>    # evaluated Bases views kept per generation, default 64
+--search-cache-entries <1..=1024>   # search answers kept per generation, default 16
 ```
 
 `--bases-cache-entries` bounds the least-recently-used store of evaluated views that `evaluate_base` pages are cut from (see **Bases** below). Every entry of an older generation is dropped on the first request at a newer one, so the bound applies to one generation's worth of views.
+
+`--search-cache-entries` bounds the least-recently-used store of computed search answers that `search` pages are cut from (see `search` below), in the same way: one generation's worth of answers, every older generation's dropped on the first request at a newer one. An answer whose hits, content matches and path matches together number more than 200,000 is never stored, whatever the bound; each of its pages is computed again.
 
 `--read-only` refuses every mutating operation — the eight note and folder verbs, the raw `write_file`, and a rename's link repair — with `read_only`, before any path is touched. Reads, snapshot sessions, reconciliation, and the watcher are unaffected: the daemon still indexes what other writers do, it simply never writes itself. The `.obsidian` zone is included; a read-only daemon writes nothing anywhere in the vault. The flag is fixed at startup and there is no operation that changes it.
 
@@ -261,6 +264,45 @@ Pages every `.base` file the index holds, in path order, with its declared view 
 ```json
 {"version":1,"id":"lb","outcome":{"status":"ok","value":{"type":"list_bases","value":{"generation":7,"items":[{"path":"Books.base","status":{"state":"parsed"},"views":["Table","Cards"]},{"path":"Broken.base","status":{"state":"parse_failed","message":"did not find expected ',' or ']'","span":{"start":7,"end":7}},"views":[]}],"next_cursor":null}}}}
 ```
+
+### `search`
+
+Answers Obsidian's core Search at the current generation: a query in Obsidian's own search syntax, and the files that match, each with its match spans. The grammar, the scopes, the file universe, how spans are chosen, case folding and freshness are under **Search** below.
+
+The parameters:
+
+- `query` (string, required): the query. An empty or all-whitespace query answers no files and is not an error.
+- `match_case` (boolean, default `false`): Obsidian's **Match case** toggle, for the whole query. `match-case:` and `ignore-case:` override it for their operand.
+- `sort` (default `file_name_asc`): one of `file_name_asc`, `file_name_desc`, `modified_desc`, `modified_asc`, `created_desc`, `created_asc`, Obsidian's six orders. Ties are broken by path, ascending, in every order.
+- `context` (default `line`): `none`, or `line`, which adds each content match's line text.
+- `cursor` and `limit`: the collection rule above (files per page, default 100, from 1 to 1000; 0 or more than 1000 is `invalid_cursor`).
+
+The answer carries the `generation`; `total_files` and `total_matches`, counted over the whole answer, not the page; the page of `items`, one per file; and `next_cursor`. Each item has:
+
+- `path` and `kind`: `note` for a Markdown note, `file` for every other file (an attachment, a `.base`, a `.canvas`). The value `canvas` is reserved and never produced in this phase: canvas content is not searched yet (design Ruling 4, issue #3), so a canvas is a `file`.
+- `path_matches`: half-open spans in the path string, in **UTF-16 units**, for the terms that matched the path or the file name.
+- `content_matches`: the spans in the note's text, in source order. Each has `span`, half-open **UTF-8 byte** offsets into the exact source (the same bytes `get_note` answers as `source`, the protocol's rule for every span), and `start` and `end` as Obsidian `Loc`s: `line` zero-based, `col` and `offset` in **UTF-16 units**, so a plugin or a web client can use a position without re-reading the note. With `context: line` each also carries `line_text`, the line that holds the match's start without its line break, and `line_text_start`, that text's byte offset in the source; a line longer than 512 bytes is cut to a window of 512 bytes around the match, on character boundaries. With `context: none` both keys are absent.
+- `matches_truncated`: `true` when the file had more than 100 content matches. Only the first 100 are listed; the file still counts as matched, and `total_matches` still counts every match, content and path alike.
+
+```json
+{"version":1,"id":"q","request":{"method":"search","params":{"query":"meeting -work tag:#project"}}}
+```
+
+```json
+{"version":1,"id":"q","outcome":{"status":"ok","value":{"type":"search","value":{"generation":12,"total_files":1,"total_matches":2,"items":[{"path":"Notes/Kickoff.md","kind":"note","path_matches":[],"content_matches":[{"span":{"start":20,"end":27},"start":{"line":3,"col":4,"offset":20},"end":{"line":3,"col":11,"offset":27},"line_text":"The meeting ran long.","line_text_start":16},{"span":{"start":38,"end":46},"start":{"line":4,"col":0,"offset":38},"end":{"line":4,"col":8,"offset":46},"line_text":"#project","line_text_start":38}],"matches_truncated":false}],"next_cursor":null}}}}
+```
+
+Here `Notes/Kickoff.md` holds `---\nkind: x\n---\nThe meeting ran long.\n#project\n`: `meeting` is on line 3, which starts at byte 16 after the three frontmatter lines, and the tag match covers the whole tag, `#` included. A note that holds `work`, or no `#project`, is not listed, and `-work` adds no span.
+
+**One computation per query and generation.** An answer is computed once per (query, `match_case`, `sort`, generation) and every page is cut from it, where the query is the parsed query printed in its canonical spelling, so two spellings of one query share an answer. The answer is kept in a bounded least-recently-used store (`--search-cache-entries`, default 16), and every entry of an older generation is dropped on the first request at a newer one. `context` changes only what a page renders, so it is not part of the key.
+
+**The cursor** binds the generation, the canonical query, `match_case`, `sort`, and the position of the next file. A cursor presented with another query, toggle or sort is `invalid_cursor`, and so is one whose position is past the end of the answer; a cursor from an older generation is `generation_mismatch` with `current_generation`. A page whose answer has left the store is computed again at the current generation, which a valid cursor's generation is. A request without a cursor that meets a publication between its answer and its line text is answered again, at most three times, before it is refused with `generation_mismatch`.
+
+**A search blocks only its own connection.** It runs on the requesting connection's dispatcher on the pinned evaluation read `evaluate_base` uses: it pins a generation under the publication guard on a private read connection, then scans with the guard released, so a publication is never held up by a search. The scan is exact, over the note text the index stores; there is no search index.
+
+**The page size and the payload cap.** The per-file cap of 100 matches keeps a default page (100 files with line text) near 7 MB, inside the 16 MiB payload cap. A `limit` above 100 with `context: line` is not bounded by that cap: 1000 files of 100 matches each with line text is near 66 MB, and the daemon writes the line rather than answering `payload_too_large`. This is a documented limit, as `read_dir`'s is; a client that pages large answers with line text keeps `limit` at 100 or below, or asks with `context: none`.
+
+Refusals: a query that does not parse is `query_invalid`, and a query that uses an operator or construct this build does not evaluate is `unsupported_operator`, both carrying `position` (see **Errors**); a bad cursor or a `limit` out of range is `invalid_cursor`; a cursor from an older generation is `generation_mismatch`; an unknown `sort` or `context` value, or a missing `query`, is `invalid_request`; health-only mode is `index_unavailable`; a pin that cannot be taken within its two-second budget is `storage_failure`.
 
 ## Mutations
 
@@ -605,6 +647,76 @@ The whole published Bases reference is implemented: every type, operator, global
 
 Where the published pages and a runtime capture of Obsidian disagree, the capture wins; where neither fixes a behaviour, a provisional rule answers and is listed for re-capture in `VAULTD-COMPATIBILITY.md`, and in the one case no rule was chosen (`keys()` and `values()` of an object holding an integer-like key beside others) the answer is an error cell naming the case. A formula that does not parse, or calls an unknown function or method, is an error cell in its column (ruling 7); a filter that does is a request-level `expression_invalid` or `unsupported_function`, because there are no rows to show. The parser refuses what Obsidian cannot parse: exponent literals, a method on a bare number literal, object literals, a regular-expression literal JavaScript refuses, and a raw line or paragraph separator inside a string. Regular expressions are limited to what the Rust `regex` crate expresses: a look-behind parses and is an error when evaluated.
 
+## Search
+
+`vaultd` answers Obsidian's core Search: the `search` operation above, and the two error codes `query_invalid` and `unsupported_operator` under **Errors**. The design and its rulings are in `docs/design/search.md`; the measurements are in `docs/performance/search-baseline.md`; what parity with Obsidian means, and the provisional rules that stand in for behaviour no capture has settled yet, are in the **Search parity** section of `VAULTD-COMPATIBILITY.md`. This build is the first cut (the MVP); the parity operators are refused by name until they land.
+
+### The grammar
+
+The parser reads the whole of Obsidian's published grammar, so a construct this build does not evaluate is refused by name rather than searched as text:
+
+```text
+query    := or_expr?
+or_expr  := and_expr ( "OR" and_expr )*
+and_expr := unary+                         -- juxtaposition is AND
+unary    := "-" unary | primary
+primary  := "(" or_expr ")"
+          | OPERATOR ":" operand            -- file: path: content: tag: line: block: section:
+          |                                 -- task: task-todo: task-done: match-case: ignore-case:
+          | "[" name ( ":" value )? "]"     -- property search
+          | PHRASE | REGEX | WORD
+operand  := "(" or_expr ")" | PHRASE | REGEX | WORD
+```
+
+- **AND binds tighter than OR.** `meeting work OR meetup personal` is `(meeting work) OR (meetup personal)`. `OR` is recognized only in upper case and only as a word of its own; `or` is a plain term.
+- **A word** runs to whitespace or a parenthesis. A word whose prefix before `:` is not an operator name (`foo:bar`) is a plain word, and a `"` inside a word is part of it.
+- **A phrase** is quoted, `"star wars"`, and matches its text as one needle, spaces included. Inside it `\"` is a quote and `\\` a backslash.
+- **Negation.** A leading `-` negates a word, a phrase, a group or an operator: `meeting -work`, `meeting -(work meetup)`, `-tag:#draft`.
+- **A regular expression** is `/source/flags`, where the flags are JavaScript's flag letters and end the word; `/usr/local` is a plain word.
+- **A property search** is `[name]`, `[name:value]`, `[name:null]`, `[name:<5]` or `[name:>5]`.
+- **Nesting** is bounded at 64 levels.
+
+What this build evaluates: words, phrases, AND, `OR`, groups, `-`, and the operators `file:`, `path:`, `content:`, `tag:`, `match-case:` and `ignore-case:`, each with a word, a phrase or a group as its operand, with the `match_case` toggle and all six sorts. What it refuses with `unsupported_operator`, naming the construct, with `position` at its first character: regular expressions, `line:`, `block:`, `section:`, `task:`, `task-todo:`, `task-done:`, and property search. What it refuses with `query_invalid`, with `position` at the problem: an unbalanced parenthesis, bracket or quote, an empty `()` or `[]`, a `-` with no term after it, an `OR` with no term before or after it, an operator with no operand, a property value missing after `:`, a comparison whose operand is not a finite number, and nesting deeper than 64. A malformed query is refused, never read leniently.
+
+### What each scope reads
+
+- **A plain word or phrase** matches a note's text, frontmatter included, and the note's whole vault path (P2, P5). On a non-note file it matches nothing.
+- **`content:`** matches a note's text only.
+- **`file:`** matches the file name, the last path segment with its extension (`file:.png`), of any file.
+- **`path:`** matches the whole vault path of any file (`path:"Daily notes/2022-07"`).
+- **`tag:`** matches a note's tags, body and frontmatter alike: the tag itself or a descendant (`tag:work` matches `#work` and `#work/meeting`, never `#myjob/work`), with or without the `#`, and always without case, under `match-case:` too (P9). An empty tag term matches nothing.
+- **`match-case:` and `ignore-case:`** set the case mode of their operand, overriding the toggle.
+
+Every term matches by substring, never by whole word (P1). An empty phrase matches nothing.
+
+### The file universe
+
+A Markdown note is always a candidate. Any other file is a candidate only when a positive `file:` or `path:` term (one under an even number of negations) holds for that file (P10). So `-foo` lists notes only, never every attachment; `file:(-x)` admits the attachments whose name lacks `x`; `-file:x` admits no attachment at all; and `-file:.png` still lists notes. Nothing under `.obsidian/` or any hidden folder is searched, because nothing there is indexed. The vault's **Excluded files** setting is not honoured yet: every indexed file is a candidate.
+
+### Spans
+
+A matching file reports the spans of every **positive** term in the branch that makes it match: under an `OR`, only the alternatives that hold contribute, and a term under a `-` contributes none. Each needle reports every non-overlapping occurrence, and spans that overlap are merged into one. A plain term reports its matches in the text as content spans and its matches in the path as path spans; a `file:` term's spans are placed in the whole path string; a `tag:` match is the whole tag, `#` included, as a content span.
+
+### Case folding
+
+Without `match_case`, both sides are lowercased the way JavaScript's `toLowerCase` lowercases them (P3): Unicode default lowercasing, Greek final sigma included, with no folding of diacritics and no normalization, so `cafe` does not match `café` and an NFC spelling does not match an NFD one (P4). The spans always point into the original text, never into a lowercased copy, even where lowercasing changes a character's length (`İ`, the Kelvin sign).
+
+### Positions
+
+A content `span` is UTF-8 bytes into the exact source; `start` and `end` are UTF-16 units, the unit of Obsidian's own positions; `path_matches` are UTF-16 units of the path string. A line ends at `\n`; a `\r` before it is not part of `line_text`. An error's `position` is different again: a character offset (a count of Unicode scalar values) into the query string, because a query is something a person typed.
+
+### Sorting
+
+The File name orders compare the base name (the file name without its extension) and then the extension, each with the collation the Bases evaluator uses (`localeCompare`, numeric, locale `en`; P15), so `Note.md` sorts before `Note 2.md`. The time orders read the file tree's modification and creation times. Every order breaks ties by path, ascending.
+
+### Canvas content
+
+Canvas content is not searched in this phase (design Ruling 4, issue #3): `vaultd` does not keep a canvas's bytes. A `.canvas` file is a `file`, reached only by `file:` and `path:`, never by a plain term or `content:`.
+
+### Freshness
+
+There is no search event. An answer names its `generation`; a client that holds one re-asks when a `generation_committed` it receives is newer. Live search subscriptions, which would re-evaluate a query on the changed paths alone, are designed and deferred (design Ruling 5, issue #1).
+
 ## Transports
 
 The daemon serves the same newline-delimited JSON over two doors.
@@ -791,6 +903,17 @@ Bases evaluation adds four, each naming what it refused:
 
 A failure inside one row's cell is not an error at all — it is an error cell, and the row stays. A formula or a base summary that does not parse, or calls an unknown function, is an error cell in every row too, not `expression_invalid` or `unsupported_function`: only a filter refuses the request, because a filter that cannot run leaves no rows to show. `evaluate_base` also answers `not_found` for a path with no indexed base and `invalid_request` for a `this_path` that names no note.
 
+Search adds two, each naming what it refused, and both carry `position`, the character offset (a count of Unicode scalar values) in the query where the refused construct or the problem is:
+
+- `query_invalid` — the query does not parse: an unbalanced parenthesis, bracket or quote, an empty group, a dangling `-` or `OR`, an operator with no operand, or nesting deeper than 64 levels. The message names the problem.
+- `unsupported_operator` — the query uses an operator or construct Obsidian's Search has and this build does not evaluate yet (in this build: regular expressions, `line:`, `block:`, `section:`, `task:`, `task-todo:`, `task-done:` and property search). The message names it.
+
+```json
+{"version":1,"id":"q","outcome":{"status":"err","value":{"code":"query_invalid","message":"unmatched `)`","position":3}}}
+```
+
+That is the answer to the query `a b)`: the stray `)` is the fourth character.
+
 `unknown` is reserved as a client-side catch-all for a code this build has not heard of. The server never emits it.
 
 Errors never contain raw SQL, internal cache paths, or backtraces.
@@ -823,17 +946,16 @@ Per the evolution rule below, a client MUST treat a `reason` it does not recogni
 These names document intended boundaries and are not accepted by the version 1 request enum:
 
 - `query`
-- `search`
 - `begin_transaction`
 - `commit_transaction`
 - `abort_transaction`
 
-The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above. The reserved `apply_mutation` family is no longer reserved either: it landed as the named operations under "Mutations" above — `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, `write_file`, `read_file`, and `read_dir` — rather than as one omnibus verb, because a typed refusal per operation says more than a shared one could.
+The reserved `subscribe` family is no longer reserved: it landed as `subscribe_events` and `unsubscribe`, documented above. The reserved `apply_mutation` family is no longer reserved either: it landed as the named operations under "Mutations" above — `write_note`, `create_folder`, `rename_note`, `rename_folder`, `copy_file`, `delete_note`, `delete_folder`, `patch_frontmatter`, `write_file`, `read_file`, and `read_dir` — rather than as one omnibus verb, because a typed refusal per operation says more than a shared one could. The reserved `search` family is no longer reserved: it landed as the `search` operation, documented above.
 
 ## Evolution
 
 Adding optional fields is backward-compatible. Adding operations is backward-compatible for servers and clients that reject unknown tagged variants cleanly. Renaming fields, changing meanings, or removing variants requires a new protocol version.
 
-**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, a tree entry's `kind`, a `read_dir` entry's `kind`, a subpath's `kind`, a cell's `kind`, a row's `kind`, or a base's status `state` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One asymmetry: a subpath of an unknown kind decodes as `Unknown` with its value discarded, and that `Unknown` is **not serialised again** — re-encoding a decoded response that holds one is an error, where every other `Unknown` above re-encodes as `"unknown"`. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. **The two raw path reads documented beside them, `read_file` and `read_dir`, reject unknown keys too** — the exception is the whole family under "Mutations" above, not the writes within it, so that a client cannot send one spelling to `write_file` and a quietly different one to `read_file`. Each takes a single `path` and has no optional key to be tolerant about; loosening this later would be additive, which is why the strict side is the safe one to start on. Every other read's parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in one of those reads' params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.
+**Unknown variants are tolerated, not fatal.** Clients MUST treat an unrecognized value of an event's `type`, a `generation_committed` `cause`, a `resync_required` `reason`, a `live_state`, an error `code`, a tree entry's `kind`, a `read_dir` entry's `kind`, a subpath's `kind`, a cell's `kind`, a row's `kind`, a base's status `state`, or a search hit's `kind` as *unknown* rather than as a protocol error: parse the surrounding envelope, keep every field the client does recognize, and ignore the payload it does not. `vaultd`'s own DTOs implement this — each of those enums carries an `Unknown` catch-all, and an unknown event type discards its `value` — so adding an event kind, a cause, a reason, or an error code never breaks a subscriber built against an earlier version. This tolerance is for variants a client has never heard of; a *known* variant whose payload is malformed is still an error. One asymmetry: a subpath of an unknown kind decodes as `Unknown` with its value discarded, and that `Unknown` is **not serialised again** — re-encoding a decoded response that holds one is an error, where every other `Unknown` above re-encodes as `"unknown"`. One narrowing rides along: an event object's `type` key must now precede its `value` key — `vaultd` has always written them in that order, but the previous decoder also accepted the reverse. Mutation request parameters are the deliberate exception to field-tolerance: they reject unknown keys, because a misspelled precondition must fail loudly rather than silently downgrade a conditional write. **The two raw path reads documented beside them, `read_file` and `read_dir`, reject unknown keys too** — the exception is the whole family under "Mutations" above, not the writes within it, so that a client cannot send one spelling to `write_file` and a quietly different one to `read_file`. Each takes a single `path` and has no optional key to be tolerant about; loosening this later would be additive, which is why the strict side is the safe one to start on. Every other read's parameters keep the tolerance, and the carve-out splits on **field versus value**: an unknown *field* in one of those reads' params is ignored, so a server may add optional ones; an unknown *value* in a closed set a client chose from — an `include` facet name on `snapshot_notes`, a `status` filter on `list_references`, a `severity` on `get_diagnostics`, a `sort` or a `context` on `search` — is `invalid_request`, because a request that names something the server does not serve must not be answered as though it named nothing. Additivity still holds in the direction that matters — a server may add optional fields that older clients simply omit — but a client must not send fields the server it talks to has not declared.
 
 **The `view` subpath kind is a break the version number does not mark.** It is new with Bases (phase 8). Before it, a subpath's `kind` was not on the tolerated list above, and `vaultd`'s own decoder of that time refuses a subpath kind it does not know, so a client built against it cannot decode a `get_note`, `resolve_link`, `list_references` or `snapshot_notes` response that holds a resolution to `X.base#View`: the whole response fails, not one field. The rule at the top of this section asks for a new protocol version only for renamed fields, changed meanings and removed variants, so the protocol version stays `1`; the server accepts exactly one version, so a bump would also refuse every request from every existing client. From this version on, a subpath's `kind` is on the tolerated list, so a client MUST treat a subpath kind it does not know as unknown, and a later kind breaks no conforming client. The TypeScript host's `SubpathDto` names `view`, and no part of it switches on the kind.

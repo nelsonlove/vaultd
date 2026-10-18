@@ -136,13 +136,15 @@ fn every_fenced_json_example_deserializes_against_the_real_protocol_types() {
     // that a JSON block became unparseable. Bases evaluation adds a pair each
     // for `evaluate_base` and `list_bases`, a second `resolve_link` pair (a
     // base target with a `view` subpath), and the `views_invalidated` event.
+    // Search adds a `search` pair and a fourth error-outcome example under
+    // "Errors" (`query_invalid` carrying `position`).
     assert_eq!(
-        requests, 32,
-        "expected 32 request examples, see docs/protocol.md"
+        requests, 33,
+        "expected 33 request examples, see docs/protocol.md"
     );
     assert_eq!(
-        responses, 35,
-        "expected 35 response examples (32 success + 3 error), see docs/protocol.md"
+        responses, 37,
+        "expected 37 response examples (33 success + 4 error), see docs/protocol.md"
     );
     assert_eq!(events, 5, "expected 5 event examples, see docs/protocol.md");
 }

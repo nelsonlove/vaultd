@@ -31,10 +31,23 @@ MCP, CLI, URI handling, Obsidian acceleration, the Node API shim, Swift, Elisp, 
 - `vault-index`: the persistent SQLite index, reconciliation, and the reads served from it
 - `vault-watch`: the debounced filesystem watcher
 - `vault-bases`: the Obsidian Bases file model, expression language and view evaluator, pure Rust with no I/O
+- `vault-search`: Obsidian's search grammar, the matcher and the sort, pure Rust with no I/O
 - `vault-server`: daemon composition and its two transports, stdio and a Unix domain socket
 - `host/`: a Node/TypeScript npm workspace, outside the Cargo workspace — the headless Obsidian plugin host and the `vaultd-host` binary. Built and tested on its own (`npm --prefix host run build`, `npm --prefix host test`); it supervises a `vaultd` child rather than linking against the crates.
 
 ## Current milestone
+
+### On the branch `feat/search`: search
+
+**Not merged.** `vaultd` now answers Obsidian's core Search. A new request, `search`, takes a query in Obsidian's own search syntax and answers the files that match at the current generation, each with its match spans in two units: UTF-8 bytes into the exact source, as every span in the protocol, and UTF-16 line, column and offset positions, as Obsidian's own APIs count them, plus the line text around each match. The answer is computed once per query and generation by an exact scan of the note text the index already stores (no search index, no schema change), and its pages are cut from that one computation and cached per generation. The query grammar lives in a new pure crate, `vault-search`.
+
+This first cut evaluates plain words and phrases (by substring, without case unless asked), implicit AND, `OR`, parentheses, `-` negation, the operators `file:`, `path:`, `content:`, `tag:`, `match-case:` and `ignore-case:`, the Match case toggle and Obsidian's six sort orders. The parity operators — regular expressions, `line:`, `block:`, `section:`, the three task operators and property search — are parsed and refused by name with `unsupported_operator`, never searched as text; a query that does not parse is `query_invalid` with the character position. Canvas content is not searched in this phase. The headless plugin host serves a real `global-search` instance, so tag-wrangler's search menu items work headless. One new flag:
+
+```
+--search-cache-entries <1..=1024>   search answers kept per generation (default 16; requires --vault)
+```
+
+The wire contract — the operation, the grammar as implemented, the scopes, the file universe, positions, freshness and the two error codes — is `docs/protocol.md`'s `search` entry and **Search** section; the host's `host.search`, `host.search_state` and `host.search_opened` are in `docs/protocol-host.md`. The design and its rulings are `docs/design/search.md`; the measured numbers against its six targets (every bounded one met after the fix rounds; the reconciliation target holds by construction and was not measured) are `docs/performance/search-baseline.md`; what parity with Obsidian means, and the provisional rules that stand in until the parity harness captures Obsidian's behaviour, is the **Search parity** section of `VAULTD-COMPATIBILITY.md`.
 
 ### On the branch `feat/bases-evaluation`: Bases evaluation
 

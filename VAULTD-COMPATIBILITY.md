@@ -93,6 +93,48 @@ The captures also settled the cases the pages leave open, among them loose equal
 
 **Documented limits.** No rendering of any kind. Map views evaluate to rows; their geodata and tiles are not served. A `fileclass-table` view, a plugin's, is passed through as declared, with no plugin semantics. `random()` is seeded per evaluation from the evaluation's instant, so it is stable across the pages of one answer and not across clients or generations. Property types come only from `.obsidian/types.json`. Regular expressions are limited to what the Rust `regex` crate expresses (a look-behind is an argument error when evaluated, told apart by the crate's error text). Collation approximates ICU for Latin text only. A cached answer of a view that reads `today()` holds for one local day, and a view that reads `now()` or `relative()` is never cached; no event marks the day turning over.
 
+## Search parity
+
+**Contract:** for a query, `search` answers the files Obsidian's Search lists, with the same match spans and, under each sort, the same order, except where a deviation below is named. The daemon renders nothing; parity is about the file set, the spans and the order, never about the Search pane. The wire contract is `docs/protocol.md`'s `search` entry and **Search** section; the design and its rulings are `docs/design/search.md`.
+
+**Where the behaviour comes from.** The published Search help page (`https://obsidian.md/help/plugins/search`, fetched 2026-10-17) fixes the grammar, the operators, the precedence of AND over `OR`, negation, phrases and escapes, the case toggle and the six sort orders. The public API typings fix the shape of a match (`[start, end]` pairs) and, with Obsidian's other APIs, the UTF-16 unit of its positions. Nothing is derived from `app.asar`. Where the page is silent, a provisional rule below answers.
+
+**Nothing is captured yet.** The parity harness — a generated vault, a committed query set, captures of a running Obsidian through the `obsidian` CLI, and a replay that compares file sets, spans and order — is the last part of this phase and has not run. Until it captures a rule, every rule below is **provisional**: vaultd behaves as the rule says, and a capture that disagrees changes the code to Obsidian's behaviour unless the owner rules an exception, which is then recorded here. The rules carry the design's numbers.
+
+- **P1.** Plain terms match by substring, not by whole word.
+- **P2.** A plain term or phrase matches a note's whole vault path (folders and extension included) as well as its content, and is reported as path spans; whether Obsidian matches the whole path or only the file name is to be captured.
+- **P3.** Case folding is JavaScript's `toLowerCase` on both sides (Unicode default lowercasing, the final-sigma rule included), not Unicode case folding.
+- **P4.** Diacritics are not folded (`cafe` does not match `café`), and text is not normalized (NFC and NFD spellings differ).
+- **P5.** Frontmatter text is part of the content a plain term matches.
+- **P6.** `OR` is recognized only in upper case; `or` is a plain term.
+- **P7.** A word whose prefix before `:` is not a known operator (`foo:bar`) is a plain term.
+- **P8.** A malformed query (an unbalanced parenthesis or quote, a dangling `-`, an empty `()`, a regex that does not compile) is refused with `query_invalid` rather than read leniently.
+- **P9.** `tag:work` and `tag:#work` are the same; a tag matches itself and its descendants (`#work/meeting`) but not a tag that only ends in it (`#myjob/work`, which the help page states); tag comparison ignores case, under `match-case:` too.
+- **P10.** Non-note files are candidates only when a positive `file:` or `path:` term holds for them, so `-foo` does not list every attachment, `file:(-x)` admits the attachments whose name lacks `x`, and `-file:x` admits none.
+- **P11.** A regex follows the Match case toggle, and the JavaScript features the `regex` crate lacks (look-around, back-references) are refused by name. (Regex is not built yet; it is refused with `unsupported_operator`.)
+- **P12.** `task-done:` means any task whose box holds a character other than a space, and `task-todo:` a space. (Not built yet.)
+- **P13.** `block:` units are Obsidian's `sections`, `task:` units are list items with a task box, and `section:` units run from one heading to the next heading of any level. (Not built yet.)
+- **P14.** `[prop:value]` matches by substring of the value's text, without case, any element of a list property, and `<` and `>` compare numbers. (Not built yet.)
+- **P15.** The File name sort compares base names (the file name without its extension) with `localeCompare` (numeric, locale `en`, the Bases collation), then the extensions the same way, ties broken by path; so `Note.md` sorts before `Note 2.md`.
+- **P16.** Canvas content means the `text` of text nodes (and whether file and link node labels count). (Out of this phase, Ruling 4, issue #3.)
+- **P17.** Excluded files are the `userIgnoreFilters` of `.obsidian/app.json`, matched as path prefixes or as `/regex/`. (Not built yet.)
+- **P18.** What a match span is for a plain term in a path, and whether a file name match is reported separately from content matches; and whether, after a character whose lowercase form has a different length (`İ`, `ẞ`, the Kelvin sign), Obsidian's offsets point into the lowercased text or the original. vaultd's point into the original.
+- **P19.** An empty phrase `""` and an empty regex `//` parse as terms; an empty text needle matches nothing, and an empty `tag:` term matches nothing. (The empty regex is the regex task's.)
+- **P20.** A slash term whose last segment is only JavaScript flag letters reads as a regex: `/tmp/my` is the regex `tmp` with the flags `my`, while `/usr/local` is a word.
+- **P21.** Repeated flag letters parse (`/a/gg`); whether they are refused is left to the regex compiler.
+- **P22.** A regex can span whitespace: in `a / b / c` the middle term is the regex ` b `.
+- **P23.** A `"` inside a word is part of the word (`a"b` is one word), not the start of a phrase.
+
+**What this build refuses with `unsupported_operator`**, by name, never misread as text: regular expressions, `line:`, `block:`, `section:`, `task:`, `task-todo:`, `task-done:`, and property search (`[name]`, `[name:value]`, `[name:null]`, comparisons). Each is a planned part of this phase; each task that lands one removes it from this list.
+
+**Documented limits.**
+
+- At most 100 content matches are listed per file; `matches_truncated` says when more exist, and `total_matches` counts every match.
+- Canvas content is not searched in this phase (design Ruling 4, issue #3). A canvas is a `file` and is reached only by `file:` and `path:`, never by a plain term, so parity excludes canvas content until canvas support lands.
+- The **Excluded files** setting is not honoured yet: an excluded file can be listed. Parity excludes queries over excluded files until that task lands.
+- No live search subscriptions: a client re-asks on a newer `generation_committed` (design Ruling 5, issue #1). The capture run against a real vault is deferred too (design Ruling 6, issue #2).
+- No Explain output, no recent-search history, no fuzzy or relevance order (Obsidian has none), no search inside attachments.
+
 ## Tier 2 — Behavioral and interface compatibility
 
 **Target contract:** Provide documented operations for note lookup, search, resolution, backlinks, compare-and-swap mutation, recoverable transactions, events, CLI commands, and `obsidian://` URI handling. Protocol support is declared per operation and version.
@@ -103,7 +145,7 @@ Compare-and-swap mutation is now implemented: `write_note`, `create_folder`, `re
 
 **Creating a folder inside the `.obsidian` zone is now possible**, which closes the gap earlier revisions of this document and `docs/protocol.md` recorded as the follow-up "Create folders inside the `.obsidian` zone". `create_folder` serves the configuration zone and every hidden folder as a raw create: no generation is published (the `generation` key is absent, not zero), and a `config_changed` event announces it when the folder landed inside `.obsidian/`. A plugin host can therefore make `.obsidian/plugins/<id>/` and its own configuration directory and then write into them. `delete_folder` and `rename_folder` still refuse both — making a directory is undone by removing it, while emptying `.trash/` or removing `.git/` is not — and every other containment gate on `create_folder` is unchanged, including the refusal of an ordinary-looking path that *resolves* onto an unindexable one.
 
-Recoverable transactions, search, CLI commands beyond daemon configuration, and URI handling remain targets, not implementations — as do multi-file atomicity, conflict merging, journaling, and undo, which this milestone deliberately does not attempt.
+Search is implemented as the `search` operation, with the parity status in **Search parity** above. Recoverable transactions, CLI commands beyond daemon configuration, and URI handling remain targets, not implementations — as do multi-file atomicity, conflict merging, journaling, and undo, which this milestone deliberately does not attempt.
 
 ## Tier 3 — Headless Obsidian plugin API compatibility
 
