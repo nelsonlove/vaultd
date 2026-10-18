@@ -405,6 +405,38 @@ mod tests {
     use vault_search::text::Loc;
     use vault_search::{ContentMatch, DocumentKind, FileHit};
 
+    /// `docs/protocol.md` states both bounds in words a client sizes itself
+    /// from; a change to either constant must change the document too.
+    #[test]
+    fn the_protocol_states_the_search_bounds_the_code_holds() {
+        let protocol = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/protocol.md"
+        ));
+        let times = ["once", "twice", "three times", "four times", "five times"];
+        let attempts = format!(
+            "is tried at most {} in all before it is refused",
+            times[FRESH_ATTEMPTS - 1]
+        );
+        assert!(
+            protocol.contains(&attempts),
+            "docs/protocol.md must say {attempts:?}"
+        );
+        let digits = MAX_STORED_MATCHES.to_string();
+        let mut grouped = String::new();
+        for (at, digit) in digits.chars().enumerate() {
+            if at > 0 && (digits.len() - at) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(digit);
+        }
+        let stored = format!("together number more than {grouped} is never stored");
+        assert!(
+            protocol.contains(&stored),
+            "docs/protocol.md must say {stored:?}"
+        );
+    }
+
     fn key(canonical: &str, generation: u64) -> CacheKey {
         CacheKey {
             canonical: canonical.to_string(),

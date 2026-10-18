@@ -108,7 +108,7 @@ The captures also settled the cases the pages leave open, among them loose equal
 - **P5.** Frontmatter text is part of the content a plain term matches.
 - **P6.** `OR` is recognized only in upper case; `or` is a plain term.
 - **P7.** A word whose prefix before `:` is not a known operator (`foo:bar`) is a plain term.
-- **P8.** A malformed query (an unbalanced parenthesis or quote, a dangling `-`, an empty `()`, a regex that does not compile) is refused with `query_invalid` rather than read leniently.
+- **P8.** A malformed query (an unbalanced parenthesis or quote, a dangling `-`, an empty `()`, a regex that does not compile, once regex is built) is refused with `query_invalid` rather than read leniently.
 - **P9.** `tag:work` and `tag:#work` are the same; a tag matches itself and its descendants (`#work/meeting`) but not a tag that only ends in it (`#myjob/work`, which the help page states); tag comparison ignores case, under `match-case:` too.
 - **P10.** Non-note files are candidates only when a positive `file:` or `path:` term holds for them, so `-foo` does not list every attachment, `file:(-x)` admits the attachments whose name lacks `x`, and `-file:x` admits none.
 - **P11.** A regex follows the Match case toggle, and the JavaScript features the `regex` crate lacks (look-around, back-references) are refused by name. (Regex is not built yet; it is refused with `unsupported_operator`.)
