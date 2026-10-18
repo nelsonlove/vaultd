@@ -273,8 +273,9 @@ fn scan(
                 .iter()
                 .map(|row| (row.path.as_str(), *row))
                 .collect();
-            let mut statement =
-                connection.prepare("SELECT path, source_bytes FROM notes ORDER BY path")?;
+            // In storage order: the waiting map picks the kept notes, and the
+            // sort's path tie-break makes the answer independent of it.
+            let mut statement = connection.prepare("SELECT path, source_bytes FROM notes")?;
             let mut stored = statement.query([])?;
             while let Some(note) = stored.next()? {
                 let path = note.get_ref(0)?.as_str().map_err(stored_path)?;
