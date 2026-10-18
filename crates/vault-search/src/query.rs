@@ -212,7 +212,9 @@ fn strip(node: &Node) -> Node {
 }
 
 /// The canonical spelling: parsing it gives back the same tree, positions
-/// aside.
+/// aside, except that a word that cannot be spelled bare (`foo:bar`, `/usr`,
+/// `a]` outside brackets, `null` or `OR` as a word) prints as a phrase and
+/// comes back with `phrase: true`.
 impl fmt::Display for Query {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.root {

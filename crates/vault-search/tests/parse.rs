@@ -498,3 +498,31 @@ fn a_group_inside_brackets_keeps_the_bracket_rules() {
     assert_round_trips("[status:(Draft OR Published)]");
     assert_round_trips("[x:(a b) OR c]");
 }
+
+/// A word the printer cannot spell bare prints as a phrase, so printing then
+/// parsing turns it into a phrase: chosen, not accidental.
+#[test]
+fn a_word_that_cannot_be_spelled_bare_comes_back_as_a_phrase() {
+    let reprinted = |text: &str| {
+        let printed = parse_query(text).unwrap().to_string();
+        (printed.clone(), parsed(&printed))
+    };
+    assert_eq!(
+        reprinted("foo:bar"),
+        (r#""foo:bar""#.to_string(), phrase("foo:bar"))
+    );
+    assert_eq!(reprinted("/usr").1, phrase("/usr"));
+    assert_eq!(reprinted("/usr/local").1, phrase("/usr/local"));
+    assert_eq!(reprinted("a]").1, phrase("a]"));
+    assert_eq!(reprinted("-OR").1, not(phrase("OR")));
+    assert_eq!(
+        reprinted("[x:null OR a]").1,
+        property(
+            word("x"),
+            Some(PropertyValueQuery::Query(Box::new(or(vec![
+                phrase("null"),
+                word("a")
+            ]))))
+        )
+    );
+}
