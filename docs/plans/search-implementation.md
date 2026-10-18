@@ -2724,7 +2724,7 @@ Document what the MVP ships, and move the two planning documents to their public
 - Modify: `docs/protocol.md`, `docs/protocol-host.md`, `README.md`, `VAULTD-COMPATIBILITY.md`, `docs/design/semantic-read-path.md`, `crates/vault-server/tests/docs.rs`
 - Modify: `docs/design/search.md` and `docs/plans/search-implementation.md` (moved there on `feat/search` before Task 1; they do not exist on `main`; this task updates the design's Status and fixes any link that still points at a working copy)
 
-- [ ] **Step 1: Write the failing pins** — in `tests/docs.rs`, in the style of its Bases pins: `docs/protocol.md` has a `### \`search\`` heading, a `## Search` section, the phrases `query_invalid`, `unsupported_operator`, `"position"`, `--search-cache-entries`, and no longer lists `search` under **Reserved operation families**; `README.md` names `--search-cache-entries`; `VAULTD-COMPATIBILITY.md` has a `## Search parity` heading and names every provisional rule `P1` to `P18`; `docs/protocol-host.md` names `host.search`, `host.search_state` and `host.search_opened`; and a test `every_search_error_code_is_documented_exactly_once`, in the shape of `every_bases_error_code_is_documented_exactly_once`, pins `query_invalid` and `unsupported_operator` to exactly one definition line each in `## Errors`. Run `TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test docs; echo "exit=$?"`; expected: the new pins fail, `exit=101`.
+- [ ] **Step 1: Write the failing pins** — in `tests/docs.rs`, in the style of its Bases pins: `docs/protocol.md` has a `### \`search\`` heading, a `## Search` section, the phrases `query_invalid`, `unsupported_operator`, `"position"`, `--search-cache-entries`, and no longer lists `search` under **Reserved operation families**; `README.md` names `--search-cache-entries`; `VAULTD-COMPATIBILITY.md` has a `## Search parity` heading and names every provisional rule `P1` to `P23`; `docs/protocol-host.md` names `host.search`, `host.search_state` and `host.search_opened`; and a test `every_search_error_code_is_documented_exactly_once`, in the shape of `every_bases_error_code_is_documented_exactly_once`, pins `query_invalid` and `unsupported_operator` to exactly one definition line each in `## Errors`. Run `TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test docs; echo "exit=$?"`; expected: the new pins fail, `exit=101`.
 
 - [ ] **Step 2: `docs/protocol.md`**
 
@@ -2739,7 +2739,7 @@ Document what the MVP ships, and move the two planning documents to their public
 
 - `docs/protocol-host.md`: `host.search` and `host.search_state` beside the other operations, `host.search_opened` beside the other events, and the `global-search` instance in the internal-plugins paragraph (what "open" means headless; only the two methods exist).
 - `README.md`: under **Current milestone**, a first subsection `### On the branch \`feat/search\`: search` — what the daemon does with a query, the MVP operators, the flag, and where the details are (`docs/protocol.md` **Search**, `docs/design/search.md`, `docs/performance/search-baseline.md`, `VAULTD-COMPATIBILITY.md` **Search parity**); in the Bases subsection, nothing changes.
-- `VAULTD-COMPATIBILITY.md`: a `## Search parity` section after **Bases parity**: the contract (for a query, `search` answers the files Obsidian's Search lists, with the same match spans and, under each sort, the same order, except where a deviation is named); the sources the behaviour comes from; the provisional rules `P1` to `P18`, one line each, all marked provisional until the parity harness captures them; what the MVP refuses with `unsupported_operator`; the documented limits (the per-file match cap of 100; canvas content is not searched in this phase, Ruling 4, issue #3: a canvas is a `file` kind and is reached only by `file:` and `path:`, never by a plain term, so parity excludes canvas content until then; excluded files not yet honoured until Task 15). The "Recoverable transactions, search, CLI commands …" sentence in Tier 2 drops "search".
+- `VAULTD-COMPATIBILITY.md`: a `## Search parity` section after **Bases parity**: the contract (for a query, `search` answers the files Obsidian's Search lists, with the same match spans and, under each sort, the same order, except where a deviation is named); the sources the behaviour comes from; the provisional rules `P1` to `P23`, one line each, all marked provisional until the parity harness captures them; what the MVP refuses with `unsupported_operator`; the documented limits (the per-file match cap of 100; canvas content is not searched in this phase, Ruling 4, issue #3: a canvas is a `file` kind and is reached only by `file:` and `path:`, never by a plain term, so parity excludes canvas content until then; excluded files not yet honoured until Task 15). The "Recoverable transactions, search, CLI commands …" sentence in Tier 2 drops "search".
 - `docs/design/semantic-read-path.md`: one line at the end of **Deferred follow-on**: "Search landed in phase 9; see `docs/design/search.md`."
 - `docs/design/search.md`: Status says the direction was approved and when; the Rulings section is checked to still hold Rulings 1 to 6 in the owner's words (the former Open questions are Rulings 4 to 6), and nothing is added to it; `docs/plans/search-implementation.md` is checked for links that still point at a working copy.
 
@@ -3472,6 +3472,7 @@ queries.jsonl {"id":"q001","query":"…","match_case":false,"sort":"file_name_as
 - Excluded files for P17: `.obsidian/app.json` with `"userIgnoreFilters":["Excluded/","/\\.draft\\.md$/"]`, a note under `Excluded/` and a `Notes/x.draft.md`, both holding a common word.
 - Sorting for P15: names that differ only in case (`zed.md`, `Zed.md` in two folders), numeric names (`Note 2.md`, `Note 10.md`), accented names (`Éclair.md`, `eclair.md`), and distinct `mtime_ms` for every file, two files sharing one.
 - Spans for P18: a note whose name and text both hold the searched word; a note with more than 100 occurrences of a word (the per-file cap).
+- Parse rules P19 to P23: text holding `tmp`, `usr/local`, `a"b` and ` b ` between two slashes (`a / b / c`), so the queries below can answer.
 - `.obsidian/core-plugins.json` enabling `global-search`.
 
 **What the query set holds** — at least one query per line below, and each line's queries carry its probe names:
@@ -3485,6 +3486,7 @@ queries.jsonl {"id":"q001","query":"…","match_case":false,"sort":"file_name_as
 - `canvas`: a word only a canvas text node holds; a word only a canvas file node's path holds.
 - `excluded`: the common word of the excluded notes (Obsidian hides them).
 - `sort`: one multi-file query under each of the six sorts.
+- The parse rules, at least one query each, probing the rule by name: `""` and `//` (P19); `/tmp/my` and `/usr/local` (P20); `/a/gg` (P21); `a / b / c` (P22); `a"b` (P23).
 - `refused`: `(a b`, `a b)`, `"abc`, `a -`, `OR a`, `file:`, `[]`, `/a(/`, each `"expect":"refused"`, recording what Obsidian does with a query this daemon refuses (P8).
 
 - [ ] **Step 1: Write the failing fixture test**
@@ -3516,7 +3518,10 @@ fn queries() -> Vec<QueryRow> {
     std::fs::read_to_string(fixtures().join("queries.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
-const RULES: [&str; 18] = ["P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","P11","P12","P13","P14","P15","P16","P17","P18"];
+const RULES: [&str; 23] = [
+    "P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","P11","P12","P13","P14","P15","P16","P17","P18",
+    "P19","P20","P21","P22","P23",
+];
 const FAMILIES: [&str; 22] = [
     "plain", "or", "group", "negation", "file", "path", "content", "tag", "line", "block", "section", "task",
     "task-todo", "task-done", "match-case", "ignore-case", "regex", "property", "canvas", "excluded", "sort", "refused",
@@ -3576,7 +3581,7 @@ git add host/scripts/search-parity.js crates/vault-server/tests/fixtures/search-
 git commit -F - <<'COMMIT'
 test(search): the parity corpus and query set, generated and committed
 
-host/scripts/search-parity.js generates a made-up parity vault's manifest and a query set that probes every operator, every sort, both case modes and every provisional rule P1 to P18, including queries this daemon refuses, and materializes the vault under target/tmp with its modification times. A test checks the fixtures are well formed and that every rule, operator family and sort is probed.
+host/scripts/search-parity.js generates a made-up parity vault's manifest and a query set that probes every operator, every sort, both case modes and every provisional rule P1 to P23, including queries this daemon refuses, and materializes the vault under target/tmp with its modification times. A test checks the fixtures are well formed and that every rule, operator family and sort is probed.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 COMMIT
@@ -3720,9 +3725,9 @@ A deviation entry is `{"id":"q042","kind":"spans","ruling":"S1: <the owner's wor
 
 - [ ] **Step 2: Run it and read the differences** — `TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test search_replay -- --nocapture; echo "exit=$?"`. Expected the first time: differences, `exit=101`. Every difference is classified, in a table in the task report, as one of: a provisional rule the capture settles the other way (a bug: fix the code, with the capture as the test); a defect in this build (fix it); or a behaviour the owner may prefer to keep (filed for a ruling, with both options and a pick).
 
-- [ ] **Step 3: Settle the rules** — for each of `P1` to `P18`, change the code where the capture contradicts it (each change with a unit test in `vault-search` that pins the captured behaviour, citing the capture id), re-run the replay until only ruled deviations remain, and record the owner's rulings in `deviations.json`. A rule no capture could reach (for example a case or sort route the view did not expose) stays provisional and is named as such.
+- [ ] **Step 3: Settle the rules** — for each of `P1` to `P23`, change the code where the capture contradicts it (each change with a unit test in `vault-search` that pins the captured behaviour, citing the capture id), re-run the replay until only ruled deviations remain, and record the owner's rulings in `deviations.json`. A rule no capture could reach (for example a case or sort route the view did not expose) stays provisional and is named as such.
 
-- [ ] **Step 4: The compatibility record** — rewrite `VAULTD-COMPATIBILITY.md`'s **Search parity** provisional list as: how it was captured (Obsidian's version and the date from `meta.json`, the routes that worked); a table of `P1` to `P18` with the verdict of each (captured as provisional, captured otherwise and fixed, ruled deviation with its ruling, or still provisional and why); and what the optional real-vault run showed, in counts only.
+- [ ] **Step 4: The compatibility record** — rewrite `VAULTD-COMPATIBILITY.md`'s **Search parity** provisional list as: how it was captured (Obsidian's version and the date from `meta.json`, the routes that worked); a table of `P1` to `P23` with the verdict of each (captured as provisional, captured otherwise and fixed, ruled deviation with its ruling, or still provisional and why); and what the optional real-vault run showed, in counts only.
 
 - [ ] **Step 5: Run it and see it pass** — `TMPDIR="$PWD/target/tmp" cargo test -p vault-server --test search_replay; echo "exit=$?"` and `TMPDIR="$PWD/target/tmp" cargo test -p vault-search; echo "exit=$?"`; expected `exit=0` twice.
 
@@ -3735,7 +3740,7 @@ git add crates VAULTD-COMPATIBILITY.md
 git commit -F - <<'COMMIT'
 test(search): replay Obsidian's captured answers and settle the provisional rules
 
-search_replay rebuilds the generated vault, runs every captured query through search, and compares file sets, match spans in UTF-16 units, the order under each sort, and match counts; every difference fails unless deviations.json names it with the owner's ruling, and a deviation that no longer occurs fails too. Each provisional rule P1 to P18 is settled against the captures: the ones they contradicted are fixed with a unit test citing the capture, and the compatibility record lists every verdict.
+search_replay rebuilds the generated vault, runs every captured query through search, and compares file sets, match spans in UTF-16 units, the order under each sort, and match counts; every difference fails unless deviations.json names it with the owner's ruling, and a deviation that no longer occurs fails too. Each provisional rule P1 to P23 is settled against the captures: the ones they contradicted are fixed with a unit test citing the capture, and the compatibility record lists every verdict.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 COMMIT
@@ -3795,7 +3800,7 @@ Every section of `docs/design/search.md`, and the task that implements it.
 | Goals 5 | The parity harness | 18, 19, 20 |
 | Goals 6 | Performance; reconciliation unchanged | 9, 21 |
 | What Obsidian's Search does | Every stated behaviour | 1 (syntax), 3 (scopes, case, sorts, file universe), 11–16 |
-| UNVERIFIED P1–P18 | Implemented as named provisional rules, listed, then settled | 1 (P6–P8), 2 (P3, P4), 3 (P1, P2, P5, P9, P10, P15, P18), 11 (P11), 12 (P12, P13), 13 (P14), 15 (P17); P16 stays provisional (Ruling 4, issue #3); 10 (listed); 20 (settled) |
+| UNVERIFIED P1–P23 | Implemented as named provisional rules, listed, then settled | 1 (P6–P8, P19–P23), 2 (P3, P4), 3 (P1, P2, P5, P9, P10, P15, P18), 11 (P11), 12 (P12, P13), 13 (P14), 15 (P17); P16 stays provisional (Ruling 4, issue #3); 10 (listed); 20 (settled) |
 | CLI and vault-mcp | The CLI is the capture route; vault-mcp's tool is not a parity source | 19 |
 | Non-goals | No fuzzy search, attachment text, live subscriptions, Explain prose, history, rendering | none by construction |
 | Architecture — `vault-search` grammar | Scannerless parser, tree, positions, printer | 1 |
