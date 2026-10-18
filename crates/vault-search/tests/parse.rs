@@ -366,6 +366,28 @@ fn arb_plain() -> impl Strategy<Value = Node> {
     })
 }
 
+fn arb_property_name() -> impl Strategy<Value = Node> {
+    prop_oneof![
+        arb_word().prop_map(|w| word(&w)),
+        "[a-z :]{1,6}".prop_map(|p| phrase(&p)),
+    ]
+}
+
+/// Every value form: none, `null`, the two comparisons over finite numbers
+/// (Rust's `f64` Display round-trips exactly), and a sub-query.
+fn arb_property_value() -> impl Strategy<Value = Option<PropertyValueQuery>> {
+    let finite = any::<f64>().prop_filter("finite", |n| n.is_finite());
+    prop_oneof![
+        Just(None),
+        Just(Some(PropertyValueQuery::Null)),
+        finite
+            .clone()
+            .prop_map(|n| Some(PropertyValueQuery::Less(n))),
+        finite.prop_map(|n| Some(PropertyValueQuery::Greater(n))),
+        arb_plain().prop_map(|n| Some(PropertyValueQuery::Query(Box::new(n)))),
+    ]
+}
+
 fn arb_node() -> impl Strategy<Value = Node> {
     arb_leaf().prop_recursive(4, 24, 4, |inner| {
         prop_oneof![
@@ -389,10 +411,8 @@ fn arb_node() -> impl Strategy<Value = Node> {
             )
                 .prop_map(|(scope, n)| scoped(scope, n)),
             (any::<bool>(), inner.clone()).prop_map(|(s, n)| case(s, n)),
-            (arb_word(), arb_plain()).prop_map(|(name, n)| property(
-                word(&name),
-                Some(PropertyValueQuery::Query(Box::new(n)))
-            )),
+            (arb_property_name(), arb_property_value())
+                .prop_map(|(name, value)| property(name, value)),
         ]
     })
 }
