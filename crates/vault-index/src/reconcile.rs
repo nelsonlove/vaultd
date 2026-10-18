@@ -5,7 +5,7 @@ use std::time::Instant;
 use vault_core::{
     Diagnostic, DiagnosticCode, LinkTarget, ParsedNote, Resolution, ResolutionNote, ScanError,
     ScanReport, SemanticGraph, Severity, SourceDocument, SourceError, VaultPath,
-    build_graph_with_bases, parse_note,
+    build_graph_with_bases,
 };
 
 use crate::bases::{BaseDelta, BaseRecord};
@@ -702,6 +702,10 @@ impl IndexService {
         // removal, deletion, and the scan-diagnostics diff are the real
         // signals.
         let mut semantic_change = previous.is_none() || !deleted.is_empty();
+        // Documents whose content moved, parsed together after the read loop
+        // (see `parallel_parse`): reads and classification stay serial here.
+        let mut to_parse: Vec<SourceDocument> = Vec::new();
+        let mut to_parse_fingerprints: Vec<FileFingerprint> = Vec::new();
 
         for path in &to_read {
             let fingerprint = first.entries[path];
@@ -732,11 +736,8 @@ impl IndexService {
                                 changed += 1;
                             }
                             semantic_change = true;
-                            let parse_start = Instant::now();
-                            let parsed = parse_note(source);
-                            metrics.stages.parse += parse_start.elapsed();
-                            metrics.work.affected_references += parsed.references.len() as u64;
-                            replaced.push((parsed, fingerprint));
+                            to_parse.push(source);
+                            to_parse_fingerprints.push(fingerprint);
                         }
                     }
                     Err(SourceError::InvalidUtf8 { path, error }) => {
@@ -768,6 +769,15 @@ impl IndexService {
                     return Err(IndexError::InvalidVaultRoot(message));
                 }
             }
+        }
+
+        let parse_start = Instant::now();
+        let parsed =
+            crate::parallel_parse::parse_in_order(to_parse, crate::parallel_parse::parse_threads());
+        metrics.stages.parse += parse_start.elapsed();
+        for (note, fingerprint) in parsed.into_iter().zip(to_parse_fingerprints) {
+            metrics.work.affected_references += note.references.len() as u64;
+            replaced.push((note, fingerprint));
         }
 
         metrics.work.changed_notes = added + changed;

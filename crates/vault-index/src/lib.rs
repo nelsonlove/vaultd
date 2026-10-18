@@ -10,6 +10,7 @@ mod live_reconcile;
 mod metrics;
 mod model;
 mod mutate;
+mod parallel_parse;
 mod query;
 mod reader;
 mod reconcile;
