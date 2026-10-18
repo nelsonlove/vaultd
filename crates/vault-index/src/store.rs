@@ -302,15 +302,19 @@ impl IndexStore {
         fingerprint: FileFingerprint,
     ) -> Result<(), IndexError> {
         let path = note.source.path().as_str();
-        transaction.execute("DELETE FROM notes WHERE path = ?1", params![path])?;
+        transaction
+            .prepare_cached("DELETE FROM notes WHERE path = ?1")?
+            .execute(params![path])?;
 
         let (filename_key, stem_key) = codec::comparison_keys(note.source.path());
-        transaction.execute(
-            "INSERT INTO notes \
+        transaction
+            .prepare_cached(
+                "INSERT INTO notes \
              (path, content_revision, source_bytes, filename_comparison_key, \
               stem_comparison_key, observed_size, observed_mtime_seconds, observed_mtime_nanos) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
+            )?
+            .execute(params![
                 path,
                 note.source.revision().as_str(),
                 note.source.text().as_bytes(),
@@ -319,8 +323,7 @@ impl IndexStore {
                 u64_to_i64(fingerprint.size, "observed size")?,
                 fingerprint.modified_seconds,
                 i64::from(fingerprint.modified_nanos),
-            ],
-        )?;
+            ])?;
 
         // Prepared once per connection and reused for every row of the
         // transaction (and every later one).
@@ -353,25 +356,28 @@ impl IndexStore {
         drop(insert_property);
 
         for (ordinal, alias) in note.aliases.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO aliases (note_path, ordinal, value, span_start, span_end) \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO aliases (note_path, ordinal, value, span_start, span_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "alias ordinal")?,
                     alias.value,
                     usize_to_i64(alias.span.start(), "alias span start")?,
                     usize_to_i64(alias.span.end(), "alias span end")?,
-                ],
-            )?;
+                ])?;
         }
 
         for (ordinal, heading) in note.headings.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO headings \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO headings \
                  (note_path, ordinal, level, text, comparison_key, span_start, span_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "heading ordinal")?,
                     i64::from(heading.level),
@@ -379,49 +385,52 @@ impl IndexStore {
                     heading.text.to_lowercase(),
                     usize_to_i64(heading.span.start(), "heading span start")?,
                     usize_to_i64(heading.span.end(), "heading span end")?,
-                ],
-            )?;
+                ])?;
         }
 
         for (ordinal, block) in note.blocks.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO blocks (note_path, ordinal, identifier, span_start, span_end) \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO blocks (note_path, ordinal, identifier, span_start, span_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "block ordinal")?,
                     block.value,
                     usize_to_i64(block.span.start(), "block span start")?,
                     usize_to_i64(block.span.end(), "block span end")?,
-                ],
-            )?;
+                ])?;
         }
 
         for (ordinal, tag) in note.tags.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO tags \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO tags \
                  (note_path, ordinal, value, comparison_key, span_start, span_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "tag ordinal")?,
                     tag.value,
                     tag.comparison_key,
                     usize_to_i64(tag.span.start(), "tag span start")?,
                     usize_to_i64(tag.span.end(), "tag span end")?,
-                ],
-            )?;
+                ])?;
         }
 
         for (ordinal, reference) in note.references.iter().enumerate() {
             let columns = codec::encode_reference_columns(reference);
-            transaction.execute(
-                "INSERT INTO note_references \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO note_references \
                  (note_path, ordinal, kind, origin, raw_target, file_target, \
                   subpath_kind, subpath_value, display, span_start, span_end, \
                   target_span_start, target_span_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "reference ordinal")?,
                     columns.kind,
@@ -435,37 +444,39 @@ impl IndexStore {
                     usize_to_i64(reference.span.end(), "reference span end")?,
                     usize_to_i64(reference.target_span.start(), "target span start")?,
                     usize_to_i64(reference.target_span.end(), "target span end")?,
-                ],
-            )?;
+                ])?;
         }
 
         // Structural rows ride the same funnel as every other per-note row,
         // so the delta/live route gets them for free: `publish_delta` replaces
         // a note through this function too.
         for (ordinal, section) in note.sections.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO sections \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO sections \
                  (note_path, ordinal, kind, span_start, span_end, block_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "section ordinal")?,
                     codec::encode_section_kind(&section.kind),
                     usize_to_i64(section.span.start(), "section span start")?,
                     usize_to_i64(section.span.end(), "section span end")?,
                     section.block_id.as_deref(),
-                ],
-            )?;
+                ])?;
         }
 
         for (ordinal, item) in note.list_items.iter().enumerate() {
             let (list_start_line, parent_start_line) = codec::encode_list_item_parent(item.parent);
-            transaction.execute(
-                "INSERT INTO list_items \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO list_items \
                  (note_path, ordinal, span_start, span_end, list_start_line, \
                   parent_start_line, task) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "list item ordinal")?,
                     usize_to_i64(item.span.start(), "list item span start")?,
@@ -473,16 +484,17 @@ impl IndexStore {
                     list_start_line,
                     parent_start_line,
                     codec::encode_task(item.task),
-                ],
-            )?;
+                ])?;
         }
 
         for (ordinal, diagnostic) in note.diagnostics.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO note_diagnostics \
+            transaction
+                .prepare_cached(
+                    "INSERT INTO note_diagnostics \
                  (note_path, ordinal, code, severity, message, path, span_start, span_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
+                )?
+                .execute(params![
                     path,
                     usize_to_i64(ordinal, "diagnostic ordinal")?,
                     codec::encode_diagnostic_code(diagnostic.code),
@@ -497,8 +509,7 @@ impl IndexStore {
                         .span
                         .map(|span| usize_to_i64(span.end(), "diagnostic span end"))
                         .transpose()?,
-                ],
-            )?;
+                ])?;
         }
         Ok(())
     }
@@ -541,57 +552,65 @@ impl IndexStore {
         let mut diagnostic_rows_written = 0u64;
         for path in graph.note_paths() {
             for (ordinal, resolved) in graph.outgoing(path).iter().enumerate() {
-                let reference_id: i64 = transaction.query_row(
-                    "SELECT id FROM note_references WHERE note_path = ?1 AND ordinal = ?2",
-                    params![path.as_str(), usize_to_i64(ordinal, "reference ordinal")?],
-                    |row| row.get(0),
-                )?;
+                let reference_id: i64 = transaction
+                    .prepare_cached(
+                        "SELECT id FROM note_references WHERE note_path = ?1 AND ordinal = ?2",
+                    )?
+                    .query_row(
+                        params![path.as_str(), usize_to_i64(ordinal, "reference ordinal")?],
+                        |row| row.get(0),
+                    )?;
                 let stored = codec::encode_resolution(&resolved.resolution);
-                transaction.execute(
-                    "INSERT INTO resolutions \
+                transaction
+                    .prepare_cached(
+                        "INSERT INTO resolutions \
                      (reference_id, kind, target_path, subpath_kind, subpath_value) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
+                    )?
+                    .execute(params![
                         reference_id,
                         stored.kind,
                         stored.target_path,
                         stored.subpath_kind,
                         stored.subpath_value,
-                    ],
-                )?;
+                    ])?;
                 resolution_rows_written += 1;
                 for (candidate_ordinal, candidate) in stored.candidates.iter().enumerate() {
-                    transaction.execute(
-                        "INSERT INTO resolution_candidates \
+                    transaction
+                        .prepare_cached(
+                            "INSERT INTO resolution_candidates \
                          (reference_id, ordinal, candidate_path) VALUES (?1, ?2, ?3)",
-                        params![
+                        )?
+                        .execute(params![
                             reference_id,
                             usize_to_i64(candidate_ordinal, "candidate ordinal")?,
                             candidate,
-                        ],
-                    )?;
+                        ])?;
                 }
 
                 let target = LinkTarget::from(&resolved.reference);
                 for key in reference_dependencies(path, &target, &resolved.resolution) {
-                    transaction.execute(
-                        "INSERT INTO resolution_dependencies \
+                    transaction
+                        .prepare_cached(
+                            "INSERT INTO resolution_dependencies \
                          (reference_id, dependency_kind, comparison_key) VALUES (?1, ?2, ?3)",
-                        params![
+                        )?
+                        .execute(params![
                             reference_id,
                             codec::encode_dependency_kind(key.kind),
                             key.comparison_key,
-                        ],
-                    )?;
+                        ])?;
                     dependency_rows_written += 1;
                 }
 
                 if let Some(diagnostic) = resolution_diagnostic(resolved) {
-                    transaction.execute(
-                        "INSERT INTO resolution_diagnostics \
+                    transaction
+                        .prepare_cached(
+                            "INSERT INTO resolution_diagnostics \
                          (reference_id, code, severity, message, path, span_start, span_end) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
+                        )?
+                        .execute(params![
                             reference_id,
                             codec::encode_diagnostic_code(diagnostic.code),
                             codec::encode_severity(diagnostic.severity),
@@ -605,8 +624,7 @@ impl IndexStore {
                                 .span
                                 .map(|span| usize_to_i64(span.end(), "diagnostic span end"))
                                 .transpose()?,
-                        ],
-                    )?;
+                        ])?;
                     diagnostic_rows_written += 1;
                 }
             }
@@ -1184,24 +1202,21 @@ fn insert_diagnostic_row(
     ordinal: usize,
     diagnostic: &Diagnostic,
 ) -> Result<(), IndexError> {
-    transaction.execute(
-        sql,
-        params![
-            usize_to_i64(ordinal, "diagnostic ordinal")?,
-            codec::encode_diagnostic_code(diagnostic.code),
-            codec::encode_severity(diagnostic.severity),
-            diagnostic.message,
-            diagnostic.path.as_ref().map(VaultPath::as_str),
-            diagnostic
-                .span
-                .map(|span| usize_to_i64(span.start(), "diagnostic span start"))
-                .transpose()?,
-            diagnostic
-                .span
-                .map(|span| usize_to_i64(span.end(), "diagnostic span end"))
-                .transpose()?,
-        ],
-    )?;
+    transaction.prepare_cached(sql)?.execute(params![
+        usize_to_i64(ordinal, "diagnostic ordinal")?,
+        codec::encode_diagnostic_code(diagnostic.code),
+        codec::encode_severity(diagnostic.severity),
+        diagnostic.message,
+        diagnostic.path.as_ref().map(VaultPath::as_str),
+        diagnostic
+            .span
+            .map(|span| usize_to_i64(span.start(), "diagnostic span start"))
+            .transpose()?,
+        diagnostic
+            .span
+            .map(|span| usize_to_i64(span.end(), "diagnostic span end"))
+            .transpose()?,
+    ])?;
     Ok(())
 }
 
