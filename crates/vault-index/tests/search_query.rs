@@ -128,6 +128,31 @@ fn a_note_with_no_stored_body_searches_as_empty_text() {
 }
 
 #[test]
+fn a_note_with_no_stored_body_searches_as_empty_text_on_the_per_note_path() {
+    // One kept note of five takes the per-note body path (fewer than a
+    // quarter of the notes), and the kept note has no stored body.
+    let (service, _vault, _index) = service(&[
+        ("bad.md", b"meeting \xff\n"),
+        ("a.md", b"meeting\n"),
+        ("b.md", b"meeting\n"),
+        ("c.md", b"other\n"),
+        ("d.md", b"other\n"),
+    ]);
+    let compiled = compile(&parse_query("file:bad -meeting").unwrap(), false).unwrap();
+    let answer = service
+        .reader()
+        .unwrap()
+        .search(&SearchQuery {
+            compiled: &compiled,
+            sort: SortOrder::FileNameAsc,
+        })
+        .unwrap();
+    let paths: Vec<&str> = answer.hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(paths, ["bad.md"], "it searches as the empty text");
+    assert_eq!(answer.texts_read, 0, "no body is stored for it to read");
+}
+
+#[test]
 fn only_candidate_bodies_are_read() {
     let (service, _vault, _index) = service(&[
         ("Notes/Kickoff.md", KICKOFF),
