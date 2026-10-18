@@ -9,6 +9,7 @@ Baselines for the search MVP (`docs/plans/search-implementation.md`, Task 9). Th
 - Date: 2026-10-18, all series.
 - Machine: MacBook Pro, Apple M2 Max (`Mac14,6`), 12 cores, 96 GiB, shared with other sessions (see above). Every run started behind `fleet-gate --in-session`; the load at each run's start (1, 5, 15 minutes) is given beside its numbers.
 - OS: macOS 26.4.1 (Darwin 25.4.0), arm64. Node v26.11.1.
+- Re-measure of `meeting group` and `tag:#group-3` (rows 1 and 3 of the table, and **Re-measured on the fixed build** under number 3): `vaultd` built in release at `5dfd0c3`, which holds follow-ups 1 and 2 (`6d58a5b`, `05b1294`, `5dfd0c3`). One series of three runs on the synthetic fixture, 5-minute load 18.5 to 19.1.
 - Engine: `vaultd`, `vault-bench` and the `search_timing` test built in release on branch `feat/search` at `17ebb07` (the engine; the harness and the timing test are `91cc175`, which changes neither). The phase 8 comparison binaries were built from `main` at `8154840` (the merge base of `feat/search`) in a throwaway worktree.
 
 ## The fixtures
@@ -23,10 +24,10 @@ Each harness series is three daemon runs (`--repeat 3`) of 200 samples (50 at 10
 
 | Requirement | Bound | Measured p50 | Verdict |
 | --- | --- | --- | --- |
-| 1. `meeting group`, first page, uncached | under 50 ms | 10.311 ms (series 10.310, 10.364) | met |
+| 1. `meeting group`, first page, uncached | under 50 ms | 10.311 ms (series 10.310, 10.364); at `5dfd0c3`: 8.968 ms | met |
 | 2. a cached page, `context: none` | under 1 ms | 0.238 ms (series 0.241, 0.235) | met |
 | 2, reported beside it: a cached page, `context: line` | no bound | 0.393 ms (series 0.390, 0.395) | — |
-| 3. `tag:#group-3`, uncached | under 10 ms | 11.291 ms (series 11.192, 11.390) | **missed** (see below) |
+| 3. `tag:#group-3`, uncached | under 10 ms | 11.291 ms (series 11.192, 11.390); at `5dfd0c3`: 7.727 ms | missed at `17ebb07`; **met** at `5dfd0c3` (see below) |
 | 3. `file:Note-0001`, uncached | under 10 ms | 5.111 ms (series 5.084, 5.138) | met |
 | 4. a publication during a whole-vault search | under 2 ms | p50 0.597 to 0.671 ms, max 1.287 to 1.881 ms | met |
 | 5. reconciliation against phase 8 | within 5 percent | not measured (disk floor) | met by construction, unmeasured (see below) |
@@ -47,7 +48,19 @@ The mechanism, from the index-side split (the `search_costs_by_shape` table, bel
 - `tag_matches` folds every tag value with `fold_js` (one allocation per tag per term), although `tags.comparison_key` stores the same fold already;
 - the query needs text (a tag match's position is a `Loc`, read from the note's text), so the 1,000 surviving notes' bodies are read one by one: about 1.4 ms (the 10 percent row of the body-read table).
 
-What would close it, measured nowhere here: filter `tag_rows` in SQL by `comparison_key` for a positive `tag:` conjunct (the prefilter already proves it is a superset), and match on the stored fold. The stored fold and a cheaper `tag_rows` landed after these measurements (follow-up 2); the SQL filter did not. The fixed build is not measured yet (see **Follow-ups**).
+What closes it: filter `tag_rows` in SQL by `comparison_key` for a positive `tag:` conjunct (the prefilter already proves it is a superset), and match on the stored fold. Both landed after these measurements (follow-up 2: the stored fold and a cheaper `tag_rows` in `05b1294`, the SQL filter in `5dfd0c3`), and the fixed build is measured below.
+
+#### Re-measured on the fixed build
+
+`vaultd` at `5dfd0c3` (follow-ups 1 and 2 complete), one series of three daemon runs of 200 samples on the synthetic fixture, the same harness and twins as above. p50 / p95 / min, ms:
+
+| Run | Load at start (1, 5, 15 min) | `meeting group` uncached | cached | line | `tag:#group-3` uncached | cached | line |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| r1 run 1 | 22.79 19.07 15.91 | 8.883 / 9.399 / 8.332 | 0.217 / 0.249 / 0.204 | 0.357 / 0.416 / 0.337 | 7.727 / 8.238 / 7.110 | 0.160 / 0.189 / 0.138 | 0.292 / 0.338 / 0.252 |
+| r1 run 2 | 20.51 18.70 15.82 | 8.968 / 9.346 / 8.396 | 0.221 / 0.250 / 0.200 | 0.385 / 0.428 / 0.337 | 7.681 / 8.213 / 7.225 | 0.143 / 0.177 / 0.129 | 0.274 / 0.333 / 0.243 |
+| r1 run 3 | 19.43 18.51 15.76 | 9.198 / 10.140 / 8.719 | 0.230 / 0.323 / 0.203 | 0.401 / 0.652 / 0.342 | 7.936 / 8.546 / 7.223 | 0.157 / 0.195 / 0.135 | 0.291 / 0.373 / 0.251 |
+
+`tag:#group-3` uncached: p50 7.727 ms (median of 7.727, 7.681, 7.936), 2.3 ms under the bound; every run's p95 (8.213 to 8.546 ms) is under it too. Every answer was 1,000 files, as designed. Against `17ebb07` it is 3.6 ms faster (11.291 to 7.727 ms); the loads were lower here (5-minute 18.5 to 19.1 against 22 to 30), so not all of the gain is the code. `meeting group` uncached is 8.968 ms (10.311 at `17ebb07`), which is follow-up 1. With a required `tag:` term the index reads only the tag rows of the notes that hold the tag or a descendant, through `tags_lookup` as a covering index (checked with `EXPLAIN QUERY PLAN` on the fixture index), so the query reads 1,000 tag rows in place of 10,000; the 1,000 body reads (about 1.4 ms) and the 4.6 ms floor stay.
 
 ### Per run (harness)
 
@@ -176,10 +189,10 @@ The same text costs 50 times more on one line, and a 1 MB single-line note (a mi
 
 ## Follow-ups
 
-Each is inside `vault-search` or `query/search.rs` and changes no answer. Follow-ups 1 and 2 were fixed after the measurements above, on the coordinator's order: `6d58a5b` and `05b1294`. Every number in this document is from the build before them (`17ebb07`). The re-measure of `tag:#group-3` and `meeting group` was not run: the free disk was 54 GB, under the 60 GB floor this task works to. So the number 3 verdict stays **missed** until a run on the fixed build says otherwise.
+Each is inside `vault-search` or `query/search.rs` and changes no answer. Follow-ups 1 and 2 were fixed after the measurements above, on the coordinator's order: `6d58a5b`, `05b1294` and `5dfd0c3`. Every number in this document is from the build before them (`17ebb07`), except the re-measure of `meeting group` and `tag:#group-3` at `5dfd0c3` (under number 3), which puts number 3 under its bound.
 
-1. **The double fold. Fixed in `6d58a5b`, not measured.** `is_match` now stops at the first occurrence: over ASCII text it compares bytes ASCII-case-insensitively without a copy, and only non-ASCII text is folded. Property tests pin it to `!find_all(..).is_empty()`. Before the fix: `Needle::is_match` calls `find_all`, which lowercases the whole haystack into a new string and collects every span; `holds` calls it per term to decide, and `collect_term` calls `find_all` again for the spans. So each text term folds each candidate note twice, and a whole-vault search folds the whole vault's text twice per term. It is most of the search cost: the bodies of the synthetic fixture are read in under 1 ms and the search costs 9.5 ms; the prose fixture's 31 MB cost 46 ms, against 4.4 to 6.0 ms to read them. Fix: an `is_match` that stops at the first occurrence without allocating (an ASCII case-insensitive scan, the short-circuit Task 2 allows), and fold once per document for both decide and collect. This is also what keeps number 6 under its trigger as notes grow.
-2. **Tag rows and tag folding. Partly fixed in `05b1294`, not measured.** `TagFact` carries the stored `comparison_key` as `folded`, and `tag:` matches on it, so no tag is folded per term. `tag_rows` groups rows into one entry per note (one path string per note) and the scan binary-searches it, in place of a `HashMap` with an owned path per row. Still open: filter `tag_rows` in SQL by `comparison_key` for a positive `tag:` conjunct, and compare against the stored fold instead of `fold_js` per tag per term. Closes the number 3 miss by about 4 ms, by this document's split (a guess until measured).
+1. **The double fold. Fixed in `6d58a5b`; measured at `5dfd0c3` with follow-up 2: `meeting group` 8.968 ms, against 10.311.** `is_match` now stops at the first occurrence: over ASCII text it compares bytes ASCII-case-insensitively without a copy, and only non-ASCII text is folded. Property tests pin it to `!find_all(..).is_empty()`. Before the fix: `Needle::is_match` calls `find_all`, which lowercases the whole haystack into a new string and collects every span; `holds` calls it per term to decide, and `collect_term` calls `find_all` again for the spans. So each text term folds each candidate note twice, and a whole-vault search folds the whole vault's text twice per term. It is most of the search cost: the bodies of the synthetic fixture are read in under 1 ms and the search costs 9.5 ms; the prose fixture's 31 MB cost 46 ms, against 4.4 to 6.0 ms to read them. Fix: an `is_match` that stops at the first occurrence without allocating (an ASCII case-insensitive scan, the short-circuit Task 2 allows), and fold once per document for both decide and collect. This is also what keeps number 6 under its trigger as notes grow.
+2. **Tag rows and tag folding. Fixed in `05b1294` and `5dfd0c3`; measured: `tag:#group-3` 7.727 ms, against 11.291, so number 3 is met.** `TagFact` carries the stored `comparison_key` as `folded`, and `tag:` matches on it, so no tag is folded per term. `tag_rows` groups rows into one entry per note (one path string per note) and the scan binary-searches it, in place of a `HashMap` with an owned path per row. Since `5dfd0c3`, a positive `tag:` term at the top level of the query (`CompiledQuery::required_tag_key`) narrows `tag_rows` in SQL: only the notes holding a tag whose `comparison_key` is the key or starts with the key plus `/` are read, with all of each such note's rows, through the `tags_lookup` index (no schema change). Under OR or NOT, or with no such term, the full read stays. `a_required_tag_narrows_the_tag_rows_read` pins the rows read (`SearchAnswer::tag_rows_read`) and the property test pins the answer.
 3. **Per-match `loc`.** Carry the previous match's position forward (matches are sorted) so each line is measured once: linear in the line length instead of 200 times it.
 4. **The bulk-pass threshold.** Decide by bytes, or lower to about 1/10 (question a).
 5. **The time map.** Build the map of times only for a time sort.
