@@ -66,7 +66,7 @@ What the sources state:
 - P15. The File name sort compares base names with `localeCompare` (numeric, locale `en`), the order `vault_bases::collate` already implements, ties broken by path.
 - P16. Canvas content means the `text` of text nodes (and whether file and link node labels count).
 - P17. Excluded files are the `userIgnoreFilters` of `.obsidian/app.json`, matched as path prefixes or as `/regex/`.
-- P18. What a match span is for a plain term in a path, and whether a file name match is reported separately from content matches.
+- P18. What a match span is for a plain term in a path, and whether a file name match is reported separately from content matches. The capture must also test a match that comes after an `İ`, a `ẞ` and a Kelvin sign `K` (characters whose lowercase form has a different length), to learn whether Obsidian's offsets point into the lowercased text or the original; vaultd's point into the original.
 
 Provisional parse rules. The parser (Task 1) follows the lexical rules of the plan where [S1] is silent; these edges follow from those rules, Obsidian's behaviour on them is unverified, and the parity harness settles them:
 

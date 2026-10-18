@@ -39,6 +39,12 @@ fn spans_point_into_the_original_after_a_length_changing_fold() {
         vec![0..8]
     );
     assert_eq!(Needle::text("kelvin", true).find_all("\u{212A}elvin"), NONE);
+    // A Kelvin needle folds to "k", so it matches an ASCII haystack through
+    // the fast path.
+    assert_eq!(
+        Needle::text("\u{212A}", false).find_all("Ok k"),
+        vec![1..2, 3..4]
+    );
 }
 
 #[test]
@@ -158,7 +164,7 @@ fn an_empty_needle_matches_nothing() {
 
 proptest! {
     #[test]
-    fn fast_path_equals_reference(haystack in "[ -~\n]{0,200}", needle in "[ -~]{1,4}") {
+    fn fast_path_equals_reference(haystack in "[ -~\n]{0,200}", needle in "[ -~\u{212A}İ]{1,4}") {
         // The fast path exists only for an insensitive needle over an ASCII
         // haystack. A sensitive needle runs the same `match_indices` in both
         // finders, so drawing one here would compare a function with itself.
@@ -177,6 +183,9 @@ proptest! {
         let needle: String = chars[from..(from + len).min(chars.len())].iter().collect();
         let spans = Needle::text(&needle, false).find_all(&haystack);
         prop_assert!(!spans.is_empty(), "the leftmost occurrence is always found");
+        for pair in spans.windows(2) {
+            prop_assert!(pair[0].end <= pair[1].start, "spans sorted and disjoint: {:?}", spans);
+        }
         let folded_needle = fold_js(&needle);
         for span in spans {
             prop_assert!(haystack.is_char_boundary(span.start) && haystack.is_char_boundary(span.end));
