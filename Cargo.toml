@@ -4,6 +4,7 @@ members = [
     "crates/vault-core",
     "crates/vault-index",
     "crates/vault-protocol",
+    "crates/vault-search",
     "crates/vault-server",
     "crates/vault-watch",
 ]

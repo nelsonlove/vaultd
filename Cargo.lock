@@ -1260,6 +1260,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vault-search"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+ "vault-bases",
+ "vault-core",
+]
+
+[[package]]
 name = "vault-server"
 version = "0.1.0"
 dependencies = [
