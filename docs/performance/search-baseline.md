@@ -10,7 +10,7 @@ Baselines for the search MVP (`docs/plans/search-implementation.md`, Task 9). Th
 - Machine: MacBook Pro, Apple M2 Max (`Mac14,6`), 12 cores, 96 GiB, under other load (see above). Every run started behind a load gate; the load at each run's start (1, 5, 15 minutes) is given beside its numbers.
 - OS: macOS 26.4.1 (Darwin 25.4.0), arm64. Node v26.11.1.
 - Re-measure of `meeting group` and `tag:#group-3` (rows 1 and 3 of the table, and **Re-measured on the fixed build** under number 3): `vaultd` built in release at `5dfd0c3`, which holds follow-ups 1 and 2 (`6d58a5b`, `05b1294`, `5dfd0c3`). One series of three runs on the synthetic fixture, 5-minute load 18.5 to 19.1.
-- Engine: `vaultd`, `vault-bench` and the `search_timing` test built in release on branch `feat/search` at `17ebb07` (the engine; the harness and the timing test are `91cc175`, which changes neither). The phase 8 comparison binaries were built from `main` at `8154840` (the merge base of `feat/search`) in a throwaway worktree.
+- Engine: `vaultd`, `vault-bench` and the `search_timing` test built in release on branch `feat/search` at `17ebb07` (the engine; the harness and the timing test are `91cc175`, which changes neither). The write-path comparison binaries (number 5) were built from `main` at `f470184` (GitHub main, which carries the vendored markdown fix) in a throwaway worktree; the head binaries for that comparison were built at `e18e353`.
 
 ## The fixtures
 
@@ -30,7 +30,7 @@ Each harness series is three daemon runs (`--repeat 3`) of 200 samples (50 at 10
 | 3. `tag:#group-3`, uncached | under 10 ms | 11.291 ms (series 11.192, 11.390); at `5dfd0c3`: 7.727 ms | missed at `17ebb07`; **met** at `5dfd0c3` (see below) |
 | 3. `file:Note-0001`, uncached | under 10 ms | 5.111 ms (series 5.084, 5.138) | met |
 | 4. a publication during a whole-vault search | under 2 ms | p50 0.597 to 0.671 ms, max 1.287 to 1.881 ms | met |
-| 5. reconciliation against phase 8 | within 5 percent | not measured (disk floor, twice) | met by construction, unmeasured (see below) |
+| 5. reconciliation against `main` at `f470184` | within 5 percent | `write_note` p50 -0.13 percent (10.15 against 10.22 ms) and p95 -0.47 percent; 100-note burst p50 +1.5 percent (median of four pairs); cold build p50 -5.7 percent (head faster) | met (see below) |
 | 6. prose fixture, `meeting group`, uncached | observational | 45.785 ms (series 45.590, 46.709) | — |
 | 6. 100,000 notes, `meeting group`, uncached | observational; over 500 ms triggers the trigram decision | 105.169 ms (runs 105.169, 105.359, 104.539) | under 500 ms: no trigger |
 
@@ -114,11 +114,31 @@ No publish while a search ran took 2 ms or more: the search holds no guard while
 
 ### Number 5: reconciliation against phase 8
 
-**Not measured.** The comparison binaries were built (`main` at `8154840`, in a throwaway worktree), but before the first comparison run the free disk was 59 GB, under the 60 GB floor this task works to (other sessions were filling the disk), and the run stopped there. A second attempt on 2026-10-18 at `966087c` stopped at the same floor: both release builds were made (head in the shared target, `8154840` in a throwaway worktree under `target/tmp`), and before the first run the free disk fell from 62 to 55 GiB as other sessions wrote; the throwaway worktree and its target were removed. The comparison commands are in **Commands** below, ready to run.
+**Measured, and met.** The comparison is the one in **Commands**: the head binaries (`vaultd`, `vault-bench`, release, this branch at `e18e353`) against `f470184`, GitHub main, built from a throwaway worktree. The base is `f470184`, not `8154840`, because `f470184` carries the vendored markdown fix, and comparing with `8154840` would credit search with that fix's gain. Free disk was 96 GB. Every run went behind a load gate, one at a time, alternated head, main, head, main; the 1-minute load average before each run is given. Both sides used the same vault and the same fixture, with separate index files.
+
+*Socket harness* (`socket-transport-baseline.js`, no `--search`, 10,000 notes, 200 samples, three daemon runs per series, two series per side). The figure is the median of the three runs.
+
+| Series | Load before (1 min) | `write_note` p50, ms | `write_note` p95, ms |
+| --- | --- | --- | --- |
+| head-1 | 7.77 | 10.155 | 11.252 |
+| main-1 | 9.63 | 10.145 | 11.249 |
+| head-2 | 10.85 | 10.175 | 11.674 |
+| main-2 | 12.62 | 10.212 | 11.784 |
+
+Pair 1: p50 +0.09 percent, p95 +0.03 percent. Pair 2: p50 -0.36 percent, p95 -0.94 percent. Over both pairs: p50 -0.13 percent, p95 -0.47 percent. Within 5 percent.
+
+*`vault-bench --notes 10000 --repeats 5 --live`*, alternated head, main, head, main. The first four runs (loads 14.04, 14.75, 14.62, 14.75) put the burst and the cold build over 5 percent in some pairs, so, as the brief requires, the pair was rerun twice more (loads 9.66, 7.64, 6.60, 6.48), eight runs in all. P50 per run, ms (p95 in the last column is the median over the four pairs):
+
+| Number | Head, four runs | Main, four runs | Pairs, percent | Median of four, p50 | Median of four, p95 |
+| --- | --- | --- | --- | --- | --- |
+| cold build | 911.6, 910.7, 955.1, 980.5 | 892.0, 972.0, 1006.7, 1014.1 | +2.2, -6.3, -5.1, -3.3 | -5.7 percent | -2.9 percent |
+| 100-note burst | 18.18, 18.71, 19.50, 20.63 | 17.07, 18.74, 18.92, 19.03 | +6.5, -0.2, +3.1, +8.4 | +1.5 percent | -4.8 percent |
+| one-note body edit (`body_only_edit`) | 0.107, 0.123, 0.127, 0.118 | 0.108, 0.116, 0.118, 0.118 | -1.0, +5.7, +7.8, +0.3 | +3.0 percent | +3.0 percent |
+| one-note reference edit | 0.197, 0.228, 0.206, 0.218 | 0.195, 0.230, 0.205, 0.229 | +0.9, -0.8, +0.2, -4.6 | -2.3 percent | -10.8 percent |
+
+The single pairs that pass 5 percent point both ways (the cold build is faster on head in three of four pairs, and the burst is slower on head in three of four but faster once), and the medians of four are inside the bound: the worst adverse median is +3.0 percent for a body edit that takes 0.12 ms, where 5 percent is 6 microseconds and the run-to-run spread of one side alone is 0.107 to 0.127 ms. The 1-minute load before a head run and before its main partner differed by about 1.8 in each harness pair, by 0.7 or less in the first bench pairs, and by 2.0 or less in the reruns, and it drifted upward through the first four bench runs (14.0 to 14.8); the later runs of each side were slower on both (cold build 892 to 1014 ms on main), so the order effect is larger than any head-to-main gap. The reruns ran at lower load and show the same picture. **Verdict: met.** The worst adverse figure for the write path is +1.5 percent (the burst, median of four pairs).
 
 The requirement holds by construction, and that much is checked here against the source: between `8154840` and this branch, `vault-index` changes in four files (`git diff --stat 8154840 HEAD -- crates/vault-index/src crates/vault-core crates/vault-watch`), and none is a write path. `query/search.rs` is new and read-only (it writes nothing and holds no lock while it scans). `reader.rs` gains one read entry point (`evaluation_read_current`, a pin without a resolver). `lib.rs` and `query.rs` gain one export and one module line each. `vault-core` and `vault-watch` do not change. On the server, the search cache is dropped lazily on the next search at a newer generation, so a commit does no search work. No schema change. So a cold build, a one-note `write_note` and a 100-note burst run the same code as in phase 8.
-
-What the head binary alone shows, for the record (not a comparison): the harness's `write_note` p50 on the synthetic search fixture is 11.218 to 12.241 ms across the six `s` runs at loads of 22 to 30, against the 10.0 to 10.2 ms that `bases-evaluation-baseline.md` measured for phase 8 at loads near 1. The two differ in the load, the fixture and the binary at once, so the gap is not evidence about this branch.
 
 ## The carried review questions
 
@@ -216,18 +236,18 @@ node host/scripts/socket-transport-baseline.js --binary <release>/vaultd --repea
 TMPDIR="$PWD/target/tmp" cargo test --release -p vault-index --test search_timing \
   -- --ignored --nocapture --test-threads 1
 
-# Phase 8's binaries, from a throwaway worktree.
-git worktree add --detach target/tmp/t9-main 8154840
+# The base binaries (GitHub main, f470184), from a throwaway worktree.
+git worktree add --detach target/tmp/r5-main f470184
 cargo build --release --bin vaultd --bin vault-bench \
-  --manifest-path target/tmp/t9-main/Cargo.toml --target-dir target/tmp/t9-main-target
+  --manifest-path target/tmp/r5-main/Cargo.toml --target-dir target/tmp/r5-main-target
 # No search, alternated head, main, head, main.
 node host/scripts/socket-transport-baseline.js --binary <release>/vaultd --vault target/tmp/t9/plain/vault \
   --index target/tmp/t9/plain/head.sqlite3 --notes 10000 --samples 200 --repeat 3 --label head-1 --out target/tmp/t9/head-1.json
-node host/scripts/socket-transport-baseline.js --binary target/tmp/t9-main-target/release/vaultd --vault target/tmp/t9/plain/vault \
+node host/scripts/socket-transport-baseline.js --binary target/tmp/r5-main-target/release/vaultd --vault target/tmp/t9/plain/vault \
   --index target/tmp/t9/plain/main.sqlite3 --notes 10000 --samples 200 --repeat 3 --label main-1 --out target/tmp/t9/main-1.json
 TMPDIR="$PWD/target/tmp" <release>/vault-bench --notes 10000 --repeats 5 --live
-TMPDIR="$PWD/target/tmp" target/tmp/t9-main-target/release/vault-bench --notes 10000 --repeats 5 --live
-git worktree remove --force target/tmp/t9-main
+TMPDIR="$PWD/target/tmp" target/tmp/r5-main-target/release/vault-bench --notes 10000 --repeats 5 --live
+git worktree remove --force target/tmp/r5-main
 ```
 
 `<release>` is the release target directory (`target/release` by default; these runs used a shared `CARGO_TARGET_DIR`). Every command ran behind a load gate, one at a time, with `CARGO_INCREMENTAL=0`, cargo through the 1.85.0 toolchain.
