@@ -27,6 +27,8 @@ Runtime tuning. Each of these requires `--vault`, exactly as `--index` does, and
 
 `--search-cache-entries` bounds the least-recently-used store of computed search answers that `search` pages are cut from (see `search` below), in the same way: one generation's worth of answers, every older generation's dropped on the first request at a newer one. An answer whose hits, content matches and path matches together number more than 200,000 is never stored, whatever the bound; each of its pages is computed again.
 
+The bound limits what the cache keeps, not what one request builds. A request that misses builds the whole answer before it cuts a page, and an answer over the bound is never stored, so every page of it computes the whole answer again: paging through N pages costs N full scans. A very common term on a very large vault can use several hundred MB of memory per request. A slimmer answer for the over-bound case is the follow-up, tracked in [issue #18](https://github.com/nelsonlove/vaultd/issues/18).
+
 `--read-only` refuses every mutating operation — the eight note and folder verbs, the raw `write_file`, and a rename's link repair — with `read_only`, before any path is touched. Reads, snapshot sessions, reconciliation, and the watcher are unaffected: the daemon still indexes what other writers do, it simply never writes itself. The `.obsidian` zone is included; a read-only daemon writes nothing anywhere in the vault. The flag is fixed at startup and there is no operation that changes it.
 
 One process serves at most one explicitly configured vault. Without `--vault`, only `health` succeeds, every indexed operation returns `index_unavailable`, `subscribe_events` returns `runtime_not_ready`, and no runtime — no watcher, no writer lease, no live graph, no timer — is started at all.
@@ -292,7 +294,7 @@ The answer carries the `generation`; `total_files` and `total_matches`, counted 
 {"version":1,"id":"q","outcome":{"status":"ok","value":{"type":"search","value":{"generation":12,"total_files":1,"total_matches":2,"items":[{"path":"Notes/Kickoff.md","kind":"note","path_matches":[],"content_matches":[{"span":{"start":20,"end":27},"start":{"line":3,"col":4,"offset":20},"end":{"line":3,"col":11,"offset":27},"line_text":"The meeting ran long.","line_text_start":16},{"span":{"start":38,"end":46},"start":{"line":4,"col":0,"offset":38},"end":{"line":4,"col":8,"offset":46},"line_text":"#project","line_text_start":38}],"matches_truncated":false}],"next_cursor":null}}}}
 ```
 
-Here `Notes/Kickoff.md` holds `---\nkind: x\n---\nThe meeting ran long.\n#project\n`: `meeting` is on line 3, which starts at byte 16 after the three frontmatter lines, and the tag match covers the whole tag, `#` included. A note that holds `work`, or no `#project`, is not listed, and `-work` adds no span.
+Here `Notes/Kickoff.md` holds `---\nkind: x\n---\nThe meeting ran long.\n#project\n`: `meeting` is on line 3, which starts at byte 16 after the three frontmatter lines, and the tag match covers the whole body tag, `#` included (a frontmatter tag's match is the YAML item's span, which has no `#`). A note that holds `work`, or no `#project`, is not listed, and `-work` adds no span.
 
 **One computation per query and generation.** An answer is computed once per (query, `match_case`, `sort`, generation) and every page is cut from it, where the query is the parsed query printed in its canonical spelling, so two spellings of one query share an answer. The answer is kept in a bounded least-recently-used store (`--search-cache-entries`, default 16), and every entry of an older generation is dropped on the first request at a newer one. `context` changes only what a page renders, so it is not part of the key.
 
@@ -695,7 +697,7 @@ A Markdown note is always a candidate. Any other file is a candidate only when a
 
 ### Spans
 
-A matching file reports the spans of every **positive** term in the branch that makes it match: under an `OR`, only the alternatives that hold contribute, and a term under a `-` contributes none. Each needle reports every non-overlapping occurrence, and spans that overlap are merged into one. A plain term reports its matches in the text as content spans and its matches in the path as path spans; a `file:` term's spans are placed in the whole path string; a `tag:` match is the whole tag, `#` included, as a content span.
+A matching file reports the spans of every **positive** term in the branch that makes it match: under an `OR`, only the alternatives that hold contribute, and a term under a `-` contributes none. Each needle reports every non-overlapping occurrence, and spans that overlap are merged into one. A plain term reports its matches in the text as content spans and its matches in the path as path spans; a `file:` term's spans are placed in the whole path string; a `tag:` match is the tag's stored span, as a content span: the whole body tag, `#` included, or the frontmatter item.
 
 ### Case folding
 
