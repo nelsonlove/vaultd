@@ -269,7 +269,7 @@ None open. The three questions of the first draft were ruled on 2026-10-17; see 
 
 ## Rulings
 
-1. Search lives in `vaultd`: "yeah. definitely we want search" (the owner, 2026-10-17); the lead drafts the design and the plan for the owner's review ("A", 2026-10-17).
+1. Search lives in `vaultd`: "yeah. definitely we want search" (the owner, 2026-10-17); the design and the plan are drafted for the owner's review ("A", 2026-10-17).
 2. Feature parity with Obsidian's core Search is the target, an MVP that can land for the next demo comes first, and the final step is testing against Obsidian's native search through the `obsidian` CLI or vault-mcp so the results are known to be consistent (the owner, 2026-10-17).
 3. Standing from earlier phases and unchanged: no process, test or fixture reads the owner's real vault except the owner-run copy script; parity comes from runtime captures and published documents, never from `app.asar`; captures of a real vault never enter the repository (2026-10-08); the spec lives repo-local in `docs/design/`.
 
