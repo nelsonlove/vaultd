@@ -93,7 +93,13 @@ export interface ProtocolErrorBody {
   supported_version?: number;
   current_generation?: number;
   current_revision?: string;
-  /** Accompanies `query_invalid`: the character position the parser stopped at. */
+  /**
+   * Accompanies `query_invalid` and `unsupported_operator`: the position in the
+   * query where the parser stopped, counted in Unicode scalar values, not
+   * UTF-16 code units. It differs from a JavaScript string index after any
+   * astral character; convert with
+   * `[...query].slice(0, position).join('').length`.
+   */
   position?: number;
 }
 

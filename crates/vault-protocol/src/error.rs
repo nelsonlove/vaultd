@@ -13,8 +13,9 @@ pub struct ProtocolError {
     /// would race the next writer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_revision: Option<String>,
-    /// The character offset in the query where a `query_invalid` refusal
-    /// found the problem.
+    /// Where in the query a `query_invalid` or `unsupported_operator` refusal
+    /// found the problem, counted in Unicode scalar values (not UTF-16 code
+    /// units, so a JavaScript string index differs after any astral character).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<u64>,
 }
@@ -75,10 +76,11 @@ pub enum ErrorCode {
     /// does not implement. In a formula or a summary it is an error cell.
     UnsupportedFunction,
     /// The search query does not parse, or a regular expression in it does
-    /// not compile; the error carries `position`.
+    /// not compile; the error carries `position` (Unicode scalar values).
     QueryInvalid,
     /// The search query uses an operator this build does not support; the
-    /// message names it.
+    /// message names it, and the error carries `position` (Unicode scalar
+    /// values).
     UnsupportedOperator,
     /// A code this build does not know. Never produced by this server.
     Unknown,
