@@ -98,7 +98,8 @@ fn a_damaged_tag_span_is_a_storage_error_not_a_panic() {
         compiled: &compiled,
         sort: SortOrder::FileNameAsc,
     };
-    assert_eq!(service.reader().unwrap().search(&request).unwrap().hits.len(), 1);
+    let clean = service.reader().unwrap().search(&request).unwrap();
+    assert_eq!(clean.hits.len(), 1);
     for (start, end) in [(1, 7), (3, 99), (7, 3)] {
         let connection = rusqlite::Connection::open(index.path().join("index.sqlite3")).unwrap();
         connection
