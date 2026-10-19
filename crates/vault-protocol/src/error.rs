@@ -75,8 +75,9 @@ pub enum ErrorCode {
     /// A filter the view reads calls a function or method this evaluator
     /// does not implement. In a formula or a summary it is an error cell.
     UnsupportedFunction,
-    /// The search query does not parse, or a regular expression in it does
-    /// not compile; the error carries `position` (Unicode scalar values).
+    /// The search query does not parse; the error carries `position`
+    /// (Unicode scalar values). A regular expression is refused as
+    /// `UnsupportedOperator` in this build, not here.
     QueryInvalid,
     /// The search query uses an operator this build does not support; the
     /// message names it, and the error carries `position` (Unicode scalar
