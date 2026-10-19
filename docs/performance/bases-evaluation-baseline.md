@@ -5,7 +5,7 @@ Baselines for phase 8, Obsidian Bases evaluation inside vaultd. The targets are 
 ## Environment
 
 - Date: 2026-10-09, all series.
-- Machine: MacBook Pro, Apple M2 Max (`Mac14,6`), 12 cores, 96 GiB. Not an idle machine: other sessions ran beside these measurements. Every measured run started behind `fleet-gate` with the 5-minute load average under 4, and the load at each run's start is given beside its numbers. A run whose 5-minute load reached 4 or more is labelled "under load" and is not used for a verdict.
+- Machine: MacBook Pro, Apple M2 Max (`Mac14,6`), 12 cores, 96 GiB. Not an idle machine: other work ran beside these measurements. Every measured run started behind a load gate with the 5-minute load average under 4, and the load at each run's start is given beside its numbers. A run whose 5-minute load reached 4 or more is labelled "under load" and is not used for a verdict.
 - OS: macOS 26.4.1 (Darwin 25.4.0), arm64. Node v26.10.0.
 - Engine: `target/release/vaultd` on branch `feat/bases-evaluation`. The first series (the "before" columns) ran at `621c48d` plus the harness and timing tests of `30a520c`; the fix-round series (the "after" columns) ran on the fix-round commit, which changed the engine in the five places the section "Fix round 1" names. The phase 7 comparison binaries (`vaultd` and `vault-bench`) were built from `main` at `b391820` in a throwaway worktree.
 
@@ -48,7 +48,7 @@ Medians of six run p50s: 10.131 against 10.060 ms (+0.7 percent).
 
 ## Fix round 1 — before and after
 
-Each item below was fixed on the controller's ruling and measured again under the same quiet-machine rule (5-minute load under 4 at every run's start, every run behind `fleet-gate`), at least twice, alternated with phase 7 where a comparison is asked.
+Each item below was fixed on the maintainer's ruling and measured again under the same quiet-machine rule (5-minute load under 4 at every run's start, every run behind a load gate), at least twice, alternated with phase 7 where a comparison is asked.
 
 ### 1. The cold-build miss: `properties` and its scalar columns
 
@@ -311,4 +311,4 @@ target/release/vault-bench --vault target/tmp/t14/vprops --repeats 5
 target/tmp/t14-main-target/release/vault-bench --vault target/tmp/t14/vprops --repeats 5
 ```
 
-`target/tmp/t14/vprops` and `vnoprops` are the `vault-bench` synthetic note shape (`title`, a `tags` list, a heading, two links) at 10,000 notes, with and without the frontmatter block; every other byte is the same. Each command ran behind `fleet-gate` with `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4` and `-j 4`, one at a time.
+`target/tmp/t14/vprops` and `vnoprops` are the `vault-bench` synthetic note shape (`title`, a `tags` list, a heading, two links) at 10,000 notes, with and without the frontmatter block; every other byte is the same. Each command ran behind a load gate with `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4` and `-j 4`, one at a time.

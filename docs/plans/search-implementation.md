@@ -2685,7 +2685,7 @@ Measure the six numbers of the design's **Performance requirements** and write `
 
 - [ ] **Step 2: The timing test** — `publications_while_a_search_runs`: the 10,000-note fixture under `target/tmp`, one whole-vault plain-term search alone (p50 of 5), then 41 one-note publishes 7 ms apart while searches run on another thread, recording each publish's duration; it asserts nothing about time (a timing assertion in the suite is a flake, as `README.md` records) and prints the numbers the baseline quotes, but it asserts that each search answers every note of the fixture (the plain term `note`, which every note's title holds), so a broken search cannot pass as a fast one.
 
-- [ ] **Step 3: Measure** — on a quiet machine, every run behind `fleet-gate` with the 5-minute load under 4, each series three daemon runs, two series alternated, release build:
+- [ ] **Step 3: Measure** — on a quiet machine, every run behind a load gate with the 5-minute load under 4, each series three daemon runs, two series alternated, release build:
 
 ```bash
 cargo build --release -p vault-server -p vault-index; echo "exit=$?"

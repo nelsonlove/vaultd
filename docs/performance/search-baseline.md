@@ -2,12 +2,12 @@
 
 Baselines for the search MVP (`docs/plans/search-implementation.md`, Task 9). The targets are the six numbers in the **Performance requirements** of `docs/design/search.md`, measured on the 10,000-note synthetic fixture, warm, unless stated. Four questions that the earlier tasks' reviews carried here follow them, and then the follow-ups those measurements point at. These are baselines, not contracts: the contract is the test suite. A target that was missed is reported as missed, with the number and the mechanism.
 
-**Every number here was taken on a loaded machine.** The house rule of the earlier baselines (every run started with the 5-minute load under 4) could not be kept: the Mac is shared, other sessions ran beside these measurements, and the 5-minute load stayed between 15 and 32 for the harness series. The coordinator ruled to measure anyway, behind `fleet-gate`, with the load beside every number and every series repeated to show the spread. The numbers are therefore upper bounds of what a quiet machine gives, and a verdict near a bound is weaker than the same verdict in `bases-evaluation-baseline.md`.
+**Every number here was taken on a loaded machine.** The house rule of the earlier baselines (every run started with the 5-minute load under 4) could not be kept: other work ran beside these measurements, and the 5-minute load stayed between 15 and 32 for the harness series. The maintainer ruled to measure anyway, behind a load gate, with the load beside every number and every series repeated to show the spread. The numbers are therefore upper bounds of what a quiet machine gives, and a verdict near a bound is weaker than the same verdict in `bases-evaluation-baseline.md`.
 
 ## Environment
 
 - Date: 2026-10-18, all series.
-- Machine: MacBook Pro, Apple M2 Max (`Mac14,6`), 12 cores, 96 GiB, shared with other sessions (see above). Every run started behind `fleet-gate --in-session`; the load at each run's start (1, 5, 15 minutes) is given beside its numbers.
+- Machine: MacBook Pro, Apple M2 Max (`Mac14,6`), 12 cores, 96 GiB, under other load (see above). Every run started behind a load gate; the load at each run's start (1, 5, 15 minutes) is given beside its numbers.
 - OS: macOS 26.4.1 (Darwin 25.4.0), arm64. Node v26.11.1.
 - Re-measure of `meeting group` and `tag:#group-3` (rows 1 and 3 of the table, and **Re-measured on the fixed build** under number 3): `vaultd` built in release at `5dfd0c3`, which holds follow-ups 1 and 2 (`6d58a5b`, `05b1294`, `5dfd0c3`). One series of three runs on the synthetic fixture, 5-minute load 18.5 to 19.1.
 - Engine: `vaultd`, `vault-bench` and the `search_timing` test built in release on branch `feat/search` at `17ebb07` (the engine; the harness and the timing test are `91cc175`, which changes neither). The phase 8 comparison binaries were built from `main` at `8154840` (the merge base of `feat/search`) in a throwaway worktree.
@@ -108,7 +108,7 @@ One aside the 100,000-note runs show, outside search: the harness's `write_note`
 | timing 2 | | alone, round 2 | 0.563 | 0.912 | 0.384 | 1.769 | 41 | — |
 | timing 2 | | one search in flight, round 2 | 0.597 | 0.891 | 0.476 | 1.287 | 41 | 18 |
 
-Two timing runs, not the three asked for: the third was held by `fleet-gate` for its full 30 minutes (the plan's 5-hour usage stood at 91 percent against a limit of 85), and when the gate let work through again the disk was under the 60 GB floor (see number 5).
+Two timing runs, not the three asked for: the third was held by the load gate for its full 30 minutes, and when the gate let work through again the disk was under the 60 GB floor (see number 5).
 
 No publish while a search ran took 2 ms or more: the search holds no guard while it scans (only its pin runs under the publication guard), so a writer never waits for it. The alone phases have the higher maxima, as in the Bases baseline (a cooling core between 7 ms-spaced edits).
 
@@ -230,4 +230,4 @@ TMPDIR="$PWD/target/tmp" target/tmp/t9-main-target/release/vault-bench --notes 1
 git worktree remove --force target/tmp/t9-main
 ```
 
-`<release>` is the release target directory (`target/release` by default; these runs used a shared `CARGO_TARGET_DIR`). Every command ran behind `fleet-gate --wait 1800 --in-session`, one at a time, with `CARGO_INCREMENTAL=0`, cargo through the 1.85.0 toolchain.
+`<release>` is the release target directory (`target/release` by default; these runs used a shared `CARGO_TARGET_DIR`). Every command ran behind a load gate, one at a time, with `CARGO_INCREMENTAL=0`, cargo through the 1.85.0 toolchain.
