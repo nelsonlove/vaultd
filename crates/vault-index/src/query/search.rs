@@ -113,7 +113,9 @@ impl IndexReader {
 
     /// [`Self::search`] without the metadata narrowing: every file is
     /// evaluated, every note with its text when the query reads text.
-    /// Test-only: the property test pins narrowing to this answer.
+    /// Test-only (the `test-support` feature, off by default): the property
+    /// test pins narrowing to this answer.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn search_unnarrowed_for_test(
         &self,
@@ -284,20 +286,21 @@ fn scan(
         })
         .collect();
 
-    let mut decide = |row: &FileRow, text: Option<&str>| {
-        let doc = IndexDocument {
-            row,
-            text,
-            tags: tags_of(row),
-        };
+    let mut decide = |row: &FileRow, text: Option<&str>| -> Result<(), IndexError> {
+        let tags = tags_of(row);
+        if let Some(text) = text {
+            check_tag_spans(tags, text, &row.path)?;
+        }
+        let doc = IndexDocument { row, text, tags };
         if let Some(hit) = evaluate(compiled, &doc) {
             answer.hits.push(hit);
         }
+        Ok(())
     };
 
     if !needs.text {
         for row in &kept {
-            decide(row, None);
+            decide(row, None)?;
         }
     } else {
         let notes_total = rows
@@ -308,7 +311,7 @@ fn scan(
         for row in &kept {
             match row.kind {
                 DocumentKind::Note => kept_notes.push(row),
-                _ => decide(row, None),
+                _ => decide(row, None)?,
             }
         }
         let mut texts_read = 0;
@@ -321,11 +324,11 @@ fn scan(
                     Some(stored) => {
                         let text = utf8(blob(stored.get_ref(0)?, &row.path)?, &row.path)?;
                         texts_read += 1;
-                        decide(row, Some(text));
+                        decide(row, Some(text))?;
                     }
                     // A note with no stored body (not UTF-8, diagnosed at
                     // reconcile): it matches by its path, never its content.
-                    None => decide(row, Some("")),
+                    None => decide(row, Some(""))?,
                 }
             }
         } else {
@@ -344,11 +347,11 @@ fn scan(
                 };
                 let text = utf8(blob(note.get_ref(1)?, &row.path)?, &row.path)?;
                 texts_read += 1;
-                decide(row, Some(text));
+                decide(row, Some(text))?;
             }
             // The kept notes the pass did not meet have no stored body.
             for row in waiting.into_values() {
-                decide(row, Some(""));
+                decide(row, Some(""))?;
             }
         }
         answer.texts_read = texts_read;
@@ -481,6 +484,26 @@ fn utf8<'a>(source: &'a [u8], path: &VaultPath) -> Result<&'a str, IndexError> {
             path.as_str()
         ))
     })
+}
+
+/// Refuses a stored tag span that is not a range of character boundaries of
+/// the note's text, as damage, before the evaluator locates it: a span off a
+/// boundary would otherwise reach a position lookup that panics.
+fn check_tag_spans(tags: &[TagFact], text: &str, path: &VaultPath) -> Result<(), IndexError> {
+    for tag in tags {
+        let span = &tag.span;
+        if span.start > span.end
+            || span.end > text.len()
+            || !text.is_char_boundary(span.start)
+            || !text.is_char_boundary(span.end)
+        {
+            return Err(IndexError::Storage(format!(
+                "tag span {span:?} is not a range of character boundaries of {}",
+                path.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The line holding `span.start`, whole when it fits in

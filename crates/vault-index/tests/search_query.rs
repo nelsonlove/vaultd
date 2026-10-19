@@ -89,6 +89,34 @@ fn body_and_frontmatter_tags_come_from_the_index() {
 }
 
 #[test]
+fn a_damaged_tag_span_is_a_storage_error_not_a_panic() {
+    // "é " is three bytes, so the tag `#tag` sits at 3..7 and byte 1 is inside
+    // the character.
+    let (service, _vault, index) = service(&[("t.md", "é #tag\n".as_bytes())]);
+    let compiled = compile(&parse_query("tag:#tag").unwrap(), false).unwrap();
+    let request = SearchQuery {
+        compiled: &compiled,
+        sort: SortOrder::FileNameAsc,
+    };
+    assert_eq!(service.reader().unwrap().search(&request).unwrap().hits.len(), 1);
+    for (start, end) in [(1, 7), (3, 99), (7, 3)] {
+        let connection = rusqlite::Connection::open(index.path().join("index.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE tags SET span_start = ?1, span_end = ?2 WHERE note_path = 't.md'",
+                [start, end],
+            )
+            .unwrap();
+        drop(connection);
+        let error = service.reader().unwrap().search(&request).unwrap_err();
+        assert!(
+            matches!(&error, IndexError::Storage(message) if message.contains("tag span")),
+            "span {start}..{end} gave {error:?}"
+        );
+    }
+}
+
+#[test]
 fn a_tag_only_query_reports_located_spans_and_reads_only_tagged_bodies() {
     let (service, _vault, _index) = service(&[
         ("Notes/Kickoff.md", KICKOFF),
