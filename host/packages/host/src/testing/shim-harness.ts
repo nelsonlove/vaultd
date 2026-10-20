@@ -283,6 +283,15 @@ export class ShimHarness extends MirrorHarness {
     else mutable.serverDom = assembly.globals.dom;
   }
 
+  /**
+   * Take this harness's host down: its globals restored, its server DOM (if
+   * any) closed. A case that installs globals other cases must not see — a
+   * server DOM, above all — calls this before it ends.
+   */
+  teardown(): Promise<void> {
+    return this.assembly.teardown();
+  }
+
   /** A shim over a tree with no note bodies — the cheapest useful fixture. */
   static async withEntries(
     entries: FixtureEntry[],
