@@ -22,6 +22,10 @@
  *   waiting for it and a leaked interval is a number a case can assert on.
  * - **Inert.** `document`, `navigator`, `MutationObserver`, `i18next` and the
  *   element constructors accept what a plugin does with them and do nothing.
+ *   That is the headless profile, and it is the default: a *screen* host
+ *   passes a DOM provider (`dom-provider.ts`), and then `document`,
+ *   `activeDocument` and the four node constructors are a real server DOM's
+ *   instead. Nothing else in this file differs between the two.
  * - **Refused.** `window.require` throws a typed {@link HeadlessUnsupported}
  *   naming the specifier, because this host is not Electron and a plugin
  *   reaching for a Node builtin through the window is asking for something
@@ -80,6 +84,7 @@ import type { Harvest, HarvestedUnreachable } from "./harvest";
 import { HOST_PLUGIN_ID } from "./errors";
 import type { HostErrors } from "./errors";
 import type { StubDocument } from "./dom";
+import type { DomEnvironment, DomProvider, ServerDocument } from "./dom-provider";
 
 /**
  * `window`, as a plugin reaches it.
@@ -107,7 +112,7 @@ export interface HostWindow {
   dispatchEvent(event: unknown): boolean;
   readonly app: App;
   readonly moment: typeof moment;
-  readonly document: StubDocument;
+  readonly document: StubDocument | ServerDocument;
   readonly window: HostWindow;
   readonly localStorage: HostLocalStorage;
   readonly [member: string]: unknown;
@@ -140,15 +145,39 @@ export interface GlobalDeps {
    * host timers on another, silently.
    */
   readonly clock: Clock;
+  /**
+   * What goes behind `document`. **Omitted, it is the inert stub**, which is
+   * the headless host and every existing harness: nothing about that profile
+   * changes when this is left out. A screen host passes a real-DOM provider;
+   * see `dom-provider.ts`.
+   */
+  readonly dom?: DomProvider;
 }
 
-/** What {@link installGlobals} hands back: the two objects, and the undo. */
-export interface GlobalInstallation {
+/**
+ * What {@link installGlobals} hands back: the two objects, and the undo.
+ *
+ * A union on `dom`, so a caller that holds the stub document is told so by the
+ * type: `dom` is `null` under the stub and the built environment under a real
+ * provider, and narrowing on it types `document` accordingly.
+ */
+export type GlobalInstallation = StubInstallation | ServerDomInstallation;
+
+interface InstallationBase {
   readonly window: HostWindow;
-  readonly document: StubDocument;
   readonly localStorage: HostLocalStorage;
   /** Put every global back exactly as it was found. */
   restore(): void;
+}
+
+export interface StubInstallation extends InstallationBase {
+  readonly dom: null;
+  readonly document: StubDocument;
+}
+
+export interface ServerDomInstallation extends InstallationBase {
+  readonly dom: DomEnvironment;
+  readonly document: ServerDocument;
 }
 
 /**
@@ -429,7 +458,19 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
   // report that counted only one of them would be answering a question nobody
   // asked.
   const listeners = new WindowListeners(deps.harvest);
-  const document = createStubDocument(listeners);
+  // Built before anything is installed, so a provider that throws (its library
+  // is not installed) leaves the process exactly as it found it.
+  const dom = deps.dom?.create() ?? null;
+  const installed: Pick<StubInstallation, "dom" | "document"> | Pick<ServerDomInstallation, "dom" | "document"> =
+    dom === null ? { dom, document: createStubDocument(listeners) } : { dom, document: dom.document };
+  const { document } = installed;
+  if (dom !== null) {
+    // Registered before anything else is installed, so it is the last undo to
+    // run: the library is released only after no global points into it.
+    patcher.onRestore(() => {
+      dom.close();
+    });
+  }
   // Module-level rather than passed, because `Node.on` is a method on a class
   // instantiated everywhere — see `dom.ts`. Taken down with everything else, so
   // a host that restores its globals stops recording into a harvest nobody
@@ -525,21 +566,30 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
     escape: (value: string): string => stub("CSS.escape", cssEscape(String(value))),
   });
 
-  // The element constructors. `Element` and `HTMLElement` are the same class,
-  // because nothing this host does distinguishes them and plugins use both
-  // names only as `instanceof` branches. `Node` is their base and
-  // `DocumentFragment` their sibling, so both tests a plugin writes — "is this
-  // an element" and "is this a fragment" — answer as a browser answers them.
-  // See `shim/dom.ts`.
-  patcher.define(globalThis, "Node", StubNode);
-  patcher.define(globalThis, "Element", StubEl);
-  patcher.define(globalThis, "HTMLElement", StubEl);
-  patcher.define(globalThis, "DocumentFragment", StubFragment);
+  if (dom === null) {
+    // The element constructors. `Element` and `HTMLElement` are the same class,
+    // because nothing this host does distinguishes them and plugins use both
+    // names only as `instanceof` branches. `Node` is their base and
+    // `DocumentFragment` their sibling, so both tests a plugin writes — "is this
+    // an element" and "is this a fragment" — answer as a browser answers them.
+    // See `shim/dom.ts`.
+    patcher.define(globalThis, "Node", StubNode);
+    patcher.define(globalThis, "Element", StubEl);
+    patcher.define(globalThis, "HTMLElement", StubEl);
+    patcher.define(globalThis, "DocumentFragment", StubFragment);
 
-  patcher.define(globalThis, "createEl", createEl);
-  patcher.define(globalThis, "createDiv", createDiv);
-  patcher.define(globalThis, "createSpan", createSpan);
-  patcher.define(globalThis, "createFragment", createFragment);
+    patcher.define(globalThis, "createEl", createEl);
+    patcher.define(globalThis, "createDiv", createDiv);
+    patcher.define(globalThis, "createSpan", createSpan);
+    patcher.define(globalThis, "createFragment", createFragment);
+  } else {
+    // The same four names from the real DOM, so `instanceof` against them is
+    // true of the nodes the document makes.
+    patcher.define(globalThis, "Node", dom.constructors.Node);
+    patcher.define(globalThis, "Element", dom.constructors.Element);
+    patcher.define(globalThis, "HTMLElement", dom.constructors.HTMLElement);
+    patcher.define(globalThis, "DocumentFragment", dom.constructors.DocumentFragment);
+  }
 
   installPrototypeExtensions(patcher);
 
@@ -552,9 +602,8 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
     moment.locale(previousLocale);
   });
 
-  return {
+  const base = {
     window: host,
-    document,
     localStorage,
     restore: () => {
       // **Timers first, globals second, and the order is the whole point.**
@@ -566,6 +615,7 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
       patcher.restore();
     },
   };
+  return { ...base, ...installed };
 }
 
 /**
