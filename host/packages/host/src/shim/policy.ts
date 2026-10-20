@@ -247,8 +247,37 @@ export function declarePolicy(symbol: string, policy: ApiPolicy): void {
  * this host does not populate is a row somebody wrote down deliberately, and
  * guessing that an unknown name is one would be inventing the claim.
  */
-export function policyOf(symbol: string): ApiPolicy {
+export function policyOf(symbol: string, profile: HostProfile = "headless"): ApiPolicy {
+  if (profile === "screen") {
+    const screen = screenDeclarations.get(symbol);
+    if (screen !== undefined) return screen;
+  }
   return declarations.get(symbol) ?? "absent";
+}
+
+/**
+ * Which host a policy row describes. `headless` is the shipped host with the
+ * inert stub document; `screen` is the second profile that runs screen plugins
+ * over a real server DOM (docs/design/web-plugins.md, section 2).
+ */
+export type HostProfile = "headless" | "screen";
+
+/**
+ * The screen profile's own rows, **a second column rather than an edit of the
+ * first**: a symbol the screen host implements over its server DOM (`document`,
+ * the DOM helpers) reads `implemented` here and stays `safe_stub` in the
+ * headless table. A symbol with no row here reads as its headless row.
+ */
+const screenDeclarations = new Map<string, ApiPolicy>();
+
+/** Declare a symbol's policy in the screen profile. Never touches a headless row. */
+export function declareScreenPolicy(symbol: string, policy: ApiPolicy): void {
+  screenDeclarations.set(symbol, policy);
+}
+
+/** The symbols the screen profile has a row of its own for. */
+export function screenSymbols(): readonly string[] {
+  return [...screenDeclarations.keys()];
 }
 
 /**

@@ -1,0 +1,24 @@
+{
+  "in_memory": {
+    "fixture-theme@@fx-compact": true,
+    "fixture-theme@@fx-density": "fx-airy",
+    "fixture-theme@@fx-gap-size": 12,
+    "fixture-theme@@fx-border-style": "dashed",
+    "fixture-theme@@fx-accent-hex": "#cc3366",
+    "fixture-theme@@fx-surface@@light": "#f5f0e6",
+    "fixture-theme@@fx-ink@@dark": "#d0e0ff",
+    "fixture-snippet@@sn-width": 700,
+    "unloaded-section@@some-setting": true
+  },
+  "on_disk": {
+    "fixture-theme@@fx-compact": true,
+    "fixture-theme@@fx-density": "fx-airy",
+    "fixture-theme@@fx-gap-size": 12,
+    "fixture-theme@@fx-border-style": "dashed",
+    "fixture-theme@@fx-accent-hex": "#cc3366",
+    "fixture-theme@@fx-surface@@light": "#f5f0e6",
+    "fixture-theme@@fx-ink@@dark": "#d0e0ff",
+    "fixture-snippet@@sn-width": 700,
+    "unloaded-section@@some-setting": true
+  }
+}

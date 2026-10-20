@@ -1,0 +1,11 @@
+{
+  "obsidian_version": "1.14.4",
+  "installer_version": "1.14.4",
+  "api_version": null,
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) obsidian/1.14.4 Chrome/150.0.7871.250 Electron/43.7.7 Safari/537.36",
+  "plugin_version": "1.0.9",
+  "theme": "Fixture Theme",
+  "cli_version": "1.14.4 (installer 1.14.4)",
+  "captured_at": "2026-10-20T02:57:26.056Z",
+  "fixture": "host/fixtures/style-settings/vault"
+}

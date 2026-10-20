@@ -13,6 +13,9 @@ vaultd itself is MIT-licensed (see `LICENSE`). The golden test fixtures under `h
 | `quickadd` | QuickAdd | 2.24.2 | https://github.com/chhoumann/quickadd (tag `2.24.2`) | MIT | Copyright (c) 2021 Christian Bager Bach Houmann |
 | `tag-wrangler` | Tag Wrangler | 0.6.5-nl.2 | https://github.com/nelsonlove/obsidian-tag-wrangler (tag `v0.6.5-nl.2`), fork of https://github.com/pjeby/tag-wrangler | ISC | Copyright 2021 PJ Eby |
 
+
+The Style Settings parity fixture, `host/fixtures/style-settings/vault/.obsidian/plugins/obsidian-style-settings/`, holds the unchanged release build of Style Settings 1.0.9 (https://github.com/community-archive/obsidian-style-settings, formerly mgmeyers/obsidian-style-settings, tag `1.0.9`), GPL-3.0, with its licence text beside it as `LICENSE.md`. Like the golden bundles it is a separate test input, not linked into vaultd, and its complete corresponding source is the public tag named here.
+
 ## Other third-party data
 
 - `host/fixtures/golden/obsidian-linter/plugin/default-misspellings.md` is the Linter plugin's default misspellings list. Its entries come from the codespell dictionary (https://github.com/codespell-project/codespell), which the codespell project releases under CC BY-SA 3.0 as a derivative work of English Wikipedia. See `default-misspellings.NOTICE` beside it.

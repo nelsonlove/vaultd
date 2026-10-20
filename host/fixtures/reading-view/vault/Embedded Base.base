@@ -1,0 +1,8 @@
+filters:
+  and:
+    - file.folder == ""
+views:
+  - type: table
+    name: Fixture table
+    order:
+      - file.name

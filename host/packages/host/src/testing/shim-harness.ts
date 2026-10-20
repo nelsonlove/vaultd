@@ -50,6 +50,7 @@ import type { ObsidianApi } from "../shim/api";
 import type { NoticeLog } from "../shim/notice";
 import type { HostWindow } from "../shim/globals";
 import type { StubDocument } from "../shim/dom";
+import type { DomEnvironment, DomProvider } from "../shim/dom-provider";
 
 export interface ShimHarnessOptions {
   /**
@@ -75,6 +76,12 @@ export interface ShimHarnessOptions {
   /** Served through `read_file`, for the config zone the host reads. */
   configFiles?: Record<string, string>;
   config?: Partial<HostConfig>;
+  /**
+   * What goes behind `document`. Omitted, it is the inert stub, as in the
+   * headless host; a real-DOM provider gives a screen host's document instead,
+   * reachable as {@link ShimHarness.serverDom}.
+   */
+  dom?: DomProvider;
 }
 
 export class ShimHarness extends MirrorHarness {
@@ -127,7 +134,24 @@ export class ShimHarness extends MirrorHarness {
    * ask the host for it rather than a module that would be lying to offer it.
    */
   readonly window!: HostWindow;
-  readonly document!: StubDocument;
+  /**
+   * The real document and its constructors, when this harness was built with a
+   * DOM provider; `null` for the stub.
+   */
+  readonly serverDom: DomEnvironment | null = null;
+  private stubDocument: StubDocument | null = null;
+
+  /**
+   * The stub document. **Refused on a server-DOM harness** rather than typed as
+   * a union: every existing case reaches stub-only members such as `on`, and a
+   * server-DOM case should be reading {@link serverDom} instead.
+   */
+  get document(): StubDocument {
+    if (this.stubDocument === null) {
+      throw new Error("this harness runs a server DOM; read harness.serverDom.document instead");
+    }
+    return this.stubDocument;
+  }
   /**
    * Where the host's own modules live — **directories**, prepended to a
    * bundle's `module.paths`.
@@ -173,6 +197,7 @@ export class ShimHarness extends MirrorHarness {
   /** The paths the auto-server answers. Everything else is answered by hand. */
   private readonly autoServed = new Set<string>();
   private layoutReady: boolean;
+  private readonly dom: DomProvider | undefined;
 
   protected constructor(options: ShimHarnessOptions) {
     // The data dir goes in **first**, so an explicit `config.dataDir` from a
@@ -183,6 +208,7 @@ export class ShimHarness extends MirrorHarness {
     // has only moved half of itself.
     super(configFor(options));
     this.layoutReady = options.layoutReady ?? true;
+    this.dom = options.dom;
     for (const [path, contents] of Object.entries(options.configFiles ?? {})) {
       this.configFiles.set(path, contents);
     }
@@ -219,6 +245,7 @@ export class ShimHarness extends MirrorHarness {
         this.spawned.push([command, [...args]]);
         return Promise.resolve();
       },
+      ...(this.dom === undefined ? {} : { dom: this.dom }),
     });
     const mutable = this as {
       -readonly [K in
@@ -230,7 +257,7 @@ export class ShimHarness extends MirrorHarness {
         | "harvest"
         | "noticeLog"
         | "window"
-        | "document"]: ShimHarness[K];
+        | "serverDom"]: ShimHarness[K];
     };
     this.assembly = assembly;
     this.loader = new BundleLoader(this.loaderDeps());
@@ -252,7 +279,17 @@ export class ShimHarness extends MirrorHarness {
     });
     mutable.noticeLog = assembly.noticeLog;
     mutable.window = assembly.globals.window;
-    mutable.document = assembly.globals.document;
+    if (assembly.globals.dom === null) this.stubDocument = assembly.globals.document;
+    else mutable.serverDom = assembly.globals.dom;
+  }
+
+  /**
+   * Take this harness's host down: its globals restored, its server DOM (if
+   * any) closed. A case that installs globals other cases must not see — a
+   * server DOM, above all — calls this before it ends.
+   */
+  teardown(): Promise<void> {
+    return this.assembly.teardown();
   }
 
   /** A shim over a tree with no note bodies — the cheapest useful fixture. */

@@ -1,0 +1,12 @@
+- [ ] open task
+- [x] done task
+- [X] done task, capital X
+- [/] half-done task
+- [-] cancelled task
+- [>] forwarded task
+- [<] scheduled task
+- [?] question task
+- [!] important task
+- [ ] open task with a nested list
+  - [ ] nested open
+  - [x] nested done

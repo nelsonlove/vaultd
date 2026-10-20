@@ -1,0 +1,5 @@
+{
+  "light": "body.css-settings-manager { --fx-gap-size: 12px; --fx-border-style: dashed; --fx-accent-hex: #cc3366; --sn-width: 700px; } body.theme-light.css-settings-manager { --fx-surface: #f5f0e6; --fx-fade-0: rgb(245,240,230); --fx-fade-25: rgb(192,189,181); --fx-fade-50: rgb(140,137,132); --fx-fade-75: rgb(87,86,83); --fx-fade-100: rgb(34,34,34); } body.theme-dark.css-settings-manager { --fx-ink: #d0e0ff; }",
+  "dark": "body.css-settings-manager { --fx-gap-size: 12px; --fx-border-style: dashed; --fx-accent-hex: #cc3366; --sn-width: 700px; } body.theme-light.css-settings-manager { --fx-surface: #f5f0e6; --fx-fade-0: rgb(245,240,230); --fx-fade-25: rgb(236,236,236); --fx-fade-50: rgb(227,232,243); --fx-fade-75: rgb(217,228,249); --fx-fade-100: rgb(208,224,255); } body.theme-dark.css-settings-manager { --fx-ink: #d0e0ff; }",
+  "equal": false
+}

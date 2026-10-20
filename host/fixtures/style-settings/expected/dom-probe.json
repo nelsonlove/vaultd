@@ -1,0 +1,101 @@
+{
+  "cls_string": {
+    "html": "<div class=\"a b\"></div>"
+  },
+  "cls_array": {
+    "html": "<div class=\"a b\"></div>"
+  },
+  "text_string": {
+    "html": "<div>hi &lt;b&gt;&amp;amp;</div>"
+  },
+  "text_fragment": {
+    "html": "<div><b>frag</b> tail</div>"
+  },
+  "attr_null_false_number": {
+    "html": "<div b=\"false\" c=\"0\" d=\"1\" e=\"s\" f=\"true\" g=\"undefined\"></div>"
+  },
+  "title": {
+    "html": "<div title=\"tip\"></div>"
+  },
+  "value_input": {
+    "html": "<input>"
+  },
+  "value_div": {
+    "html": "<div></div>"
+  },
+  "type_input": {
+    "html": "<input type=\"checkbox\">"
+  },
+  "placeholder": {
+    "html": "<input placeholder=\"ph\">"
+  },
+  "href": {
+    "html": "<a href=\"https://example.invalid/\">l</a>"
+  },
+  "parent": {
+    "html": "<div><span>kid</span></div>"
+  },
+  "prepend": {
+    "html": "<div><span>second</span><span>first</span></div>"
+  },
+  "callback": {
+    "html": "<p class=\"from-callback\">cb</p>"
+  },
+  "createDiv": {
+    "html": "<div class=\"d\">t</div>"
+  },
+  "createSpan": {
+    "html": "<span class=\"s\">t</span>"
+  },
+  "el_createEl": {
+    "html": "<div><em>e</em></div>"
+  },
+  "setAttr_string": {
+    "html": "<div data-x=\"1\"></div>"
+  },
+  "setAttr_null": {
+    "html": "<div></div>"
+  },
+  "setAttr_false": {
+    "html": "<div data-x=\"false\"></div>"
+  },
+  "setAttr_zero": {
+    "html": "<div data-x=\"0\"></div>"
+  },
+  "setAttr_true": {
+    "html": "<div data-x=\"true\"></div>"
+  },
+  "setText_string": {
+    "html": "<div>new</div>"
+  },
+  "setText_fragment": {
+    "html": "<div><b>frag</b> tail</div>"
+  },
+  "appendText": {
+    "html": "<div>ab</div>"
+  },
+  "empty": {
+    "html": "<div></div>"
+  },
+  "addClass_many": {
+    "html": "<div class=\"a b\"></div>"
+  },
+  "removeClass": {
+    "html": "<div class=\"b\"></div>"
+  },
+  "toggleClass_true": {
+    "html": "<div class=\"on\"></div>"
+  },
+  "toggleClass_false": {
+    "html": "<div class=\"\"></div>"
+  },
+  "toggleClass_array": {
+    "html": "<div class=\"a b\"></div>"
+  },
+  "hasClass": {
+    "html": "true"
+  },
+  "createFragment_callback": {
+    "html": "<div><b>frag</b> tail</div>"
+  }
+}

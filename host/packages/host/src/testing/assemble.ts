@@ -54,6 +54,7 @@ import type { Mirror } from "../mirror/mirror";
 import type { ObsidianApi } from "../shim/api";
 import type { ApiPolicy, PolicyRecorder, RecordedApiCall } from "../shim/policy";
 import type { GlobalInstallation } from "../shim/globals";
+import type { DomProvider } from "../shim/dom-provider";
 import { DryRunGate, forwardingWriteGate } from "../dryrun/dry-run";
 import type { WriteGate } from "../dryrun/dry-run";
 import { createElectronStub, osSpawn } from "../runtime/electron-stub";
@@ -345,6 +346,11 @@ export function assembleShim(deps: {
    * Production takes the default, which really spawns.
    */
   spawn?: OsSpawn;
+  /**
+   * What goes behind `document`. Omitted, it is the inert stub — the headless
+   * host. A screen host passes a real-DOM provider; see `shim/dom-provider.ts`.
+   */
+  dom?: DomProvider;
 }): HostAssembly {
   const { config, mirror, clock } = deps;
   const client = forwardingSink(deps.client);
@@ -425,7 +431,13 @@ export function assembleShim(deps: {
   // standing before a bundle can be loaded. The `App`'s own surfaces land a few
   // lines below, and nothing reads them in between: only the assembler is
   // running.
-  const globals = installGlobals(app, config, { dataDir, errors, harvest, clock });
+  const globals = installGlobals(app, config, {
+    dataDir,
+    errors,
+    harvest,
+    clock,
+    ...(deps.dom === undefined ? {} : { dom: deps.dom }),
+  });
   const vault = new Vault({ config, client, mirror, events, writes, queue, errors });
   // After the vault, because it resolves link paths to the `TFile` instances
   // the vault's index owns — and it reads that index rather than holding a

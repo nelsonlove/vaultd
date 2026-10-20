@@ -1,0 +1,75 @@
+{
+  "Block Target.md": null,
+  "Link Target.md": null,
+  "Target With Headings.md": null,
+  "blockquotes.md": null,
+  "callouts.md": null,
+  "code-blocks.md": null,
+  "comments.md": null,
+  "embeds.md": null,
+  "escaped-characters.md": null,
+  "footnotes.md": null,
+  "frontmatter-types.md": {
+    "string": "a plain string",
+    "quoted": "a: quoted string",
+    "number": 42,
+    "decimal": 3.14,
+    "bool-true": true,
+    "bool-false": false,
+    "date": "2026-01-15",
+    "datetime": "2026-01-15T10:30:00",
+    "list": [
+      "one",
+      "two",
+      "three"
+    ],
+    "inline-list": [
+      "alpha",
+      "beta"
+    ],
+    "nested": {
+      "child": "value",
+      "deeper": {
+        "leaf": 1
+      }
+    },
+    "link": "[[Link Target]]",
+    "link-alias": "[[Link Target|an alias]]",
+    "link-list": [
+      "[[Link Target]]",
+      "[[Target With Headings]]"
+    ],
+    "external": "https://example.com",
+    "empty": null,
+    "null-value": null,
+    "tags": [
+      "fixture-type-tag"
+    ],
+    "aliases": [
+      "Frontmatter Types Alias"
+    ],
+    "cssclasses": [
+      "fixture-cssclass"
+    ],
+    "show-properties": true
+  },
+  "hard-line-breaks.md": null,
+  "headings.md": null,
+  "horizontal-rules.md": null,
+  "images.md": null,
+  "inline-formatting.md": null,
+  "inline-html.md": null,
+  "links.md": null,
+  "lists.md": null,
+  "math.md": null,
+  "tables.md": null,
+  "tags.md": {
+    "tags": [
+      "fixture-frontmatter-tag",
+      "fixture/nested-tag"
+    ]
+  },
+  "task-lists.md": null,
+  "view-field-code.md": null,
+  "wikilinks.md": null
+}
