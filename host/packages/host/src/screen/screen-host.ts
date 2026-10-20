@@ -35,7 +35,7 @@ import { assembleShim } from "../testing/assemble";
 import { createApplyService } from "./apply-service";
 import { happyDomProvider } from "../shim/dom-providers/happy-dom";
 import { installModuleInterception } from "../runtime/intercept";
-import { testClock } from "../testing/clock";
+import { drivenClock } from "../runtime/driven-clock";
 import type { ApplyRequest, ApplyService } from "./apply-service";
 import type { HostConfig } from "../config";
 import type { PluginManifest } from "../shim/plugin";
@@ -104,7 +104,7 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     void mirror.applyEvent(event).catch(() => undefined);
   });
 
-  const clock = testClock(Date.now());
+  const clock = drivenClock(Date.now());
   const assembly = assembleShim({ config, client: clientOf, mirror, clock, dom: happyDomProvider() });
   const modulePaths = [resolve(__dirname, "..", "..", "..", "..", "node_modules")];
   const interception = installModuleInterception({
