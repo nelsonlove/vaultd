@@ -250,14 +250,18 @@ export class ApplyService {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    await this.chain;
-    if (this.live !== null) {
-      this.live = null;
-      this.counts.unloads += 1;
-      await this.deps.unloadPlugin();
+    try {
+      await this.chain;
+      if (this.live !== null) {
+        this.live = null;
+        this.counts.unloads += 1;
+        await this.deps.unloadPlugin();
+      }
+    } finally {
+      // Whatever the unload did, the listener and the guard go.
+      this.unlisten();
+      this.deps.release?.();
     }
-    this.unlisten();
-    this.deps.release?.();
   }
 
   /**
@@ -353,8 +357,10 @@ export class ApplyService {
     this.deps.store.use(store);
     this.counts.loads += 1;
     await this.deps.loadPlugin();
-    this.live = { viewer: request.viewer, revision: "", setHash };
+    // Checked before `live` is set, so an abandoned apply never names the
+    // live context the request after it relies on.
     this.check(token);
+    this.live = { viewer: request.viewer, revision: "", setHash };
     // `onload` arms the first parse; let it run.
     await this.deps.advance(DEBOUNCE_STEP_MS);
     await this.deps.settle();
@@ -446,6 +452,12 @@ export interface ScreenApplyDeps {
   readonly cacheLimit?: number;
   /** Default {@link APPLY_DEADLINE_MS}. */
   readonly applyDeadlineMs?: number;
+  /**
+   * Where a host error is shown: every one the host reports while this service
+   * lives, inside an apply or not, a stray rejection the guard caught among
+   * them. One line each. Default: standard error.
+   */
+  readonly log?: (line: string) => void;
   /** Wrap each viewer's store; a test uses it to make a store fail. */
   readonly wrapStore?: (store: PluginDataStore, viewer: string) => PluginDataStore;
 }
@@ -469,7 +481,32 @@ export function createApplyService(deps: ScreenApplyDeps): ApplyService {
   const unguard = guardUnhandledRejections((reason) => {
     context.errors.report(reason, HOST_PLUGIN_ID, "event");
   });
+  // The host's error ring keeps the last few for a reader that asks; nothing
+  // asks in the screen host, so each one is also written out.
+  const log = deps.log ?? ((line: string): void => void process.stderr.write(`${line}\n`));
+  const unlog = context.errors.onError((error, pluginId, phase) => {
+    log(`vaultd-screen-host: ${pluginId} (${phase}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+  });
+  const release = (): void => {
+    unlog();
+    unguard();
+  };
   const pluginId = deps.bundle.manifest.id;
+  try {
+    return buildService(deps, context, store, pluginId, release);
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
+function buildService(
+  deps: ScreenApplyDeps,
+  context: ReturnType<typeof pluginHostFor>,
+  store: SwitchableDataStore,
+  pluginId: string,
+  release: () => void,
+): ApplyService {
   return new ApplyService({
     document: deps.document,
     raiseCssChange: () => {
@@ -494,7 +531,7 @@ export function createApplyService(deps: ScreenApplyDeps): ApplyService {
     pluginId,
     timers: systemClock(),
     onHostError: (listener) => context.errors.onError(listener),
-    release: unguard,
+    release,
     ...(deps.cacheLimit === undefined ? {} : { cacheLimit: deps.cacheLimit }),
     ...(deps.applyDeadlineMs === undefined ? {} : { deadlineMs: deps.applyDeadlineMs }),
   });

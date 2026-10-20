@@ -16,6 +16,7 @@ import { DATA_JSON, EXPECTED, FIXTURE, MAIN_JS, MAIN_JS_PATH, pluginOwnedClasses
 import { scratchRoot } from "./scratch";
 import { ApplyService, createApplyService } from "../src/screen/apply-service";
 import { BundleLoader } from "../src/runtime/loader";
+import { pluginHostFor } from "../src/shim/plugin";
 import { rejectionGuardArmed, reportUnhandledRejection } from "../src/server/server";
 import { ShimHarness } from "../src/testing/shim-harness";
 import { buildSheetSet } from "../src/web/sheet-set";
@@ -47,15 +48,18 @@ interface Rig {
   readonly loader: BundleLoader;
   readonly stateRoot: string;
   readonly sheets: Sheet[];
+  /** What the service logged, one line per host error. */
+  readonly logged: string[];
 }
 
 const live: Rig[] = [];
+const harnesses: ShimHarness[] = [];
 
 afterEach(async () => {
-  for (const rig of live.splice(0).reverse()) {
-    await rig.service.close();
-    await rig.harness.teardown();
-    await rig.harness.stop();
+  for (const rig of live.splice(0).reverse()) await rig.service.close().catch(() => undefined);
+  for (const harness of harnesses.splice(0).reverse()) {
+    await harness.teardown();
+    await harness.stop();
   }
 });
 
@@ -67,6 +71,8 @@ interface RigOptions {
 
 async function rig(options: RigOptions = {}): Promise<Rig> {
   const harness = await ShimHarness.withVault({}, { dom: happyDomProvider() });
+  harnesses.push(harness);
+  const logged: string[] = [];
   // The vault's own `data.json`, which the `viewer` store reads (never writes).
   harness.setConfigFile(`.obsidian/plugins/${PLUGIN_ID}/data.json`, DATA_JSON);
   const loader = new BundleLoader(harness.loaderDeps());
@@ -84,12 +90,15 @@ async function rig(options: RigOptions = {}): Promise<Rig> {
       request: { pluginId: PLUGIN_ID, filename: MAIN_JS_PATH, source: MAIN_JS, hostModulePaths: harness.hostModulePaths },
     },
     stateRoot,
+    log: (line) => {
+      logged.push(line);
+    },
     ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
     ...(options.applyDeadlineMs === undefined ? {} : { applyDeadlineMs: options.applyDeadlineMs }),
     ...(options.wrapStore === undefined ? {} : { wrapStore: options.wrapStore }),
   });
   const { sheets } = await buildSheetSet(readFixture);
-  const made = { harness, service, loader, stateRoot, sheets };
+  const made = { harness, service, loader, stateRoot, sheets, logged };
   live.push(made);
   return made;
 }
@@ -307,5 +316,40 @@ describe("apply through the service", () => {
     await r.service.close();
     await expect(r.service.apply(request(r, "alice", "light"))).rejects.toThrow(/closed/);
     expect(r.service.stats()).toMatchObject({ loads: 1, unloads: 1 });
+  });
+
+  it("logs a host error or a stray rejection that happens outside any apply", async () => {
+    const r = await rig();
+    await r.service.apply(request(r, "alice", "dark"));
+    pluginHostFor(r.harness.app).errors.report(new Error("late handler failed"), PLUGIN_ID, "event");
+    const runnerListeners = process
+      .listeners("unhandledRejection")
+      .filter((listener) => listener !== reportUnhandledRejection);
+    for (const listener of runnerListeners) process.off("unhandledRejection", listener);
+    try {
+      void Promise.reject(new Error("stray promise"));
+      for (let i = 0; i < 5; i += 1) await new Promise<void>((done) => setImmediate(done));
+    } finally {
+      for (const listener of runnerListeners) process.on("unhandledRejection", listener);
+    }
+    expect(r.logged.some((line) => line.includes(PLUGIN_ID) && line.includes("late handler failed"))).toBe(true);
+    expect(r.logged.some((line) => line.includes("stray promise"))).toBe(true);
+    // The apply itself was not touched.
+    expect(r.service.stats()).toMatchObject({ misses: 1, size: 2 });
+  });
+
+  it("releases the guard when the service cannot be built", async () => {
+    await expect(rig({ cacheLimit: 0 })).rejects.toThrow(RangeError);
+    expect(rejectionGuardArmed()).toBe(false);
+  });
+
+  it("releases the guard and stops logging even when the unload in close throws", async () => {
+    const r = await rig();
+    await r.service.apply(request(r, "alice", "dark"));
+    vi.spyOn(r.loader, "unload").mockRejectedValue(new Error("unload broke"));
+    await expect(r.service.close()).rejects.toThrow(/unload broke/);
+    expect(rejectionGuardArmed()).toBe(false);
+    pluginHostFor(r.harness.app).errors.report(new Error("after close"), PLUGIN_ID, "event");
+    expect(r.logged.some((line) => line.includes("after close"))).toBe(false);
   });
 });
