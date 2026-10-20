@@ -333,6 +333,33 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     expect(host.stats().config_events).toBe(0);
   }, 120_000);
 
+  it("an outside snippet edit is still seen when another request rebuilt a set from the new file inside the period", async () => {
+    const { host, vault } = await screenHost({ revalidateMs: 1_000 });
+    expect(outputText(await host.apply({ viewer: "alice", mode: "dark", appearance: {} }))).toContain("--sn-width: 700px");
+    writeFileSync(join(vault, SNIPPET), readFileSync(join(vault, SNIPPET), "utf8").replace("format: px", "format: em"));
+    // A different choice misses the cache and reads the edited file inside the period.
+    expect(outputText(await host.apply({ viewer: "alice", mode: "dark", appearance: { snippets: ["fixture-snippet"] } }))).toContain("--sn-width: 700em");
+    // The kept set for the first choice is still the old one until the check.
+    expect(outputText(await host.apply({ viewer: "alice", mode: "dark", appearance: {} }))).toContain("--sn-width: 700px");
+    const before = host.stats();
+    await new Promise((settle) => setTimeout(settle, 1_100));
+    expect(outputText(await host.apply({ viewer: "alice", mode: "dark", appearance: {} }))).toContain("--sn-width: 700em");
+    expect(host.stats().config_checks).toBe(before.config_checks + 1);
+  }, 120_000);
+
+  it("an outside edit of community-plugins.json replaces the service at the next check", async () => {
+    const { host, vault } = await screenHost({ revalidateMs: 500 });
+    expect(outputText(await host.apply({ viewer: "alice", mode: "dark", appearance: {} }))).toContain("--sn-width: 700px");
+    const service = host.service;
+    expect(service).not.toBeNull();
+    writeFileSync(join(vault, ENABLED), "[]");
+    await new Promise((settle) => setTimeout(settle, 600));
+    expect(await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).toEqual({ classes: [], styles: [] });
+    expect(host.service).toBeNull();
+    expect(host.plugins).toEqual([]);
+    expect(host.stats().config_events).toBe(0);
+  }, 120_000);
+
   it("a vaultd read that never answers fails its request at the read timeout, the queue keeps moving, and the next request reads again", async () => {
     let hang = false;
     const { host, vault } = await screenHost({

@@ -333,8 +333,14 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     assembly.app.plugins.setLoader(loader);
 
     const readTimeoutMs = options.readTimeoutMs ?? CONFIG_READ_TIMEOUT_MS;
-    /** The revision of every `.obsidian` file the host read, `null` for one that was not there. */
-    const revisions = new Map<string, string | null>();
+    /**
+     * What the period's check compares against: the revision each file had the
+     * first time the host read it since the last full refresh (or since the
+     * check last saw it change). A later read, such as the one a new set makes,
+     * does not move it, so an edit made outside vaultd cannot be hidden by a
+     * read that happened to see it.
+     */
+    const validated = new Map<string, string | null>();
     /**
      * One read through vaultd, bounded: vaultd's client has no timeout of its
      * own, and these reads run outside the apply deadline, so a read that never
@@ -360,7 +366,7 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       });
       try {
         const entry = await Promise.race([bounded, deadline]);
-        revisions.set(path, entry?.revision ?? null);
+        if (!validated.has(path)) validated.set(path, entry?.revision ?? null);
         return entry;
       } finally {
         clearTimeout(timer);
@@ -432,7 +438,7 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       counts.configReads += 1;
       sets.clear();
       vaultDocuments.clear();
-      revisions.clear();
+      validated.clear();
       const enabled = parseIds(await read(enabledPath));
       // Nothing is named: nothing loads (never "every enabled plugin").
       const ids = named === null ? [] : [...new Set(enabled)].filter((id) => named.has(id));
@@ -518,12 +524,16 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       counts.configChecks += 1;
       const dataPaths = new Set(candidates.filter(isFolderName).map(dataPathOf));
       const bundle = new Set([enabledPath, ...candidates.filter(isFolderName).flatMap(bundlePathsOf)]);
-      const paths = new Set([...revisions.keys(), enabledPath, ...dataPaths]);
-      const before = new Map(revisions);
+      const paths = new Set([...validated.keys(), ...bundle, ...dataPaths]);
+      const before = new Map(validated);
       const changed: string[] = [];
       for (const path of paths) {
         const entry = await readEntry(path);
-        if ((entry?.revision ?? null) !== (before.has(path) ? before.get(path) : undefined)) changed.push(path);
+        const revision = entry?.revision ?? null;
+        if (revision !== (before.has(path) ? before.get(path) : undefined)) {
+          changed.push(path);
+          validated.set(path, revision);
+        }
       }
       if (changed.some((path) => bundle.has(path))) {
         await refresh();
