@@ -236,7 +236,12 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
         },
       });
     };
-    const mirror = await Mirror.open(clientOf, config);
+    // **No note mirror.** The screen plugins read only `.obsidian/`, through
+    // vaultd, so the mirror is the empty one: a full `Mirror.open` would load
+    // every note's metadata (on a vault of about 22,400 notes, 24 s and most
+    // of the process's 940 MB) for nothing. `app.vault` and `metadataCache`
+    // answer as an empty vault here.
+    const mirror = Mirror.empty(clientOf, config);
     undo.push(() => {
       mirror.stop();
     });
@@ -324,7 +329,6 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     // vaultd's own events: a config change that can change the output, or a
     // resync (an engine restart, a lost event), makes the next request re-read.
     await supervisor.subscribe((event: RuntimeEventDto) => {
-      void mirror.applyEvent(event).catch(() => undefined);
       if (!isKnownRuntimeEvent(event)) return;
       if (event.type === "config_changed" && affectsScreen(event.value.path)) {
         counts.configEvents += 1;

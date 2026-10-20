@@ -833,6 +833,8 @@ export class Mirror implements MirrorQuery {
   private resyncingValue = false;
   /** Set by {@link Mirror.stop}: the queue is closed and applies nothing more. */
   private stopped = false;
+  /** Set by {@link Mirror.empty}: never hydrated, and events move nothing. */
+  private inert = false;
   /**
    * Failures already announced through {@link onApplyError}.
    *
@@ -880,6 +882,20 @@ export class Mirror implements MirrorQuery {
     mirror.state = staging;
     mirror.generationValue = summary.generation;
     mirror.appliedThroughValue = summary.generation;
+    return mirror;
+  }
+
+  /**
+   * A mirror that holds no vault: it is never hydrated, answers every query
+   * as an empty vault (no files, no notes, no links), and ignores every event,
+   * so no event and no resync can hydrate it later. For a host profile whose
+   * plugins read nothing from the note mirror (the screen host: Style Settings
+   * reads only `.obsidian/`, through vaultd), where a full hydration would load
+   * every note's metadata for nothing.
+   */
+  static empty(client: MirrorClientSource, config: HostConfig): Mirror {
+    const mirror = new Mirror(client, config);
+    mirror.inert = true;
     return mirror;
   }
 
@@ -1179,6 +1195,7 @@ export class Mirror implements MirrorQuery {
    * loud recovery.
    */
   applyEvent(event: RuntimeEventDto): Promise<void> {
+    if (this.inert) return Promise.resolve();
     return this.dispatch(event).catch((error: unknown) => {
       // The engine went away. The supervisor's marker is already on its way and
       // will re-hydrate everything; asking for a second resync here would be
