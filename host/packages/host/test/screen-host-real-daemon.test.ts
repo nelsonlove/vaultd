@@ -8,7 +8,9 @@
  * the socket's door and envelope; and that nothing is written into the vault.
  */
 
-import { cpSync, readFileSync, readdirSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createConnection } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -18,6 +20,7 @@ import { HostTestClient } from "../src/testing/host-harness";
 import { buildSheetSet } from "../src/web/sheet-set";
 import { defaultHostConfig, systemClock } from "../src/config";
 import { startScreenHost } from "../src/screen/screen-host";
+import { rejectionGuardArmed } from "../src/server/server";
 import type { HostConfig } from "../src/config";
 import type { Mode } from "./style-settings-run";
 import type { RunningScreenHost } from "../src/screen/screen-host";
@@ -45,7 +48,7 @@ function snapshot(root: string): Map<string, string> {
   return files;
 }
 
-async function screenHost(): Promise<{ host: RunningScreenHost; vault: string; state: string; stateRoot: string }> {
+function screenConfig(): { config: HostConfig; vault: string; state: string; stateRoot: string } {
   const vault = scratchRoot("vaultd-screen-vault-");
   cpSync(join(FIXTURE, "vault"), vault, { recursive: true });
   const state = scratchRoot("vaultd-screen-host-");
@@ -60,9 +63,34 @@ async function screenHost(): Promise<{ host: RunningScreenHost; vault: string; s
     allowNetwork: false,
     watchdogThresholdMs: 0,
   };
+  return { config, vault: config.vaultRoot, state, stateRoot };
+}
+
+async function screenHost(): Promise<{ host: RunningScreenHost; vault: string; state: string; stateRoot: string }> {
+  const { config, state, stateRoot } = screenConfig();
   const host = await startScreenHost(config, { stateRoot });
   running.push(host);
   return { host, vault: config.vaultRoot, state, stateRoot };
+}
+
+/** Does any process's command line name this vault? (A spawned vaultd does.) */
+function vaultdRunningFor(vault: string): boolean {
+  return execFileSync("ps", ["-axo", "command"], { encoding: "utf8" })
+    .split("\n")
+    .some((line) => line.includes(vault) && line.includes("vaultd"));
+}
+
+function canConnect(path: string): Promise<boolean> {
+  return new Promise((settle) => {
+    const socket = createConnection(path);
+    socket.once("connect", () => {
+      socket.destroy();
+      settle(true);
+    });
+    socket.once("error", () => {
+      settle(false);
+    });
+  });
 }
 
 async function connect(host: RunningScreenHost, state: string): Promise<HostTestClient> {
@@ -121,5 +149,31 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     await expect(client.call("screen.apply", { viewer: "a", mode: "dark", sheets: [] })).rejects.toMatchObject({
       code: "not_owner",
     });
+  }, 120_000);
+
+  it("takes down what it started when the start fails, the spawned vaultd included", async () => {
+    const { config, vault, stateRoot } = screenConfig();
+    // A socket directory somebody opened up: the socket refuses to listen.
+    const open = join(config.dataDir, "open");
+    mkdirSync(open, { mode: 0o755 });
+    chmodSync(open, 0o755);
+    await expect(startScreenHost({ ...config, socketPath: join(open, "s") }, { stateRoot })).rejects.toThrow(
+      /refusing to listen/,
+    );
+    expect((globalThis as { document?: unknown }).document).toBeUndefined();
+    expect(rejectionGuardArmed()).toBe(false);
+    expect(vaultdRunningFor(vault)).toBe(false);
+  }, 120_000);
+
+  it("stops the socket and the plugin, and the engine with them", async () => {
+    const { host, vault, state } = await screenHost();
+    const client = await connect(host, state);
+    await client.call("screen.apply", { viewer: "alice", mode: "dark", sheets: [] });
+    running.splice(running.indexOf(host), 1);
+    await host.stop();
+    expect(await canConnect(host.socketPath)).toBe(false);
+    await expect(host.service?.apply({ viewer: "alice", mode: "dark", sheets: [] })).rejects.toThrow(/closed/);
+    expect(rejectionGuardArmed()).toBe(false);
+    expect(vaultdRunningFor(vault)).toBe(false);
   }, 120_000);
 });

@@ -98,123 +98,142 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     await supervisor.stop();
     throw new DaemonUnreachable(error);
   }
-  const clientOf = (): VaultdClient => supervisor.client();
-  const mirror = await Mirror.open(clientOf, config);
-  await supervisor.subscribe((event) => {
-    void mirror.applyEvent(event).catch(() => undefined);
-  });
-
-  const clock = drivenClock(Date.now());
-  const assembly = assembleShim({ config, client: clientOf, mirror, clock, dom: happyDomProvider() });
-  const modulePaths = [resolve(__dirname, "..", "..", "..", "..", "node_modules")];
-  const interception = installModuleInterception({
-    hostModulePaths: modulePaths,
-    allowNodeBuiltins: true,
-    harvest: assembly.harvest,
-  });
-  const loader = new BundleLoader({
-    app: assembly.app,
-    queue: assembly.queue,
-    events: assembly.events,
-    harvest: assembly.harvest,
-    errors: assembly.errors,
-  });
-  assembly.app.plugins.setLoader(loader);
-
-  const read = async (path: string): Promise<string | null> => {
-    try {
-      const response = await clientOf().request<ReadFileResponse>("read_file", { path });
-      return Buffer.from(response.content_base64, "base64").toString("utf8");
-    } catch (error) {
-      if (error instanceof VaultdError && (error.code === "not_found" || error.code === "parent_not_found")) return null;
-      throw error;
-    }
-  };
-
-  const enabled = parseIds(await read(`${OBSIDIAN_CONFIG_DIR}/community-plugins.json`));
-  const id = SCREEN_PLUGIN_IDS.find((candidate) => enabled.includes(candidate)) ?? null;
-  let service: ApplyService | null = null;
-  if (id !== null && assembly.globals.dom !== null) {
-    const dir = `${OBSIDIAN_CONFIG_DIR}/plugins/${id}`;
-    const manifestText = await read(`${dir}/manifest.json`);
-    const source = await read(`${dir}/main.js`);
-    if (manifestText !== null && source !== null) {
-      const manifest = { ...(JSON.parse(manifestText) as PluginManifest), dir };
-      service = createApplyService({
-        app: assembly.app,
-        loader,
-        queue: assembly.queue,
-        document: assembly.globals.dom.document as unknown as ServiceDocument,
-        clock,
-        bundle: {
-          manifest,
-          request: {
-            pluginId: id,
-            filename: join(config.vaultRoot, dir, "main.js"),
-            source,
-            hostModulePaths: modulePaths,
-          },
-        },
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
-      });
-    }
-  }
-  const plugins = service === null || id === null ? [] : [id];
-
-  const apply = async (request: ApplyRequest): Promise<{ classes: readonly string[]; style: string }> => {
-    if (service === null) return { classes: [], style: "" };
-    return service.apply(request);
-  };
-
-  const server = new ScreenServer({
-    socketPath: config.socketPath,
-    dataDir: config.dataDir,
-    clock: config.clock,
-    handshakeTimeoutMs: config.handshakeTimeoutMs,
-    maxPreAuthConnections: config.maxPreAuthConnections,
-    lineCapBytes: SCREEN_LINE_CAP_BYTES,
-    hello: () => ({ protocol_version: 1, profile: "screen", vault_root: config.vaultRoot, plugins }),
-    dispatch: async (method, params) => {
-      switch (method) {
-        case "screen.apply": {
-          try {
-            const result = await apply(params as ApplyRequest);
-            return { classes: [...result.classes], style: result.style };
-          } catch (error) {
-            if (error instanceof TypeError) throw new ScreenError("invalid_request", error.message);
-            throw error;
-          }
-        }
-        case "screen.stats":
-          return service?.stats() ?? { loads: 0, unloads: 0, hits: 0, misses: 0, size: 0 };
-        default:
-          throw new ScreenError("invalid_request", `the screen host has no method ${JSON.stringify(method)}`);
+  // **Undone in reverse, on a failed start and at stop.** Each step pushes its
+  // own undo once it exists, so a start that fails half way takes down what it
+  // built, the spawned vaultd included, rather than leaving it running. The
+  // reverse order is also the stop order: the socket first (no new request
+  // can reload the plugin), then the plugin, the module interception, the
+  // assembly's globals, the mirror, and the engine last.
+  const undo: Array<() => Promise<void> | void> = [() => supervisor.stop()];
+  const unwind = async (): Promise<void> => {
+    for (const step of undo.splice(0).reverse()) {
+      try {
+        await step();
+      } catch {
+        // Keep unwinding: a later step still owns a resource.
       }
-    },
-  });
-  const socketPath = options.listen === false ? config.socketPath : await server.listen();
-
-  let stopped = false;
-  return {
-    config,
-    socketPath,
-    plugins,
-    service,
-    apply,
-    async stop(): Promise<void> {
-      if (stopped) return;
-      stopped = true;
-      // The order is the headless host's: the plugin first, then the socket,
-      // the mirror, the process-wide state, and the engine last.
-      await service?.close();
-      await server.close();
-      mirror.stop();
-      interception.restore();
-      await assembly.teardown();
-      await supervisor.stop();
-    },
+    }
   };
+  try {
+    const clientOf = (): VaultdClient => supervisor.client();
+    const mirror = await Mirror.open(clientOf, config);
+    undo.push(() => {
+      mirror.stop();
+    });
+    await supervisor.subscribe((event) => {
+      void mirror.applyEvent(event).catch(() => undefined);
+    });
+
+    const clock = drivenClock(Date.now());
+    const assembly = assembleShim({ config, client: clientOf, mirror, clock, dom: happyDomProvider() });
+    undo.push(() => assembly.teardown());
+    const modulePaths = [resolve(__dirname, "..", "..", "..", "..", "node_modules")];
+    const interception = installModuleInterception({
+      hostModulePaths: modulePaths,
+      allowNodeBuiltins: true,
+      harvest: assembly.harvest,
+    });
+    undo.push(() => {
+      interception.restore();
+    });
+    const loader = new BundleLoader({
+      app: assembly.app,
+      queue: assembly.queue,
+      events: assembly.events,
+      harvest: assembly.harvest,
+      errors: assembly.errors,
+    });
+    assembly.app.plugins.setLoader(loader);
+
+    const read = async (path: string): Promise<string | null> => {
+      try {
+        const response = await clientOf().request<ReadFileResponse>("read_file", { path });
+        return Buffer.from(response.content_base64, "base64").toString("utf8");
+      } catch (error) {
+        if (error instanceof VaultdError && (error.code === "not_found" || error.code === "parent_not_found")) return null;
+        throw error;
+      }
+    };
+
+    const enabled = parseIds(await read(`${OBSIDIAN_CONFIG_DIR}/community-plugins.json`));
+    const id = SCREEN_PLUGIN_IDS.find((candidate) => enabled.includes(candidate)) ?? null;
+    let service: ApplyService | null = null;
+    if (id !== null && assembly.globals.dom !== null) {
+      const dir = `${OBSIDIAN_CONFIG_DIR}/plugins/${id}`;
+      const manifestText = await read(`${dir}/manifest.json`);
+      const source = await read(`${dir}/main.js`);
+      if (manifestText !== null && source !== null) {
+        const manifest = { ...(JSON.parse(manifestText) as PluginManifest), dir };
+        service = createApplyService({
+          app: assembly.app,
+          loader,
+          queue: assembly.queue,
+          document: assembly.globals.dom.document as unknown as ServiceDocument,
+          clock,
+          bundle: {
+            manifest,
+            request: {
+              pluginId: id,
+              filename: join(config.vaultRoot, dir, "main.js"),
+              source,
+              hostModulePaths: modulePaths,
+            },
+          },
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+          ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
+        });
+        const started = service;
+        undo.push(() => started.close());
+      }
+    }
+    const plugins = service === null || id === null ? [] : [id];
+
+    const apply = async (request: ApplyRequest): Promise<{ classes: readonly string[]; style: string }> => {
+      if (service === null) return { classes: [], style: "" };
+      return service.apply(request);
+    };
+
+    const server = new ScreenServer({
+      socketPath: config.socketPath,
+      dataDir: config.dataDir,
+      clock: config.clock,
+      handshakeTimeoutMs: config.handshakeTimeoutMs,
+      maxPreAuthConnections: config.maxPreAuthConnections,
+      lineCapBytes: SCREEN_LINE_CAP_BYTES,
+      hello: () => ({ protocol_version: 1, profile: "screen", vault_root: config.vaultRoot, plugins }),
+      dispatch: async (method, params) => {
+        switch (method) {
+          case "screen.apply": {
+            try {
+              const result = await apply(params as ApplyRequest);
+              return { classes: [...result.classes], style: result.style };
+            } catch (error) {
+              if (error instanceof TypeError) throw new ScreenError("invalid_request", error.message);
+              throw error;
+            }
+          }
+          case "screen.stats":
+            return service?.stats() ?? { loads: 0, unloads: 0, hits: 0, misses: 0, size: 0 };
+          default:
+            throw new ScreenError("invalid_request", `the screen host has no method ${JSON.stringify(method)}`);
+        }
+      },
+    });
+    undo.push(() => server.close());
+    const socketPath = options.listen === false ? config.socketPath : await server.listen();
+
+    return {
+      config,
+      socketPath,
+      plugins,
+      service,
+      apply,
+      stop: unwind,
+    };
+  } catch (error) {
+    await unwind();
+    throw error;
+  }
 }
 
 function parseIds(text: string | null): string[] {
