@@ -6,7 +6,7 @@
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "bin": { "vaultd-host": "dist/main.js" },
+  "bin": { "vaultd-host": "dist/main.js", "vaultd-screen-host": "dist/screen-main.js" },
   "dependencies": {
     "js-yaml": "4.1.0",
     "moment": "2.30.1"
