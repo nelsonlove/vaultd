@@ -133,7 +133,7 @@ function sheetFor(owner: unknown): ServerStyleSheet {
 /**
  * Load a server-DOM library, or say plainly that it is not installed.
  *
- * Both libraries are **optional** dependencies of this package: the headless
+ * happy-dom is an **optional** dependency of this package: the headless
  * host never needs them, so an install without optional dependencies is a
  * valid headless install. A screen host on such an install would otherwise
  * fail with Node's bare `MODULE_NOT_FOUND`; this names the package and the

@@ -11,7 +11,7 @@ This measures stage 1 of `docs/design/web-plugins.md`: the web server asks the s
 - Node: v26.11.1
 - vaultd: release build, `target/review-shared/release/vaultd` (a release profile binary)
 - Code: branch `spike/style-settings` at `68c3ed8`, plus the two bench scripts of this task
-- The Mac was not idle. Load average (1 minute) before each part is in the tables; it was 5.7 to 7.9 during the runs. Each run went through a load gate, one at a time, so the numbers are real but not quiet-machine numbers.
+- The Mac was not idle. Load average (1 minute) before each part is in the tables; it was 5.7 to 7.9 during the runs. Runs were made one at a time, so the numbers are real but not quiet-machine numbers.
 
 ## Fixtures
 
@@ -30,7 +30,7 @@ node host/scripts/style-settings-obsidian-bench.js --vault <scratch vault open i
      --realistic-vault target/tmp/ss-perf/realistic/vault --out <json> --runs 20
 ```
 
-Every run was started through a load gate, one at a time.
+Runs were made one at a time, under other load.
 
 ## What each number is
 

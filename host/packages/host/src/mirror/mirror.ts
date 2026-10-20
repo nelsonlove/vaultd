@@ -888,7 +888,9 @@ export class Mirror implements MirrorQuery {
   /**
    * A mirror that holds no vault: it is never hydrated, answers every query
    * as an empty vault (no files, no notes, no links), and ignores every event,
-   * so no event and no resync can hydrate it later. For a host profile whose
+   * so no event and no resync can hydrate it later. It is not read-only:
+   * when writes are on, `applyMutation` still records the rows a plugin's own
+   * write adds, so a plugin may read back what it wrote in the same run. For a host profile whose
    * plugins read nothing from the note mirror (the screen host: Style Settings
    * reads only `.obsidian/`, through vaultd), where a full hydration would load
    * every note's metadata for nothing.
