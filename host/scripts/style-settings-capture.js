@@ -150,10 +150,13 @@ const WAIT_FOR_PLUGIN = `
 /** Run `fn` in light mode and in dark mode, and restore the theme the app had. */
 const WITH_BOTH_MODES = `
   const original = app.vault.getConfig("theme");
+  // The Obsidian build captured against switches the mode with changeTheme; setTheme does not
+  // change the body class there. Fall back to setTheme on builds without changeTheme.
+  const switchMode = (theme) => (typeof app.changeTheme === "function" ? app.changeTheme(theme) : app.setTheme(theme));
   const results = {};
   try {
     for (const [mode, theme] of [["light", "moonstone"], ["dark", "obsidian"]]) {
-      app.setTheme(theme);
+      switchMode(theme);
       await sleep(300);
       app.workspace.trigger("css-change");
       await sleep(700);
@@ -163,7 +166,7 @@ const WITH_BOTH_MODES = `
       results[mode] = capture();
     }
   } finally {
-    app.setTheme(original);
+    switchMode(original);
     await sleep(300);
   }
 `;

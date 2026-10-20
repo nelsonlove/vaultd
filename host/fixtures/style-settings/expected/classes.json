@@ -1,0 +1,36 @@
+{
+  "light": [
+    "auto-full-screen",
+    "css-settings-manager",
+    "fx-airy",
+    "fx-compact",
+    "fx-rounded",
+    "is-floating-nav",
+    "is-frameless",
+    "is-fullscreen",
+    "is-hidden-frameless",
+    "mod-macos",
+    "obsidian-app",
+    "show-inline-title",
+    "show-ribbon",
+    "show-view-header",
+    "theme-light"
+  ],
+  "dark": [
+    "auto-full-screen",
+    "css-settings-manager",
+    "fx-airy",
+    "fx-compact",
+    "fx-rounded",
+    "is-floating-nav",
+    "is-frameless",
+    "is-fullscreen",
+    "is-hidden-frameless",
+    "mod-macos",
+    "obsidian-app",
+    "show-inline-title",
+    "show-ribbon",
+    "show-view-header",
+    "theme-dark"
+  ]
+}
