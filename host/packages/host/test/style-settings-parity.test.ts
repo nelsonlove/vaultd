@@ -20,7 +20,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { EXPECTED, pluginOwnedClasses, runStyleSettings } from "./style-settings-run";
+import { EXPECTED, pluginOwnedClasses, runStyleSettings, switchMode } from "./style-settings-run";
 import { happyDomProvider } from "../src/shim/dom-providers/happy-dom";
 import type { DomProvider } from "../src/shim/dom-provider";
 import type { Mode, StyleSettingsRun } from "./style-settings-run";
@@ -85,5 +85,19 @@ describe.each(PROVIDERS)("stock Style Settings over %s", (_name, provider) => {
       expect(done.inMemory).toEqual(EXPECTED.pluginData.in_memory);
       expect(done.saved).toEqual(EXPECTED.pluginData.on_disk);
     });
+  });
+
+  it("reproduces both modes in one host, light then dark, as the capture ran", async () => {
+    const done = await run(provider, "light");
+    const owned = pluginOwnedClasses();
+    expect(done.styleText).toBe(EXPECTED.styleText.light);
+    const dark = await switchMode(done, "dark");
+    expect(dark.styleText).toBe(EXPECTED.styleText.dark);
+    expect(dark.classes.filter((name) => owned.has(name))).toEqual(
+      EXPECTED.classes.dark.filter((name) => owned.has(name)),
+    );
+    expect(dark.classes).toContain("theme-dark");
+    expect(dark.classes).not.toContain("theme-light");
+    expect(done.harness.hostErrors).toEqual([]);
   });
 });

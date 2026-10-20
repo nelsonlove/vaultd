@@ -184,6 +184,26 @@ export async function runStyleSettings(
   };
 }
 
+/**
+ * Switch a run's host to `mode` the way the capture script did: change the
+ * `body` mode class, raise `css-change`, and advance past the debounce. The
+ * same host and the same plugin instance, so the new apply sees the previous
+ * one's output, as the live capture's second mode did.
+ */
+export async function switchMode(run: StyleSettingsRun, mode: Mode): Promise<{ classes: string[]; styleText: string | null }> {
+  const document = (globalThis as unknown as { document: RunDocument }).document;
+  const list = document.body.classList as unknown as { add(...c: string[]): void; remove(...c: string[]): void };
+  list.remove("theme-light", "theme-dark");
+  list.add(mode === "light" ? "theme-light" : "theme-dark");
+  run.harness.app.workspace.trigger("css-change");
+  await run.harness.clock.advance(150);
+  await settle();
+  return {
+    classes: [...document.body.classList].sort(),
+    styleText: document.getElementById("css-settings-manager")?.textContent ?? null,
+  };
+}
+
 /** Let the save's promise chain and the fake daemon's answer settle. */
 async function settle(): Promise<void> {
   for (let i = 0; i < 20; i += 1) await new Promise<void>((done) => setImmediate(done));
