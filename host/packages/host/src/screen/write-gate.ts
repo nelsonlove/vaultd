@@ -1,15 +1,19 @@
 /**
- * The screen profile's write gate: **it refuses every vault write.**
+ * The screen profile's opt-in write gate: **with `--read-only` it refuses
+ * every vault write.** The switch is off by default.
  *
  * The screen host loads stock plugins to read back what they do to the page.
- * A page view must never write the vault (the owner's ruling, Meta Bind
- * decision 2 and E20 of `docs/design/web-plugins-meta-bind.md`): the vault may
- * be kept by Obsidian Sync, and a write here would reach every device. Every
- * mutation the shim makes (`app.vault` create, modify, process, rename and
- * delete, the adapter's writes, `fileManager.processFrontMatter`, folder
- * creates) goes through one {@link WriteGate}; this one answers each with a
- * typed {@link ScreenWriteRefused}, records it, and reports it to the host's
- * error sink with phase `write`. Nothing reaches vaultd.
+ * By default a plugin's vault writes go through vaultd as in the headless
+ * host: they are that plugin's own behaviour on one more device (the owner's
+ * pick A, E20 of `docs/design/web-plugins-meta-bind.md`). The vault may be
+ * kept by Obsidian Sync, where such a write reaches every device, so `--read-only`
+ * (`readOnly` in `startScreenHost`) installs this gate. Then every mutation
+ * the shim makes (`app.vault` create, modify, process, rename and delete, the
+ * adapter's writes, `fileManager.processFrontMatter`, folder creates) goes
+ * through it; it answers each with a typed {@link ScreenWriteRefused}, records
+ * it, and reports it to the host's error sink with phase `write`. Nothing
+ * reaches vaultd. The gate covers vault writes only; the node modules a
+ * bundle may not load under `--read-only` are set in `screen-host.ts`.
  *
  * Unlike the dry-run gate it pretends nothing: a plugin that writes sees the
  * write fail, as it would on a read-only vault. The apply service does not
@@ -36,7 +40,7 @@ export class ScreenWriteRefused extends Error {
   ) {
     super(
       `screen_write_refused: ${method}${path === null ? "" : ` ${JSON.stringify(path)}`} ` +
-        `by ${pluginId ?? "the host"}: the screen host never writes the vault`,
+        `by ${pluginId ?? "the host"}: the screen host runs with --read-only`,
     );
     this.name = "ScreenWriteRefused";
   }
