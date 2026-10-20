@@ -453,6 +453,24 @@ class InertMutationObserver {
  */
 export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): GlobalInstallation {
   const patcher = new GlobalPatcher();
+  // **All or nothing.** A throw partway through — a provider whose library is
+  // missing, a prototype that refuses a property — undoes every global already
+  // installed and closes a server DOM already built, so a caller that catches
+  // the error has the process exactly as it was before the call.
+  try {
+    return installWith(patcher, app, config, deps);
+  } catch (error) {
+    patcher.restore();
+    throw error;
+  }
+}
+
+function installWith(
+  patcher: GlobalPatcher,
+  app: App,
+  config: HostConfig,
+  deps: GlobalDeps,
+): GlobalInstallation {
   const timers = new ShimTimers(deps.clock);
   const localStorage = new HostLocalStorage(new DataDir(deps.dataDir), LOCAL_STORAGE_FILE, deps.errors);
   // One recorder for both surfaces: a plugin that listens on `document` and one
