@@ -148,13 +148,15 @@ function wrapEval(expected, body) {
   return `(async () => { const base = app.vault.adapter.basePath; if (base !== ${JSON.stringify(expected)}) return JSON.stringify({ refused: base }); return JSON.stringify({ value: await (${body})() }); })()`;
 }
 
-function evalInFixture(options, expected, body) {
+function evalInFixture(options, expected, body, { tolerate = false } = {}) {
   const answer = obsidian(options.vaultName, ["eval", `code=${wrapEval(expected, body)}`]);
   let parsed;
   try {
     parsed = JSON.parse(answer.stdout.trim().replace(/^=>\s*/, ""));
   } catch {
-    console.error(`reading-view-capture: the eval gave no JSON (exit ${answer.code}): ${answer.stdout.slice(0, 500)} ${answer.stderr.slice(0, 500)}`);
+    const message = `the eval gave no JSON (exit ${answer.code}): ${answer.stdout.slice(0, 500)} ${answer.stderr.slice(0, 500)}`;
+    if (tolerate) throw new Error(message);
+    console.error(`reading-view-capture: ${message}`);
     process.exit(2);
   }
   if ("refused" in parsed) {
@@ -312,7 +314,18 @@ function capture(options) {
     console.log(`wrote ${stem}.html${result.settled ? "" : " (did not settle within 5 s)"}`);
   }
   writeJson(options.out, "frontmatter.json", frontmatter);
-  writeJson(options.out, "render-markdown.json", evalInFixture(options, expected, STEP_RENDER_MARKDOWN));
+  // `require("obsidian")` is not reachable from the CLI's eval in a vault with no
+  // plugin (measured 2026-10-20: "Cannot find module 'obsidian'"), so this step
+  // records its failure and the capture goes on; the Meta Bind fixture, which
+  // has a plugin, answers E27.
+  let renderMarkdown;
+  try {
+    renderMarkdown = evalInFixture(options, expected, STEP_RENDER_MARKDOWN, { tolerate: true });
+  } catch (error) {
+    renderMarkdown = { error: String(error && error.message || error) };
+    console.log("render-markdown.json: the step failed; recorded the error");
+  }
+  writeJson(options.out, "render-markdown.json", renderMarkdown);
   const meta = evalInFixture(options, expected, STEP_META);
   const cli = obsidian(options.vaultName, ["version"]);
   writeJson(options.out, "meta.json", {

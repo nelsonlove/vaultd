@@ -1,0 +1,90 @@
+{
+  "obsidian_version": "1.14.4",
+  "installer_version": "1.14.4",
+  "api_version": null,
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) obsidian/1.14.4 Chrome/150.0.7871.250 Electron/43.7.7 Safari/537.36",
+  "theme": "default",
+  "readable_line_length": true,
+  "strict_line_breaks": false,
+  "base_color_scheme": "light",
+  "cli_version": "1.14.4 (installer 1.14.4)",
+  "captured_at": "2026-10-20T18:25:20.866Z",
+  "fixture": "host/fixtures/reading-view/vault",
+  "notes": [
+    "Block Target.md",
+    "Link Target.md",
+    "Target With Headings.md",
+    "blockquotes.md",
+    "callouts.md",
+    "code-blocks.md",
+    "comments.md",
+    "embeds.md",
+    "escaped-characters.md",
+    "footnotes.md",
+    "frontmatter-types.md",
+    "hard-line-breaks.md",
+    "headings.md",
+    "horizontal-rules.md",
+    "images.md",
+    "inline-formatting.md",
+    "inline-html.md",
+    "links.md",
+    "lists.md",
+    "math.md",
+    "tables.md",
+    "tags.md",
+    "task-lists.md",
+    "view-field-code.md",
+    "wikilinks.md"
+  ],
+  "unsettled_notes": [
+    "Block Target.md",
+    "Link Target.md",
+    "Target With Headings.md",
+    "blockquotes.md",
+    "callouts.md",
+    "code-blocks.md",
+    "comments.md",
+    "escaped-characters.md",
+    "footnotes.md",
+    "frontmatter-types.md",
+    "hard-line-breaks.md",
+    "headings.md",
+    "horizontal-rules.md",
+    "images.md",
+    "inline-formatting.md",
+    "inline-html.md",
+    "links.md",
+    "lists.md",
+    "math.md",
+    "tables.md",
+    "tags.md",
+    "task-lists.md",
+    "view-field-code.md",
+    "wikilinks.md"
+  ],
+  "unlisted_data_attributes": [
+    "data-property-count"
+  ],
+  "normalisation": {
+    "style_stripped_on": [
+      "markdown-preview-pusher",
+      "markdown-preview-sizer"
+    ],
+    "bookkeeping_data_removed": [
+      "data-line",
+      "data-ln",
+      "data-section",
+      "data-section-index",
+      "data-tooltip-position",
+      "data-block-id"
+    ],
+    "data_kept": [
+      "data-href",
+      "data-callout*",
+      "data-task",
+      "data-heading"
+    ],
+    "whitespace_between_tags_collapsed": true
+  }
+}
