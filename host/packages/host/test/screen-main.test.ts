@@ -60,12 +60,18 @@ describe("parseScreenArgs", () => {
     expect(SCREEN_USAGE).toContain("--revalidate-ms");
   });
 
-  it("loads every enabled plugin by default, and only the --plugins list when it is given", () => {
+  it("names no plugin by default (nothing loads), and takes the --plugins list", () => {
     expect(parseScreenArgs(["--vault", "/tmp"]).plugins).toBeNull();
     expect(parseScreenArgs(["--vault", "/tmp", "--plugins", "a, b-c"]).plugins).toEqual(["a", "b-c"]);
     expect(() => parseScreenArgs(["--vault", "/tmp", "--plugins", "a,,b"])).toThrow(CliRefusal);
     expect(() => parseScreenArgs(["--vault", "/tmp", "--plugins"])).toThrow(CliRefusal);
     expect(SCREEN_USAGE).toContain("--plugins");
+  });
+
+  it("writes through vaultd by default, and refuses every vault write with --read-only", () => {
+    expect(parseScreenArgs(["--vault", "/tmp"]).readOnly).toBe(false);
+    expect(parseScreenArgs(["--vault", "/tmp", "--read-only"]).readOnly).toBe(true);
+    expect(SCREEN_USAGE).toContain("--read-only");
   });
 
   it("keeps its state apart from the headless host's", () => {

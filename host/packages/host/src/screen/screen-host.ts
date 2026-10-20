@@ -5,14 +5,20 @@
  * Its own process beside the web server, never inside the headless host: the
  * headless host keeps its inert stub document on purpose. This one assembles
  * the same shim with happy-dom behind `document`, connects to `vaultd` the way
- * the headless host does, and loads the plugins the vault's own
- * `.obsidian/community-plugins.json` enables, in its order — all of them by
- * default, or only those named by {@link ScreenHostOptions.plugins} (the
- * `--plugins` flag). It names no plugin itself: what a plugin did to the page
+ * the headless host does, and loads only the plugins named by
+ * {@link ScreenHostOptions.plugins} (the `--plugins` flag), each only while the
+ * vault's own `.obsidian/community-plugins.json` enables it, in that file's
+ * order. **With none named it loads nothing**: never "every enabled plugin",
+ * because this process is not a sandbox and a plugin that writes files on a
+ * Sync-kept vault pushes them to every device (owner's ruling, 2026-10-20). It
+ * names no plugin itself: what a plugin did to the page
  * is read back as a diff (`apply-service.ts`). A plugin that cannot be read or
  * loaded is reported (`host.hello`'s `failed`), not fatal; the others are
- * served. It reads the vault's `.obsidian` (the GUI's directory) and never
- * writes there: the plugins' saves go to the `viewer` store, outside the vault.
+ * served. It reads the vault's `.obsidian` (the GUI's directory) and writes
+ * nothing of its own; a plugin's writes go through vaultd as in the headless
+ * host, or with {@link ScreenHostOptions.readOnly} (`--read-only`) are all
+ * refused and recorded (`write-gate.ts`). The plugins' own saves go to the
+ * `viewer` store, outside the vault.
  *
  * It answers one request, `screen.apply` (`apply-service.ts`), over its own
  * socket (`screen-server.ts`).
@@ -52,7 +58,8 @@ import { ScreenError, ScreenServer } from "./screen-server";
 import { Supervisor } from "../supervisor";
 import { VaultdError } from "../client/errors";
 import { assembleShim } from "../testing/assemble";
-import { APPLY_DEADLINE_MS, createApplyService } from "./apply-service";
+import { APPLY_DEADLINE_MS, boundedLoaderQueue, createApplyService } from "./apply-service";
+import { RefusingWriteGate } from "./write-gate";
 import { happyDomProvider } from "../shim/dom-providers/happy-dom";
 import { installModuleInterception } from "../runtime/intercept";
 import { drivenClock } from "../runtime/driven-clock";
@@ -148,6 +155,12 @@ export interface ScreenStats {
   /** As `host.hello` says now: the plugins loaded, and those that failed. */
   readonly plugins: readonly string[];
   readonly failed: readonly PluginFailure[];
+  /** Plugins `--plugins` names that the vault does not enable. */
+  readonly unknown: readonly string[];
+  /** Whether the host refuses every vault write (`--read-only`). */
+  readonly read_only: boolean;
+  /** Vault writes refused under `--read-only` (each one a plugin tried); 0 without it. */
+  readonly writes_refused: number;
 }
 
 /** `$XDG_STATE_HOME/vaultd-screen-host`: this host's own state, apart from the headless host's. */
@@ -167,11 +180,18 @@ export function screenSocketPathFor(dataDir: string, vaultRoot: string): string 
 
 export interface ScreenHostOptions {
   /**
-   * Load only these plugins (the `--plugins` flag), each still only when the
-   * vault enables it, in the vault's order. Default: every plugin the vault's
-   * `community-plugins.json` enables.
+   * The plugins to load (the `--plugins` flag), each only while the vault's
+   * `community-plugins.json` enables it, in that file's order. Default: none,
+   * so the host loads nothing; it never loads "every enabled plugin".
    */
   readonly plugins?: readonly string[];
+  /**
+   * Refuse every vault write a plugin tries, record it, and refuse the node
+   * file system, process and network modules to bundles (`--read-only`).
+   * Default: off, so a plugin's writes go through vaultd as in the headless
+   * host.
+   */
+  readonly readOnly?: boolean;
   /** The `viewer` store's state root. Default `$XDG_STATE_HOME/vaultd-web/plugin-data`. */
   readonly stateRoot?: string;
   readonly cacheLimit?: number;
@@ -189,13 +209,17 @@ export interface RunningScreenHost {
   readonly config: HostConfig;
   readonly socketPath: string;
   /**
-   * The plugins the host loads, by id, in load order: enabled (and named, with
-   * `plugins`), read, and not failed. Empty when there are none. As last read;
+   * The plugins the host loads, by id, in load order: named in `plugins`,
+   * enabled, read, and not failed. Empty when there are none. As last read;
    * a plugin whose `onload` throws leaves it at the first apply that loads it.
    */
   readonly plugins: readonly string[];
   /** The plugins that could not be read or loaded, with the reason. */
   readonly failed: readonly PluginFailure[];
+  /** The plugins `plugins` names that the vault does not enable. As last read. */
+  readonly unknown: readonly string[];
+  /** With `readOnly`, the gate that refused every vault write a plugin tried; else `null`. */
+  readonly writes: RefusingWriteGate | null;
   /** The apply service, or `null` when no plugin is loaded. As last read. */
   readonly service: ApplyService | null;
   apply(request: ScreenApplyRequest): Promise<ApplyResult>;
@@ -267,12 +291,31 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     });
 
     const clock = drivenClock(Date.now());
-    const assembly = assembleShim({ config, client: countedClient, mirror, clock, dom: happyDomProvider() });
+    // **`readOnly`: the screen profile writes nothing (review S1).** Every
+    // mutation the shim makes goes through this gate, which refuses it and
+    // records it; the node file system, process and network modules are
+    // refused to plugin bundles below. Without it, a plugin's writes go to
+    // vaultd as in the headless host: they are the plugin's own behaviour on
+    // one more device (owner's ruling, 2026-10-20). Either way a plugin's own
+    // data goes to the viewer store.
+    const readOnly = options.readOnly === true;
+    const writes = readOnly ? new RefusingWriteGate() : null;
+    const assembly = assembleShim({
+      config,
+      client: countedClient,
+      mirror,
+      clock,
+      dom: happyDomProvider(),
+      ...(writes === null ? {} : { writes }),
+    });
+    writes?.reportTo(assembly.errors);
     undo.push(() => assembly.teardown());
     const modulePaths = [resolve(__dirname, "..", "..", "..", "..", "node_modules")];
     const interception = installModuleInterception({
       hostModulePaths: modulePaths,
-      allowNodeBuiltins: true,
+      // Read-only: no `fs`, `child_process`, network or `vm` for a bundle, or
+      // the gate above would be a door with a wall beside it.
+      allowNodeBuiltins: !readOnly,
       harvest: assembly.harvest,
     });
     undo.push(() => {
@@ -280,7 +323,9 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     });
     const loader = new BundleLoader({
       app: assembly.app,
-      queue: assembly.queue,
+      // Each load, unload and compile fails at its own deadline, so a plugin
+      // whose `onload` never finishes fails alone (apply-service.ts).
+      queue: boundedLoaderQueue(assembly.queue),
       events: assembly.events,
       harvest: assembly.harvest,
       errors: assembly.errors,
@@ -332,6 +377,8 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     let service: ApplyService | null = null;
     /** The enabled (and named) plugin ids, as last read, whether or not they could be read. */
     let candidates: readonly string[] = [];
+    /** Plugins `plugins` names that the vault does not enable, as last read. */
+    let unknown: readonly string[] = [];
     /** Plugins whose files could not be read or parsed at the last read. */
     let readFailures: readonly PluginFailure[] = [];
     /** A digest of the plugin ids, manifests and bundles in use and of the read failures, or `null` for none. */
@@ -387,7 +434,9 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       vaultDocuments.clear();
       revisions.clear();
       const enabled = parseIds(await read(enabledPath));
-      const ids = [...new Set(enabled)].filter((id) => named === null || named.has(id));
+      // Nothing is named: nothing loads (never "every enabled plugin").
+      const ids = named === null ? [] : [...new Set(enabled)].filter((id) => named.has(id));
+      unknown = named === null ? [] : [...named].filter((id) => !enabled.includes(id));
       const ready: Array<{ id: string; manifest: PluginManifest; source: string }> = [];
       const failures: PluginFailure[] = [];
       const digest = createHash("sha256");
@@ -563,6 +612,9 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       bundle_changes: counts.bundleChanges,
       plugins: [...loadedPlugins()],
       failed: failedPlugins().map((failure) => ({ ...failure })),
+      unknown: [...unknown],
+      read_only: readOnly,
+      writes_refused: writes?.refusals ?? 0,
     });
 
     const server = new ScreenServer({
@@ -578,6 +630,8 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
         vault_root: config.vaultRoot,
         plugins: [...loadedPlugins()],
         failed: failedPlugins().map((failure) => ({ ...failure })),
+        unknown: [...unknown],
+        read_only: readOnly,
       }),
       dispatch: async (method, params) => {
         switch (method) {
@@ -612,6 +666,10 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       get failed() {
         return failedPlugins();
       },
+      get unknown() {
+        return unknown;
+      },
+      writes,
       get service() {
         return service;
       },

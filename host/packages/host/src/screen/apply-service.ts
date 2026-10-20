@@ -63,6 +63,7 @@ import type { HostErrorPhase } from "../shim/errors";
 import type { App } from "../shim/app";
 import type { BundleLoader, BundleSource } from "../runtime/loader";
 import type { DispatchQueue } from "../runtime/queue";
+import { isScreenWriteRefusal } from "./write-gate";
 import type { Mode, Sheet } from "../web/sheet-set";
 import type { PluginDataStore } from "../shim/plugin-data-store";
 
@@ -77,6 +78,15 @@ export const APPLY_CACHE_LIMIT = 64;
  * reloads the plugin, and later requests are not held behind it for ever.
  */
 export const APPLY_DEADLINE_MS = 5_000;
+
+/**
+ * How long one plugin's load (compile, construct, `onload`) may take, in real
+ * milliseconds, in the screen profile's loader ({@link boundedLoaderQueue}).
+ * Well under {@link APPLY_DEADLINE_MS}, so a plugin whose `onload` never
+ * finishes fails as that plugin, and the others are still loaded and served
+ * within the apply's deadline.
+ */
+export const PLUGIN_LOAD_DEADLINE_MS = 2_000;
 
 /** One clock step: past the plugin's 100 ms debounce, as the parity harness steps. */
 export const DEBOUNCE_STEP_MS = 150;
@@ -265,7 +275,11 @@ export class ApplyService {
       throw new RangeError("the apply cache limit must be a whole number of at least 1");
     }
     this.unlisten = deps.onHostError((error, _pluginId, phase) => {
-      if (this.failures !== null && phase !== "plugin-data" && phase !== "onload") this.failures.push(error);
+      // A vault write the screen profile refused is not a failed apply: the
+      // page does not depend on it, and the refusal is recorded by the gate.
+      if (this.failures === null || phase === "plugin-data" || phase === "onload") return;
+      if (isScreenWriteRefusal(error)) return;
+      this.failures.push(error);
     });
   }
 
@@ -421,7 +435,14 @@ export class ApplyService {
       }
     } catch (error) {
       // Abandoned part way: unload what did load, so nothing is left running.
-      for (const id of loaded.reverse()) await this.deps.unloadPlugin(id);
+      // One unload that throws does not keep the others loaded.
+      for (const id of loaded.reverse()) {
+        try {
+          await this.deps.unloadPlugin(id);
+        } catch {
+          // The loader reported it; go on with the rest.
+        }
+      }
       throw error;
     }
     // Checked before `live` is set, so an abandoned apply never names the
@@ -679,6 +700,49 @@ export function installScreenWorkspace(app: App): void {
 }
 
 declareScreenPolicy("Workspace.detachLeavesOfType", "safe_stub");
+
+/**
+ * The dispatch queue as the screen profile's loader sees it: every task the
+ * loader queues (a compile, an `onload`, an `onunload`) fails at `deadlineMs`
+ * of real time if it has not finished, which frees the queue's one slot.
+ *
+ * Without it, an `onload` that never settles holds the host's single FIFO for
+ * good: every later load, unload and settle waits behind it, so every apply
+ * fails at its deadline and the plugin is never named. With it, the loader
+ * sees the timeout as that plugin's `onload` throwing: it rolls the plugin
+ * back, reports it, and the apply service lists it as failed and loads the
+ * rest. The hung work itself is not cancelled (nothing can cancel a promise);
+ * it is left behind, outside the queue.
+ *
+ * Only the loader is given this view; the queue itself, and the headless
+ * host, are unchanged.
+ */
+export function boundedLoaderQueue(
+  queue: DispatchQueue,
+  deadlineMs: number = PLUGIN_LOAD_DEADLINE_MS,
+  timers: Pick<Clock, "setTimeout" | "clearTimeout"> = systemClock(),
+): DispatchQueue {
+  const run = <T>(pluginId: string | null, label: string, task: () => Promise<T> | T): Promise<T> =>
+    queue.run(pluginId, label, () => {
+      let timer: ReturnType<Clock["setTimeout"]> | undefined;
+      const deadline = new Promise<never>((_settle, fail) => {
+        timer = timers.setTimeout(() => {
+          fail(new Error(`${label} did not finish within ${String(deadlineMs)} ms`));
+        }, deadlineMs);
+      });
+      const work = Promise.resolve().then(task);
+      return Promise.race([work, deadline]).finally(() => {
+        if (timer !== undefined) timers.clearTimeout(timer);
+      });
+    });
+  return new Proxy(queue, {
+    get(target, key): unknown {
+      if (key === "run") return run;
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
 
 /**
  * Let a parse's saves finish: a few turns of the loop so the save is queued,

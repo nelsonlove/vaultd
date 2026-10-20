@@ -8,7 +8,7 @@
  * the socket's door and envelope; and that nothing is written into the vault.
  */
 
-import { chmodSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -21,6 +21,8 @@ import { buildSheetSet } from "../src/web/sheet-set";
 import { defaultHostConfig, systemClock } from "../src/config";
 import { startScreenHost } from "../src/screen/screen-host";
 import { rejectionGuardArmed } from "../src/server/server";
+import { installFsWriteGuard } from "../src/testing/fs-guard";
+import { APPLY_DEADLINE_MS, PLUGIN_LOAD_DEADLINE_MS } from "../src/screen/apply-service";
 import type { HostConfig } from "../src/config";
 import type { Mode } from "./style-settings-run";
 import type { RunningScreenHost, ScreenHostOptions, ScreenStats } from "../src/screen/screen-host";
@@ -70,7 +72,8 @@ async function screenHost(
   options: ScreenHostOptions = {},
 ): Promise<{ host: RunningScreenHost; vault: string; state: string; stateRoot: string }> {
   const { config, state, stateRoot } = screenConfig();
-  const host = await startScreenHost(config, { stateRoot, ...options });
+  // Style Settings is named: with no `plugins` the host loads nothing.
+  const host = await startScreenHost(config, { stateRoot, plugins: [STYLE_SETTINGS], ...options });
   running.push(host);
   return { host, vault: config.vaultRoot, state, stateRoot };
 }
@@ -144,6 +147,30 @@ function addPlugin(vault: string, id: string, onload: string): void {
   writeFileSync(enabledPath, JSON.stringify([...enabled, id]));
 }
 
+const STYLE_SETTINGS = "obsidian-style-settings";
+
+/**
+ * Tries every road to the vault in `onload`: an awaited note create, an
+ * unawaited adapter write, a frontmatter write, and reaching the node file
+ * system (it asks for `fs`, and writes nothing with it). Then
+ * writes what each met into a `<style id="writer-verdict">`, as JSON.
+ */
+const WRITER_ONLOAD = `
+    const verdict = {};
+    try { await this.app.vault.create("written-by-plugin.md", "x"); verdict.create = "written"; } catch (e) { verdict.create = String(e && e.message); }
+    void this.app.vault.adapter.write(".obsidian/writer-cache.json", "{}");
+    try {
+      const file = this.app.vault.getFileByPath ? this.app.vault.getFileByPath("note.md") : null;
+      if (file === null) throw new Error("no file note.md in the screen profile's empty vault");
+      await this.app.fileManager.processFrontMatter(file, (fm) => { fm.x = 1; });
+      verdict.frontmatter = "written";
+    } catch (e) { verdict.frontmatter = String(e && e.message); }
+    try { verdict.fs = typeof require("fs").writeFileSync; } catch (e) { verdict.fs = String(e && e.message); }
+    const el = document.createElement("style");
+    el.id = "writer-verdict";
+    el.textContent = JSON.stringify(verdict);
+    document.head.appendChild(el);
+    this.register(() => el.remove());`;
 const SNIPPET = ".obsidian/snippets/fixture-snippet.css";
 const DATA = ".obsidian/plugins/obsidian-style-settings/data.json";
 const ENABLED = ".obsidian/community-plugins.json";
@@ -358,10 +385,26 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     expect(host.failed).toEqual([]);
   }, 120_000);
 
-  it("loads every enabled plugin by default: a second plugin's <style> with no id is returned beside Style Settings'", async () => {
+  it("with no plugins named it loads nothing, though the vault enables some: hello lists none and an apply answers an empty diff", async () => {
     const { config, vault, state, stateRoot } = screenConfig();
     addPlugin(vault, "extra-style", UNNAMED_STYLE_ONLOAD);
     const host = await startScreenHost(config, { stateRoot });
+    running.push(host);
+    expect(host.plugins).toEqual([]);
+    expect(host.failed).toEqual([]);
+    expect(host.service).toBeNull();
+    const client = await HostTestClient.open(host.socketPath);
+    clients.push(client);
+    const hello = await client.call<{ plugins: string[]; failed: unknown[] }>("host.hello", { nonce: readFileSync(join(state, "nonce"), "utf8").trim() });
+    expect(hello).toMatchObject({ plugins: [], failed: [] });
+    expect(await client.call("screen.apply", { viewer: "alice", mode: "dark", appearance: {} })).toEqual({ classes: [], styles: [] });
+    expect(await client.call("screen.stats")).toMatchObject({ loads: 0, plugins: [] });
+  }, 120_000);
+
+  it("loads every named plugin: a second plugin's <style> with no id is returned beside Style Settings'", async () => {
+    const { config, vault, state, stateRoot } = screenConfig();
+    addPlugin(vault, "extra-style", UNNAMED_STYLE_ONLOAD);
+    const host = await startScreenHost(config, { stateRoot, plugins: [STYLE_SETTINGS, "extra-style"] });
     running.push(host);
     expect(host.plugins).toEqual(["obsidian-style-settings", "extra-style"]);
     const client = await HostTestClient.open(host.socketPath);
@@ -380,17 +423,101 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     expect(result.classes).toContain("extra-plugin");
   }, 120_000);
 
-  it("--plugins overrides the default: only the named plugins load", async () => {
+  it("--plugins names what loads: an enabled plugin it does not name stays out, and a named one the vault does not enable too", async () => {
     const { config, vault, stateRoot } = screenConfig();
     addPlugin(vault, "extra-style", UNNAMED_STYLE_ONLOAD);
     const host = await startScreenHost(config, { stateRoot, plugins: ["extra-style", "not-enabled"] });
     running.push(host);
     expect(host.plugins).toEqual(["extra-style"]);
     expect(host.failed).toEqual([]);
+    // The named plugin the vault does not enable is reported, not dropped silently.
+    expect(host.unknown).toEqual(["not-enabled"]);
+    expect(host.stats().unknown).toEqual(["not-enabled"]);
     expect(await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).toEqual({
       classes: ["extra-plugin"],
       styles: [{ id: null, text: ".extra-plugin { --extra: 1; }" }],
     });
+  }, 120_000);
+
+  it("with --read-only it refuses every vault write a plugin tries, records it, and still serves the apply; the vault is unchanged", async () => {
+    const { config, vault, state, stateRoot } = screenConfig();
+    addPlugin(vault, "writer", WRITER_ONLOAD);
+    const before = snapshot(vault);
+    const guard = installFsWriteGuard(vault);
+    try {
+      const host = await startScreenHost(config, { stateRoot, plugins: [STYLE_SETTINGS, "writer"], readOnly: true });
+      running.push(host);
+      const writes = host.writes;
+      if (writes === null) throw new Error("--read-only gave no write gate");
+      const result = await host.apply({ viewer: "alice", mode: "dark", appearance: {} });
+      // Served: Style Settings' output, and the writer's own style, which says what each write met.
+      expect(outputText(result)).toBe(EXPECTED.styleText.dark);
+      const verdict = JSON.parse(result.styles.find((style) => style.id === "writer-verdict")?.text ?? "null") as Record<string, string> | null;
+      expect(verdict?.["create"]).toMatch(/screen_write_refused/);
+      expect(verdict?.["frontmatter"]).toMatch(/screen_write_refused|not found|no file/i);
+      expect(verdict?.["fs"]).toMatch(/refused/);
+      expect(host.plugins).toEqual([STYLE_SETTINGS, "writer"]);
+      expect(host.failed).toEqual([]);
+      // Recorded: the awaited create and the adapter write left unawaited.
+      const methods = writes.recent().map((write) => `${write.method} ${String(write.path)} ${String(write.pluginId)}`);
+      expect(methods).toContain("write_note written-by-plugin.md writer");
+      expect(methods).toContain("write_file .obsidian/writer-cache.json writer");
+      expect(host.stats().writes_refused).toBe(writes.refusals);
+      const client = await HostTestClient.open(host.socketPath);
+      clients.push(client);
+      await client.call("host.hello", { nonce: readFileSync(join(state, "nonce"), "utf8").trim() });
+      expect(await client.call<ScreenStats>("screen.stats")).toMatchObject({ read_only: true, writes_refused: writes.refusals });
+      // A second viewer with values of their own reloads every plugin, and its writes are refused again.
+      mkdirSync(join(stateRoot, "bob"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(stateRoot, "bob", `${STYLE_SETTINGS}.json`), JSON.stringify({ "fixture-snippet@@sn-width": 900 }));
+      const refusedBefore = writes.refusals;
+      expect(outputText(await host.apply({ viewer: "bob", mode: "dark", appearance: {} }))).toContain("--sn-width: 900px");
+      expect(writes.refusals).toBeGreaterThan(refusedBefore);
+    } finally {
+      guard.release();
+    }
+    expect(guard.violations()).toEqual([]);
+    expect(snapshot(vault)).toEqual(before);
+  }, 120_000);
+
+  it("without --read-only a plugin's writes go through vaultd, as in the headless host", async () => {
+    const { config, vault, stateRoot } = screenConfig();
+    addPlugin(vault, "writer", WRITER_ONLOAD);
+    const host = await startScreenHost(config, { stateRoot, plugins: [STYLE_SETTINGS, "writer"] });
+    running.push(host);
+    expect(host.writes).toBeNull();
+    const result = await host.apply({ viewer: "alice", mode: "dark", appearance: {} });
+    expect(outputText(result)).toBe(EXPECTED.styleText.dark);
+    const verdict = JSON.parse(result.styles.find((style) => style.id === "writer-verdict")?.text ?? "null") as Record<string, string> | null;
+    expect(verdict).toMatchObject({ create: "written", fs: "function" });
+    expect(readFileSync(join(vault, "written-by-plugin.md"), "utf8")).toBe("x");
+    // The unawaited adapter write lands too, once vaultd has answered it.
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(join(vault, ".obsidian", "writer-cache.json"))) {
+      if (Date.now() > deadline) throw new Error("the adapter write never reached the vault");
+      await new Promise((settle) => setTimeout(settle, 20));
+    }
+    expect(host.stats()).toMatchObject({ read_only: false, writes_refused: 0 });
+  }, 120_000);
+
+  it("a plugin whose onload never finishes fails alone: the others are served within the apply deadline", async () => {
+    const { config, vault, stateRoot } = screenConfig();
+    addPlugin(vault, "hangs", "    await new Promise(() => undefined);");
+    addPlugin(vault, "extra-style", UNNAMED_STYLE_ONLOAD);
+    const host = await startScreenHost(config, { stateRoot, plugins: [STYLE_SETTINGS, "hangs", "extra-style"] });
+    running.push(host);
+    const started = Date.now();
+    const result = await host.apply({ viewer: "alice", mode: "dark", appearance: {} });
+    expect(Date.now() - started).toBeLessThan(APPLY_DEADLINE_MS);
+    expect(outputText(result)).toBe(EXPECTED.styleText.dark);
+    expect(result.styles.map((style) => style.id)).toEqual(["css-settings-manager", null]);
+    expect(host.plugins).toEqual([STYLE_SETTINGS, "extra-style"]);
+    expect(host.failed.map((failure) => failure.id)).toEqual(["hangs"]);
+    expect(host.failed[0]?.reason).toMatch(new RegExp(`did not finish within ${String(PLUGIN_LOAD_DEADLINE_MS)} ms`));
+    // The queue is free: another viewer's reload is quick and skips the hung plugin.
+    const again = Date.now();
+    expect(outputText(await host.apply({ viewer: "bob", mode: "light", appearance: {} }))).toBe(EXPECTED.styleText.light);
+    expect(Date.now() - again).toBeLessThan(PLUGIN_LOAD_DEADLINE_MS);
   }, 120_000);
 
   it("a vault enabling two plugins where one fails to load still serves the other", async () => {
@@ -399,7 +526,7 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     // And one whose main.js is missing, which fails at the read.
     addPlugin(vault, "no-main", "");
     rmSync(join(vault, ".obsidian", "plugins", "no-main", "main.js"));
-    const host = await startScreenHost(config, { stateRoot });
+    const host = await startScreenHost(config, { stateRoot, plugins: ["no-main", "broken-onload", STYLE_SETTINGS] });
     running.push(host);
     expect(host.failed).toEqual([{ id: "no-main", reason: "no-main has no main.js" }]);
     const result = await host.apply({ viewer: "alice", mode: "dark", appearance: {} });

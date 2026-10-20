@@ -22,9 +22,11 @@ export const SCREEN_USAGE = `vaultd-screen-host — apply plugins to the page fo
 
   vaultd-screen-host --vault <path> [options]
 
-It loads the plugins the vault's .obsidian enables (all of them, or those
---plugins names), never writes the vault, and answers screen.apply on its
-socket (docs/protocol-host.md, "The screen host").
+It loads only the plugins --plugins names, each only while the vault's
+.obsidian enables it; with no --plugins it loads nothing. With --read-only
+it refuses every vault write a plugin tries. It answers screen.apply on its
+socket (docs/protocol-host.md, "The
+screen host").
 
 Options:
   --vault <path>        The vault. Required.
@@ -40,9 +42,12 @@ Options:
   --engine <mode>       connect (default): use the vaultd already listening for
                         this vault; exit 3 if none is. auto and spawn as for
                         vaultd-host.
-  --plugins <ids>       Load only these plugins, a comma list of ids, each
-                        still only when the vault enables it.
-                        Default: every plugin the vault enables.
+  --plugins <ids>       The plugins to load, a comma list of ids, each only
+                        while the vault enables it. Default: none (nothing
+                        loads; never every enabled plugin).
+  --read-only           Refuse and record every vault write a plugin tries,
+                        and refuse it the node fs, process and network
+                        modules. Default: off (writes go through vaultd).
   --state-root <path>   Where the viewer store keeps each viewer's values.
                         Default: $XDG_STATE_HOME/vaultd-web/plugin-data.
   --revalidate-ms <ms>  How often .obsidian is checked again when no
@@ -58,8 +63,9 @@ export interface ParsedScreenArgs {
   readonly config: HostConfig;
   readonly stateRoot: string | null;
   readonly revalidateMs: number | null;
-  /** `--plugins`, or `null` for every enabled plugin. */
+  /** `--plugins`, or `null` when it is not given (nothing loads). */
   readonly plugins: readonly string[] | null;
+  readonly readOnly: boolean;
   readonly help: boolean;
 }
 
@@ -73,6 +79,7 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
   let engine: EngineMode = "connect";
   let revalidateMs: number | null = null;
   let plugins: string[] | null = null;
+  let readOnly = false;
 
   const valueOf = (flag: string, at: number): string => {
     const value = argv[at + 1];
@@ -85,7 +92,7 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
     switch (flag) {
       case "-h":
       case "--help":
-        return { config: defaultHostConfig("."), stateRoot: null, revalidateMs: null, plugins: null, help: true };
+        return { config: defaultHostConfig("."), stateRoot: null, revalidateMs: null, plugins: null, readOnly: false, help: true };
       case "--vault":
         vault = valueOf(flag, at);
         at += 1;
@@ -109,6 +116,9 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
       case "--state-root":
         stateRoot = resolve(valueOf(flag, at));
         at += 1;
+        break;
+      case "--read-only":
+        readOnly = true;
         break;
       case "--plugins": {
         const ids = valueOf(flag, at)
@@ -154,7 +164,7 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
     // No stall watchdog: the screen host's work is a few milliseconds per apply.
     watchdogThresholdMs: 0,
   };
-  return { config, stateRoot, revalidateMs, plugins, help: false };
+  return { config, stateRoot, revalidateMs, plugins, readOnly, help: false };
 }
 
 export async function screenMain(
@@ -174,6 +184,7 @@ export async function screenMain(
         ...(parsed.stateRoot === null ? {} : { stateRoot: parsed.stateRoot }),
         ...(parsed.revalidateMs === null ? {} : { revalidateMs: parsed.revalidateMs }),
         ...(parsed.plugins === null ? {} : { plugins: parsed.plugins }),
+        ...(parsed.readOnly ? { readOnly: true } : {}),
       });
     } catch (error) {
       if (error instanceof DaemonUnreachable) throw new CliRefusal(EXIT_DAEMON_UNREACHABLE, error.message);
@@ -187,6 +198,8 @@ export async function screenMain(
         vault: running.config.vaultRoot,
         plugins: running.plugins,
         failed: running.failed,
+        unknown: running.unknown,
+        read_only: running.stats().read_only,
       }),
     );
     await untilSignal();
