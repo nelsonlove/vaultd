@@ -38,6 +38,11 @@ import { ViewerDataStore } from "../shim/viewer-data-store";
 import { installPluginHost, pluginHostFor } from "../shim/plugin";
 import { sheetSetHash } from "../web/sheet-set";
 import { declareScreenPolicy, stub } from "../shim/policy";
+import { HOST_PLUGIN_ID } from "../shim/errors";
+import { guardUnhandledRejections } from "../server/server";
+import { systemClock } from "../config";
+import type { Clock } from "../config";
+import type { HostErrorPhase } from "../shim/errors";
 import type { App } from "../shim/app";
 import type { BundleLoader, BundleSource } from "../runtime/loader";
 import type { DispatchQueue } from "../runtime/queue";
@@ -48,6 +53,13 @@ export type { Mode, Sheet } from "../web/sheet-set";
 
 /** How many applies the cache keeps by default. */
 export const APPLY_CACHE_LIMIT = 64;
+
+/**
+ * How long one apply may take, in real milliseconds, before it fails. Bounds a
+ * vaultd that is connected but stuck: the apply fails, the next request
+ * reloads the plugin, and later requests are not held behind it for ever.
+ */
+export const APPLY_DEADLINE_MS = 5_000;
 
 /** One clock step: past the plugin's 100 ms debounce, as the parity harness steps. */
 export const DEBOUNCE_STEP_MS = 150;
@@ -158,7 +170,32 @@ export interface ApplyServiceDeps {
   readonly store: SwitchableDataStore;
   readonly pluginId: string;
   readonly cacheLimit?: number;
+  /** Default {@link APPLY_DEADLINE_MS}. */
+  readonly deadlineMs?: number;
+  /** The real clock the deadline runs on. */
+  readonly timers: Pick<Clock, "setTimeout" | "clearTimeout">;
+  /**
+   * Hear every host error. An error reported while the plugin is running for
+   * an apply fails that apply (phase `plugin-data` excepted: a data file that
+   * cannot be read falls back to defaults, which is a sound answer).
+   */
+  onHostError(listener: (error: unknown, pluginId: string, phase: HostErrorPhase) => void): () => void;
+  /** Called once by {@link ApplyService.close}. */
+  release?(): void;
 }
+
+/** An apply that ran but whose plugin reported a failure; nothing is cached. */
+export class ApplyFailed extends Error {
+  constructor(readonly causes: readonly unknown[]) {
+    super(
+      `the apply failed: ${causes.map((cause) => (cause instanceof Error ? cause.message : String(cause))).join("; ")}`,
+    );
+    this.name = "ApplyFailed";
+  }
+}
+
+/** Thrown inside an apply that its deadline has already abandoned. */
+class Abandoned extends Error {}
 
 interface LiveContext {
   viewer: string;
@@ -172,12 +209,23 @@ export class ApplyService {
   private live: LiveContext | null = null;
   private chain: Promise<unknown> = Promise.resolve();
   private counts = { loads: 0, unloads: 0, hits: 0, misses: 0 };
+  /** Bumped by each apply and by a deadline; work holding an older token stops. */
+  private generation = 0;
+  /** Set when an apply was abandoned: the plugin's state is not trusted. */
+  private needsReload = false;
+  /** Errors reported while the plugin runs for the current apply, else `null`. */
+  private failures: unknown[] | null = null;
+  private closed = false;
+  private readonly unlisten: () => void;
 
   constructor(private readonly deps: ApplyServiceDeps) {
     this.limit = deps.cacheLimit ?? APPLY_CACHE_LIMIT;
     if (!Number.isInteger(this.limit) || this.limit < 1) {
       throw new RangeError("the apply cache limit must be a whole number of at least 1");
     }
+    this.unlisten = deps.onHostError((error, _pluginId, phase) => {
+      if (this.failures !== null && phase !== "plugin-data") this.failures.push(error);
+    });
   }
 
   /** Apply for one viewer. Requests run one at a time, in the order they arrive. */
@@ -187,7 +235,8 @@ export class ApplyService {
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
-    const run = this.chain.then(() => this.applyNow(request));
+    if (this.closed) return Promise.reject(new Error("the apply service is closed"));
+    const run = this.chain.then(() => this.withDeadline(request));
     // The chain carries on after a failed apply; the caller still sees the failure.
     this.chain = run.catch(() => undefined);
     return run;
@@ -197,20 +246,59 @@ export class ApplyService {
     return { ...this.counts, size: this.cache.size };
   }
 
-  /** Unload the plugin, if it is loaded. The cache stays. */
+  /** Refuse new requests, let the queued ones finish, unload the plugin. The cache stays. */
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     await this.chain;
     if (this.live !== null) {
       this.live = null;
       this.counts.unloads += 1;
       await this.deps.unloadPlugin();
     }
+    this.unlisten();
+    this.deps.release?.();
   }
 
-  private async applyNow(request: ApplyRequest): Promise<ApplyResult> {
+  /**
+   * Run one apply, but fail it at the deadline. An abandoned apply keeps
+   * running until its next step, where its stale token stops it before it
+   * touches the page again; the next apply reloads the plugin.
+   */
+  private withDeadline(request: ApplyRequest): Promise<ApplyResult> {
+    this.generation += 1;
+    const token = this.generation;
+    const ms = this.deps.deadlineMs ?? APPLY_DEADLINE_MS;
+    return new Promise<ApplyResult>((resolve, reject) => {
+      const timer = this.deps.timers.setTimeout(() => {
+        if (token !== this.generation) return;
+        this.generation += 1;
+        this.needsReload = true;
+        this.failures = null;
+        reject(new Error(`the apply did not finish within its deadline of ${String(ms)} ms`));
+      }, ms);
+      this.applyNow(request, token).then(
+        (result) => {
+          this.deps.timers.clearTimeout(timer);
+          resolve(result);
+        },
+        (error: unknown) => {
+          this.deps.timers.clearTimeout(timer);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        },
+      );
+    });
+  }
+
+  private check(token: number): void {
+    if (token !== this.generation) throw new Abandoned("abandoned at its deadline");
+  }
+
+  private async applyNow(request: ApplyRequest, token: number): Promise<ApplyResult> {
     const setHash = sheetSetHash(request.sheets);
     const store = this.deps.storeFor(request.viewer);
     const revision = await this.revisionOf(store);
+    this.check(token);
     const key = cacheKey(setHash, request.mode, revision);
     const cached = this.cache.get(key);
     if (cached !== undefined) {
@@ -220,34 +308,45 @@ export class ApplyService {
     }
     this.counts.misses += 1;
 
+    this.failures = [];
     try {
       const live = this.live;
-      if (live === null || live.viewer !== request.viewer || live.revision !== revision) {
-        await this.reload(request, store, setHash);
+      if (this.needsReload || live === null || live.viewer !== request.viewer || live.revision !== revision) {
+        await this.reload(request, store, setHash, token);
       } else {
         if (live.setHash !== setHash) this.replaceSheets(request.sheets);
         live.setHash = setHash;
         this.setMode(request.mode);
-        await this.parse();
+        await this.parse(token);
       }
-      await this.parse();
+      await this.parse(token);
+      // A failure the plugin reported (a rejected save, a throwing handler)
+      // means the page may not hold its answer: fail, and cache nothing.
+      if (this.failures.length > 0) throw new ApplyFailed(this.failures);
     } catch (error) {
+      // An abandoned apply leaves the page to the request after it.
+      if (error instanceof Abandoned || token !== this.generation) throw error;
+      this.failures = null;
       // A context that failed half way is not one to reuse.
       await this.dropContext();
       throw error;
     }
+    this.failures = null;
 
     const result = this.read();
     this.remember(key, result);
     const after = await this.revisionOf(store);
+    this.check(token);
     if (after !== revision) this.remember(cacheKey(setHash, request.mode, after), result);
     if (this.live !== null) this.live.revision = after;
     return result;
   }
 
   /** A new live context: unload, clear the page, select the store, load. */
-  private async reload(request: ApplyRequest, store: PluginDataStore, setHash: string): Promise<void> {
+  private async reload(request: ApplyRequest, store: PluginDataStore, setHash: string, token: number): Promise<void> {
     await this.dropContext();
+    this.check(token);
+    this.needsReload = false;
     this.clearPage();
     this.replaceSheets(request.sheets);
     this.setMode(request.mode);
@@ -255,9 +354,11 @@ export class ApplyService {
     this.counts.loads += 1;
     await this.deps.loadPlugin();
     this.live = { viewer: request.viewer, revision: "", setHash };
+    this.check(token);
     // `onload` arms the first parse; let it run.
     await this.deps.advance(DEBOUNCE_STEP_MS);
     await this.deps.settle();
+    this.check(token);
   }
 
   private async dropContext(): Promise<void> {
@@ -268,10 +369,11 @@ export class ApplyService {
   }
 
   /** `css-change`, then past the debounce. */
-  private async parse(): Promise<void> {
+  private async parse(token: number): Promise<void> {
     this.deps.raiseCssChange();
     await this.deps.advance(DEBOUNCE_STEP_MS);
     await this.deps.settle();
+    this.check(token);
   }
 
   private clearPage(): void {
@@ -342,6 +444,10 @@ export interface ScreenApplyDeps {
   /** The vault's own config directory. Default `.obsidian`. */
   readonly vaultConfigDirName?: string;
   readonly cacheLimit?: number;
+  /** Default {@link APPLY_DEADLINE_MS}. */
+  readonly applyDeadlineMs?: number;
+  /** Wrap each viewer's store; a test uses it to make a store fail. */
+  readonly wrapStore?: (store: PluginDataStore, viewer: string) => PluginDataStore;
 }
 
 /**
@@ -355,6 +461,14 @@ export function createApplyService(deps: ScreenApplyDeps): ApplyService {
   // in place before the first load.
   installPluginHost(deps.app, { ...context, dataStore: store });
   installScreenWorkspace(deps.app);
+  // **The process-level guard, for as long as this service can run a plugin.**
+  // The stock plugin's load-time prune calls an async save without awaiting
+  // it, so a save that rejects is an unhandled rejection, which ends a Node
+  // process. The headless host's refcounted guard reports it to the host's
+  // errors instead; the service then fails the apply that was running.
+  const unguard = guardUnhandledRejections((reason) => {
+    context.errors.report(reason, HOST_PLUGIN_ID, "event");
+  });
   const pluginId = deps.bundle.manifest.id;
   return new ApplyService({
     document: deps.document,
@@ -367,16 +481,22 @@ export function createApplyService(deps: ScreenApplyDeps): ApplyService {
       await deps.loader.loadBundle(deps.bundle);
     },
     unloadPlugin: () => deps.loader.unload(pluginId),
-    storeFor: (viewer) =>
-      new ViewerDataStore({
+    storeFor: (viewer) => {
+      const store = new ViewerDataStore({
         host: context,
         viewerId: viewer,
         ...(deps.stateRoot === undefined ? {} : { stateRoot: deps.stateRoot }),
         ...(deps.vaultConfigDirName === undefined ? {} : { vaultConfigDirName: deps.vaultConfigDirName }),
-      }),
+      });
+      return deps.wrapStore === undefined ? store : deps.wrapStore(store, viewer);
+    },
     store,
     pluginId,
+    timers: systemClock(),
+    onHostError: (listener) => context.errors.onError(listener),
+    release: unguard,
     ...(deps.cacheLimit === undefined ? {} : { cacheLimit: deps.cacheLimit }),
+    ...(deps.applyDeadlineMs === undefined ? {} : { deadlineMs: deps.applyDeadlineMs }),
   });
 }
 

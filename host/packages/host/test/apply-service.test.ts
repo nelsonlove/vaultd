@@ -16,12 +16,14 @@ import { DATA_JSON, EXPECTED, FIXTURE, MAIN_JS, MAIN_JS_PATH, pluginOwnedClasses
 import { scratchRoot } from "./scratch";
 import { ApplyService, createApplyService } from "../src/screen/apply-service";
 import { BundleLoader } from "../src/runtime/loader";
+import { rejectionGuardArmed, reportUnhandledRejection } from "../src/server/server";
 import { ShimHarness } from "../src/testing/shim-harness";
 import { buildSheetSet } from "../src/web/sheet-set";
 import { happyDomProvider } from "../src/shim/dom-providers/happy-dom";
 import type { ApplyRequest } from "../src/screen/apply-service";
 import type { Mode } from "./style-settings-run";
 import type { PluginManifest } from "../src/shim/plugin";
+import type { PluginDataStore } from "../src/shim/plugin-data-store";
 import type { Sheet } from "../src/web/sheet-set";
 
 const PLUGIN_ID = "obsidian-style-settings";
@@ -51,12 +53,19 @@ const live: Rig[] = [];
 
 afterEach(async () => {
   for (const rig of live.splice(0).reverse()) {
+    await rig.service.close();
     await rig.harness.teardown();
     await rig.harness.stop();
   }
 });
 
-async function rig(options: { cacheLimit?: number } = {}): Promise<Rig> {
+interface RigOptions {
+  cacheLimit?: number;
+  applyDeadlineMs?: number;
+  wrapStore?: (store: PluginDataStore, viewer: string) => PluginDataStore;
+}
+
+async function rig(options: RigOptions = {}): Promise<Rig> {
   const harness = await ShimHarness.withVault({}, { dom: happyDomProvider() });
   // The vault's own `data.json`, which the `viewer` store reads (never writes).
   harness.setConfigFile(`.obsidian/plugins/${PLUGIN_ID}/data.json`, DATA_JSON);
@@ -76,6 +85,8 @@ async function rig(options: { cacheLimit?: number } = {}): Promise<Rig> {
     },
     stateRoot,
     ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
+    ...(options.applyDeadlineMs === undefined ? {} : { applyDeadlineMs: options.applyDeadlineMs }),
+    ...(options.wrapStore === undefined ? {} : { wrapStore: options.wrapStore }),
   });
   const { sheets } = await buildSheetSet(readFixture);
   const made = { harness, service, loader, stateRoot, sheets };
@@ -221,5 +232,80 @@ describe("apply through the service", () => {
     await expect(r.service.apply({ viewer: "a", mode: "sepia" as Mode, sheets: [] })).rejects.toThrow(/mode/);
     await expect(r.service.apply({ viewer: "a", mode: "dark", sheets: [{ id: 1 }] as never })).rejects.toThrow(/sheets/);
     expect(r.service.stats().loads).toBe(0);
+  });
+
+  it("survives a store whose save rejects: the apply fails, nothing is cached, and the next one succeeds", async () => {
+    // The plugin's load-time prune calls `save()` without awaiting it, so a
+    // rejected save is an unhandled rejection. The runner's own listeners are
+    // taken off for this case, so the screen host's guard is the only one: if
+    // it were missing, Node would end this worker.
+    let failing = true;
+    const r = await rig({
+      wrapStore: (store) => ({
+        kind: store.kind,
+        load: (id) => store.load(id),
+        save: (id, data) => (failing ? Promise.reject(new Error("disk full")) : store.save(id, data)),
+      }),
+    });
+    const runnerListeners = process
+      .listeners("unhandledRejection")
+      .filter((listener) => listener !== reportUnhandledRejection);
+    for (const listener of runnerListeners) process.off("unhandledRejection", listener);
+    expect(rejectionGuardArmed()).toBe(true);
+    try {
+      await expect(r.service.apply(request(r, "alice", "dark"))).rejects.toThrow(/disk full/);
+      expect(r.service.stats().size).toBe(0);
+    } finally {
+      for (const listener of runnerListeners) process.on("unhandledRejection", listener);
+    }
+    failing = false;
+    const recovered = await r.service.apply(request(r, "alice", "dark"));
+    expect(recovered.style).toBe(EXPECTED.styleText.dark);
+    expect(recovered.classes).toEqual(capturedClasses("dark"));
+    expect(r.service.stats()).toMatchObject({ loads: 2, misses: 2 });
+  });
+
+  it("fails an apply past its deadline, and serves the next one", async () => {
+    const stuck: Array<() => void> = [];
+    let hang = true;
+    const r = await rig({
+      applyDeadlineMs: 1_000,
+      wrapStore: (store) => ({
+        kind: store.kind,
+        load: (id) =>
+          hang
+            ? new Promise((resolve) => {
+                stuck.push(() => {
+                  resolve(store.load(id));
+                });
+              })
+            : store.load(id),
+        save: (id, data) => store.save(id, data),
+      }),
+    });
+    await expect(r.service.apply(request(r, "alice", "dark"))).rejects.toThrow(/deadline/);
+    hang = false;
+    const served = await r.service.apply(request(r, "alice", "dark"));
+    expect(served.style).toBe(EXPECTED.styleText.dark);
+    // The stuck read finishes late; the abandoned apply must not touch the page.
+    for (const release of stuck) release();
+    for (let i = 0; i < 20; i += 1) await new Promise<void>((done) => setImmediate(done));
+    expect(await r.service.apply(request(r, "alice", "dark"))).toEqual(served);
+    expect(await r.service.apply(request(r, "alice", "light"))).toMatchObject({ style: EXPECTED.styleText.light });
+  });
+
+  it("holds the process-level rejection guard until close", async () => {
+    const r = await rig();
+    expect(rejectionGuardArmed()).toBe(true);
+    await r.service.close();
+    expect(rejectionGuardArmed()).toBe(false);
+  });
+
+  it("refuses an apply after close", async () => {
+    const r = await rig();
+    await r.service.apply(request(r, "alice", "dark"));
+    await r.service.close();
+    await expect(r.service.apply(request(r, "alice", "light"))).rejects.toThrow(/closed/);
+    expect(r.service.stats()).toMatchObject({ loads: 1, unloads: 1 });
   });
 });

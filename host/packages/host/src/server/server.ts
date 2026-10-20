@@ -136,7 +136,7 @@ export function reportUnhandledRejection(reason: unknown): void {
   }
 }
 
-function guardUnhandledRejections(report: (reason: unknown) => void): () => void {
+export function guardUnhandledRejections(report: (reason: unknown) => void): () => void {
   rejectionReporters.add(report);
   if (installedRejectionHandler === null) {
     installedRejectionHandler = reportUnhandledRejection;
