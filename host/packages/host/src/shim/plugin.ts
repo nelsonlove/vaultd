@@ -37,14 +37,12 @@
 
 import { declarePolicy, recordUse, stub } from "./policy";
 import { clearTimerById, intervalMsOf } from "./timers";
-import { pluginDataPath } from "../pluginset/config-dir";
-import { VaultdError } from "../client/errors";
-import { readThroughOverlay } from "../dryrun/dry-run";
+import { dataStoreOf } from "./plugin-data-store";
 import type { App } from "./app";
 import type { EventRef, ShimEventBus } from "./events";
 import type { Harvest } from "./harvest";
 import type { HostErrorPhase, HostErrors } from "./errors";
-import type { WriteFileResponse } from "../client/protocol";
+import type { PluginDataStore } from "./plugin-data-store";
 import type { RequestSink } from "../client/request-sink";
 import type { Clock, HostConfig } from "../config";
 import type { DispatchQueue } from "../runtime/queue";
@@ -136,6 +134,12 @@ export interface PluginHostContext {
   readonly clock: Clock;
   /** Where a failure with nobody waiting on it goes — see `shim/errors.ts`. */
   readonly errors: HostErrors;
+  /**
+   * Where `loadData` and `saveData` go. Omitted, the vault store: the host's
+   * own config directory through vaultd, as before this seam existed. A web
+   * deployment installs the `viewer` store here.
+   */
+  readonly dataStore?: PluginDataStore;
 }
 
 /**
@@ -618,116 +622,21 @@ export abstract class Plugin extends Component {
   // --- Plugin data -----------------------------------------------------------
 
   /**
-   * Read `<hostConfigDir>/plugins/<id>/data.json`, or `null` if it is not there.
+   * The plugin's saved settings, or `null` if there are none.
    *
-   * `null` rather than `{}`: a plugin with no saved data is the ordinary case,
-   * and fifty plugins in the corpus branch on a falsy answer to install their
-   * defaults.
-   *
-   * **A file that is not JSON is reported and answered `null` too** — the
-   * least-harm choice pending a runtime capture of what the GUI really does
-   * with one. The alternative is a throw inside `onload`, which kills the whole
-   * plugin over one bad byte in a settings file; answering `null` puts it on
-   * the path every one of those fifty plugins already handles, and the failure
-   * still reaches the host's error sink rather than disappearing.
-   *
-   * It stays inside the **host's** config directory, so the GUI copy's
-   * `data.json` is structurally untouchable rather than merely left alone by
-   * convention.
+   * Answered by the host's {@link PluginDataStore}: the vault store (the host's
+   * own `<hostConfigDir>/plugins/<id>/data.json` through vaultd) unless the
+   * deployment installed another. No plugin byte depends on which.
    */
-  async loadData(): Promise<unknown> {
+  loadData(): Promise<unknown> {
     recordUse("Plugin.loadData");
-    let source: string;
-    try {
-      // **Through the dry-run overlay**, which is what makes `saveData` then
-      // `loadData` round-trip under `--dry-run`. It is the same file either
-      // way; the overlay simply holds the bytes the gate recorded instead of
-      // the daemon holding the bytes it wrote. A plugin whose `onload` saves
-      // defaults and reads them back is ordinary, and a run that answered the
-      // *previous* settings there would make the detector's transcript describe
-      // a plugin that is not the one that ran.
-      const read = await readThroughOverlay(
-        this.host.client,
-        this.host.writes.overlay,
-        this.dataPath(),
-      );
-      source = read.content.toString("utf8");
-    } catch (error) {
-      if (isMissing(error)) return null;
-      throw error;
-    }
-    if (source.trim() === "") return null;
-    try {
-      return JSON.parse(source) as unknown;
-    } catch (error) {
-      this.host.errors.report(error, this.manifest.id, "plugin-data");
-      return null;
-    }
+    return dataStoreOf(this.host).load(this.manifest.id);
   }
 
-  /**
-   * Write the plugin's `data.json`, creating its folder if the daemon says it
-   * is not there.
-   *
-   * The folder is created **on the refusal** rather than ahead of every write:
-   * a plugin that saves its settings on every keystroke would otherwise send a
-   * `create_folder` per save for a folder that has existed since the first one.
-   * `create_folder` walks its own segments, so one call is enough however much
-   * of the chain is missing.
-   *
-   * **It holds the file's path lock**, which is the same lock Task 17's
-   * `PluginConfigService.set` takes, keyed by the same path string. The host's
-   * `set` is a read-modify-write and this is a blind whole-file write, so with
-   * no lock between them a save landing in the middle of a `set` is lost
-   * silently — the `set` writes the document it read before the save, and both
-   * callers believe they succeeded. Obsidian has no such race because it has
-   * one writer; a host with a socket door has two.
-   *
-   * **The lock is not re-entrant, so do not await this from inside one.**
-   * `DispatchQueue.runExclusivePath` is a promise chain per path (Task 7), so
-   * code already holding *this file's* path lock that then **awaits** a
-   * `saveData` waits for itself, for ever. The two holders in the host are this
-   * method and `PluginConfigService.set`, and `set` releases the lock before it
-   * calls `onExternalSettingsChange` so that a handler may save. The shape to
-   * avoid is a plugin running `Vault.process` — the other user of this lock —
-   * against its own `data.json` and saving inside the callback.
-   *
-   * **The trailing newline is deliberate and matches
-   * `HeadlessConfigDir.writeEnabledSet` and `writePluginData`.** Two writers of
-   * one file that disagree about the last byte flip it on every alternation,
-   * which is diff noise on the file this layout exists to keep diffable.
-   */
+  /** Save the plugin's settings through the host's {@link PluginDataStore}. */
   saveData(data: unknown): Promise<void> {
     recordUse("Plugin.saveData");
-    const path = this.dataPath();
-    return this.host.queue.runExclusivePath(path, async () => {
-      const params = {
-        path,
-        content_base64: Buffer.from(`${JSON.stringify(data, null, 2)}\n`, "utf8").toString(
-          "base64",
-        ),
-      };
-      try {
-        await this.host.writes.send<WriteFileResponse>("write_file", params);
-        return;
-      } catch (error) {
-        if (!isParentMissing(error)) throw error;
-      }
-      await this.host.writes.send<unknown>("create_folder", { path: parentOf(path) });
-      await this.host.writes.send<WriteFileResponse>("write_file", params);
-    });
-  }
-
-  /**
-   * `<hostConfigDir>/plugins/<id>/data.json`. Never `.obsidian/`.
-   *
-   * Through the shared helper rather than a template string of its own, so that
-   * this and `HeadlessConfigDir.dataPath` cannot drift: Task 17's config service
-   * reads the file this method writes, and the two naming it independently is
-   * the kind of agreement that holds until someone changes one of them.
-   */
-  private dataPath(): string {
-    return pluginDataPath(this.host.config.configDirName, this.manifest.id);
+    return dataStoreOf(this.host).save(this.manifest.id, data);
   }
 }
 
@@ -780,23 +689,6 @@ function describeRegistration(value: unknown, fallback: string): string {
     return name === undefined || name === "" || name === "Object" ? fallback : name;
   }
   return fallback;
-}
-
-/** The daemon's two ways of saying "there is no such file". */
-function isMissing(error: unknown): boolean {
-  return (
-    error instanceof VaultdError &&
-    (error.code === "not_found" || error.code === "parent_not_found")
-  );
-}
-
-function isParentMissing(error: unknown): boolean {
-  return error instanceof VaultdError && error.code === "parent_not_found";
-}
-
-function parentOf(path: string): string {
-  const cut = path.lastIndexOf("/");
-  return cut === -1 ? "" : path.slice(0, cut);
 }
 
 /**
