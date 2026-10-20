@@ -31,7 +31,7 @@
  */
 
 const { spawnSync } = require("node:child_process");
-const { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } = require("node:fs");
+const { copyFileSync, cpSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } = require("node:fs");
 const { homedir } = require("node:os");
 const { join, resolve, sep } = require("node:path");
 
