@@ -2,7 +2,7 @@
 
 This measures stage 1 of `docs/design/web-plugins.md`: the web server asks the screen host for the stock Style Settings output on every full page, and writes the classes and the `<style id="css-settings-manager">` into the first HTML. It follows section 5, item 1 of the design and the task 9 line of section 6.
 
-**The Obsidian side was not measured.** The only Obsidian window available showed `document.hasFocus() === false` and `visibilityState === "hidden"` on two probes, a few minutes apart. Live Obsidian timings are void unless the window is in the foreground, so the script stopped and wrote no number (see "Obsidian side"). Every comparison with Obsidian below is therefore open. The vaultd-web side is complete.
+**The Obsidian side was measured in a second run, 2026-10-20,** with the Obsidian window in the foreground (`document.hasFocus() === true`, `visibilityState === "visible"` at the probe and at each calibration). Obsidian 1.14.4 takes 112.2 ms (small) and 119.2 ms (realistic) median from enabling the plugin to its final output, its own 100 ms debounce included. vaultd-web's cache miss is 4.4 ms and 11.1 ms, and its cache hit 0.09 ms and 0.31 ms of server time.
 
 ## Environment
 
@@ -86,7 +86,14 @@ So the apply needs no client script, and nothing in the page can restyle after f
 
 It checks the safety rules of `style-settings-capture.js`: each CLI call runs with the scratch vault as its working directory and is killed after 60 s, and each eval first checks that `app.vault.adapter.basePath` equals the scratch path.
 
-Result: the first probe read `focus: false`, `visibility: "hidden"`. A second probe, some minutes later, read the same. The script stopped before any timed run, restored the vault (checked byte for byte against its backup), and wrote `{"void": true}`. **There is no Obsidian number in this document.** To fill the gap, bring that Obsidian window to the front and run the last command above; I did not bring the window to the front myself, because that changes what is on the owner's screen.
+First run: the probe read `focus: false`, `visibility: "hidden"` twice, minutes apart; the script stopped before any timed run and wrote `{"void": true}`. Second run, the same day, with the owner keeping the window in front: every probe and calibration read `focus: true`, `visibility: "visible"`, and the vault was restored afterwards (theme back to Fixture Theme, Minimal removed).
+
+| Fixture | Runs | Median (ms) | p95 (ms) |
+| --- | --- | --- | --- |
+| Small (Fixture Theme) | 20 | 112.2 | 115.4 |
+| Realistic (Minimal 9.1.4) | 20 | 119.2 | 123.0 |
+
+The time includes the plugin's 100 ms debounce, so the plugin's own work in Obsidian is about 12 ms (small) and 19 ms (realistic), against vaultd-web's whole cache miss of 4.4 ms and 11.1 ms.
 
 ## Comparison with the design's targets
 
@@ -95,7 +102,7 @@ Result: the first probe read `focus: false`, `visibility: "hidden"`. A second pr
 | Server time added per page under 5 ms on a cache hit | 0.09 ms (small), 0.31 ms (realistic); p95 0.15 and 0.37 ms | Met, by more than 10x |
 | Zero client script for the apply | No script touches the output; it is in the first HTML | Met |
 | Zero restyles after first paint | The first HTML carries the classes and the style, and nothing changes them; shown by reading the HTML, not by a paint trace | Met by construction |
-| A cache miss under Obsidian's own onload-to-apply time | Miss: 4.4 ms (small), 11.1 ms (realistic). Obsidian's time not measured. | Open |
+| A cache miss under Obsidian's own onload-to-apply time | Miss: 4.4 ms (small), 11.1 ms (realistic). Obsidian: 112.2 ms and 119.2 ms (about 12 ms and 19 ms without its debounce). | Met |
 
 On the open target: the plugin parses its settings after a 100 ms debounce, and the design says Obsidian's onload-to-apply figure includes it. If that holds, Obsidian's figure is at least about 100 ms, and a miss of 11 ms would be well under it. That is a reading of the design, not a measurement, and the Obsidian figure also includes the plugin's load and its first parse of a 267 KB theme, so I leave the target open until the bench has run in a foreground window.
 
