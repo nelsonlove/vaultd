@@ -126,5 +126,5 @@ Stage 2 — the plugin's own settings UI in the web settings modal, changes kept
 
 ## Owner decisions
 
-1. **A second host profile with a real server DOM.** The headless host chose "deliberately not jsdom" so that no plugin is mistaken for working. This design keeps that for the headless host and adds a screen host profile, its own instance, with a real server DOM (linkedom or happy-dom, picked by task 4) behind a DOM provider seam. Pick: yes.
-2. **Who a viewer is.** Per-viewer values need an identity. Pick: the Tailscale login header that `tailscale serve` adds (the same person on every device), with a cookie id only when the header is absent.
+1. **A second host profile with a real server DOM.** The headless host chose "deliberately not jsdom" so that no plugin is mistaken for working. This design keeps that for the headless host and adds a screen host profile, its own instance, with a real server DOM (linkedom or happy-dom, picked by task 4) behind a DOM provider seam. Pick: yes. **Ruled yes** by the owner, 2026-10-19 ("your picks").
+2. **Who a viewer is.** Per-viewer values need an identity. Pick: the Tailscale login header that `tailscale serve` adds (the same person on every device), with a cookie id only when the header is absent. **Ruled yes** by the owner, 2026-10-19 ("your picks").
