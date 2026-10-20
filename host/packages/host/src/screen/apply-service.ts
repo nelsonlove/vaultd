@@ -37,7 +37,7 @@ import { createHash } from "node:crypto";
 import { ViewerDataStore } from "../shim/viewer-data-store";
 import { installPluginHost, pluginHostFor } from "../shim/plugin";
 import { sheetSetHash } from "../web/sheet-set";
-import { stub } from "../shim/policy";
+import { declareScreenPolicy, stub } from "../shim/policy";
 import type { App } from "../shim/app";
 import type { BundleLoader, BundleSource } from "../runtime/loader";
 import type { DispatchQueue } from "../runtime/queue";
@@ -402,6 +402,8 @@ export function installScreenWorkspace(app: App): void {
     },
   });
 }
+
+declareScreenPolicy("Workspace.detachLeavesOfType", "safe_stub");
 
 /**
  * Let a parse's saves finish: a few turns of the loop so the save is queued,

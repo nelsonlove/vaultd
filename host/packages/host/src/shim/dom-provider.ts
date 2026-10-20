@@ -21,6 +21,8 @@
  * `docs/design/web-plugins.md`), and linkedom was removed.
  */
 
+import { declareScreenPolicy } from "./policy";
+
 /**
  * The part of a server DOM's document this host's own code relies on.
  *
@@ -155,4 +157,40 @@ export function loadOptionalDom<T>(name: string, load: () => unknown): T {
     }
     throw error;
   }
+}
+
+// The screen profile's rows: what a host built with a provider implements over
+// its real document. Declared in the screen column only, so the headless rows
+// for the same names (`safe_stub` over the stub document) stay as they are.
+// `self` and `getComputedStyle` exist only in this profile (task 4: Pickr reads
+// `self` at module scope, and a `color-gradient` reads `getComputedStyle`).
+for (const symbol of [
+  "document",
+  "activeDocument",
+  "self",
+  "getComputedStyle",
+  "Node",
+  "Element",
+  "HTMLElement",
+  "DocumentFragment",
+  // Obsidian's DOM helpers from `obsidian-dom.ts`, the global builders and the
+  // prototype extensions.
+  "createEl",
+  "createDiv",
+  "createSpan",
+  "createFragment",
+  "Node.createEl",
+  "Node.createDiv",
+  "Node.createSpan",
+  "Node.empty",
+  "Node.detach",
+  "Node.appendText",
+  "Element.addClass",
+  "Element.removeClass",
+  "Element.toggleClass",
+  "Element.hasClass",
+  "Element.setText",
+  "Element.setAttr",
+]) {
+  declareScreenPolicy(symbol, "implemented");
 }
