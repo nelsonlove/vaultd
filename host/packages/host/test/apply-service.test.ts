@@ -100,12 +100,12 @@ function patchFor(r: Rig, viewer: string, patch: Record<string, unknown>): void 
 }
 
 describe("the fixture's sheet set", () => {
-  it("is the theme, the snippet and the plugin's own styles.css, in that order", async () => {
+  it("is the plugin's own styles.css, the theme and the snippet, in Obsidian 1.14.4's head order", async () => {
     const set = await buildSheetSet(readFixture);
     expect(set.sheets.map((sheet) => sheet.id)).toEqual([
+      `plugin:${PLUGIN_ID}`,
       "theme:Fixture Theme",
       "snippet:fixture-snippet",
-      `plugin:${PLUGIN_ID}`,
     ]);
     expect(set.mode).toBe("dark");
   });

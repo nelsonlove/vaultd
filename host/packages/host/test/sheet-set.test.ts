@@ -30,13 +30,13 @@ const VAULT: Record<string, string> = {
 };
 
 describe("buildSheetSet", () => {
-  it("puts the theme, then the enabled snippets, then enabled plugins' styles.css", async () => {
+  it("puts enabled plugins' styles.css, then the theme, then the enabled snippets", async () => {
     const set = await buildSheetSet(reader(VAULT));
     expect(set.sheets).toEqual([
+      { id: "plugin:obsidian-style-settings", text: "/* ss */" },
       { id: "theme:Minimal", text: "/* minimal */" },
       { id: "snippet:b-snippet", text: "/* b */" },
       { id: "snippet:a-snippet", text: "/* a */" },
-      { id: "plugin:obsidian-style-settings", text: "/* ss */" },
     ]);
     // `no-styles` has no styles.css: that is ordinary, not a missing sheet.
     expect(set.missing).toEqual([]);
@@ -55,24 +55,24 @@ describe("buildSheetSet", () => {
     const set = await buildSheetSet(reader(VAULT), { theme: "Other", mode: "light", snippets: ["c-snippet"] });
     expect(set.mode).toBe("light");
     expect(set.sheets.map((sheet) => sheet.id)).toEqual([
+      "plugin:obsidian-style-settings",
       "theme:Other",
       "snippet:c-snippet",
-      "plugin:obsidian-style-settings",
     ]);
   });
 
   it("drops the theme for the default theme (an empty name)", async () => {
     const set = await buildSheetSet(reader(VAULT), { theme: "" });
     expect(set.sheets.map((sheet) => sheet.id)).toEqual([
+      "plugin:obsidian-style-settings",
       "snippet:b-snippet",
       "snippet:a-snippet",
-      "plugin:obsidian-style-settings",
     ]);
   });
 
   it("names a theme or snippet file that is missing, and leaves it out", async () => {
     const set = await buildSheetSet(reader(VAULT), { theme: "Gone", snippets: ["nope", "a-snippet"] });
-    expect(set.sheets.map((sheet) => sheet.id)).toEqual(["snippet:a-snippet", "plugin:obsidian-style-settings"]);
+    expect(set.sheets.map((sheet) => sheet.id)).toEqual(["plugin:obsidian-style-settings", "snippet:a-snippet"]);
     expect(set.missing).toEqual([".obsidian/themes/Gone/theme.css", ".obsidian/snippets/nope.css"]);
   });
 

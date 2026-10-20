@@ -4,9 +4,12 @@ import { createHash } from "node:crypto";
  * The stylesheet set a page is styled with, in Obsidian's order
  * (docs/design/web-plugins.md, section 4 and edge case E8).
  *
- * The order is the theme, then the enabled snippets, then each enabled
- * community plugin's `styles.css`. Every sheet is the text of one `<style>`
- * element: Style Settings reads `ownerNode.textContent`, so a `<link>` would
+ * The order is each enabled community plugin's `styles.css`, then the theme,
+ * then the enabled snippets. That is `document.head` in Obsidian 1.14.4 on the
+ * fixture vault, read live (2026-10-20): the `app.css` link, the plugin's
+ * `styles.css`, the theme, the snippet, then `#css-settings-manager`. So a
+ * theme or snippet can override a plugin's rules. Every sheet is the text of
+ * one `<style>` element: Style Settings reads `ownerNode.textContent`, so a `<link>` would
  * hide its `@settings` blocks (E1).
  *
  * Plain code with no host imports, so the web server can `require` the
@@ -14,9 +17,11 @@ import { createHash } from "node:crypto";
  * asked to apply. It reads the vault through a function it is given; it never
  * reads a file itself.
  *
- * **Not checked against Obsidian:** the snippet order. This takes the order of
- * `enabledCssSnippets` (or of the viewer's override). Obsidian may instead
- * apply them in the order of its snippet folder listing.
+ * **Not checked against Obsidian:** the order of one snippet against another
+ * (the fixture has one). This takes the order of `enabledCssSnippets` (or of
+ * the viewer's override); Obsidian may instead use its snippet folder listing.
+ * The order of one plugin's `styles.css` against another's is the order of
+ * `community-plugins.json`, also unchecked.
  */
 
 export type Mode = "light" | "dark";
@@ -93,20 +98,17 @@ export async function buildSheetSet(
     sheets.push({ id, text });
   };
 
-  if (themeName !== "") {
-    checkName(themeName, "theme");
-    await add(`theme:${themeName}`, `${configDir}/themes/${themeName}/theme.css`, true);
-  }
-  for (const name of snippetNames) {
-    checkName(name, "snippet");
-    await add(`snippet:${name}`, `${configDir}/snippets/${name}.css`, true);
-  }
+  if (themeName !== "") checkName(themeName, "theme");
+  for (const name of snippetNames) checkName(name, "snippet");
+
   const plugins = parseArray(await read(`${configDir}/community-plugins.json`));
   for (const id of plugins) {
     if (!isPlainName(id)) continue;
     // A plugin with no `styles.css` is ordinary, so its absence is not "missing".
     await add(`plugin:${id}`, `${configDir}/plugins/${id}/styles.css`, false);
   }
+  if (themeName !== "") await add(`theme:${themeName}`, `${configDir}/themes/${themeName}/theme.css`, true);
+  for (const name of snippetNames) await add(`snippet:${name}`, `${configDir}/snippets/${name}.css`, true);
   return { sheets, mode, missing };
 }
 
