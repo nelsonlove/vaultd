@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
  *
  * The order is each enabled community plugin's `styles.css`, then the theme,
  * then the enabled snippets. That is `document.head` in Obsidian 1.14.4 on the
- * fixture vault, read live (2026-10-20): the `app.css` link, the plugin's
+ * fixture vault, read live (2026-10-19): the `app.css` link, the plugin's
  * `styles.css`, the theme, the snippet, then `#css-settings-manager`. So a
  * theme or snippet can override a plugin's rules. Every sheet is the text of
  * one `<style>` element: Style Settings reads `ownerNode.textContent`, so a `<link>` would
