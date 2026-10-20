@@ -23,7 +23,8 @@ interface Rig {
 
 /** A host whose write gate counts every mutation it is asked to send. */
 async function rig(): Promise<Rig> {
-  const harness = await ShimHarness.withVault({});
+  const vaultRoot = scratchRoot("vaultd-viewer-vault-");
+  const harness = await ShimHarness.withVault({}, { config: { vaultRoot } });
   const real = pluginHostFor(harness.app);
   const sent: string[] = [];
   const writes = {
@@ -37,7 +38,6 @@ async function rig(): Promise<Rig> {
   // No vault data.json until a case sets one: the daemon answers not_found.
   harness.unserveFile(VAULT_DATA);
   const stateRoot = scratchRoot("vaultd-viewer-state-");
-  const vaultRoot = scratchRoot("vaultd-viewer-vault-");
   return {
     harness,
     sent,
@@ -112,6 +112,63 @@ describe("ViewerDataStore", () => {
     await expect(store.load("demo")).resolves.toBeNull();
     await store.save("demo", { a: 1 });
     await expect(store.load("demo")).resolves.toEqual({ a: 1 });
+  });
+
+  it("deletes the patch when a save equals a non-object vault document", async () => {
+    const r = await rig();
+    r.setVault([1, 2]);
+    const store = r.store("ann");
+    await store.save("demo", [3]);
+    expect(fs.existsSync(r.patchFile("ann"))).toBe(true);
+    await store.save("demo", [1, 2]);
+    expect(fs.existsSync(r.patchFile("ann"))).toBe(false);
+    await expect(store.load("demo")).resolves.toEqual([1, 2]);
+  });
+
+  it("applies the null-is-absent rule on load too", async () => {
+    const r = await rig();
+    r.setVault({ a: null, b: 1 });
+    await expect(r.store("ann").load("demo")).resolves.toEqual({ b: 1 });
+    await r.store("ann").save("demo", { b: 1 });
+    expect(fs.existsSync(r.patchFile("ann"))).toBe(false);
+  });
+
+  it("stores a full copy, and reports, when the vault data.json is not JSON", async () => {
+    const r = await rig();
+    r.harness.setConfigFile(VAULT_DATA, "{not json");
+    const store = r.store("ann");
+    await expect(store.load("demo")).resolves.toBeNull();
+    await store.save("demo", { a: 1, b: 2 });
+    expect(read(r.patchFile("ann"))).toEqual({ a: 1, b: 2 });
+    expect(r.harness.hostErrors.map((e) => e.phase)).toContain("plugin-data");
+    // Once the vault file is valid the viewer's keys win; other keys show through.
+    r.setVault({ a: 9, c: 3 });
+    await expect(store.load("demo")).resolves.toEqual({ a: 1, b: 2, c: 3 });
+  });
+
+  it("creates the state root readable by its owner only", async () => {
+    const r = await rig();
+    fs.rmSync(r.stateRoot, { recursive: true, force: true });
+    await r.store("ann").save("demo", { a: 1 });
+    expect(fs.statSync(r.stateRoot).mode & 0o777).toBe(0o700);
+  });
+
+  it("serialises concurrent saves for one viewer and plugin; the last wins", async () => {
+    const r = await rig();
+    r.setVault({ a: 0 });
+    const store = r.store("ann");
+    await Promise.all([1, 2, 3, 4, 5].map((n) => store.save("demo", { a: n })));
+    await expect(store.load("demo")).resolves.toEqual({ a: 5 });
+    expect(read(r.patchFile("ann"))).toEqual({ a: 5 });
+  });
+
+  it("stores a plugin id containing a slash as one file", async () => {
+    const r = await rig();
+    r.harness.setConfigFile(".obsidian/plugins/a/b/data.json", JSON.stringify({ x: 1 }));
+    const store = r.store("ann");
+    await store.save("a/b", { x: 2 });
+    expect(fs.readdirSync(join(r.stateRoot, "ann"))).toEqual(["a%2Fb.json"]);
+    await expect(store.load("a/b")).resolves.toEqual({ x: 2 });
   });
 
   it("writes nothing to the vault: zero direct writes and no vaultd mutation", async () => {

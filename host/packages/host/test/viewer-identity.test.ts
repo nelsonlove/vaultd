@@ -43,6 +43,12 @@ describe("resolveViewer", () => {
     expect(got.id).toMatch(/^[0-9a-f]{32}$/);
   });
 
+  it("takes the first well-formed cookie when the name is repeated", () => {
+    const good = "b".repeat(32);
+    const got = resolveViewer(req({ cookie: `${VIEWER_COOKIE}=bad; ${VIEWER_COOKIE}=${good}; ${VIEWER_COOKIE}=${"c".repeat(32)}` }));
+    expect(got).toEqual({ id: good, source: "cookie", setCookie: null });
+  });
+
   it("makes different ids for different first visits", () => {
     expect(resolveViewer(req({})).id).not.toBe(resolveViewer(req({})).id);
   });

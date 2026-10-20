@@ -41,12 +41,14 @@ function first(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function cookieValue(header: string | undefined, name: string): string | undefined {
+/** The first well-formed `name=<32 hex>` pair; a malformed duplicate is skipped. */
+function viewerCookie(header: string | undefined): string | undefined {
   if (header === undefined) return undefined;
   for (const part of header.split(";")) {
     const eq = part.indexOf("=");
-    if (eq < 0) continue;
-    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+    if (eq < 0 || part.slice(0, eq).trim() !== VIEWER_COOKIE) continue;
+    const value = part.slice(eq + 1).trim();
+    if (COOKIE_ID.test(value)) return value;
   }
   return undefined;
 }
@@ -61,8 +63,8 @@ export function resolveViewer(req: ViewerRequest): ResolvedViewer {
   const login = first(req.headers[TAILSCALE_LOGIN_HEADER])?.trim();
   if (login !== undefined && login !== "") return { id: login, source: "header", setCookie: null };
 
-  const held = cookieValue(first(req.headers["cookie"]), VIEWER_COOKIE);
-  if (held !== undefined && COOKIE_ID.test(held)) {
+  const held = viewerCookie(first(req.headers["cookie"]));
+  if (held !== undefined) {
     return { id: held, source: "cookie", setCookie: null };
   }
 
