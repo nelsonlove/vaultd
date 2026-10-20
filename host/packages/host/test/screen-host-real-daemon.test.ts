@@ -8,7 +8,7 @@
  * the socket's door and envelope; and that nothing is written into the vault.
  */
 
-import { chmodSync, cpSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -23,7 +23,7 @@ import { startScreenHost } from "../src/screen/screen-host";
 import { rejectionGuardArmed } from "../src/server/server";
 import type { HostConfig } from "../src/config";
 import type { Mode } from "./style-settings-run";
-import type { RunningScreenHost } from "../src/screen/screen-host";
+import type { RunningScreenHost, ScreenHostOptions, ScreenStats } from "../src/screen/screen-host";
 
 const running: RunningScreenHost[] = [];
 const clients: HostTestClient[] = [];
@@ -66,9 +66,11 @@ function screenConfig(): { config: HostConfig; vault: string; state: string; sta
   return { config, vault: config.vaultRoot, state, stateRoot };
 }
 
-async function screenHost(): Promise<{ host: RunningScreenHost; vault: string; state: string; stateRoot: string }> {
+async function screenHost(
+  options: ScreenHostOptions = {},
+): Promise<{ host: RunningScreenHost; vault: string; state: string; stateRoot: string }> {
   const { config, state, stateRoot } = screenConfig();
-  const host = await startScreenHost(config, { stateRoot });
+  const host = await startScreenHost(config, { stateRoot, ...options });
   running.push(host);
   return { host, vault: config.vaultRoot, state, stateRoot };
 }
@@ -102,6 +104,29 @@ async function connect(host: RunningScreenHost, state: string): Promise<HostTest
   return client;
 }
 
+/** Write a vault file through the screen host's own vaultd, which announces it with `config_changed`. */
+async function writeThroughVaultd(host: RunningScreenHost, path: string, text: string): Promise<void> {
+  await host.client().request("write_file", {
+    path,
+    content_base64: Buffer.from(text, "utf8").toString("base64"),
+    expected: { any: true },
+  });
+}
+
+/** Wait until the host has heard `count` more `config_changed` events than `before`. */
+async function heard(host: RunningScreenHost, before: ScreenStats, count = 1): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (host.stats().config_events < before.config_events + count) {
+    if (Date.now() > deadline) throw new Error("no config_changed reached the screen host within 10 s");
+    await new Promise((settle) => setTimeout(settle, 10));
+  }
+}
+
+const SNIPPET = ".obsidian/snippets/fixture-snippet.css";
+const DATA = ".obsidian/plugins/obsidian-style-settings/data.json";
+const ENABLED = ".obsidian/community-plugins.json";
+const MANIFEST = ".obsidian/plugins/obsidian-style-settings/manifest.json";
+
 describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
   it("reproduces the capture in both modes over its socket, and writes nothing into the vault", async () => {
     const { host, vault, state, stateRoot } = await screenHost();
@@ -131,6 +156,132 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     // The load-time prune went to the viewer's patch, outside the vault.
     expect(readdirSync(join(stateRoot, "alice"))).toEqual(["obsidian-style-settings.json"]);
     expect(snapshot(vault)).toEqual(before);
+  }, 120_000);
+
+  it("builds the set itself from an appearance, and a cache hit makes no vaultd request and takes no sheet text", async () => {
+    const { host, state } = await screenHost({ revalidateMs: 0 });
+    const client = await connect(host, state);
+    const owned = pluginOwnedClasses();
+    for (const mode of ["dark", "light"] as Mode[]) {
+      const result = await client.call<{ classes: string[]; style: string }>("screen.apply", {
+        viewer: "alice",
+        mode,
+        appearance: {},
+      });
+      expect(result.style).toBe(EXPECTED.styleText[mode]);
+      expect(result.classes).toEqual(EXPECTED.classes[mode].filter((name) => owned.has(name)).sort());
+    }
+    const before = await client.call<ScreenStats>("screen.stats");
+    const again = await client.call<{ style: string }>("screen.apply", { viewer: "alice", mode: "light", appearance: {} });
+    expect(again.style).toBe(EXPECTED.styleText.light);
+    const after = await client.call<ScreenStats>("screen.stats");
+    expect(after.hits).toBe(before.hits + 1);
+    expect(after.misses).toBe(before.misses);
+    expect(after.vaultd_requests).toBe(before.vaultd_requests);
+    expect(after.config_reads).toBe(before.config_reads);
+    expect(after.sheet_bytes_received).toBe(0);
+    // The explicit theme and snippet list is the same set as the vault's.
+    await client.call("screen.apply", {
+      viewer: "alice",
+      mode: "light",
+      appearance: { theme: "Fixture Theme", snippets: ["fixture-snippet"] },
+    });
+    const third = await client.call<ScreenStats>("screen.stats");
+    expect(third.hits).toBe(after.hits + 1);
+    // A bad appearance is refused.
+    await expect(client.call("screen.apply", { viewer: "a", mode: "dark", appearance: { theme: "../x" } })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    await expect(client.call("screen.apply", { viewer: "a", mode: "dark" })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+  }, 120_000);
+
+  it("a snippet's @settings change made through vaultd changes the next apply, with no restart", async () => {
+    const { host, vault } = await screenHost({ revalidateMs: 0 });
+    const first = await host.apply({ viewer: "alice", mode: "dark", appearance: {} });
+    expect(first.style).toContain("--sn-width: 700px");
+    const before = host.stats();
+    const text = readFileSync(join(vault, SNIPPET), "utf8").replace("format: px", "format: em");
+    await writeThroughVaultd(host, SNIPPET, text);
+    await heard(host, before);
+    const next = await host.apply({ viewer: "alice", mode: "dark", appearance: {} });
+    expect(next.style).toContain("--sn-width: 700em");
+    expect(next.style).not.toContain("--sn-width: 700px");
+  }, 120_000);
+
+  it("a vault data.json change reaches a viewer with no override of that key, and not one with", async () => {
+    const { host, vault, stateRoot } = await screenHost({ revalidateMs: 0 });
+    // Alice overrides the width; Bob does not.
+    mkdirSync(join(stateRoot, "alice"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(stateRoot, "alice", "obsidian-style-settings.json"), JSON.stringify({ "fixture-snippet@@sn-width": 900 }));
+    expect((await host.apply({ viewer: "bob", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700px");
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 900px");
+    const before = host.stats();
+    const data = JSON.parse(readFileSync(join(vault, DATA), "utf8")) as Record<string, unknown>;
+    await writeThroughVaultd(host, DATA, JSON.stringify({ ...data, "fixture-snippet@@sn-width": 820 }));
+    await heard(host, before);
+    expect((await host.apply({ viewer: "bob", mode: "dark", appearance: {} })).style).toContain("--sn-width: 820px");
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 900px");
+  }, 120_000);
+
+  it("disabling the plugin removes the output, enabling it brings it back, and a bundle change reloads it", async () => {
+    const { host, vault, state } = await screenHost({ revalidateMs: 0 });
+    const client = await connect(host, state);
+    const enabledText = readFileSync(join(vault, ENABLED), "utf8");
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toBe(EXPECTED.styleText.dark);
+
+    let before = host.stats();
+    await writeThroughVaultd(host, ENABLED, "[]");
+    await heard(host, before);
+    expect(await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).toEqual({ classes: [], style: "" });
+    expect(host.plugins).toEqual([]);
+    expect(host.service).toBeNull();
+    // A new connection's hello says so too.
+    const fresh = await HostTestClient.open(host.socketPath);
+    clients.push(fresh);
+    const hello = await fresh.call<{ plugins: string[] }>("host.hello", { nonce: readFileSync(join(state, "nonce"), "utf8").trim() });
+    expect(hello.plugins).toEqual([]);
+
+    before = host.stats();
+    await writeThroughVaultd(host, ENABLED, enabledText);
+    await heard(host, before);
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toBe(EXPECTED.styleText.dark);
+    expect(host.plugins).toEqual(["obsidian-style-settings"]);
+
+    // A changed manifest is a changed bundle: the service is replaced and the plugin loaded again.
+    const service = host.service;
+    before = host.stats();
+    const manifest = JSON.parse(readFileSync(join(vault, MANIFEST), "utf8")) as Record<string, unknown>;
+    await writeThroughVaultd(host, MANIFEST, JSON.stringify({ ...manifest, description: "changed" }));
+    await heard(host, before);
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toBe(EXPECTED.styleText.dark);
+    expect(host.service).not.toBe(service);
+    const after = await client.call<ScreenStats>("screen.stats");
+    expect(after.bundle_changes).toBe(before.bundle_changes + 1);
+    expect(after.loads).toBe(1);
+  }, 120_000);
+
+  it("a change that is not the screen's raises no re-read", async () => {
+    const { host } = await screenHost({ revalidateMs: 0 });
+    await host.apply({ viewer: "alice", mode: "dark", appearance: {} });
+    const before = host.stats();
+    await writeThroughVaultd(host, ".obsidian/app.json", "{}");
+    // Then one that is, so there is something to wait for.
+    await writeThroughVaultd(host, ".obsidian/appearance.json", readFileSync(join(FIXTURE, "vault", ".obsidian", "appearance.json"), "utf8"));
+    await heard(host, before);
+    expect(host.stats().config_events).toBe(before.config_events + 1);
+  }, 120_000);
+
+  it("an edit made outside vaultd, which raises no event, shows after the re-read period", async () => {
+    const { host, vault } = await screenHost({ revalidateMs: 2_000 });
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700px");
+    writeFileSync(join(vault, SNIPPET), readFileSync(join(vault, SNIPPET), "utf8").replace("format: px", "format: em"));
+    // Within the period the kept set still answers.
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700px");
+    await new Promise((settle) => setTimeout(settle, 2_100));
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700em");
+    expect(host.stats().config_events).toBe(0);
   }, 120_000);
 
   it("refuses a request of the wrong shape, and an unknown method", async () => {
