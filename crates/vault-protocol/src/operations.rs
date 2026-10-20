@@ -8,6 +8,7 @@ use crate::mutations::{
     ReadFileResponse, RenameFolderParams, RenameNoteParams, RenameResponse, WriteFileParams,
     WriteFileResponse, WriteNoteParams,
 };
+use crate::search::{SearchParams, SearchResponse};
 use crate::semantic::{
     DiagnosticDto, IndexStateDto, NoteDto, NoteSummaryDto, ReferenceDto, ResolutionDto, SeverityDto,
 };
@@ -53,6 +54,8 @@ pub enum Request {
     CloseSnapshot(CloseSnapshotParams),
     EvaluateBase(EvaluateBaseParams),
     ListBases(ListBasesParams),
+    /// A query in Obsidian's search syntax, answered per file with match spans.
+    Search(SearchParams),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,6 +195,8 @@ pub enum Response {
     CloseSnapshot(CloseSnapshotResponse),
     EvaluateBase(EvaluateBaseResponse),
     ListBases(PageResponse<BaseSummaryDto>),
+    /// One page of the files a `search` query matched.
+    Search(SearchResponse),
 }
 
 impl Response {

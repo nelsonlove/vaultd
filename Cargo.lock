@@ -1247,6 +1247,8 @@ dependencies = [
  "trash",
  "vault-bases",
  "vault-core",
+ "vault-index",
+ "vault-search",
  "walkdir",
  "xdg",
 ]
@@ -1257,6 +1259,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "vault-search"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+ "vault-bases",
+ "vault-core",
 ]
 
 [[package]]
@@ -1275,6 +1287,7 @@ dependencies = [
  "vault-core",
  "vault-index",
  "vault-protocol",
+ "vault-search",
  "vault-watch",
  "xdg",
 ]

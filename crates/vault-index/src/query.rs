@@ -8,6 +8,7 @@ use vault_core::{
 
 pub(crate) mod bases;
 pub(crate) mod diagnostics;
+pub(crate) mod search;
 
 use crate::codec;
 use crate::cursor::{CursorPosition, decode_cursor, encode_cursor};

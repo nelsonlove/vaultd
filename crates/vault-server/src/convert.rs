@@ -318,6 +318,7 @@ pub(crate) fn refresh_failure(value: RefreshFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         RefreshFailure::NotReady => ProtocolError {
             code: ErrorCode::RuntimeNotReady,
@@ -325,6 +326,7 @@ pub(crate) fn refresh_failure(value: RefreshFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         RefreshFailure::Failed(error) => index_error(error),
     }
@@ -339,6 +341,7 @@ pub(crate) fn index_error(value: IndexError) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     };
     match value {
         IndexError::InvalidPath(message) => {
@@ -455,6 +458,7 @@ pub(crate) fn mutation_error(value: vault_index::MutationError) -> ProtocolError
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     };
     match value {
         MutationError::RevisionConflict { current, .. } => {
@@ -523,6 +527,7 @@ pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: revision,
+            position: None,
         },
         MutationFailure::Overloaded => ProtocolError {
             code: ErrorCode::RuntimeOverloaded,
@@ -530,6 +535,7 @@ pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         MutationFailure::NotReady => ProtocolError {
             code: ErrorCode::RuntimeNotReady,
@@ -537,6 +543,7 @@ pub(crate) fn mutation_failure(value: MutationFailure) -> ProtocolError {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         },
         MutationFailure::Failed(error) => index_error(error),
     }
@@ -549,6 +556,7 @@ fn invalid_request(message: &str) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -713,6 +721,7 @@ pub(crate) fn structural_facets(
                     supported_version: None,
                     current_generation: None,
                     current_revision: None,
+                    position: None,
                 });
             }
         }
@@ -843,6 +852,7 @@ pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ProtocolError> {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         })
 }
 
@@ -1003,6 +1013,75 @@ fn value_cell(
             value: text.clone(),
         },
     }
+}
+
+fn to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("a position fits u64")
+}
+
+fn loc(value: vault_search::text::Loc) -> vault_protocol::LocDto {
+    vault_protocol::LocDto {
+        line: to_u64(value.line),
+        col: to_u64(value.col),
+        offset: to_u64(value.offset),
+    }
+}
+
+/// One matched file on the wire. `contexts`, when the page read them, pair
+/// one-to-one with the hit's content matches; any other count is a defect
+/// (a page note missing at the answer's generation), refused as `internal`
+/// rather than answered as a silently shortened hit.
+pub(crate) fn search_hit(
+    hit: &vault_search::FileHit,
+    contexts: Option<&[vault_index::MatchContext]>,
+) -> Result<vault_protocol::SearchHitDto, ProtocolError> {
+    if let Some(contexts) = contexts {
+        if contexts.len() != hit.content_matches.len() {
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!(
+                    "line contexts do not pair with the matches of {}",
+                    hit.path.as_str()
+                ),
+            ));
+        }
+    }
+    let content_matches = hit
+        .content_matches
+        .iter()
+        .enumerate()
+        .map(|(at, found)| {
+            let context = contexts.map(|contexts| &contexts[at]);
+            vault_protocol::ContentMatchDto {
+                span: SpanDto {
+                    start: to_u64(found.span.start),
+                    end: to_u64(found.span.end),
+                },
+                start: loc(found.start),
+                end: loc(found.end),
+                line_text: context.map(|context| context.line_text.clone()),
+                line_text_start: context.map(|context| to_u64(context.line_text_start)),
+            }
+        })
+        .collect();
+    Ok(vault_protocol::SearchHitDto {
+        path: hit.path.as_str().to_string(),
+        kind: match hit.kind {
+            vault_search::DocumentKind::Note => vault_protocol::DocumentKindDto::Note,
+            vault_search::DocumentKind::Canvas => vault_protocol::DocumentKindDto::Canvas,
+            vault_search::DocumentKind::File => vault_protocol::DocumentKindDto::File,
+        },
+        path_matches: hit
+            .path_matches
+            .iter()
+            .map(|range| vault_protocol::Utf16SpanDto {
+                start: to_u64(range.start),
+                end: to_u64(range.end),
+            })
+            .collect(),
+        content_matches,
+        matches_truncated: hit.matches_truncated,
+    })
 }
 
 #[cfg(test)]

@@ -123,7 +123,7 @@ function validateEnvelope(parsed: unknown): Frame | string {
       if (!isRecord(body)) return "err outcome with no error body";
       if (typeof body.code !== "string") return "error body with no string code";
       if (typeof body.message !== "string") return "error body with no string message";
-      // The three tails are optional, and each is checked only when present:
+      // The four tails are optional, and each is checked only when present:
       // absent is the common case, and a wrong type here would reach a caller
       // as a plausible-looking number or string on `VaultdError`.
       if ("supported_version" in body && typeof body.supported_version !== "number") {
@@ -134,6 +134,9 @@ function validateEnvelope(parsed: unknown): Frame | string {
       }
       if ("current_revision" in body && typeof body.current_revision !== "string") {
         return "error body with a non-string current_revision";
+      }
+      if ("position" in body && typeof body.position !== "number") {
+        return "error body with a non-numeric position";
       }
       return parsed as unknown as ResponseEnvelope;
     }

@@ -4,7 +4,9 @@ pub mod connection;
 mod convert;
 pub mod fixture_row;
 pub mod listener;
+mod paging;
 pub mod runtime;
+mod search;
 pub mod service;
 pub mod signals;
 pub mod stdio;
@@ -12,6 +14,7 @@ pub mod subscriptions;
 mod views;
 
 pub use bases::DEFAULT_BASE_CACHE_ENTRIES;
+pub use search::{DEFAULT_SEARCH_CACHE_ENTRIES, MAX_STORED_MATCHES};
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -79,6 +82,10 @@ pub struct Server {
     /// `evaluate_base` result are cut from one computation. Bounded by
     /// `--bases-cache-entries`.
     base_cache: bases::BaseCache,
+    /// Search answers at the current generation, so the pages of one
+    /// `search` answer are cut from one computation. Bounded by
+    /// `--search-cache-entries`.
+    search_cache: search::SearchCache,
     /// What each view last answered and every base's views, for the
     /// `views_invalidated` staleness rule each dispatcher runs.
     views: views::ViewTracker,
@@ -169,6 +176,7 @@ fn index_unavailable() -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -184,6 +192,7 @@ fn snapshot_not_found(snapshot_id: &str) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -196,6 +205,7 @@ fn runtime_not_ready(message: &str) -> ProtocolError {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     }
 }
 
@@ -223,6 +233,7 @@ pub(crate) fn parse_path(value: &str) -> Result<VaultPath, ProtocolError> {
         supported_version: None,
         current_generation: None,
         current_revision: None,
+        position: None,
     };
     if value.contains('\0') {
         return Err(invalid(value));
@@ -271,6 +282,7 @@ impl Server {
             socket_path: None,
             engine: None,
             base_cache: bases::BaseCache::default(),
+            search_cache: search::SearchCache::default(),
             views: views::ViewTracker::default(),
         }
     }
@@ -299,6 +311,7 @@ impl Server {
             socket_path: None,
             engine: Some(engine),
             base_cache: bases::BaseCache::default(),
+            search_cache: search::SearchCache::default(),
             views: views::ViewTracker::default(),
         }
     }
@@ -397,6 +410,12 @@ impl Server {
     /// dropping whatever it held.
     pub fn set_base_cache_entries(&mut self, entries: usize) {
         self.base_cache = bases::BaseCache::with_capacity(entries);
+    }
+
+    /// Bound the search answer cache to `entries` answers (at least one),
+    /// dropping whatever it held.
+    pub fn set_search_cache_entries(&mut self, entries: usize) {
+        self.search_cache = search::SearchCache::with_capacity(entries);
     }
 
     /// The views one committed generation may have changed, one event each,
@@ -678,6 +697,7 @@ impl Server {
             supported_version: None,
             current_generation: None,
             current_revision: None,
+            position: None,
         })
     }
 
@@ -713,6 +733,7 @@ impl Server {
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             });
         };
         let indexed = !vault_index::is_unindexable(written);
@@ -761,6 +782,7 @@ impl Server {
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             });
         };
         match vault_index::is_unindexable_folder(written) {
@@ -791,6 +813,7 @@ impl Server {
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             });
         }
         paths.iter().map(|path| parse_path(path)).collect()
@@ -1422,6 +1445,13 @@ impl Server {
                 None => ResponseEnvelope::error(id, index_unavailable()),
                 Some(reader) => match bases::list_bases(reader, params) {
                     Ok(page) => ResponseEnvelope::success(id, Response::ListBases(page)),
+                    Err(error) => ResponseEnvelope::error(id, error),
+                },
+            },
+            Request::Search(params) => match reader {
+                None => ResponseEnvelope::error(id, index_unavailable()),
+                Some(reader) => match search::search(reader, &self.search_cache, params) {
+                    Ok(answer) => ResponseEnvelope::success(id, Response::Search(answer)),
                     Err(error) => ResponseEnvelope::error(id, error),
                 },
             },

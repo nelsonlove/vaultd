@@ -376,3 +376,81 @@ fn every_bases_error_code_is_documented_exactly_once() {
         assert_eq!(definitions, 1, "`{code}` is defined {definitions} times");
     }
 }
+
+#[test]
+fn search_is_documented_where_its_users_look() {
+    assert_document_contains(
+        "docs/protocol.md",
+        &[
+            "### `search`",
+            "## Search",
+            "query_invalid",
+            "unsupported_operator",
+            "\"position\"",
+            "--search-cache-entries",
+            "a search hit's `kind`",
+        ],
+    );
+    assert_document_contains("README.md", &["--search-cache-entries"]);
+    let compatibility = read_document("VAULTD-COMPATIBILITY.md");
+    assert!(
+        compatibility.contains("## Search parity"),
+        "VAULTD-COMPATIBILITY.md must have a `## Search parity` section"
+    );
+    // Every provisional rule of the design, P1 to P23, until the parity
+    // harness settles it.
+    for rule in 1..=23 {
+        let name = format!("**P{rule}.**");
+        assert!(
+            compatibility.contains(&name),
+            "VAULTD-COMPATIBILITY.md must name the provisional rule {name}"
+        );
+    }
+    assert_document_contains(
+        "docs/protocol-host.md",
+        &["host.search", "host.search_state", "host.search_opened"],
+    );
+    assert_document_contains(
+        "docs/design/semantic-read-path.md",
+        &["Search landed in phase 9"],
+    );
+}
+
+/// `search` left the reserved families when it landed as an operation, so
+/// the reserved list must no longer name it.
+#[test]
+fn search_is_no_longer_a_reserved_operation_family() {
+    let document = read_document("docs/protocol.md");
+    let reserved = document
+        .split_once("\n## Reserved operation families\n")
+        .expect("a Reserved operation families section")
+        .1;
+    let reserved = match reserved.split_once("\n## ") {
+        Some((section, _)) => section,
+        None => reserved,
+    };
+    assert!(
+        !reserved.lines().any(|line| line == "- `search`"),
+        "`search` is still listed as a reserved operation family"
+    );
+}
+
+#[test]
+fn every_search_error_code_is_documented_exactly_once() {
+    let document = read_document("docs/protocol.md");
+    let errors = document
+        .split_once("\n## Errors\n")
+        .expect("an Errors section")
+        .1;
+    let errors = match errors.split_once("\n## ") {
+        Some((section, _)) => section,
+        None => errors,
+    };
+    for code in ["query_invalid", "unsupported_operator"] {
+        let definitions = errors
+            .lines()
+            .filter(|line| line.starts_with(&format!("- `{code}`")))
+            .count();
+        assert_eq!(definitions, 1, "`{code}` is defined {definitions} times");
+    }
+}

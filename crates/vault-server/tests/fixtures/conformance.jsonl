@@ -38,6 +38,10 @@
 {"version":1,"id":"c51","request":{"method":"evaluate_base","params":{"path":"Nowhere.base"}}}
 # Non-finite numbers as `string` cells (NaN, Infinity, -Infinity): provisional until the Task 13 capture.
 {"version":1,"id":"c52","request":{"method":"evaluate_base","params":{"path":"Numbers.base"}}}
+# Search: an answer with spans, Locs and line text, and its two refusals with their position.
+{"version":1,"id":"c53","request":{"method":"search","params":{"query":"one"}}}
+{"version":1,"id":"c54","request":{"method":"search","params":{"query":"a b)"}}}
+{"version":1,"id":"c55","request":{"method":"search","params":{"query":"x line:(a b)"}}}
 # Refusals, each of which must read identically through either door.
 {"version":1,"id":"c10","request":{"method":"get_note","params":{"path":"Nowhere.md"}}}
 {"version":1,"id":"c11","request":{"method":"get_note","params":{"path":"../escape.md"}}}

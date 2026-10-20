@@ -6,14 +6,14 @@
 //! spelling and its own clients would silently degrade it to `Unknown`, suite
 //! green. These witnesses make variant addition a **compile error** in this
 //! file; the required fix is to extend the matching round-trip table (in
-//! `events.rs`, `schema.rs`, `wire_tolerance.rs`, `snapshots.rs`, or
-//! `bases_wire.rs`) with the
+//! `events.rs`, `schema.rs`, `wire_tolerance.rs`, `snapshots.rs`,
+//! `bases_wire.rs`, or `search_wire.rs`) with the
 //! new variant — never just the match arm here — so the decoder arm and its
 //! test land in the same change.
 
 use vault_protocol::{
-    DirEntryKindDto, ErrorCode, GenerationCauseDto, LiveStateDto, ResyncReasonDto, RuntimeEventDto,
-    TreeEntryKindDto,
+    DirEntryKindDto, DocumentKindDto, ErrorCode, GenerationCauseDto, LiveStateDto, ResyncReasonDto,
+    RuntimeEventDto, TreeEntryKindDto,
 };
 
 #[test]
@@ -51,6 +51,9 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
             | ErrorCode::ViewNotFound
             | ErrorCode::ExpressionInvalid
             | ErrorCode::UnsupportedFunction
+            // Round-tripped in search_wire.rs.
+            | ErrorCode::QueryInvalid
+            | ErrorCode::UnsupportedOperator
             | ErrorCode::Unknown => {}
         }
     }
@@ -102,6 +105,14 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
             | DirEntryKindDto::Unknown => {}
         }
     }
+    fn witness_document_kind(kind: &DocumentKindDto) {
+        match kind {
+            DocumentKindDto::Note
+            | DocumentKindDto::Canvas
+            | DocumentKindDto::File
+            | DocumentKindDto::Unknown => {}
+        }
+    }
     fn witness_event(event: &RuntimeEventDto) {
         match event {
             RuntimeEventDto::GenerationCommitted(_)
@@ -119,5 +130,6 @@ fn every_open_ended_enum_variant_is_anchored_to_a_round_trip_table() {
     witness_reason(&ResyncReasonDto::SubscriberLag);
     witness_tree_kind(&TreeEntryKindDto::Note);
     witness_dir_kind(&DirEntryKindDto::Symlink);
+    witness_document_kind(&DocumentKindDto::Note);
     witness_event(&RuntimeEventDto::Unknown);
 }

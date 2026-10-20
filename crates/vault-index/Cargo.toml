@@ -9,6 +9,10 @@ license.workspace = true
 name = "vault-bench"
 path = "src/bin/vault-bench.rs"
 
+[features]
+# Test-only hooks on the reader; enabled by this crate's own dev-dependency.
+test-support = []
+
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
@@ -23,9 +27,11 @@ tempfile.workspace = true
 thiserror.workspace = true
 trash.workspace = true
 vault-bases = { path = "../vault-bases" }
+vault-search = { path = "../vault-search" }
 vault-core = { path = "../vault-core" }
 walkdir.workspace = true
 xdg.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+vault-index = { path = ".", features = ["test-support"] }

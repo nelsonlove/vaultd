@@ -382,6 +382,20 @@ impl IndexReader {
         self.pin_evaluation(Some(expected), true, under_guard)
     }
 
+    /// [`Self::evaluation_read`] at whatever generation is published, without a
+    /// resolver: a search reads rows, never resolutions.
+    pub(crate) fn evaluation_read_current<T>(
+        &self,
+        under_guard: impl FnOnce(&crate::LiveGraph) -> T,
+    ) -> Result<(EvaluationRead<'_>, T), IndexError> {
+        if self.forced_stale {
+            return Err(IndexError::LiveStateStale(
+                "evaluations are refused as stale by a test".into(),
+            ));
+        }
+        self.pin_evaluation(None, true, under_guard)
+    }
+
     /// [`Self::evaluation_read`] at whatever generation is published, with
     /// the resolver for exactly that generation.
     ///

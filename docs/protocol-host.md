@@ -94,6 +94,10 @@ Every field below is `snake_case`. The **Task** column says which task implement
 | `host.detach_interaction` | `{}` | `{ attached: bool }` | 18 |
 | `host.respond_interaction` | `{ prompt_id, choice_index?: number, value?: string, cancelled?: bool }` | `{ prompt_id }` | 18 |
 | `host.list_interactions` | `{}` | `{ pending: InteractionRequest[] }` | 20b |
+| `host.search` | the daemon's `search` params: `{ query, match_case?, sort?, context?, cursor?, limit? }` | the daemon's `search` answer, unchanged | search 7 |
+| `host.search_state` | `{}` | `{ query, answer: SearchResponse \| null, error: string \| null }` | search 7 |
+
+The two search rows come from the search phase's plan (`docs/plans/search-implementation.md`, Task 7), not the host phase's, hence the prefix; **Search** below describes them.
 
 The last seven rows need a service the server is handed rather than one it builds: the interaction broker, the plugin config service and the compatibility detector. Until the host has been given the one an operation needs, that operation answers `host_not_ready` **naming that service** — a typed, documented state rather than a missing method. The services themselves are Tasks 18, 17 and 20; 20b is where they reach the socket.
 
@@ -153,11 +157,21 @@ The plugin-config rows carry **two ratified amendments** from Task 17's fix roun
 
 A `plugin_id` reports one plugin; omitting it reports every installed one. **One plugin's refusal is one row's, never the report's** — a host holding a quarantined plugin is exactly the host an operator wants a report from, so the refusal becomes a sentence in that row's `notes` and the walk goes on.
 
+### Search
+
+**`host.search` and a forwarded `search` give the same answer.** `host.search` is a pass-through for a host client that holds no engine connection of its own: the params go to the engine's `search` unchanged, and its answer — or its refusal with its own code, `query_invalid` and `unsupported_operator` with `position`, `invalid_cursor`, `generation_mismatch` — comes back unchanged. Sending `search` itself to this host, which proxies every non-`host.` method, reaches the same engine operation and gives the same answer. The host checks only that `query` is a string, because a request without one is malformed whatever the engine would say. The grammar, the scopes and the answer's shape are `docs/protocol.md`'s `search` and **Search**.
+
+**`host.search_state` is the host's current search**: the query a plugin last opened, the first page of the engine's answer to it (`answer`, `null` while it runs or when it was refused) and the refusal's message (`error`, `null` when there was none). It is empty — `{"query":"","answer":null,"error":null}` — until a plugin opens a search.
+
+**The `global-search` core plugin has a real instance**, with exactly the two methods the plugin corpus calls. `openGlobalSearch(query)` makes the query the host's current search, runs the engine's `search` for its first page of 100 files, and, when the answer or the refusal lands, raises `host.search_opened` to every subscriber; `getGlobalSearchQuery()` returns the current query, `""` when none. **"Open" means only that, headless**: in Obsidian it reveals the Search pane and types the query into it, and this host has no pane, so the search becomes the host's current search state, which any host client reads through `host.search_state`. The newest open wins: an older search that answers after a newer one was opened is dropped. A refusal is state, never a throw to the plugin, as in Obsidian. The instance is served only when the vault's `core-plugins.json` enables `global-search`, as Obsidian's is; otherwise `getPluginById("global-search").instance` is `null`. With it, tag-wrangler's "Search for #tag", "Require #tag in search" and "Exclude #tag from search" work headless.
+
 ### Readiness
 
 `host.hello`, `host.info`, `host.list_plugins` and `host.subscribe` answer from the moment the socket is up: a client that has just connected needs to be able to ask what is going on *because* something is wrong. Every operation that needs a loaded plugin set — the command, menu, protocol and plugin operations — answers `host_not_ready` until the lifecycle sequencer reports `steady`. The snapshot operations do not wait, because the mirror is hydrated before the host starts.
 
 **`host.compat_report` and `host.set_plugin_config` need `steady` too, and `host.get_plugin_config` does not.** A report before `steady` describes nothing: the detector cannot load a plugin to probe it, so every row under `--dry-run` read `fails` about plugins in perfect health. A write before `steady` races the startup beside it — one that lands before a plugin's own `loadData` silently changes what that plugin loads with, and the `onExternalSettingsChange` that follows queues behind the plugin's in-flight `onload`. Reading a settings document, by contrast, is well defined at every phase: it is a file, and `host.get_plugin_config` answers it whenever it is asked.
+
+`host.search` and `host.search_state` do not wait either: the first is the engine's `search` and the second the instance's own state, and neither reads the loaded plugin set.
 
 `host.attach_interaction`, `host.detach_interaction`, `host.respond_interaction` and `host.list_interactions` do not wait either — a client attaches before anything can prompt it, which is the point of attaching.
 
@@ -385,6 +399,9 @@ Host events:
 | `host.notice` | `{ plugin_id, message, at_unix_ms }` |
 | `host.overlap_changed` | `{ overlap, gui_enabled }` |
 | `host.interaction_request` | `{ prompt_id, plugin_id, kind, prompt, items, timeout_ms }` — to the **attached** client only |
+| `host.search_opened` | `{ query, total_files: number \| null, error: string \| null }` |
+
+`host.search_opened` says a plugin opened a search (`openGlobalSearch`) and the engine answered or refused it. It carries the count and the refusal, never the hits: a page of results is not pushed to every subscriber, and a client that wants them reads `host.search_state`.
 
 Daemon-shaped events carry their `vaultd` payloads **unchanged**: `generation_committed`, `runtime_state_changed`, `resync_required` and `config_changed`. Nothing is recomputed here, so a client correlating this door with a direct daemon subscription sees the same numbers.
 

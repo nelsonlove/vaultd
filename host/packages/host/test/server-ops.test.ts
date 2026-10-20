@@ -386,6 +386,25 @@ describe("host.* operations", () => {
     }
   });
 
+  it("answers host.search_state and refuses a host.search with no query, before the host is steady", async () => {
+    const harness = await HostHarness.create({ vault: {}, enabled: [] });
+    try {
+      // Not started: neither search operation reads the loaded plugin set.
+      const client = await harness.connectClient();
+      await expect(client.call("host.search_state", {})).resolves.toEqual({
+        query: "",
+        answer: null,
+        error: null,
+      });
+      await expect(client.call("host.search", {})).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(client.call("host.search", { query: 7 })).rejects.toMatchObject({
+        code: "invalid_request",
+      });
+    } finally {
+      await harness.stop();
+    }
+  });
+
   it("returns typed errors for unknown ids", async () => {
     const harness = await HostHarness.create({ vault: {}, enabled: [] });
     try {

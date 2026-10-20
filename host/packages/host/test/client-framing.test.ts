@@ -114,6 +114,23 @@ describe("LineFramer", () => {
     expect(malformed).toHaveLength(1);
   });
 
+  it("refuses an error body whose position is not a number, and accepts one that is", () => {
+    const framer = new LineFramer();
+    const bad = framer.push(
+      Buffer.from(
+        '{"version":1,"id":"h-1","outcome":{"status":"err","value":{"code":"query_invalid","message":"m","position":"3"}}}\n',
+      ),
+    );
+    expect(bad.malformed).toHaveLength(1);
+    const good = framer.push(
+      Buffer.from(
+        '{"version":1,"id":"h-2","outcome":{"status":"err","value":{"code":"query_invalid","message":"m","position":3}}}\n',
+      ),
+    );
+    expect(good.malformed).toEqual([]);
+    expect(good.frames).toHaveLength(1);
+  });
+
   it("accepts an error body carrying only its two required fields", () => {
     const framer = new LineFramer();
     const { frames, malformed } = framer.push(

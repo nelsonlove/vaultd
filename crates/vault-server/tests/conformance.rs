@@ -532,6 +532,38 @@ fn the_socket_answers_the_fixture_set_exactly_as_stdio_does() {
         "the non-finite row is in the transcript"
     );
 
+    // c53 to c55 are right, not only alike: a search answer with line text,
+    // and the two refusals with their codes and character positions.
+    let outcome = |id: &str| -> serde_json::Value {
+        let line = over_stdio
+            .iter()
+            .find(|line| line.contains(&format!(r#""id":"{id}""#)))
+            .unwrap_or_else(|| panic!("no response to {id}"));
+        serde_json::from_str::<serde_json::Value>(line).expect("a JSON response")["outcome"].clone()
+    };
+    let found = outcome("c53");
+    assert_eq!(found["status"], "ok", "c53: {found}");
+    assert_eq!(found["value"]["type"], "search", "c53: {found}");
+    let items = found["value"]["value"]["items"]
+        .as_array()
+        .expect("c53 items");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["path"] == "One.md"
+                && item["content_matches"][0]["line_text"].is_string()),
+        "c53 answers One.md with line text: {found}"
+    );
+    for (id, code, position) in [
+        ("c54", "query_invalid", 3),
+        ("c55", "unsupported_operator", 2),
+    ] {
+        let refused = outcome(id);
+        assert_eq!(refused["status"], "err", "{id}: {refused}");
+        assert_eq!(refused["value"]["code"], code, "{id}: {refused}");
+        assert_eq!(refused["value"]["position"], position, "{id}: {refused}");
+    }
+
     // The Bases fixtures and the mutations after them produce
     // `views_invalidated` lines (`Views.base` has views with no prefilter, so
     // every mutation stales them), or "both transports carry the same ones"

@@ -259,6 +259,7 @@ export async function startHost(
     queue: assembly.queue,
     errors: assembly.errors,
     policyRecorder: assembly.policyRecorder,
+    globalSearch: assembly.globalSearch,
     liveState: () => supervisor.liveState(),
     engineSource: () => supervisor.engineSource(),
   });

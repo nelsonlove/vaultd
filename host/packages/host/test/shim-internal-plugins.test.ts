@@ -6,13 +6,16 @@
  * The cases are the corpus's own shapes. rollover-daily-todos reads
  * `daily-notes`' options through `getEnabledPluginById` **and**
  * `plugins["daily-notes"].instance`, so both spellings are pinned; folder-notes
- * asks for `file-explorer` and early-returns on a falsy answer; tag-wrangler
- * asks for `global-search`. A `null` instance is what makes those branches run;
- * an object with plausible-looking empty methods would not.
+ * asks for `file-explorer` and early-returns on a falsy answer, and a `null`
+ * instance is what makes that branch run; an object with plausible-looking empty
+ * methods would not. tag-wrangler asks for `global-search`, whose instance is
+ * now real: when `core-plugins.json` enables it, it is a `GlobalSearchInstance`
+ * that runs the query on the engine.
  */
 
 import { describe, expect, it } from "vitest";
 
+import { GlobalSearchInstance } from "../src/shim/global-search";
 import { ShimHarness } from "../src/testing/shim-harness";
 
 describe("app.internalPlugins", () => {
@@ -94,7 +97,7 @@ describe("app.internalPlugins", () => {
     expect(instance.getItemTitle({ type: "group", title: "Reading" })).toBe("Reading");
   });
 
-  it("reports the six absent core plugins with a null instance", async () => {
+  it("reports the five view-only core plugins and templates with a null instance", async () => {
     const harness = await ShimHarness.withVault(
       {},
       {
@@ -114,7 +117,6 @@ describe("app.internalPlugins", () => {
     const internal = harness.app.internalPlugins;
     for (const id of [
       "file-explorer",
-      "global-search",
       "bases",
       "file-recovery",
       "properties",
@@ -125,6 +127,23 @@ describe("app.internalPlugins", () => {
       expect(internal.getEnabledPluginById(id), id).toBeNull();
     }
     expect(internal.getPluginById("file-explorer")?.enabled).toBe(true);
+  });
+
+  it("serves a real global-search instance only when core-plugins.json enables it", async () => {
+    const enabled = await ShimHarness.withVault(
+      {},
+      { configFiles: { ".obsidian/core-plugins.json": JSON.stringify({ "global-search": true }) } },
+    );
+    const instance = enabled.app.internalPlugins.getPluginById("global-search")?.instance;
+    expect(instance).toBeInstanceOf(GlobalSearchInstance);
+    expect(enabled.app.internalPlugins.getEnabledPluginById("global-search")).toBe(instance);
+
+    const disabled = await ShimHarness.withVault(
+      {},
+      { configFiles: { ".obsidian/core-plugins.json": JSON.stringify({ "global-search": false }) } },
+    );
+    expect(disabled.app.internalPlugins.getPluginById("global-search")?.instance).toBeNull();
+    expect(disabled.app.internalPlugins.getEnabledPluginById("global-search")).toBeNull();
   });
 
   it("answers Obsidian's daily-notes defaults when there is no config file", async () => {

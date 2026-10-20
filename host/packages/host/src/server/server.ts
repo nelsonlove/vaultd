@@ -43,8 +43,8 @@
  * ## Events
  *
  * Host events (`host.plugin_state_changed`, `host.notice`,
- * `host.overlap_changed`) come from the components that produce them. Every
- * daemon-shaped event is relayed with its `vaultd` payload **unchanged**, so a
+ * `host.overlap_changed`, `host.search_opened`) come from the components that
+ * produce them. Every daemon-shaped event is relayed with its `vaultd` payload **unchanged**, so a
  * client correlating this door with a direct daemon subscription sees the same
  * numbers — which a host that recomputed them could not promise, and the first
  * cut of this file recomputed all of them.
@@ -732,6 +732,21 @@ export class HostServer {
         this.broadcast({
           type: "host.overlap_changed",
           value: { overlap: wire.overlap, gui_enabled: wire.gui_enabled },
+        });
+      }),
+    );
+    // A plugin opened a search and the engine answered (or refused). The event
+    // carries the count and the refusal; the hits are `host.search_state`'s, so
+    // a page of results is never pushed to every subscriber.
+    this.detachers.push(
+      this.deps.globalSearch.onOpened((state) => {
+        this.broadcast({
+          type: "host.search_opened",
+          value: {
+            query: state.query,
+            total_files: state.answer?.total_files ?? null,
+            error: state.error,
+          },
         });
       }),
     );

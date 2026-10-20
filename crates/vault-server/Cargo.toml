@@ -42,6 +42,7 @@ vault-bases = { path = "../vault-bases" }
 vault-core = { path = "../vault-core" }
 vault-index = { path = "../vault-index" }
 vault-protocol = { path = "../vault-protocol" }
+vault-search = { path = "../vault-search" }
 vault-watch = { path = "../vault-watch" }
 xdg.workspace = true
 

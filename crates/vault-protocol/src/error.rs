@@ -13,6 +13,25 @@ pub struct ProtocolError {
     /// would race the next writer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_revision: Option<String>,
+    /// Where in the query a `query_invalid` or `unsupported_operator` refusal
+    /// found the problem, counted in Unicode scalar values (not UTF-16 code
+    /// units, so a JavaScript string index differs after any astral character).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u64>,
+}
+
+impl ProtocolError {
+    /// An error with `code` and `message` and every optional field absent.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            supported_version: None,
+            current_generation: None,
+            current_revision: None,
+            position: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -56,6 +75,14 @@ pub enum ErrorCode {
     /// A filter the view reads calls a function or method this evaluator
     /// does not implement. In a formula or a summary it is an error cell.
     UnsupportedFunction,
+    /// The search query does not parse; the error carries `position`
+    /// (Unicode scalar values). A regular expression is refused as
+    /// `UnsupportedOperator` in this build, not here.
+    QueryInvalid,
+    /// The search query uses an operator this build does not support; the
+    /// message names it, and the error carries `position` (Unicode scalar
+    /// values).
+    UnsupportedOperator,
     /// A code this build does not know. Never produced by this server.
     Unknown,
 }
@@ -96,6 +123,8 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "view_not_found" => Self::ViewNotFound,
             "expression_invalid" => Self::ExpressionInvalid,
             "unsupported_function" => Self::UnsupportedFunction,
+            "query_invalid" => Self::QueryInvalid,
+            "unsupported_operator" => Self::UnsupportedOperator,
             _ => Self::Unknown,
         })
     }

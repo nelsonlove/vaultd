@@ -149,6 +149,7 @@ fn respond(
                 supported_version: None,
                 current_generation: None,
                 current_revision: None,
+                position: None,
             },
         ),
     }

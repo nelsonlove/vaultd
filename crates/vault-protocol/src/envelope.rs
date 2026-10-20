@@ -78,5 +78,6 @@ pub fn validate_version(version: u16) -> Result<(), ProtocolError> {
         supported_version: Some(PROTOCOL_VERSION),
         current_generation: None,
         current_revision: None,
+        position: None,
     })
 }

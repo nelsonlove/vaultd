@@ -44,6 +44,7 @@ pub use query::bases::{
     BaseAnswer, BaseQuery, BaseQueryError, BaseStatus, BaseSummary, BaseViewDependencies,
     PrefilterFacts, parse_property_types,
 };
+pub use query::search::{MAX_LINE_TEXT_BYTES, MatchContext, SearchAnswer, SearchQuery};
 pub use query::{
     DEFAULT_PAGE_LIMIT, IndexedNote, MAX_PAGE_LIMIT, NoteSummary, Page, ReferenceStatus,
     StructuralFacets, VaultInfo,
