@@ -13,7 +13,7 @@
  * empty `<body>`.
  */
 
-import { installStyleSheetList } from "../dom-provider";
+import { installStyleSheetList, loadOptionalDom } from "../dom-provider";
 import type { DomEnvironment, DomProvider, ServerDocument } from "../dom-provider";
 
 /** The slice of linkedom's module this provider uses. */
@@ -33,8 +33,10 @@ export function linkedomProvider(): DomProvider {
   return {
     name: "linkedom",
     create(): DomEnvironment {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports -- an ES module, loaded lazily; see the header.
-      const linkedom = require("linkedom") as Linkedom;
+      const linkedom = loadOptionalDom<Linkedom>("linkedom", () =>
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- an ES module, loaded lazily; see the header.
+        require("linkedom"),
+      );
       const window = linkedom.parseHTML(SKELETON);
       installStyleSheetList(window.document);
       return {

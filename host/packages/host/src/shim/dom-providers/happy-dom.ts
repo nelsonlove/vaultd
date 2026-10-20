@@ -11,7 +11,7 @@
  * settings below are happy-dom's own switches for exactly that.
  */
 
-import { installStyleSheetList } from "../dom-provider";
+import { installStyleSheetList, loadOptionalDom } from "../dom-provider";
 import type { DomEnvironment, DomProvider, ServerDocument } from "../dom-provider";
 
 /** The slice of happy-dom's `Window` this provider uses. */
@@ -39,8 +39,10 @@ export function happyDomProvider(): DomProvider {
   return {
     name: "happy-dom",
     create(): DomEnvironment {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports -- an ES module, loaded lazily; see the header.
-      const happyDom = require("happy-dom") as HappyDom;
+      const happyDom = loadOptionalDom<HappyDom>("happy-dom", () =>
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- an ES module, loaded lazily; see the header.
+        require("happy-dom"),
+      );
       const window = new happyDom.Window({ settings: SETTINGS });
       installStyleSheetList(window.document);
       return {
