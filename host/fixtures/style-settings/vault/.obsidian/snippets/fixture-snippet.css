@@ -1,0 +1,34 @@
+/* Fixture snippet: a second source of settings for the Style Settings parity capture. */
+
+/* @settings
+
+name: Fixture Snippet
+id: fixture-snippet
+settings:
+    -
+        id: sn-hide-status
+        title: Hide the status bar
+        description: Class toggle, off by default
+        type: class-toggle
+    -
+        id: sn-width
+        title: Readable width
+        description: Variable number with a unit
+        type: variable-number
+        default: 600
+        format: px
+
+*/
+
+body {
+  --sn-width: 600px;
+}
+
+.markdown-preview-sizer,
+.markdown-source-view.mod-cm6 .cm-sizer {
+  max-width: var(--sn-width);
+}
+
+body.sn-hide-status .status-bar {
+  display: none;
+}

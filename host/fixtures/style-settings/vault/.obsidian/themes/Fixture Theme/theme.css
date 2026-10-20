@@ -1,0 +1,200 @@
+/* Fixture Theme: a small, hand-written theme for the Style Settings parity capture.
+   It carries one @settings block with one setting of each type. */
+
+/* @settings
+
+name: Fixture Theme
+id: fixture-theme
+settings:
+    -
+        id: fx-heading
+        title: Fixture heading
+        description: A heading groups the settings under it
+        type: heading
+        level: 1
+        collapsed: false
+    -
+        id: fx-info
+        title: Plain information
+        description: Plain text, shown as it is
+        type: info-text
+    -
+        id: fx-info-md
+        title: Markdown information
+        description: "Some **bold** text and a [link](https://example.invalid/)"
+        type: info-text
+        markdown: true
+    -
+        id: fx-compact
+        title: Compact notes
+        description: Class toggle, off by default
+        type: class-toggle
+    -
+        id: fx-rounded
+        title: Rounded corners
+        description: Class toggle, on by default
+        type: class-toggle
+        default: true
+    -
+        id: fx-density
+        title: Density
+        description: Class select with a default
+        type: class-select
+        allowEmpty: false
+        default: fx-normal
+        options:
+            - fx-tight
+            - fx-normal
+            -
+                label: Airy
+                value: fx-airy
+    -
+        id: fx-quote-font
+        title: Quote font
+        description: Variable text
+        type: variable-text
+        default: Georgia, serif
+    -
+        id: fx-line-height
+        title: Line height
+        description: Variable number
+        type: variable-number
+        default: 1.5
+    -
+        id: fx-gap-size
+        title: Gap size
+        description: Variable number with a unit
+        type: variable-number
+        default: 8
+        format: px
+    -
+        id: fx-radius
+        title: Corner radius
+        description: Variable number slider
+        type: variable-number-slider
+        default: 6
+        min: 0
+        max: 24
+        step: 2
+        format: px
+    -
+        id: fx-border-style
+        title: Border style
+        description: Variable select
+        type: variable-select
+        default: solid
+        options:
+            - solid
+            - dashed
+            - dotted
+    -
+        id: fx-accent-hex
+        title: Accent colour
+        description: Variable colour, hex
+        type: variable-color
+        format: hex
+        default: "#3366cc"
+    -
+        id: fx-overlay
+        title: Overlay colour
+        description: Variable colour with opacity, rgb
+        type: variable-color
+        format: rgb
+        opacity: true
+        default: "#0a141e"
+    -
+        id: fx-surface
+        title: Surface colour
+        description: Themed colour, light and dark defaults
+        type: variable-themed-color
+        format: hex
+        opacity: false
+        default-light: "#ffffff"
+        default-dark: "#1e1e1e"
+    -
+        id: fx-ink
+        title: Ink colour
+        description: Themed colour, light and dark defaults
+        type: variable-themed-color
+        format: hex
+        opacity: false
+        default-light: "#222222"
+        default-dark: "#eeeeee"
+    -
+        id: fx-fade
+        title: Surface to ink
+        description: Colour gradient between the two themed colours
+        type: color-gradient
+        from: fx-surface
+        to: fx-ink
+        step: 25
+        format: hex
+
+*/
+
+body {
+  --fx-quote-font: Georgia, serif;
+  --fx-line-height: 1.5;
+  --fx-gap-size: 8px;
+  --fx-radius: 6px;
+  --fx-border-style: solid;
+  --fx-accent-hex: #3366cc;
+  --fx-overlay: rgba(10, 20, 30, 0.5);
+}
+
+body.theme-light {
+  --fx-surface: #ffffff;
+  --fx-ink: #222222;
+}
+
+body.theme-dark {
+  --fx-surface: #1e1e1e;
+  --fx-ink: #eeeeee;
+}
+
+.markdown-rendered {
+  line-height: var(--fx-line-height);
+}
+
+.markdown-rendered blockquote {
+  font-family: var(--fx-quote-font);
+  border-left: 3px var(--fx-border-style) var(--fx-accent-hex);
+  background: var(--fx-surface);
+  color: var(--fx-ink);
+  padding: var(--fx-gap-size);
+}
+
+.markdown-rendered hr {
+  border-color: var(--fx-fade-50, var(--fx-accent-hex));
+}
+
+.modal-container .modal {
+  background-color: var(--fx-overlay);
+}
+
+.callout,
+.markdown-rendered pre {
+  border-radius: var(--fx-radius);
+}
+
+body:not(.fx-rounded) .callout,
+body:not(.fx-rounded) .markdown-rendered pre {
+  border-radius: 0;
+}
+
+body.fx-compact .markdown-rendered {
+  --p-spacing: 0.5em;
+  --list-spacing: 0.1em;
+}
+
+body.fx-tight .markdown-rendered p {
+  margin-block: 0.25em;
+}
+
+body.fx-normal .markdown-rendered p {
+  margin-block: 0.75em;
+}
+
+body.fx-airy .markdown-rendered p {
+  margin-block: 1.5em;
+}
