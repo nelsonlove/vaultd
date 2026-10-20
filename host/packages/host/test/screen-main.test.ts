@@ -43,6 +43,16 @@ describe("parseScreenArgs", () => {
     expect(parsed.stateRoot).toBe(resolve("rel/state"));
   });
 
+  it("takes the vaultd socket to connect to, and its own state directory", () => {
+    const parsed = parseScreenArgs(["--vault", "/tmp", "--vaultd-socket", "rel/h.sock", "--data-dir", "rel/screen"]);
+    expect(parsed.config.engineSocketPath).toBe(resolve("rel/h.sock"));
+    expect(parsed.config.dataDir).toBe(resolve("rel/screen"));
+    // The socket's default follows the moved state directory.
+    expect(parsed.config.socketPath).toBe(screenSocketPathFor(resolve("rel/screen"), parsed.config.vaultRoot));
+    expect(SCREEN_USAGE).toContain("--vaultd-socket");
+    expect(SCREEN_USAGE).toContain("--data-dir");
+  });
+
   it("keeps its state apart from the headless host's", () => {
     expect(screenDataDir({ XDG_STATE_HOME: "/s" })).toBe(join("/s", "vaultd-screen-host"));
   });

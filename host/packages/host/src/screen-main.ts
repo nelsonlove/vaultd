@@ -31,6 +31,12 @@ Options:
   --socket <path>       Where to bind the socket.
                         Default: <state dir>/run/<vault digest>/screen.sock.
   --vaultd <path>       The vaultd binary. Default: "vaultd" on PATH.
+  --vaultd-socket <path>
+                        The socket of the vaultd to connect to. Default: the
+                        socket vaultd derives for this vault.
+  --data-dir <path>     The screen host's own state (the nonce, and the
+                        socket's default place).
+                        Default: $XDG_STATE_HOME/vaultd-screen-host.
   --engine <mode>       connect (default): use the vaultd already listening for
                         this vault; exit 3 if none is. auto and spawn as for
                         vaultd-host.
@@ -53,6 +59,8 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
   let socketPath: string | null = null;
   let vaultdBinary: string | null = null;
   let stateRoot: string | null = null;
+  let vaultdSocket: string | null = null;
+  let dataDirFlag: string | null = null;
   let engine: EngineMode = "connect";
 
   const valueOf = (flag: string, at: number): string => {
@@ -79,6 +87,14 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
         vaultdBinary = valueOf(flag, at);
         at += 1;
         break;
+      case "--vaultd-socket":
+        vaultdSocket = resolve(valueOf(flag, at));
+        at += 1;
+        break;
+      case "--data-dir":
+        dataDirFlag = resolve(valueOf(flag, at));
+        at += 1;
+        break;
       case "--state-root":
         stateRoot = resolve(valueOf(flag, at));
         at += 1;
@@ -99,13 +115,14 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
   if (vault === null) throw new CliRefusal(EXIT_USAGE, "--vault is required");
 
   const base = defaultHostConfig(resolve(vault));
-  const dataDir = screenDataDir();
+  const dataDir = dataDirFlag ?? screenDataDir();
   const config: HostConfig = {
     ...base,
     clock: systemClock(),
     dataDir,
     socketPath: socketPath ?? screenSocketPathFor(dataDir, base.vaultRoot),
     ...(vaultdBinary === null ? {} : { vaultdBinary }),
+    ...(vaultdSocket === null ? {} : { engineSocketPath: vaultdSocket }),
     engine,
     // No stall watchdog: the screen host's work is a few milliseconds per apply.
     watchdogThresholdMs: 0,
