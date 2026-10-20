@@ -53,6 +53,13 @@ describe("parseScreenArgs", () => {
     expect(SCREEN_USAGE).toContain("--data-dir");
   });
 
+  it("takes the re-read period, and refuses one that is not a whole number", () => {
+    expect(parseScreenArgs(["--vault", "/tmp"]).revalidateMs).toBeNull();
+    expect(parseScreenArgs(["--vault", "/tmp", "--revalidate-ms", "0"]).revalidateMs).toBe(0);
+    expect(() => parseScreenArgs(["--vault", "/tmp", "--revalidate-ms", "-1"])).toThrow(CliRefusal);
+    expect(SCREEN_USAGE).toContain("--revalidate-ms");
+  });
+
   it("keeps its state apart from the headless host's", () => {
     expect(screenDataDir({ XDG_STATE_HOME: "/s" })).toBe(join("/s", "vaultd-screen-host"));
   });

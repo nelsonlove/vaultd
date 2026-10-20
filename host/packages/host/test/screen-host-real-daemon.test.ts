@@ -284,6 +284,82 @@ describe.skipIf(!BINARY_EXISTS)("the screen host over a real vaultd", () => {
     expect(host.stats().config_events).toBe(0);
   }, 120_000);
 
+  it("a vaultd read that never answers fails its request at the read timeout, the queue keeps moving, and the next request reads again", async () => {
+    let hang = false;
+    const { host, vault } = await screenHost({
+      revalidateMs: 0,
+      readTimeoutMs: 300,
+      interceptRead: <T,>(path: string, read: Promise<T>): Promise<T> =>
+        hang && path === ENABLED ? new Promise<T>(() => undefined) : read,
+    });
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700px");
+    const before = host.stats();
+    await writeThroughVaultd(host, SNIPPET, readFileSync(join(vault, SNIPPET), "utf8").replace("format: px", "format: em"));
+    await heard(host, before);
+    hang = true;
+    const started = Date.now();
+    const settled = await Promise.allSettled([
+      host.apply({ viewer: "alice", mode: "dark", appearance: {} }),
+      host.apply({ viewer: "bob", mode: "dark", appearance: {} }),
+    ]);
+    // Each one fails at its read's timeout; neither hangs.
+    expect(settled.map((outcome) => outcome.status)).toEqual(["rejected", "rejected"]);
+    expect(String((settled[0] as PromiseRejectedResult).reason)).toMatch(/took over 300 ms/);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    hang = false;
+    // Still stale after the failure: the next request reads again and sees the change.
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700em");
+  }, 120_000);
+
+  it("a manifest that is not valid keeps the old service, and the host retries", async () => {
+    const { host, vault } = await screenHost({ revalidateMs: 0 });
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toBe(EXPECTED.styleText.dark);
+    const service = host.service;
+    const manifestText = readFileSync(join(vault, MANIFEST), "utf8");
+    let before = host.stats();
+    await writeThroughVaultd(host, MANIFEST, "{not json");
+    await heard(host, before);
+    await expect(host.apply({ viewer: "alice", mode: "dark", appearance: {} })).rejects.toThrow(/manifest of obsidian-style-settings is not JSON/);
+    expect(host.service).toBe(service);
+    expect(host.plugins).toEqual(["obsidian-style-settings"]);
+    before = host.stats();
+    await writeThroughVaultd(host, MANIFEST, JSON.stringify({ ...(JSON.parse(manifestText) as object), id: "someone-else" }));
+    await heard(host, before);
+    await expect(host.apply({ viewer: "alice", mode: "dark", appearance: {} })).rejects.toThrow(/names the id/);
+    before = host.stats();
+    await writeThroughVaultd(host, MANIFEST, manifestText);
+    await heard(host, before);
+    // The same bundle as before: the old service goes on, its cache with it.
+    expect((await host.apply({ viewer: "alice", mode: "dark", appearance: {} })).style).toBe(EXPECTED.styleText.dark);
+    expect(host.service).toBe(service);
+    expect(host.stats().bundle_changes).toBe(0);
+  }, 120_000);
+
+  it("the period's check rebuilds nothing when nothing changed, and drops only data.json when only it changed", async () => {
+    const { host, vault } = await screenHost({ revalidateMs: 300 });
+    expect((await host.apply({ viewer: "bob", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700px");
+    const service = host.service;
+    let before = host.stats();
+    await new Promise((settle) => setTimeout(settle, 350));
+    expect((await host.apply({ viewer: "bob", mode: "dark", appearance: {} })).style).toContain("--sn-width: 700px");
+    let after = host.stats();
+    expect(after.config_checks).toBe(before.config_checks + 1);
+    expect(after.config_reads).toBe(before.config_reads);
+    expect(after.hits).toBe(before.hits + 1);
+    expect(after.misses).toBe(before.misses);
+    expect(host.service).toBe(service);
+    // Edited on disk, so no event: the check finds it, and only data.json's cache goes.
+    const data = JSON.parse(readFileSync(join(vault, DATA), "utf8")) as Record<string, unknown>;
+    writeFileSync(join(vault, DATA), JSON.stringify({ ...data, "fixture-snippet@@sn-width": 830 }));
+    before = host.stats();
+    await new Promise((settle) => setTimeout(settle, 350));
+    expect((await host.apply({ viewer: "bob", mode: "dark", appearance: {} })).style).toContain("--sn-width: 830px");
+    after = host.stats();
+    expect(after.config_checks).toBe(before.config_checks + 1);
+    expect(after.config_reads).toBe(before.config_reads);
+    expect(host.service).toBe(service);
+  }, 120_000);
+
   it("refuses a request of the wrong shape, and an unknown method", async () => {
     const { host, state } = await screenHost();
     const client = await connect(host, state);

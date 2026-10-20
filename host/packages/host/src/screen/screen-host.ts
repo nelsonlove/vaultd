@@ -26,8 +26,12 @@
  * marks all of it stale, and the next request reads it again; a changed bundle
  * or enabled state replaces the apply service (and with it the result cache).
  * vaultd does not watch `.obsidian`, so an edit made outside vaultd (desktop
- * Obsidian, a sync tool) raises no event: the host also re-reads after
- * {@link CONFIG_REVALIDATE_MS} so such an edit shows within that bound.
+ * Obsidian, a sync tool) raises no event: after {@link CONFIG_REVALIDATE_MS}
+ * the host reads the files again and compares their revisions, and drops only
+ * what changed. Every one of these reads has a timeout
+ * ({@link CONFIG_READ_TIMEOUT_MS}); a read that fails or times out fails its
+ * request and leaves the host stale, so the next request reads everything
+ * again and the queue keeps moving.
  */
 
 import { createHash } from "node:crypto";
@@ -43,7 +47,7 @@ import { ScreenError, ScreenServer } from "./screen-server";
 import { Supervisor } from "../supervisor";
 import { VaultdError } from "../client/errors";
 import { assembleShim } from "../testing/assemble";
-import { createApplyService } from "./apply-service";
+import { APPLY_DEADLINE_MS, createApplyService } from "./apply-service";
 import { happyDomProvider } from "../shim/dom-providers/happy-dom";
 import { installModuleInterception } from "../runtime/intercept";
 import { drivenClock } from "../runtime/driven-clock";
@@ -71,6 +75,13 @@ export const SCREEN_LINE_CAP_BYTES = 64 * 1024 * 1024;
  * period, not per request.
  */
 export const CONFIG_REVALIDATE_MS = 10_000;
+
+/**
+ * How long one `.obsidian` read through vaultd may take, in real milliseconds:
+ * the apply deadline's value. These reads (the bundle, the sets, the period's
+ * check) run before the apply and outside its deadline.
+ */
+export const CONFIG_READ_TIMEOUT_MS = APPLY_DEADLINE_MS;
 
 /** How many built stylesheet sets the host keeps (one per distinct theme and snippet choice). */
 export const SHEET_SET_CACHE_LIMIT = 32;
@@ -123,8 +134,10 @@ export interface ScreenStats {
   readonly sheet_bytes_received: number;
   /** `config_changed` events that marked the host's config stale. */
   readonly config_events: number;
-  /** Times the host read `.obsidian` again (after an event or the period). */
+  /** Times the host read all of `.obsidian` again and dropped what it kept (at start, after an event or a failure, or when the period's check found the bundle changed). */
   readonly config_reads: number;
+  /** Times the period's check compared revisions (it drops only what changed). */
+  readonly config_checks: number;
   /** Times the screen plugin's bundle or enabled state changed and the service was replaced. */
   readonly bundle_changes: number;
 }
@@ -152,6 +165,10 @@ export interface ScreenHostOptions {
   readonly listen?: boolean;
   /** Default {@link CONFIG_REVALIDATE_MS}; `0` trusts events alone. */
   readonly revalidateMs?: number;
+  /** How long one `.obsidian` read through vaultd may take. Default {@link CONFIG_READ_TIMEOUT_MS}. */
+  readonly readTimeoutMs?: number;
+  /** A test seam: wrap each `.obsidian` read (for example, never answer one). */
+  readonly interceptRead?: <T>(path: string, read: Promise<T>) => Promise<T>;
 }
 
 export interface RunningScreenHost {
@@ -245,32 +262,64 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     });
     assembly.app.plugins.setLoader(loader);
 
-    const read = async (path: string): Promise<string | null> => {
+    const readTimeoutMs = options.readTimeoutMs ?? CONFIG_READ_TIMEOUT_MS;
+    /** The revision of every `.obsidian` file the host read, `null` for one that was not there. */
+    const revisions = new Map<string, string | null>();
+    /**
+     * One read through vaultd, bounded: vaultd's client has no timeout of its
+     * own, and these reads run outside the apply deadline, so a read that never
+     * answers would otherwise hold the host's queue for good (review of task 8,
+     * finding 1). A timed-out read fails its request; the host is left stale.
+     */
+    const readEntry = async (path: string): Promise<{ text: string; revision: string } | null> => {
+      const underlying = (async (): Promise<{ text: string; revision: string } | null> => {
+        try {
+          const response = await countedClient().request<ReadFileResponse>("read_file", { path });
+          return { text: Buffer.from(response.content_base64, "base64").toString("utf8"), revision: response.revision };
+        } catch (error) {
+          if (error instanceof VaultdError && (error.code === "not_found" || error.code === "parent_not_found")) return null;
+          throw error;
+        }
+      })();
+      const bounded = options.interceptRead === undefined ? underlying : options.interceptRead(path, underlying);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_settle, fail) => {
+        timer = setTimeout(() => {
+          fail(new Error(`reading ${path} through vaultd took over ${String(readTimeoutMs)} ms`));
+        }, readTimeoutMs);
+      });
       try {
-        const response = await countedClient().request<ReadFileResponse>("read_file", { path });
-        return Buffer.from(response.content_base64, "base64").toString("utf8");
-      } catch (error) {
-        if (error instanceof VaultdError && (error.code === "not_found" || error.code === "parent_not_found")) return null;
-        throw error;
+        const entry = await Promise.race([bounded, deadline]);
+        revisions.set(path, entry?.revision ?? null);
+        return entry;
+      } finally {
+        clearTimeout(timer);
       }
     };
+    const read = async (path: string): Promise<string | null> => (await readEntry(path))?.text ?? null;
 
     // --- What the host read from `.obsidian`, and when it is read again. ---
     const dom = assembly.globals.dom;
     const vaultDocuments = new VaultDocumentCache();
     const sets = new Map<string, readonly Sheet[]>();
     const revalidateMs = options.revalidateMs ?? CONFIG_REVALIDATE_MS;
-    const counts = { sheetBytes: 0, configEvents: 0, configReads: 0, bundleChanges: 0 };
+    const counts = { sheetBytes: 0, configEvents: 0, configReads: 0, configChecks: 0, bundleChanges: 0 };
     let service: ApplyService | null = null;
     let plugins: readonly string[] = [];
     /** A digest of the plugin id, manifest and bundle in use, or `null` for none. */
     let bundleDigest: string | null = null;
-    let stale = true;
+    /**
+     * Stale until a refresh succeeds: `changes` counts the marks, `readThrough`
+     * is the count a successful refresh started at. A mark that lands while a
+     * refresh runs is not lost, and a refresh that fails leaves the host stale.
+     */
+    let changes = 1;
+    let readThrough = 0;
     let readAt = 0;
     let stopped = false;
 
     const markStale = (): void => {
-      stale = true;
+      changes += 1;
     };
     // vaultd's own events: a config change that can change the output, or a
     // resync (an engine restart, a lost event), makes the next request re-read.
@@ -285,62 +334,102 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       }
     });
 
+    const dataPathOf = (id: string): string => `${OBSIDIAN_CONFIG_DIR}/plugins/${id}/data.json`;
+    const bundlePaths = (id: string): string[] => [
+      `${OBSIDIAN_CONFIG_DIR}/community-plugins.json`,
+      `${OBSIDIAN_CONFIG_DIR}/plugins/${id}/manifest.json`,
+      `${OBSIDIAN_CONFIG_DIR}/plugins/${id}/main.js`,
+    ];
+
     /**
-     * Read the plugin's enabled state and bundle again. A change replaces the
-     * service: the old one is closed (its plugin unloaded), and the new one
-     * starts with an empty result cache, because the cache key does not hold
-     * the bundle. Built sets and `data.json` are always dropped.
+     * Read everything again (after an event, a failure, or at start). Sets and
+     * `data.json` are dropped. The plugin's enabled state and bundle are read,
+     * and a new manifest is parsed and checked **before** the old service is
+     * touched; a change replaces the service (the old one is closed, its plugin
+     * unloaded), and the new one starts with an empty result cache, because
+     * the cache key does not hold the bundle.
      */
     const refresh = async (): Promise<void> => {
+      const at = changes;
       counts.configReads += 1;
-      // Dropped first: a read that fails below leaves nothing stale behind.
       sets.clear();
       vaultDocuments.clear();
-      stale = false;
-      readAt = Date.now();
+      revisions.clear();
       const enabled = parseIds(await read(`${OBSIDIAN_CONFIG_DIR}/community-plugins.json`));
       const id = SCREEN_PLUGIN_IDS.find((candidate) => enabled.includes(candidate)) ?? null;
-      let next: { id: string; manifestText: string; source: string; digest: string } | null = null;
+      let next: { id: string; manifest: PluginManifest; source: string; digest: string } | null = null;
       if (id !== null && dom !== null) {
         const dir = `${OBSIDIAN_CONFIG_DIR}/plugins/${id}`;
         const manifestText = await read(`${dir}/manifest.json`);
         const source = await read(`${dir}/main.js`);
+        // The baseline the period's check compares `data.json` against.
+        await readEntry(dataPathOf(id));
         if (manifestText !== null && source !== null) {
           const digest = createHash("sha256").update(`${id}\n${String(manifestText.length)}\n${manifestText}\n`).update(source).digest("hex");
-          next = { id, manifestText, source, digest };
+          next = { id, manifest: { ...parseManifest(manifestText, id), dir }, source, digest };
         }
       }
-      if ((next?.digest ?? null) === bundleDigest) return;
-      if (bundleDigest !== null) counts.bundleChanges += 1;
-      const old = service;
-      service = null;
-      plugins = [];
-      bundleDigest = null;
-      if (old !== null) await old.close();
-      if (next === null || dom === null) return;
-      const dir = `${OBSIDIAN_CONFIG_DIR}/plugins/${next.id}`;
-      const manifest = { ...(JSON.parse(next.manifestText) as PluginManifest), dir };
-      service = createApplyService({
-        app: assembly.app,
-        loader,
-        queue: assembly.queue,
-        document: dom.document as unknown as ServiceDocument,
-        clock,
-        bundle: {
-          manifest,
-          request: {
-            pluginId: next.id,
-            filename: join(config.vaultRoot, dir, "main.js"),
-            source: next.source,
-            hostModulePaths: modulePaths,
-          },
-        },
-        vaultDocuments,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
-      });
-      plugins = [next.id];
-      bundleDigest = next.digest;
+      if ((next?.digest ?? null) !== bundleDigest) {
+        if (bundleDigest !== null) counts.bundleChanges += 1;
+        const old = service;
+        service = null;
+        plugins = [];
+        bundleDigest = null;
+        if (old !== null) await old.close();
+        if (next !== null && dom !== null) {
+          service = createApplyService({
+            app: assembly.app,
+            loader,
+            queue: assembly.queue,
+            document: dom.document as unknown as ServiceDocument,
+            clock,
+            bundle: {
+              manifest: next.manifest,
+              request: {
+                pluginId: next.id,
+                filename: join(config.vaultRoot, OBSIDIAN_CONFIG_DIR, "plugins", next.id, "main.js"),
+                source: next.source,
+                hostModulePaths: modulePaths,
+              },
+            },
+            vaultDocuments,
+            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
+          });
+          plugins = [next.id];
+          bundleDigest = next.digest;
+        }
+      }
+      readThrough = at;
+      readAt = Date.now();
+    };
+
+    /**
+     * The period's check, when no event said anything changed: read the files
+     * again and compare their revisions with the ones kept. Nothing changed:
+     * nothing is dropped or rebuilt. The bundle or enabled state changed: a
+     * full refresh. Otherwise only `data.json`'s cache, or only the sets, go.
+     */
+    const revalidate = async (): Promise<void> => {
+      counts.configChecks += 1;
+      const id = plugins[0] ?? null;
+      const paths = new Set(revisions.keys());
+      paths.add(`${OBSIDIAN_CONFIG_DIR}/community-plugins.json`);
+      if (id !== null) paths.add(dataPathOf(id));
+      const before = new Map(revisions);
+      const changed: string[] = [];
+      for (const path of paths) {
+        const entry = await readEntry(path);
+        if ((entry?.revision ?? null) !== (before.has(path) ? before.get(path) : undefined)) changed.push(path);
+      }
+      const bundle = new Set(bundlePaths(id ?? SCREEN_PLUGIN_IDS[0] ?? ""));
+      if (changed.some((path) => bundle.has(path))) {
+        await refresh();
+        return;
+      }
+      if (id !== null && changed.includes(dataPathOf(id))) vaultDocuments.clear();
+      if (changed.some((path) => id === null || path !== dataPathOf(id))) sets.clear();
+      readAt = Date.now();
     };
     undo.push(async () => {
       stopped = true;
@@ -377,14 +466,20 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     const applyNow = async (request: ScreenApplyRequest): Promise<ApplyResult> => {
       checkScreenRequest(request);
       if (stopped) throw new Error("the screen host is stopped");
-      if (stale || (revalidateMs > 0 && Date.now() - readAt >= revalidateMs)) await refresh();
-      if (service === null) return { classes: [], style: "" };
-      let sheets: readonly Sheet[];
-      if (request.sheets !== undefined) {
-        for (const sheet of request.sheets) counts.sheetBytes += Buffer.byteLength(String(sheet?.text ?? ""), "utf8");
-        sheets = request.sheets;
-      } else {
-        sheets = await setFor(request.appearance ?? {});
+      let sheets: readonly Sheet[] | null = null;
+      try {
+        if (readThrough !== changes) await refresh();
+        else if (revalidateMs > 0 && Date.now() - readAt >= revalidateMs) await revalidate();
+        if (service === null) return { classes: [], style: "" };
+        if (request.sheets === undefined) sheets = await setFor(request.appearance ?? {});
+      } catch (error) {
+        // A read that failed or timed out: the next request reads everything again.
+        if (!(error instanceof TypeError)) markStale();
+        throw error;
+      }
+      if (sheets === null) {
+        for (const sheet of request.sheets ?? []) counts.sheetBytes += Buffer.byteLength(String(sheet?.text ?? ""), "utf8");
+        sheets = request.sheets ?? [];
       }
       return service.apply({ viewer: request.viewer, mode: request.mode, sheets } satisfies ApplyRequest);
     };
@@ -402,6 +497,7 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       sheet_bytes_received: counts.sheetBytes,
       config_events: counts.configEvents,
       config_reads: counts.configReads,
+      config_checks: counts.configChecks,
       bundle_changes: counts.bundleChanges,
     });
 
@@ -463,6 +559,20 @@ function checkScreenRequest(request: ScreenApplyRequest): void {
       throw new TypeError("an apply request needs sheets or an appearance object");
     }
   }
+}
+
+/** The plugin's manifest, parsed and checked before it replaces anything. */
+function parseManifest(text: string, id: string): PluginManifest {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`the manifest of ${id} is not JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`the manifest of ${id} is not an object`);
+  const manifest = value as Record<string, unknown>;
+  if (manifest["id"] !== id) throw new Error(`the manifest of ${id} names the id ${JSON.stringify(manifest["id"])}`);
+  return manifest as unknown as PluginManifest;
 }
 
 function parseIds(text: string | null): string[] {

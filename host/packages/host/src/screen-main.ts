@@ -42,6 +42,9 @@ Options:
                         vaultd-host.
   --state-root <path>   Where the viewer store keeps each viewer's values.
                         Default: $XDG_STATE_HOME/vaultd-web/plugin-data.
+  --revalidate-ms <ms>  How often .obsidian is checked again when no
+                        config_changed came (an edit made outside vaultd).
+                        0 trusts events alone. Default: 10000.
   -h, --help            Print this and exit 0.
 
 Exit codes: 0 clean shutdown, 1 other failure, 2 usage error, 3 daemon
@@ -51,6 +54,7 @@ unreachable.
 export interface ParsedScreenArgs {
   readonly config: HostConfig;
   readonly stateRoot: string | null;
+  readonly revalidateMs: number | null;
   readonly help: boolean;
 }
 
@@ -62,6 +66,7 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
   let vaultdSocket: string | null = null;
   let dataDirFlag: string | null = null;
   let engine: EngineMode = "connect";
+  let revalidateMs: number | null = null;
 
   const valueOf = (flag: string, at: number): string => {
     const value = argv[at + 1];
@@ -74,7 +79,7 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
     switch (flag) {
       case "-h":
       case "--help":
-        return { config: defaultHostConfig("."), stateRoot: null, help: true };
+        return { config: defaultHostConfig("."), stateRoot: null, revalidateMs: null, help: true };
       case "--vault":
         vault = valueOf(flag, at);
         at += 1;
@@ -99,6 +104,13 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
         stateRoot = resolve(valueOf(flag, at));
         at += 1;
         break;
+      case "--revalidate-ms": {
+        const value = valueOf(flag, at);
+        if (!/^\d+$/.test(value)) throw new CliRefusal(EXIT_USAGE, `--revalidate-ms must be a whole number, not "${value}"`);
+        revalidateMs = Number(value);
+        at += 1;
+        break;
+      }
       case "--engine": {
         const value = valueOf(flag, at);
         if (value !== "auto" && value !== "connect" && value !== "spawn") {
@@ -127,7 +139,7 @@ export function parseScreenArgs(argv: readonly string[]): ParsedScreenArgs {
     // No stall watchdog: the screen host's work is a few milliseconds per apply.
     watchdogThresholdMs: 0,
   };
-  return { config, stateRoot, help: false };
+  return { config, stateRoot, revalidateMs, help: false };
 }
 
 export async function screenMain(
@@ -143,7 +155,10 @@ export async function screenMain(
       return EXIT_OK;
     }
     try {
-      running = await startScreenHost(parsed.config, parsed.stateRoot === null ? {} : { stateRoot: parsed.stateRoot });
+      running = await startScreenHost(parsed.config, {
+        ...(parsed.stateRoot === null ? {} : { stateRoot: parsed.stateRoot }),
+        ...(parsed.revalidateMs === null ? {} : { revalidateMs: parsed.revalidateMs }),
+      });
     } catch (error) {
       if (error instanceof DaemonUnreachable) throw new CliRefusal(EXIT_DAEMON_UNREACHABLE, error.message);
       throw error;
