@@ -5,7 +5,7 @@ import { installFsWriteGuard } from "../src/testing/fs-guard";
 import { ShimHarness } from "../src/testing/shim-harness";
 import { installPluginHost, pluginHostFor } from "../src/shim/plugin";
 import type { PluginHostContext } from "../src/shim/plugin";
-import { ViewerDataStore, viewerStateRoot } from "../src/shim/viewer-data-store";
+import { VaultDocumentCache, ViewerDataStore, viewerStateRoot } from "../src/shim/viewer-data-store";
 import { diffMergePatch, mergePatch } from "../src/shim/merge-patch";
 import { scratchRoot } from "./scratch";
 
@@ -52,6 +52,36 @@ async function rig(): Promise<Rig> {
 const read = (path: string): unknown => JSON.parse(fs.readFileSync(path, "utf8")) as unknown;
 
 describe("ViewerDataStore", () => {
+  it("with a vault document cache, a load reads the vault once until the cache is cleared; a save always reads afresh", async () => {
+    const r = await rig();
+    r.setVault({ a: 1, b: 2 });
+    const cache = new VaultDocumentCache();
+    const host = pluginHostFor(r.harness.app);
+    const store = new ViewerDataStore({ host, viewerId: "ann", stateRoot: r.stateRoot, vaultDocuments: cache });
+    await expect(store.load("demo")).resolves.toEqual({ a: 1, b: 2 });
+    r.setVault({ a: 5, b: 2 });
+    // Kept: no event has said the file changed.
+    await expect(store.load("demo")).resolves.toEqual({ a: 1, b: 2 });
+    expect(cache.reads).toBe(1);
+    // A save diffs against the vault as it is now, not the kept copy.
+    await store.save("demo", { a: 5, b: 3 });
+    expect(read(r.patchFile("ann"))).toEqual({ b: 3 });
+    cache.clear();
+    await expect(store.load("demo")).resolves.toEqual({ a: 5, b: 3 });
+    expect(cache.reads).toBe(2);
+    // What a load answers is a copy: changing it does not change the kept document.
+    const loaded = (await store.load("demo")) as Record<string, unknown>;
+    loaded.a = 99;
+    await expect(store.load("demo")).resolves.toEqual({ a: 5, b: 3 });
+  });
+
+  it("a vault document cache keeps no failed read", async () => {
+    const cache = new VaultDocumentCache();
+    await expect(cache.get("p", () => Promise.reject(new Error("down")))).rejects.toThrow("down");
+    await expect(cache.get("p", () => Promise.resolve({ ok: true }))).resolves.toEqual({ ok: true });
+    expect(cache.reads).toBe(2);
+  });
+
   it("stores only the patch, and reads back the saved document", async () => {
     const r = await rig();
     r.setVault({ a: 1, b: { c: 2, d: 3 }, list: [1, 2] });

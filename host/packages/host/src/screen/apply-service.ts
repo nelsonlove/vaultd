@@ -26,7 +26,10 @@
  * **Cache.** Keyed by (sheet-set hash, mode, data revision), bounded LRU. The
  * data revision is a digest of the document the viewer's store loads, so it is
  * content-addressed: two viewers whose saved values come out the same share an
- * entry, and a vault `data.json` change gives a new revision by itself. An
+ * entry, and a vault `data.json` change gives a new revision by itself. With a
+ * `VaultDocumentCache` (the screen host's), the vault document is the one last
+ * read, re-read only after the owner empties the cache on a `config_changed`,
+ * so a hit costs no vaultd round trip; the viewer's patch is read from disk. An
  * apply can save (the load-time prune, E4), which changes the revision; the
  * result is cached under the revision before the apply and the one after it,
  * so the next identical request is a hit.
@@ -35,6 +38,7 @@
 import { createHash } from "node:crypto";
 
 import { ViewerDataStore } from "../shim/viewer-data-store";
+import type { VaultDocumentCache } from "../shim/viewer-data-store";
 import { installPluginHost, pluginHostFor } from "../shim/plugin";
 import { sheetSetHash } from "../web/sheet-set";
 import { declareScreenPolicy, stub } from "../shim/policy";
@@ -458,6 +462,13 @@ export interface ScreenApplyDeps {
    * them. One line each. Default: standard error.
    */
   readonly log?: (line: string) => void;
+  /**
+   * The vault's `data.json` as last read, shared by every viewer's store, so a
+   * cache hit (which reads the data revision) costs no vaultd round trip. The
+   * screen host empties it on a `config_changed`. Without it, every revision
+   * read goes to vaultd.
+   */
+  readonly vaultDocuments?: VaultDocumentCache;
   /** Wrap each viewer's store; a test uses it to make a store fail. */
   readonly wrapStore?: (store: PluginDataStore, viewer: string) => PluginDataStore;
 }
@@ -524,6 +535,7 @@ function buildService(
         viewerId: viewer,
         ...(deps.stateRoot === undefined ? {} : { stateRoot: deps.stateRoot }),
         ...(deps.vaultConfigDirName === undefined ? {} : { vaultConfigDirName: deps.vaultConfigDirName }),
+        ...(deps.vaultDocuments === undefined ? {} : { vaultDocuments: deps.vaultDocuments }),
       });
       return deps.wrapStore === undefined ? store : deps.wrapStore(store, viewer);
     },

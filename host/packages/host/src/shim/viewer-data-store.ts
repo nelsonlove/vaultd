@@ -81,6 +81,48 @@ export interface ViewerDataStoreOptions {
   readonly stateRoot?: string;
   /** The vault's own config directory name. Defaults to `.obsidian`. */
   readonly vaultConfigDirName?: string;
+  /**
+   * Where a `load` takes the vault's `data.json` from, when given: a cache the
+   * owner empties when vaultd says the file changed (`config_changed`). Without
+   * it every `load` reads through vaultd. A `save` always reads afresh, because
+   * it diffs against the vault document as it is now.
+   */
+  readonly vaultDocuments?: VaultDocumentCache;
+}
+
+/**
+ * The vault's `data.json` documents as last read through vaultd, by path, so a
+ * screen host's cache hit needs no vaultd round trip (review M4 of task 6).
+ * The owner calls {@link clear} on a `config_changed` for the file (or on any
+ * doubt); nothing here expires by itself. A read that fails is not kept, and a
+ * read still in flight when the cache is cleared is not kept either.
+ */
+export class VaultDocumentCache {
+  private readonly docs = new Map<string, Promise<unknown>>();
+  private readsValue = 0;
+
+  /** The cached document for `path`, or the result of `read`, kept. */
+  get(path: string, read: () => Promise<unknown>): Promise<unknown> {
+    const held = this.docs.get(path);
+    if (held !== undefined) return held;
+    this.readsValue += 1;
+    const pending = read();
+    this.docs.set(path, pending);
+    pending.catch(() => {
+      if (this.docs.get(path) === pending) this.docs.delete(path);
+    });
+    return pending;
+  }
+
+  /** Forget every document. */
+  clear(): void {
+    this.docs.clear();
+  }
+
+  /** How many reads went through to vaultd. */
+  get reads(): number {
+    return this.readsValue;
+  }
 }
 
 export class ViewerDataStore implements PluginDataStore {
@@ -89,9 +131,11 @@ export class ViewerDataStore implements PluginDataStore {
   private readonly viewerSegment: string;
   private readonly vaultConfigDirName: string;
   private readonly host: DataStoreHost;
+  private readonly vaultDocuments: VaultDocumentCache | null;
 
   constructor(options: ViewerDataStoreOptions) {
     this.host = options.host;
+    this.vaultDocuments = options.vaultDocuments ?? null;
     this.dir = new DataDir(options.stateRoot ?? viewerStateRoot());
     this.viewerSegment = encodeSegment(options.viewerId);
     this.vaultConfigDirName = options.vaultConfigDirName ?? OBSIDIAN_CONFIG_DIR;
@@ -100,7 +144,12 @@ export class ViewerDataStore implements PluginDataStore {
   async load(pluginId: string): Promise<unknown> {
     // The null rule applies on read as on write: a vault `{a: null}` reads as
     // `{}`, so a load and a save-then-load agree.
-    const raw = await this.readVault(pluginId);
+    const raw =
+      this.vaultDocuments === null
+        ? await this.readVault(pluginId)
+        : await this.vaultDocuments.get(pluginDataPath(this.vaultConfigDirName, pluginId), () =>
+            this.readVault(pluginId),
+          );
     const base = raw === null ? null : withoutNullKeys(raw);
     const patch = this.readPatch(pluginId);
     if (patch === undefined) return base;
