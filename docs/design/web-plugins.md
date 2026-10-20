@@ -4,6 +4,8 @@
 
 Draft for the owner's cut. Nothing here is accepted. It designs how an unchanged Obsidian community plugin that touches the screen runs in vaultd-web (`spikes/htmx-client/server.js`), using Style Settings 1.0.9 as the first case. The headless host (`host/`, [design](headless-plugin-host.md)) is the starting point and is not changed by this document; where this design needs something from it, the section says so. Edge cases go to issue #10, tagged (a) design gap or (b) missing API.
 
+The second plugin, Meta Bind's view fields rendered on the server, has its own design: [Stock Meta Bind view fields in vaultd-web](web-plugins-meta-bind.md).
+
 Evidence: the release bundle of Style Settings 1.0.9 (`main.js` 154,561 bytes, `styles.css` 13,906 bytes, `manifest.json`; downloaded to `target/tmp/style-settings/`, never committed), its source at tag `1.0.9` (`src/main.ts`, `src/SettingsManager.ts`, `src/settingsView/**`, `src/Utils.ts`, `src/lang/helpers.ts`), the shipped host shim (`host/packages/host/src/shim/`), and the web spike. The bundle is esbuild CommonJS and its only external `require` is `"obsidian"` (17 sites); Pickr (the colour picker), chroma-js, js-yaml, detect-indent and fuzzysort are bundled inside it.
 
 ## What the plugin does, in the order it does it
