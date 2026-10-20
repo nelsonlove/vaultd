@@ -12,11 +12,13 @@
  * a {@link DomProvider}, and `installGlobals` puts the provider's document and
  * node constructors where the stub's would have gone.
  *
- * **Providers live in their own modules** (`dom-providers/linkedom.ts`,
- * `dom-providers/happy-dom.ts`) and nothing in the headless path imports them,
- * so a headless host never loads a server DOM and does not need one installed;
- * both libraries are optional dependencies of this package. Both are offered
- * until task 4 of the design picks one by measurement.
+ * **The provider lives in its own module** (`dom-providers/happy-dom.ts`) and
+ * nothing in the headless path imports it, so a headless host never loads a
+ * server DOM and does not need one installed; the library is an optional
+ * dependency of this package. Task 4 of the design picked happy-dom over
+ * linkedom by running the stock Style Settings bundle against the live
+ * Obsidian capture (the "Task 4 result" in section 2 of
+ * `docs/design/web-plugins.md`), and linkedom was removed.
  */
 
 /**
@@ -36,7 +38,7 @@ export interface ServerDocument {
 
 /** One built document and the constructors that go with it. */
 export interface DomEnvironment {
-  /** The provider's name, for reports and errors: `linkedom`, `happy-dom`. */
+  /** The provider's name, for reports and errors: `happy-dom`. */
   readonly name: string;
   readonly document: ServerDocument;
   /**
@@ -51,8 +53,21 @@ export interface DomEnvironment {
     readonly HTMLElement: { readonly prototype: object };
     readonly DocumentFragment: { readonly prototype: object };
   };
+  /**
+   * `getComputedStyle`, where the library can give one that a plugin may
+   * trust; absent where it cannot, and then the global is not installed (a
+   * plugin that reaches for it gets the same `ReferenceError` as under the
+   * headless profile). Style Settings reads only custom properties through it,
+   * for a `color-gradient` whose end colour is not saved.
+   */
+  readonly getComputedStyle?: (element: unknown) => ComputedStyle;
   /** Release whatever the library holds open. Called on restore. */
   close(): void;
+}
+
+/** The member of a `CSSStyleDeclaration` from `getComputedStyle` that the seam guarantees. */
+export interface ComputedStyle {
+  getPropertyValue(name: string): string;
 }
 
 /** Builds a fresh {@link DomEnvironment}, once per installation. */
@@ -77,18 +92,18 @@ const SHEET_OWNERS = 'style, link[rel~="stylesheet"]';
 /**
  * Give a server document a browser's `document.styleSheets`.
  *
- * **Neither library has one that Style Settings can use**, measured on the
- * pinned versions: linkedom has no `document.styleSheets` at all, and
- * happy-dom's sheets carry no `ownerNode` — and `ownerNode.textContent` is the
- * one thing the plugin reads from a sheet. So both providers install this
- * getter on their document instance.
+ * **happy-dom's own list is not one Style Settings can use**, measured on the
+ * pinned version: its sheets carry no `ownerNode`, and `ownerNode.textContent`
+ * is the one thing the plugin reads from a sheet. (linkedom, measured before
+ * it was removed, had no `document.styleSheets` at all.) So the provider
+ * installs this getter on its document instance.
  *
  * **Read fresh on every access, in document order**, which is what a browser's
  * live list gives a caller that reads `length` and then `item(i)`: every
  * connected `<style>` element and every `<link rel="stylesheet">`, and nothing
  * that is not in the document. The library's own sheet object is used where it
  * has one, with `ownerNode` added when it lacks it; a `<link>` with no sheet
- * (linkedom loads nothing) gets a minimal one with `ownerNode` and empty
+ * (CSS file loading is off) gets a minimal one with `ownerNode` and empty
  * `cssRules`, which is what a cross-origin sheet looks like to a script.
  */
 export function installStyleSheetList(document: ServerDocument): void {

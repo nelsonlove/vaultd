@@ -609,12 +609,22 @@ function installWith(
     patcher.define(globalThis, "Element", dom.constructors.Element);
     patcher.define(globalThis, "HTMLElement", dom.constructors.HTMLElement);
     patcher.define(globalThis, "DocumentFragment", dom.constructors.DocumentFragment);
+    // `self` is the window in a browser, and bundles that wrap a UMD library
+    // read it bare at module scope: Style Settings' bundled Pickr is
+    // `(function (root, factory) {…})(self, …)`, a `ReferenceError` without it.
+    // Screen profile only; the headless profile's global set is unchanged.
+    patcher.define(globalThis, "self", host);
+    // Only where the provider can give one a plugin may trust; see
+    // `DomEnvironment.getComputedStyle`. Absent, the name stays undefined, as
+    // under the headless profile.
+    const computed = dom.getComputedStyle;
+    if (computed !== undefined) patcher.define(globalThis, "getComputedStyle", computed);
     // Obsidian's DOM helpers, over the real document: the `Node` and `Element`
     // prototype extensions (hidden, so no `for…in` sees them) and the four
     // global builders. Only here — the stub's `StubEl` carries its own inert
     // versions, and these are never put onto it. Through the patcher, so a
-    // restore takes them off the library's prototypes again: linkedom and
-    // happy-dom share those prototypes across every document in the process.
+    // restore takes them off the library's prototypes again: happy-dom shares
+    // those prototypes across every document in the process.
     installObsidianDom(
       { ...dom.constructors, document: dom.document, global: globalThis },
       (target, key, value, enumerable) => {

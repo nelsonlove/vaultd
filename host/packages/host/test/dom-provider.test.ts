@@ -9,9 +9,9 @@
  * `document.styleSheets` iterating the document's `<style>` elements, each with
  * an `ownerNode` whose text it parses.
  *
- * Both server DOMs are held to the same cases, because task 4 of
- * `docs/design/web-plugins.md` picks one of them by measurement and the seam
- * must not have decided that already.
+ * The cases run over happy-dom, the one provider task 4 of
+ * `docs/design/web-plugins.md` kept; the table form stays so a second provider
+ * is one row.
  */
 
 import { join } from "node:path";
@@ -25,7 +25,6 @@ import { ShimHarness } from "../src/testing/shim-harness";
 import { defaultHostConfig } from "../src/config";
 import { installGlobals } from "../src/shim/globals";
 import { happyDomProvider } from "../src/shim/dom-providers/happy-dom";
-import { linkedomProvider } from "../src/shim/dom-providers/linkedom";
 import { testClock } from "../src/testing/clock";
 import { loadOptionalDom } from "../src/shim/dom-provider";
 import type { DomEnvironment, DomProvider } from "../src/shim/dom-provider";
@@ -58,10 +57,7 @@ function globalDocument(): Doc {
   return (globalThis as unknown as { document: Doc }).document;
 }
 
-const PROVIDERS: ReadonlyArray<readonly [string, () => DomProvider]> = [
-  ["linkedom", linkedomProvider],
-  ["happy-dom", happyDomProvider],
-];
+const PROVIDERS: ReadonlyArray<readonly [string, () => DomProvider]> = [["happy-dom", happyDomProvider]];
 
 /**
  * Every harness a case builds, torn down after it.
@@ -101,6 +97,8 @@ function swapped(): Record<string, unknown> {
     createDiv: scope.createDiv,
     createSpan: scope.createSpan,
     createFragment: scope.createFragment,
+    self: scope.self,
+    getComputedStyle: scope.getComputedStyle,
   };
 }
 
@@ -254,6 +252,37 @@ describe.each(PROVIDERS)("the %s provider", (name, provider) => {
     }
   });
 
+  it("installs self as the window, as a browser has it", async () => {
+    const built = await harness(provider());
+    expect((globalThis as unknown as { self: unknown }).self).toBe(built.window);
+  });
+
+  it("answers getComputedStyle with inherited custom properties", async () => {
+    await harness(provider());
+    const document = globalDocument();
+    const style = document.createElement("style");
+    style.textContent =
+      "body { --plain: 1px; } body.theme-dark { --ink: #eeeeee; } body.theme-dark.css-settings-manager { --ink: #d0e0ff; } .own { --plain: 2px; }";
+    document.head.appendChild(style);
+    document.body.classList.add("theme-dark", "css-settings-manager");
+    const child = document.createElement("div");
+    child.classList.add("theme-light");
+    document.body.appendChild(child);
+    const own = document.createElement("div");
+    own.classList.add("own");
+    child.appendChild(own);
+    const read = (globalThis as unknown as { getComputedStyle: (el: unknown) => { getPropertyValue(n: string): string } })
+      .getComputedStyle;
+    // The more specific rule wins on the element that matches it.
+    expect(read(document.body).getPropertyValue("--ink").trim()).toBe("#d0e0ff");
+    // A descendant with no rule of its own inherits, as in a browser.
+    expect(read(child).getPropertyValue("--ink").trim()).toBe("#d0e0ff");
+    expect(read(child).getPropertyValue("--plain").trim()).toBe("1px");
+    // Its own declaration beats the inherited one.
+    expect(read(own).getPropertyValue("--plain").trim()).toBe("2px");
+    expect(read(own).getPropertyValue("--missing")).toBe("");
+  });
+
   it("is what window.document and activeDocument resolve to", async () => {
     const built = await harness(provider());
     const document = built.serverDom?.document;
@@ -277,7 +306,7 @@ describe("a provider that fails", () => {
   });
 
   it("undoes everything and closes the DOM when a later step throws", () => {
-    const env = linkedomProvider().create();
+    const env = happyDomProvider().create();
     let closed = 0;
     // A frozen prototype refuses the first helper, after the document and
     // constructors are already installed.
@@ -301,20 +330,20 @@ describe("a provider that fails", () => {
 
 describe("a missing optional dependency", () => {
   it("is named, with the profile that needs it", () => {
-    const missing = Object.assign(new Error("Cannot find module 'linkedom'\nRequire stack: ..."), {
+    const missing = Object.assign(new Error("Cannot find module 'happy-dom'\nRequire stack: ..."), {
       code: "MODULE_NOT_FOUND",
     });
     expect(() =>
-      loadOptionalDom("linkedom", () => {
+      loadOptionalDom("happy-dom", () => {
         throw missing;
       }),
-    ).toThrow(/screen host profile needs the optional dependency "linkedom"/);
+    ).toThrow(/screen host profile needs the optional dependency "happy-dom"/);
   });
 
   it("passes any other failure through unchanged", () => {
-    const other = Object.assign(new Error("Cannot find module 'htmlparser2'"), { code: "MODULE_NOT_FOUND" });
+    const other = Object.assign(new Error("Cannot find module 'whatwg-mimetype'"), { code: "MODULE_NOT_FOUND" });
     expect(() =>
-      loadOptionalDom("linkedom", () => {
+      loadOptionalDom("happy-dom", () => {
         throw other;
       }),
     ).toThrow(other);

@@ -1,5 +1,5 @@
 /**
- * Obsidian's DOM helpers, over both server DOMs.
+ * Obsidian's DOM helpers, over the server DOM.
  *
  * `shim/obsidian-dom.ts` is written against standard DOM only, so the same
  * module can run in a browser and over a server DOM. These cases hold it to
@@ -13,7 +13,6 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { installObsidianDom } from "../src/shim/obsidian-dom";
 import { happyDomProvider } from "../src/shim/dom-providers/happy-dom";
-import { linkedomProvider } from "../src/shim/dom-providers/linkedom";
 import type { DomEnvironment, DomProvider } from "../src/shim/dom-provider";
 import type { DomDocument, DomElementInfo, ObsidianBuilders } from "../src/shim/obsidian-dom";
 
@@ -53,10 +52,7 @@ interface N {
   setAttr(name: string, value: string | number | boolean | null): void;
 }
 
-const PROVIDERS: ReadonlyArray<readonly [string, () => DomProvider]> = [
-  ["linkedom", linkedomProvider],
-  ["happy-dom", happyDomProvider],
-];
+const PROVIDERS: ReadonlyArray<readonly [string, () => DomProvider]> = [["happy-dom", happyDomProvider]];
 
 describe.each(PROVIDERS)("Obsidian's DOM helpers over %s", (_name, provider) => {
   let env: DomEnvironment | null = null;

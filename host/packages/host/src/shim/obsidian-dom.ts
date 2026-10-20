@@ -6,7 +6,7 @@
  * `Element.prototype` with a family of helpers — `createEl`, `createDiv`,
  * `empty`, `addClass`, `setText` and the rest — and installs global builders
  * beside them. Plugins build all their markup with these. This module gives
- * the same helpers over any standards DOM: a browser, linkedom or happy-dom.
+ * the same helpers over any standards DOM: a browser or happy-dom.
  *
  * **It imports nothing**, on purpose: no Node module, no host module, no DOM
  * library types. The same file has to run in a browser bundle later (task 10),
