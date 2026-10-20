@@ -12,7 +12,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { DATA_JSON, EXPECTED, FIXTURE, MAIN_JS, MAIN_JS_PATH, pluginOwnedClasses } from "./style-settings-run";
+import { DATA_JSON, EXPECTED, FIXTURE, MAIN_JS, MAIN_JS_PATH, OUTPUT_STYLE_ID, outputText, pluginOwnedClasses } from "./style-settings-run";
 import { scratchRoot } from "./scratch";
 import { ApplyService, createApplyService } from "../src/screen/apply-service";
 import { BundleLoader } from "../src/runtime/loader";
@@ -22,6 +22,7 @@ import { ShimHarness } from "../src/testing/shim-harness";
 import { buildSheetSet } from "../src/web/sheet-set";
 import { happyDomProvider } from "../src/shim/dom-providers/happy-dom";
 import type { ApplyRequest } from "../src/screen/apply-service";
+import type { BundleSource } from "../src/runtime/loader";
 import type { Mode } from "./style-settings-run";
 import type { PluginManifest } from "../src/shim/plugin";
 import type { PluginDataStore } from "../src/shim/plugin-data-store";
@@ -63,7 +64,34 @@ afterEach(async () => {
   }
 });
 
+/** A plugin of the test's own, beside Style Settings, written as a bundle in the corpus's CJS shape. */
+function extraBundle(harness: ShimHarness, id: string, onload: string): BundleSource {
+  // No saved data: the harness answers `not_found`, as vaultd would.
+  harness.unserveFile(`.obsidian/plugins/${id}/data.json`);
+  return {
+    manifest: { id, name: id, version: "1.0.0", minAppVersion: "1.0.0", dir: `.obsidian/plugins/${id}` } as PluginManifest,
+    request: {
+      pluginId: id,
+      filename: join(VAULT_DIR, ".obsidian", "plugins", id, "main.js"),
+      source: `"use strict";\nvar obsidian = require("obsidian");\nmodule.exports = class extends obsidian.Plugin {\n  async onload() {\n${onload}\n  }\n};\n`,
+      hostModulePaths: harness.hostModulePaths,
+    },
+  };
+}
+
+/** Adds a `<style>` with no id to `head` and a class to `body`, and takes both away on unload. */
+const UNNAMED_STYLE_ONLOAD = `
+    const el = document.createElement("style");
+    el.textContent = ".extra-plugin { --extra: 1; }";
+    document.head.appendChild(el);
+    document.body.classList.add("extra-plugin");
+    this.register(() => { el.remove(); document.body.classList.remove("extra-plugin"); });`;
+
 interface RigOptions {
+  /** More plugins, loaded after Style Settings, as `(harness) => bundle`. */
+  extra?: Array<(harness: ShimHarness) => BundleSource>;
+  /** Leave Style Settings out. */
+  withoutStyleSettings?: boolean;
   cacheLimit?: number;
   applyDeadlineMs?: number;
   wrapStore?: (store: PluginDataStore, viewer: string) => PluginDataStore;
@@ -85,10 +113,17 @@ async function rig(options: RigOptions = {}): Promise<Rig> {
     queue: harness.loaderDeps().queue,
     document: dom.document as never,
     clock: harness.clock,
-    bundle: {
-      manifest: { ...MANIFEST, dir: `.obsidian/plugins/${PLUGIN_ID}` },
-      request: { pluginId: PLUGIN_ID, filename: MAIN_JS_PATH, source: MAIN_JS, hostModulePaths: harness.hostModulePaths },
-    },
+    bundles: [
+      ...(options.withoutStyleSettings === true
+        ? []
+        : [
+            {
+              manifest: { ...MANIFEST, dir: `.obsidian/plugins/${PLUGIN_ID}` },
+              request: { pluginId: PLUGIN_ID, filename: MAIN_JS_PATH, source: MAIN_JS, hostModulePaths: harness.hostModulePaths },
+            },
+          ]),
+      ...(options.extra ?? []).map((make) => make(harness)),
+    ],
     stateRoot,
     log: (line) => {
       logged.push(line);
@@ -135,7 +170,9 @@ describe("apply through the service", () => {
   it.each<Mode>(["light", "dark"])("reproduces the capture in %s mode", async (mode) => {
     const r = await rig();
     const result = await r.service.apply(request(r, "alice", mode));
-    expect(result.style).toBe(EXPECTED.styleText[mode]);
+    expect(outputText(result)).toBe(EXPECTED.styleText[mode]);
+    // The plugin's one `<style>`, found by the diff, is the whole answer.
+    expect(result.styles.map((style) => style.id)).toEqual([OUTPUT_STYLE_ID]);
     expect(result.classes).toEqual(capturedClasses(mode));
     expect(r.harness.hostErrors).toEqual([]);
   });
@@ -144,8 +181,8 @@ describe("apply through the service", () => {
     const r = await rig();
     const light = await r.service.apply(request(r, "alice", "light"));
     const dark = await r.service.apply(request(r, "alice", "dark"));
-    expect(light.style).toBe(EXPECTED.styleText.light);
-    expect(dark.style).toBe(EXPECTED.styleText.dark);
+    expect(outputText(light)).toBe(EXPECTED.styleText.light);
+    expect(outputText(dark)).toBe(EXPECTED.styleText.dark);
     expect(dark.classes).toEqual(capturedClasses("dark"));
     // A mode switch for the same viewer does not reload the plugin.
     expect(r.service.stats().loads).toBe(1);
@@ -169,9 +206,9 @@ describe("apply through the service", () => {
       r.service.apply(request(r, "alice", "dark")),
       r.service.apply(request(r, "alice", "light")),
     ]);
-    expect(a.style).toBe(EXPECTED.styleText.dark);
+    expect(outputText(a)).toBe(EXPECTED.styleText.dark);
     expect(b).toEqual(a);
-    expect(c.style).toBe(EXPECTED.styleText.light);
+    expect(outputText(c)).toBe(EXPECTED.styleText.light);
     expect(loads).toHaveBeenCalledTimes(1);
   });
 
@@ -181,7 +218,7 @@ describe("apply through the service", () => {
     patchFor(r, "bob", { "fixture-snippet@@sn-width": 900 });
     const outputs: string[] = [];
     for (const viewer of ["alice", "bob", "alice", "bob"]) {
-      outputs.push((await r.service.apply(request(r, viewer, "dark"))).style);
+      outputs.push(outputText(await r.service.apply(request(r, viewer, "dark"))));
     }
     expect(outputs[0]).toBe(EXPECTED.styleText.dark);
     expect(outputs[0]).toContain("--sn-width: 700px;");
@@ -210,8 +247,8 @@ describe("apply through the service", () => {
       sheet.id === "snippet:fixture-snippet" ? { ...sheet, text: sheet.text.replace("format: px", "format: em") } : sheet,
     );
     const after = await r.service.apply(request(r, "alice", "dark", changed));
-    expect(before.style).toContain("--sn-width: 700px;");
-    expect(after.style).toBe(before.style.replace("--sn-width: 700px;", "--sn-width: 700em;"));
+    expect(outputText(before)).toContain("--sn-width: 700px;");
+    expect(outputText(after)).toBe(outputText(before).replace("--sn-width: 700px;", "--sn-width: 700em;"));
     expect(after.classes).toEqual(before.classes);
     // A sheet that drops a class toggle's section drops its class as well.
     const noTheme = r.sheets.filter((sheet) => !sheet.id.startsWith("theme:"));
@@ -269,7 +306,7 @@ describe("apply through the service", () => {
     }
     failing = false;
     const recovered = await r.service.apply(request(r, "alice", "dark"));
-    expect(recovered.style).toBe(EXPECTED.styleText.dark);
+    expect(outputText(recovered)).toBe(EXPECTED.styleText.dark);
     expect(recovered.classes).toEqual(capturedClasses("dark"));
     expect(r.service.stats()).toMatchObject({ loads: 2, misses: 2 });
   });
@@ -295,12 +332,12 @@ describe("apply through the service", () => {
     await expect(r.service.apply(request(r, "alice", "dark"))).rejects.toThrow(/deadline/);
     hang = false;
     const served = await r.service.apply(request(r, "alice", "dark"));
-    expect(served.style).toBe(EXPECTED.styleText.dark);
+    expect(outputText(served)).toBe(EXPECTED.styleText.dark);
     // The stuck read finishes late; the abandoned apply must not touch the page.
     for (const release of stuck) release();
     for (let i = 0; i < 20; i += 1) await new Promise<void>((done) => setImmediate(done));
     expect(await r.service.apply(request(r, "alice", "dark"))).toEqual(served);
-    expect(await r.service.apply(request(r, "alice", "light"))).toMatchObject({ style: EXPECTED.styleText.light });
+    expect(outputText(await r.service.apply(request(r, "alice", "light")))).toBe(EXPECTED.styleText.light);
   });
 
   it("holds the process-level rejection guard until close", async () => {
@@ -341,6 +378,45 @@ describe("apply through the service", () => {
   it("releases the guard when the service cannot be built", async () => {
     await expect(rig({ cacheLimit: 0 })).rejects.toThrow(RangeError);
     expect(rejectionGuardArmed()).toBe(false);
+  });
+
+  it("returns a second plugin's <style> with no id, after Style Settings', and its class", async () => {
+    const r = await rig({ extra: [(h) => extraBundle(h, "extra-style", UNNAMED_STYLE_ONLOAD)] });
+    const result = await r.service.apply(request(r, "alice", "dark"));
+    expect(result.styles).toEqual([
+      { id: OUTPUT_STYLE_ID, text: EXPECTED.styleText.dark },
+      { id: null, text: ".extra-plugin { --extra: 1; }" },
+    ]);
+    expect(result.classes).toEqual([...capturedClasses("dark"), "extra-plugin"].sort());
+    expect(r.service.plugins()).toEqual([PLUGIN_ID, "extra-style"]);
+    // A reload for another viewer unloads both and finds the same diff again.
+    const bob = await r.service.apply(request(r, "bob", "light"));
+    expect(bob.styles.map((style) => style.id)).toEqual([OUTPUT_STYLE_ID, null]);
+    expect(outputText(bob)).toBe(EXPECTED.styleText.light);
+  });
+
+  it("answers nothing for a plugin that changes nothing on the page", async () => {
+    const r = await rig({ withoutStyleSettings: true, extra: [(h) => extraBundle(h, "quiet", "")] });
+    expect(await r.service.apply(request(r, "alice", "dark"))).toEqual({ classes: [], styles: [] });
+  });
+
+  it("serves the other plugins when one fails to load, and reports the one that failed", async () => {
+    const r = await rig({
+      extra: [
+        (h) => extraBundle(h, "broken", '    throw new Error("broken onload");'),
+        (h) => extraBundle(h, "extra-style", UNNAMED_STYLE_ONLOAD),
+      ],
+    });
+    const result = await r.service.apply(request(r, "alice", "dark"));
+    expect(outputText(result)).toBe(EXPECTED.styleText.dark);
+    expect(result.styles.map((style) => style.id)).toEqual([OUTPUT_STYLE_ID, null]);
+    expect(r.service.plugins()).toEqual([PLUGIN_ID, "extra-style"]);
+    expect(r.service.failed().map((failure) => failure.id)).toEqual(["broken"]);
+    expect(r.service.failed()[0]?.reason).toMatch(/broken onload/);
+    // A reload for another viewer does not try the failed one again.
+    const loads = vi.spyOn(r.loader, "loadBundle");
+    await r.service.apply(request(r, "bob", "dark"));
+    expect(loads.mock.calls.map(([bundle]) => bundle.manifest.id)).toEqual([PLUGIN_ID, "extra-style"]);
   });
 
   it("releases the guard and stops logging even when the unload in close throws", async () => {

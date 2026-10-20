@@ -1,14 +1,27 @@
 /**
- * The screen host's one job: apply a screen plugin for a viewer and say what it
- * did to the page (docs/design/web-plugins.md, section 2 option C and task 6).
+ * The screen host's one job: apply the screen profile's plugins for a viewer
+ * and say what they did to the page (docs/design/web-plugins.md, section 2
+ * option C and task 6).
  *
- * **Apply.** `{ viewer, mode, sheets }` → `{ classes, style }`. The sheets go
+ * **Apply.** `{ viewer, mode, sheets }` → `{ classes, styles }`. The sheets go
  * into `document.head` as `<style>` elements in the order given (Obsidian's
  * order, built by `web/sheet-set.ts`), `body` gets `theme-light` or
- * `theme-dark`, the plugin's data store is the viewer's, `css-change` is raised
- * and the plugin's 100 ms debounce is driven on the host's own clock (never a
- * real wait). The answer is the `body` classes the plugin set and the text of
- * its `<style id="css-settings-manager">`.
+ * `theme-dark`, the plugins' data store is the viewer's, `css-change` is raised
+ * and the plugins' timers (a 100 ms debounce, say) are driven on the host's own
+ * clock (never a real wait).
+ *
+ * **The answer is a diff, and names no plugin.** Just before the plugins load,
+ * the service notes the page: every `<style>` in `head` it did not put there
+ * itself, by id (or by position, for one with no id) and text, and the `body`
+ * classes. After the apply settles it compares: the answer is the `body`
+ * classes added since (sorted, the mode class left out), and every `<style>`
+ * added or changed since, in document order, each with its id or `null`. The
+ * service knows nothing of what any one plugin writes.
+ *
+ * **A plugin that fails to load is reported, not fatal.** Its `onload` (or
+ * its bundle, or its constructor) throws: it is rolled back by the loader,
+ * left out of this service's later loads, and listed by {@link
+ * ApplyService.failed}; the others are served.
  *
  * **Two parses, always.** The output depends on the previous apply (E11): a
  * `color-gradient` whose end colour is not saved reads that colour back through
@@ -68,9 +81,6 @@ export const APPLY_DEADLINE_MS = 5_000;
 /** One clock step: past the plugin's 100 ms debounce, as the parity harness steps. */
 export const DEBOUNCE_STEP_MS = 150;
 
-/** The id of the `<style>` element Style Settings writes its output into. */
-export const OUTPUT_STYLE_ID = "css-settings-manager";
-
 /** The attribute that marks a `<style>` element this service put in the head. */
 const SHEET_ATTRIBUTE = "data-vaultd-sheet";
 
@@ -84,11 +94,24 @@ export interface ApplyRequest {
   readonly sheets: readonly Sheet[];
 }
 
+/** One `<style>` element the plugins added to `head`, or changed. */
+export interface AppliedStyle {
+  /** Its `id`, or `null` when it has none. */
+  readonly id: string | null;
+  readonly text: string;
+}
+
 export interface ApplyResult {
-  /** The `body` classes the plugin set, sorted. The mode class is not among them. */
+  /** The `body` classes the plugins added, sorted. The mode class is not among them. */
   readonly classes: readonly string[];
-  /** The text of `#css-settings-manager`, or `""` when the plugin wrote none. */
-  readonly style: string;
+  /** The `<style>` elements the plugins added to `head` or changed, in document order. */
+  readonly styles: readonly AppliedStyle[];
+}
+
+/** A plugin that could not be loaded, and why. */
+export interface PluginFailure {
+  readonly id: string;
+  readonly reason: string;
 }
 
 export interface ApplyStats {
@@ -104,6 +127,7 @@ export interface ApplyStats {
 /** The members of a server-DOM element this service uses. */
 export interface ServiceElement {
   textContent: string | null;
+  readonly id: string;
   readonly classList: Iterable<string> & {
     add(...names: string[]): void;
     remove(...names: string[]): void;
@@ -165,23 +189,25 @@ export interface ApplyServiceDeps {
   advance(ms: number): Promise<void>;
   /** Wait until the plugin's saves and every other queued task have finished. */
   settle(): Promise<void>;
-  /** Compile and load the plugin; `onload` runs. */
-  loadPlugin(): Promise<void>;
-  unloadPlugin(): Promise<void>;
+  /** Compile and load one plugin; its `onload` runs. Throws when it fails to load. */
+  loadPlugin(id: string): Promise<void>;
+  unloadPlugin(id: string): Promise<void>;
   /** The viewer's data store. */
   storeFor(viewer: string): PluginDataStore;
   /** The store installed behind the plugin. */
   readonly store: SwitchableDataStore;
-  readonly pluginId: string;
+  /** The plugins to load, in load order. */
+  readonly pluginIds: readonly string[];
   readonly cacheLimit?: number;
   /** Default {@link APPLY_DEADLINE_MS}. */
   readonly deadlineMs?: number;
   /** The real clock the deadline runs on. */
   readonly timers: Pick<Clock, "setTimeout" | "clearTimeout">;
   /**
-   * Hear every host error. An error reported while the plugin is running for
+   * Hear every host error. An error reported while the plugins are running for
    * an apply fails that apply (phase `plugin-data` excepted: a data file that
-   * cannot be read falls back to defaults, which is a sound answer).
+   * cannot be read falls back to defaults, which is a sound answer; and phase
+   * `onload`: a plugin that fails to load is left out, not a failed apply).
    */
   onHostError(listener: (error: unknown, pluginId: string, phase: HostErrorPhase) => void): () => void;
   /** Called once by {@link ApplyService.close}. */
@@ -205,12 +231,23 @@ interface LiveContext {
   viewer: string;
   revision: string;
   setHash: string;
+  /** The plugins loaded in this context, in load order. */
+  loaded: string[];
+}
+
+/** The page just before the plugins loaded: each `<style>` not the service's, by key, and the `body` classes. */
+interface Baseline {
+  styles: Map<string, string>;
+  classes: Set<string>;
 }
 
 export class ApplyService {
   private readonly cache = new Map<string, ApplyResult>();
   private readonly limit: number;
   private live: LiveContext | null = null;
+  private baseline: Baseline = { styles: new Map(), classes: new Set() };
+  /** Plugins that failed to load, by id, with the reason; left out of later loads. */
+  private readonly failedPlugins = new Map<string, string>();
   private chain: Promise<unknown> = Promise.resolve();
   private counts = { loads: 0, unloads: 0, hits: 0, misses: 0 };
   /** Bumped by each apply and by a deadline; work holding an older token stops. */
@@ -228,7 +265,7 @@ export class ApplyService {
       throw new RangeError("the apply cache limit must be a whole number of at least 1");
     }
     this.unlisten = deps.onHostError((error, _pluginId, phase) => {
-      if (this.failures !== null && phase !== "plugin-data") this.failures.push(error);
+      if (this.failures !== null && phase !== "plugin-data" && phase !== "onload") this.failures.push(error);
     });
   }
 
@@ -250,17 +287,26 @@ export class ApplyService {
     return { ...this.counts, size: this.cache.size };
   }
 
+  /** The plugins that failed to load so far, in load order. */
+  failed(): readonly PluginFailure[] {
+    return this.deps.pluginIds.flatMap((id) => {
+      const reason = this.failedPlugins.get(id);
+      return reason === undefined ? [] : [{ id, reason }];
+    });
+  }
+
+  /** The plugins this service loads: every one given, less those that failed. */
+  plugins(): readonly string[] {
+    return this.deps.pluginIds.filter((id) => !this.failedPlugins.has(id));
+  }
+
   /** Refuse new requests, let the queued ones finish, unload the plugin. The cache stays. */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     try {
       await this.chain;
-      if (this.live !== null) {
-        this.live = null;
-        this.counts.unloads += 1;
-        await this.deps.unloadPlugin();
-      }
+      await this.dropContext();
     } finally {
       // Whatever the unload did, the listener and the guard go.
       this.unlisten();
@@ -359,23 +405,48 @@ export class ApplyService {
     this.replaceSheets(request.sheets);
     this.setMode(request.mode);
     this.deps.store.use(store);
+    this.baseline = this.notePage();
     this.counts.loads += 1;
-    await this.deps.loadPlugin();
+    const loaded: string[] = [];
+    try {
+      for (const id of this.plugins()) {
+        try {
+          await this.deps.loadPlugin(id);
+          loaded.push(id);
+        } catch (error) {
+          // The loader rolled it back; the others go on.
+          this.failedPlugins.set(id, error instanceof Error ? describeLoadFailure(error) : String(error));
+        }
+        this.check(token);
+      }
+    } catch (error) {
+      // Abandoned part way: unload what did load, so nothing is left running.
+      for (const id of loaded.reverse()) await this.deps.unloadPlugin(id);
+      throw error;
+    }
     // Checked before `live` is set, so an abandoned apply never names the
     // live context the request after it relies on.
-    this.check(token);
-    this.live = { viewer: request.viewer, revision: "", setHash };
-    // `onload` arms the first parse; let it run.
+    this.live = { viewer: request.viewer, revision: "", setHash, loaded };
+    // `onload` may arm work on a timer (a debounced parse); let it run.
     await this.deps.advance(DEBOUNCE_STEP_MS);
     await this.deps.settle();
     this.check(token);
   }
 
   private async dropContext(): Promise<void> {
-    if (this.live === null) return;
+    const live = this.live;
+    if (live === null) return;
     this.live = null;
     this.counts.unloads += 1;
-    await this.deps.unloadPlugin();
+    const errors: unknown[] = [];
+    for (const id of [...live.loaded].reverse()) {
+      try {
+        await this.deps.unloadPlugin(id);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw errors[0];
   }
 
   /** `css-change`, then past the debounce. */
@@ -415,17 +486,45 @@ export class ApplyService {
     classList.add(mode === "light" ? "theme-light" : "theme-dark");
   }
 
+  /** Every `<style>` in `head` this service did not put there, in document order, with its key. */
+  private pluginStyles(): Array<{ key: string; id: string | null; text: string }> {
+    const found: Array<{ key: string; id: string | null; text: string }> = [];
+    let unnamed = 0;
+    for (const element of this.deps.document.querySelectorAll("head > style")) {
+      if (element.getAttribute(SHEET_ATTRIBUTE) !== null) continue;
+      const id = element.id === "" ? null : element.id;
+      // An element with no id is known by its place among the others with none.
+      const key = id === null ? `#${String((unnamed += 1))}` : `id:${id}`;
+      found.push({ key, id, text: element.textContent ?? "" });
+    }
+    return found;
+  }
+
+  /** The page as it is before the plugins load, to compare the answer against. */
+  private notePage(): Baseline {
+    return {
+      styles: new Map(this.pluginStyles().map((style) => [style.key, style.text])),
+      classes: new Set(this.deps.document.body.classList),
+    };
+  }
+
   private read(): ApplyResult {
     const { document } = this.deps;
     const modeClasses = new Set<string>(MODE_CLASSES);
-    const classes = [...document.body.classList].filter((name) => !modeClasses.has(name)).sort();
-    const style = document.getElementById(OUTPUT_STYLE_ID)?.textContent ?? "";
-    return Object.freeze({ classes: Object.freeze(classes), style });
+    const classes = [...document.body.classList]
+      .filter((name) => !modeClasses.has(name) && !this.baseline.classes.has(name))
+      .sort();
+    const styles = this.pluginStyles()
+      .filter((style) => this.baseline.styles.get(style.key) !== style.text)
+      .map((style) => Object.freeze({ id: style.id, text: style.text }));
+    return Object.freeze({ classes: Object.freeze(classes), styles: Object.freeze(styles) });
   }
 
+  /** A digest of every loaded plugin's data as the viewer's store loads it. */
   private async revisionOf(store: PluginDataStore): Promise<string> {
-    const data = await store.load(this.deps.pluginId);
-    return createHash("sha256").update(canonicalJson(data)).digest("hex");
+    const entries: unknown[] = [];
+    for (const id of this.plugins()) entries.push([id, await store.load(id)]);
+    return createHash("sha256").update(canonicalJson(entries)).digest("hex");
   }
 
   private remember(key: string, result: ApplyResult): void {
@@ -447,8 +546,8 @@ export interface ScreenApplyDeps {
   readonly document: ServiceDocument;
   /** The clock the assembly's timers are on; the service moves it. */
   readonly clock: { advance(ms: number): Promise<void> };
-  /** The screen plugin's bundle and manifest. */
-  readonly bundle: BundleSource;
+  /** The plugins' bundles and manifests, in load order. */
+  readonly bundles: readonly BundleSource[];
   /** The viewer store's state root. Default `viewerStateRoot()`. */
   readonly stateRoot?: string;
   /** The vault's own config directory. Default `.obsidian`. */
@@ -475,7 +574,7 @@ export interface ScreenApplyDeps {
 
 /**
  * Build the service over an assembled host: install the switchable store
- * behind the plugin, and load and unload through `loader`.
+ * behind the plugins, and load and unload through `loader`.
  */
 export function createApplyService(deps: ScreenApplyDeps): ApplyService {
   const store = new SwitchableDataStore();
@@ -502,9 +601,13 @@ export function createApplyService(deps: ScreenApplyDeps): ApplyService {
     unlog();
     unguard();
   };
-  const pluginId = deps.bundle.manifest.id;
+  const pluginIds = deps.bundles.map((bundle) => bundle.manifest.id);
+  if (new Set(pluginIds).size !== pluginIds.length) {
+    release();
+    throw new Error("the screen profile names a plugin twice");
+  }
   try {
-    return buildService(deps, context, store, pluginId, release);
+    return buildService(deps, context, store, pluginIds, release);
   } catch (error) {
     release();
     throw error;
@@ -515,9 +618,10 @@ function buildService(
   deps: ScreenApplyDeps,
   context: ReturnType<typeof pluginHostFor>,
   store: SwitchableDataStore,
-  pluginId: string,
+  pluginIds: readonly string[],
   release: () => void,
 ): ApplyService {
+  const bundles = new Map(deps.bundles.map((bundle) => [bundle.manifest.id, bundle]));
   return new ApplyService({
     document: deps.document,
     raiseCssChange: () => {
@@ -525,10 +629,12 @@ function buildService(
     },
     advance: (ms) => deps.clock.advance(ms),
     settle: () => settle(deps.queue),
-    loadPlugin: async () => {
-      await deps.loader.loadBundle(deps.bundle);
+    loadPlugin: async (id) => {
+      const bundle = bundles.get(id);
+      if (bundle === undefined) throw new Error(`no bundle for ${id}`);
+      await deps.loader.loadBundle(bundle);
     },
-    unloadPlugin: () => deps.loader.unload(pluginId),
+    unloadPlugin: (id) => deps.loader.unload(id),
     storeFor: (viewer) => {
       const store = new ViewerDataStore({
         host: context,
@@ -540,7 +646,7 @@ function buildService(
       return deps.wrapStore === undefined ? store : deps.wrapStore(store, viewer);
     },
     store,
-    pluginId,
+    pluginIds,
     timers: systemClock(),
     onHostError: (listener) => context.errors.onError(listener),
     release,
@@ -587,6 +693,13 @@ async function settle(queue: DispatchQueue): Promise<void> {
 
 async function turns(count: number): Promise<void> {
   for (let i = 0; i < count; i += 1) await new Promise<void>((done) => setImmediate(done));
+}
+
+/** One line for a plugin that failed to load: the loader's message, and its cause's when it wraps one. */
+function describeLoadFailure(error: Error): string {
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause instanceof Error && !error.message.includes(cause.message)) return `${error.message}: ${cause.message}`;
+  return error.message;
 }
 
 function cacheKey(setHash: string, mode: Mode, revision: string): string {

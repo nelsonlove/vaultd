@@ -60,6 +60,14 @@ describe("parseScreenArgs", () => {
     expect(SCREEN_USAGE).toContain("--revalidate-ms");
   });
 
+  it("loads every enabled plugin by default, and only the --plugins list when it is given", () => {
+    expect(parseScreenArgs(["--vault", "/tmp"]).plugins).toBeNull();
+    expect(parseScreenArgs(["--vault", "/tmp", "--plugins", "a, b-c"]).plugins).toEqual(["a", "b-c"]);
+    expect(() => parseScreenArgs(["--vault", "/tmp", "--plugins", "a,,b"])).toThrow(CliRefusal);
+    expect(() => parseScreenArgs(["--vault", "/tmp", "--plugins"])).toThrow(CliRefusal);
+    expect(SCREEN_USAGE).toContain("--plugins");
+  });
+
   it("keeps its state apart from the headless host's", () => {
     expect(screenDataDir({ XDG_STATE_HOME: "/s" })).toBe(join("/s", "vaultd-screen-host"));
   });

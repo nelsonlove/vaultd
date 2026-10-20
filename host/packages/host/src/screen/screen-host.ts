@@ -5,10 +5,14 @@
  * Its own process beside the web server, never inside the headless host: the
  * headless host keeps its inert stub document on purpose. This one assembles
  * the same shim with happy-dom behind `document`, connects to `vaultd` the way
- * the headless host does, and loads **only the screen plugins** — today Style
- * Settings, and only when the vault's own `.obsidian/community-plugins.json`
- * enables it. It reads the vault's `.obsidian` (the GUI's directory) and never
- * writes there: the plugin's saves go to the `viewer` store, outside the vault.
+ * the headless host does, and loads the plugins the vault's own
+ * `.obsidian/community-plugins.json` enables, in its order — all of them by
+ * default, or only those named by {@link ScreenHostOptions.plugins} (the
+ * `--plugins` flag). It names no plugin itself: what a plugin did to the page
+ * is read back as a diff (`apply-service.ts`). A plugin that cannot be read or
+ * loaded is reported (`host.hello`'s `failed`), not fatal; the others are
+ * served. It reads the vault's `.obsidian` (the GUI's directory) and never
+ * writes there: the plugins' saves go to the `viewer` store, outside the vault.
  *
  * It answers one request, `screen.apply` (`apply-service.ts`), over its own
  * socket (`screen-server.ts`).
@@ -20,11 +24,12 @@
  *
  * **Config changes reach the next apply without a restart (task 8).** The
  * host reads the vault's `.obsidian` through vaultd and keeps what it read:
- * the screen plugin's bundle and enabled state, each stylesheet set it built,
- * and the vault's `data.json`. A `config_changed` from vaultd for a path that
+ * the plugins' bundles and enabled state, each stylesheet set it built, and
+ * the vault's `data.json` of each plugin. A `config_changed` from vaultd for a path that
  * can change the output (see {@link affectsScreen}), or any `resync_required`,
- * marks all of it stale, and the next request reads it again; a changed bundle
- * or enabled state replaces the apply service (and with it the result cache).
+ * marks all of it stale, and the next request reads it again; a changed bundle,
+ * enabled state or set of failures replaces the apply service (and with it the
+ * result cache).
  * vaultd does not watch `.obsidian`, so an edit made outside vaultd (desktop
  * Obsidian, a sync tool) raises no event: after {@link CONFIG_REVALIDATE_MS}
  * the host reads the files again and compares their revisions, and drops only
@@ -54,15 +59,15 @@ import { drivenClock } from "../runtime/driven-clock";
 import { VaultDocumentCache } from "../shim/viewer-data-store";
 import { buildSheetSet } from "../web/sheet-set";
 import { isKnownRuntimeEvent } from "../client/protocol";
-import type { ApplyRequest, ApplyResult, ApplyService, Mode, Sheet } from "./apply-service";
+import type { ApplyRequest, ApplyResult, ApplyService, Mode, PluginFailure, Sheet } from "./apply-service";
 import type { HostConfig } from "../config";
 import type { PluginManifest } from "../shim/plugin";
 import type { ReadFileResponse, RuntimeEventDto } from "../client/protocol";
 import type { ServiceDocument } from "./apply-service";
 import type { VaultdClient } from "../client/client";
 
-/** The plugins this profile runs. Everything else in the vault is the headless host's. */
-export const SCREEN_PLUGIN_IDS: readonly string[] = ["obsidian-style-settings"];
+/** The answer when no plugin is loaded: nothing added to the page. */
+const EMPTY_RESULT: ApplyResult = Object.freeze({ classes: Object.freeze([]), styles: Object.freeze([]) });
 
 /** One `screen.apply` line can carry a whole theme; 64 MB is far past any real set. */
 export const SCREEN_LINE_CAP_BYTES = 64 * 1024 * 1024;
@@ -138,8 +143,11 @@ export interface ScreenStats {
   readonly config_reads: number;
   /** Times the period's check compared revisions (it drops only what changed). */
   readonly config_checks: number;
-  /** Times the screen plugin's bundle or enabled state changed and the service was replaced. */
+  /** Times the plugins' bundles, enabled state or read failures changed and the service was replaced. */
   readonly bundle_changes: number;
+  /** As `host.hello` says now: the plugins loaded, and those that failed. */
+  readonly plugins: readonly string[];
+  readonly failed: readonly PluginFailure[];
 }
 
 /** `$XDG_STATE_HOME/vaultd-screen-host`: this host's own state, apart from the headless host's. */
@@ -158,6 +166,12 @@ export function screenSocketPathFor(dataDir: string, vaultRoot: string): string 
 }
 
 export interface ScreenHostOptions {
+  /**
+   * Load only these plugins (the `--plugins` flag), each still only when the
+   * vault enables it, in the vault's order. Default: every plugin the vault's
+   * `community-plugins.json` enables.
+   */
+  readonly plugins?: readonly string[];
   /** The `viewer` store's state root. Default `$XDG_STATE_HOME/vaultd-web/plugin-data`. */
   readonly stateRoot?: string;
   readonly cacheLimit?: number;
@@ -174,9 +188,15 @@ export interface ScreenHostOptions {
 export interface RunningScreenHost {
   readonly config: HostConfig;
   readonly socketPath: string;
-  /** The screen plugins that are loaded-on-demand, by id. Empty when none is enabled. As last read. */
+  /**
+   * The plugins the host loads, by id, in load order: enabled (and named, with
+   * `plugins`), read, and not failed. Empty when there are none. As last read;
+   * a plugin whose `onload` throws leaves it at the first apply that loads it.
+   */
   readonly plugins: readonly string[];
-  /** The apply service, or `null` when no screen plugin is enabled. As last read. */
+  /** The plugins that could not be read or loaded, with the reason. */
+  readonly failed: readonly PluginFailure[];
+  /** The apply service, or `null` when no plugin is loaded. As last read. */
   readonly service: ApplyService | null;
   apply(request: ScreenApplyRequest): Promise<ApplyResult>;
   stats(): ScreenStats;
@@ -310,8 +330,11 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     const revalidateMs = options.revalidateMs ?? CONFIG_REVALIDATE_MS;
     const counts = { sheetBytes: 0, configEvents: 0, configReads: 0, configChecks: 0, bundleChanges: 0 };
     let service: ApplyService | null = null;
-    let plugins: readonly string[] = [];
-    /** A digest of the plugin id, manifest and bundle in use, or `null` for none. */
+    /** The enabled (and named) plugin ids, as last read, whether or not they could be read. */
+    let candidates: readonly string[] = [];
+    /** Plugins whose files could not be read or parsed at the last read. */
+    let readFailures: readonly PluginFailure[] = [];
+    /** A digest of the plugin ids, manifests and bundles in use and of the read failures, or `null` for none. */
     let bundleDigest: string | null = null;
     /**
      * Stale until a refresh succeeds: `changes` counts the marks, `readThrough`
@@ -338,20 +361,24 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       }
     });
 
+    const enabledPath = `${OBSIDIAN_CONFIG_DIR}/community-plugins.json`;
     const dataPathOf = (id: string): string => `${OBSIDIAN_CONFIG_DIR}/plugins/${id}/data.json`;
-    const bundlePaths = (id: string): string[] => [
-      `${OBSIDIAN_CONFIG_DIR}/community-plugins.json`,
+    const bundlePathsOf = (id: string): string[] => [
       `${OBSIDIAN_CONFIG_DIR}/plugins/${id}/manifest.json`,
       `${OBSIDIAN_CONFIG_DIR}/plugins/${id}/main.js`,
     ];
+    const named = options.plugins === undefined ? null : new Set(options.plugins);
 
     /**
      * Read everything again (after an event, a failure, or at start). Sets and
-     * `data.json` are dropped. The plugin's enabled state and bundle are read,
-     * and a new manifest is parsed and checked **before** the old service is
-     * touched; a change replaces the service (the old one is closed, its plugin
-     * unloaded), and the new one starts with an empty result cache, because
-     * the cache key does not hold the bundle.
+     * `data.json` are dropped. The enabled list is read, and each plugin's
+     * bundle and manifest are read and checked **before** the old service is
+     * touched. A plugin whose files are missing or whose manifest is not
+     * valid is a read failure: reported, and left out, while the others load.
+     * A change to what loads (or to the failures) replaces the service (the
+     * old one is closed, its plugins unloaded), and the new one starts with an
+     * empty result cache, because the cache key does not hold the bundles. A
+     * read that fails or times out throws, and the host stays stale.
      */
     const refresh = async (): Promise<void> => {
       const at = changes;
@@ -359,50 +386,74 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       sets.clear();
       vaultDocuments.clear();
       revisions.clear();
-      const enabled = parseIds(await read(`${OBSIDIAN_CONFIG_DIR}/community-plugins.json`));
-      const id = SCREEN_PLUGIN_IDS.find((candidate) => enabled.includes(candidate)) ?? null;
-      let next: { id: string; manifest: PluginManifest; source: string; digest: string } | null = null;
-      if (id !== null && dom !== null) {
-        const dir = `${OBSIDIAN_CONFIG_DIR}/plugins/${id}`;
-        const manifestText = await read(`${dir}/manifest.json`);
-        const source = await read(`${dir}/main.js`);
-        // The baseline the period's check compares `data.json` against.
-        await readEntry(dataPathOf(id));
-        if (manifestText !== null && source !== null) {
-          const digest = createHash("sha256").update(`${id}\n${String(manifestText.length)}\n${manifestText}\n`).update(source).digest("hex");
-          next = { id, manifest: { ...parseManifest(manifestText, id), dir }, source, digest };
+      const enabled = parseIds(await read(enabledPath));
+      const ids = [...new Set(enabled)].filter((id) => named === null || named.has(id));
+      const ready: Array<{ id: string; manifest: PluginManifest; source: string }> = [];
+      const failures: PluginFailure[] = [];
+      const digest = createHash("sha256");
+      if (dom !== null) {
+        for (const id of ids) {
+          if (!isFolderName(id)) {
+            failures.push({ id, reason: `${JSON.stringify(id)} is not a plugin folder name` });
+            continue;
+          }
+          const dir = `${OBSIDIAN_CONFIG_DIR}/plugins/${id}`;
+          const [manifestPath, sourcePath] = bundlePathsOf(id) as [string, string];
+          const manifestText = await read(manifestPath);
+          const source = await read(sourcePath);
+          // The baseline the period's check compares `data.json` against.
+          await readEntry(dataPathOf(id));
+          let reason: string | null = null;
+          let manifest: PluginManifest | null = null;
+          if (manifestText === null) reason = `${id} has no manifest.json`;
+          else if (source === null) reason = `${id} has no main.js`;
+          else {
+            try {
+              manifest = { ...parseManifest(manifestText, id), dir };
+            } catch (error) {
+              reason = error instanceof Error ? error.message : String(error);
+            }
+          }
+          if (manifest === null || source === null || manifestText === null) {
+            failures.push({ id, reason: reason ?? `${id} could not be read` });
+            digest.update(`failed\n${id}\n${reason ?? ""}\n`);
+            continue;
+          }
+          ready.push({ id, manifest, source });
+          digest.update(`${id}\n${String(manifestText.length)}\n${manifestText}\n${String(source.length)}\n`).update(source);
         }
       }
-      if ((next?.digest ?? null) !== bundleDigest) {
+      candidates = ids;
+      readFailures = failures;
+      const next = ready.length === 0 && failures.length === 0 ? null : digest.digest("hex");
+      if (next !== bundleDigest) {
         if (bundleDigest !== null) counts.bundleChanges += 1;
         const old = service;
         service = null;
-        plugins = [];
         bundleDigest = null;
         if (old !== null) await old.close();
-        if (next !== null && dom !== null) {
+        if (ready.length > 0 && dom !== null) {
           service = createApplyService({
             app: assembly.app,
             loader,
             queue: assembly.queue,
             document: dom.document as unknown as ServiceDocument,
             clock,
-            bundle: {
-              manifest: next.manifest,
+            bundles: ready.map(({ id, manifest, source }) => ({
+              manifest,
               request: {
-                pluginId: next.id,
-                filename: join(config.vaultRoot, OBSIDIAN_CONFIG_DIR, "plugins", next.id, "main.js"),
-                source: next.source,
+                pluginId: id,
+                filename: join(config.vaultRoot, OBSIDIAN_CONFIG_DIR, "plugins", id, "main.js"),
+                source,
                 hostModulePaths: modulePaths,
               },
-            },
+            })),
             vaultDocuments,
             ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
             ...(options.cacheLimit === undefined ? {} : { cacheLimit: options.cacheLimit }),
           });
-          plugins = [next.id];
-          bundleDigest = next.digest;
         }
+        bundleDigest = next;
       }
       readThrough = at;
       readAt = Date.now();
@@ -411,28 +462,26 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     /**
      * The period's check, when no event said anything changed: read the files
      * again and compare their revisions with the ones kept. Nothing changed:
-     * nothing is dropped or rebuilt. The bundle or enabled state changed: a
+     * nothing is dropped or rebuilt. A bundle or the enabled state changed: a
      * full refresh. Otherwise only `data.json`'s cache, or only the sets, go.
      */
     const revalidate = async (): Promise<void> => {
       counts.configChecks += 1;
-      const id = plugins[0] ?? null;
-      const paths = new Set(revisions.keys());
-      paths.add(`${OBSIDIAN_CONFIG_DIR}/community-plugins.json`);
-      if (id !== null) paths.add(dataPathOf(id));
+      const dataPaths = new Set(candidates.filter(isFolderName).map(dataPathOf));
+      const bundle = new Set([enabledPath, ...candidates.filter(isFolderName).flatMap(bundlePathsOf)]);
+      const paths = new Set([...revisions.keys(), enabledPath, ...dataPaths]);
       const before = new Map(revisions);
       const changed: string[] = [];
       for (const path of paths) {
         const entry = await readEntry(path);
         if ((entry?.revision ?? null) !== (before.has(path) ? before.get(path) : undefined)) changed.push(path);
       }
-      const bundle = new Set(bundlePaths(id ?? SCREEN_PLUGIN_IDS[0] ?? ""));
       if (changed.some((path) => bundle.has(path))) {
         await refresh();
         return;
       }
-      if (id !== null && changed.includes(dataPathOf(id))) vaultDocuments.clear();
-      if (changed.some((path) => id === null || path !== dataPathOf(id))) sets.clear();
+      if (changed.some((path) => dataPaths.has(path))) vaultDocuments.clear();
+      if (changed.some((path) => !dataPaths.has(path))) sets.clear();
       readAt = Date.now();
     };
     undo.push(async () => {
@@ -474,7 +523,7 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       try {
         if (readThrough !== changes) await refresh();
         else if (revalidateMs > 0 && Date.now() - readAt >= revalidateMs) await revalidate();
-        if (service === null) return { classes: [], style: "" };
+        if (service === null) return EMPTY_RESULT;
         if (request.sheets === undefined) sheets = await setFor(request.appearance ?? {});
       } catch (error) {
         // A read that failed or timed out: the next request reads everything again.
@@ -495,6 +544,15 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
     // The first read happens now, so the ready line names the plugins.
     await refresh();
 
+    const loadedPlugins = (): readonly string[] => service?.plugins() ?? [];
+    const failedPlugins = (): readonly PluginFailure[] => {
+      const byId = new Map([...readFailures, ...(service?.failed() ?? [])].map((failure) => [failure.id, failure]));
+      return candidates.flatMap((id) => {
+        const failure = byId.get(id);
+        return failure === undefined ? [] : [failure];
+      });
+    };
+
     const stats = (): ScreenStats => ({
       ...(service?.stats() ?? { loads: 0, unloads: 0, hits: 0, misses: 0, size: 0 }),
       vaultd_requests: vaultdRequests,
@@ -503,6 +561,8 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       config_reads: counts.configReads,
       config_checks: counts.configChecks,
       bundle_changes: counts.bundleChanges,
+      plugins: [...loadedPlugins()],
+      failed: failedPlugins().map((failure) => ({ ...failure })),
     });
 
     const server = new ScreenServer({
@@ -512,13 +572,22 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       handshakeTimeoutMs: config.handshakeTimeoutMs,
       maxPreAuthConnections: config.maxPreAuthConnections,
       lineCapBytes: SCREEN_LINE_CAP_BYTES,
-      hello: () => ({ protocol_version: 1, profile: "screen", vault_root: config.vaultRoot, plugins: [...plugins] }),
+      hello: () => ({
+        protocol_version: 1,
+        profile: "screen",
+        vault_root: config.vaultRoot,
+        plugins: [...loadedPlugins()],
+        failed: failedPlugins().map((failure) => ({ ...failure })),
+      }),
       dispatch: async (method, params) => {
         switch (method) {
           case "screen.apply": {
             try {
               const result = await apply(params as ScreenApplyRequest);
-              return { classes: [...result.classes], style: result.style };
+              return {
+                classes: [...result.classes],
+                styles: result.styles.map((style) => ({ id: style.id, text: style.text })),
+              };
             } catch (error) {
               if (error instanceof TypeError) throw new ScreenError("invalid_request", error.message);
               throw error;
@@ -538,7 +607,10 @@ export async function startScreenHost(config: HostConfig, options: ScreenHostOpt
       config,
       socketPath,
       get plugins() {
-        return plugins;
+        return loadedPlugins();
+      },
+      get failed() {
+        return failedPlugins();
       },
       get service() {
         return service;
@@ -577,6 +649,11 @@ function parseManifest(text: string, id: string): PluginManifest {
   const manifest = value as Record<string, unknown>;
   if (manifest["id"] !== id) throw new Error(`the manifest of ${id} names the id ${JSON.stringify(manifest["id"])}`);
   return manifest as unknown as PluginManifest;
+}
+
+/** One folder entry: not empty, no slash, not `.` or `..`. A plugin id is read as a folder under `plugins/`. */
+function isFolderName(id: string): boolean {
+  return id !== "" && id !== "." && id !== ".." && !id.includes("/") && !id.includes("\\") && !id.includes("\0");
 }
 
 function parseIds(text: string | null): string[] {

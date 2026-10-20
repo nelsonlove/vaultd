@@ -90,6 +90,17 @@ export function pluginOwnedClasses(): Set<string> {
   return owned;
 }
 
+/** The id of the `<style>` Style Settings writes; only tests and fixtures name it. */
+export const OUTPUT_STYLE_ID = "css-settings-manager";
+
+/**
+ * The text of Style Settings' output in a screen apply's answer, found by the
+ * id the fixture knows (the screen host itself names no plugin), or `""`.
+ */
+export function outputText(result: { readonly styles: ReadonlyArray<{ readonly id: string | null; readonly text: string }> }): string {
+  return result.styles.find((style) => style.id === OUTPUT_STYLE_ID)?.text ?? "";
+}
+
 /** The members of the real document a run reads. */
 interface RunElement {
   id: string;
