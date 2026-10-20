@@ -25,7 +25,8 @@
  *   That is the headless profile, and it is the default: a *screen* host
  *   passes a DOM provider (`dom-provider.ts`), and then `document`,
  *   `activeDocument` and the four node constructors are a real server DOM's
- *   instead. Nothing else in this file differs between the two.
+ *   instead, with Obsidian's DOM helpers (`obsidian-dom.ts`) installed over
+ *   them. Nothing else in this file differs between the two.
  * - **Refused.** `window.require` throws a typed {@link HeadlessUnsupported}
  *   naming the specifier, because this host is not Electron and a plugin
  *   reaching for a Node builtin through the window is asking for something
@@ -77,6 +78,7 @@ import {
   createStubDocument,
   setDelegatedListenerSink,
 } from "./dom";
+import { installObsidianDom } from "./obsidian-dom";
 import { currentPluginId, declarePolicy, recordUse, stub, unsupported } from "./policy";
 import type { App } from "./app";
 import type { Clock, HostConfig } from "../config";
@@ -589,6 +591,19 @@ export function installGlobals(app: App, config: HostConfig, deps: GlobalDeps): 
     patcher.define(globalThis, "Element", dom.constructors.Element);
     patcher.define(globalThis, "HTMLElement", dom.constructors.HTMLElement);
     patcher.define(globalThis, "DocumentFragment", dom.constructors.DocumentFragment);
+    // Obsidian's DOM helpers, over the real document: the `Node` and `Element`
+    // prototype extensions (hidden, so no `for…in` sees them) and the four
+    // global builders. Only here — the stub's `StubEl` carries its own inert
+    // versions, and these are never put onto it. Through the patcher, so a
+    // restore takes them off the library's prototypes again: linkedom and
+    // happy-dom share those prototypes across every document in the process.
+    installObsidianDom(
+      { ...dom.constructors, document: dom.document, global: globalThis },
+      (target, key, value, enumerable) => {
+        if (enumerable) patcher.define(target, key, value);
+        else patcher.defineHidden(target, key, value);
+      },
+    );
   }
 
   installPrototypeExtensions(patcher);

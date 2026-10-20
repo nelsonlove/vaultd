@@ -146,6 +146,41 @@ describe.each(PROVIDERS)("the %s provider", (name, provider) => {
     }
   });
 
+  it("installs Obsidian's DOM helpers over the real document", async () => {
+    const harness = await ShimHarness.withVault({}, { dom: provider() });
+    const document = globalDocument() as Doc & { body: El & { createDiv(o?: string): El } };
+    const ref = document.body.createDiv("theme-light style-settings-ref");
+    expect(ref.classList.contains("style-settings-ref")).toBe(true);
+    const builders = globalThis as unknown as { createEl(tag: string, o?: { cls: string }): El; HTMLElement: new () => unknown };
+    const style = builders.createEl("style", { cls: "probe" });
+    expect(style.tagName).toBe("STYLE");
+    expect(style).toBeInstanceOf(builders.HTMLElement);
+    expect(harness.serverDom?.constructors.HTMLElement).toBe(builders.HTMLElement);
+  });
+
+  it("puts the library's prototypes back as it found them on restore", () => {
+    const env = provider().create();
+    const prototype = env.constructors.Node.prototype;
+    env.close();
+    // The libraries share their prototypes across every document in the
+    // process, so a harness earlier in this file may have left its own helpers
+    // there. A sentinel makes "whatever was there before" observable.
+    const original = Object.getOwnPropertyDescriptor(prototype, "createDiv");
+    const sentinel = { value: "sentinel", writable: false, configurable: true, enumerable: true };
+    Object.defineProperty(prototype, "createDiv", sentinel);
+    try {
+      const installation = install(provider());
+      const during = Object.getOwnPropertyDescriptor(prototype, "createDiv");
+      expect(typeof during?.value).toBe("function");
+      expect(during?.enumerable).toBe(false);
+      installation.restore();
+      expect(Object.getOwnPropertyDescriptor(prototype, "createDiv")).toEqual(sentinel);
+    } finally {
+      if (original === undefined) delete (prototype as Record<string, unknown>).createDiv;
+      else Object.defineProperty(prototype, "createDiv", original);
+    }
+  });
+
   it("puts the stub globals back on restore", () => {
     const before = globalDocument();
     const installation = install(provider());
